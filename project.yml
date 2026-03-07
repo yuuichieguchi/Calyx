@@ -1,0 +1,65 @@
+name: Calyx
+options:
+  bundleIdPrefix: com.calyx
+  deploymentTarget:
+    macOS: "26.0"
+  xcodeVersion: "26.2"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.2"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    OTHER_LDFLAGS:
+      - -framework Metal
+      - -framework MetalKit
+      - -framework QuartzCore
+      - -framework CoreGraphics
+      - -framework Foundation
+      - -framework IOKit
+      - -framework CoreText
+      - -lz
+      - -lc++
+    SWIFT_ACTIVE_COMPILATION_CONDITIONS:
+      - DEBUG
+
+targets:
+  Calyx:
+    type: application
+    platform: macOS
+    sources:
+      - path: Calyx
+        excludes:
+          - "**/*.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.calyx.terminal
+        INFOPLIST_GENERATION_MODE: GeneratedFile
+        PRODUCT_NAME: Calyx
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSMainNibFile: ""
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        CODE_SIGN_ENTITLEMENTS: Calyx/Calyx.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+    dependencies:
+      - framework: GhosttyKit.xcframework
+        embed: false
+      - sdk: Carbon.framework
+      - sdk: WebKit.framework
+      - sdk: UserNotifications.framework
+
+  CalyxTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: CalyxTests
+    dependencies:
+      - target: Calyx
+
+fileGroups:
+  - Calyx-Bridging-Header.h
