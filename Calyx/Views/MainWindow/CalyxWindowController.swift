@@ -14,6 +14,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var splitContainerView: SplitContainerView?
     private var hostingView: NSHostingView<MainContentView>?
     private let commandRegistry = CommandRegistry()
+    private var closingTabIDs: Set<UUID> = []
 
     // MARK: - Computed Properties
 
@@ -260,12 +261,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func closeTab(id tabID: UUID) {
-        // Find which group owns this tab (may not be the active group)
+        // Prevent double execution
+        guard !closingTabIDs.contains(tabID) else { return }
+
         guard let group = windowSession.groups.first(where: { g in
             g.tabs.contains(where: { $0.id == tabID })
         }) else { return }
-
         guard let tab = group.tabs.first(where: { $0.id == tabID }) else { return }
+
+        closingTabIDs.insert(tabID)
 
         // Destroy all surfaces in the tab
         for surfaceID in tab.registry.allIDs {
@@ -277,12 +281,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         switch result {
         case .switchedTab(_, let newTabID):
             switchToTab(id: newTabID)
-        case .switchedGroup(let newGroupID, let newTabID):
+        case .switchedGroup(let newGroupID, _):
             switchToGroup(id: newGroupID)
-            _ = newTabID // activeTab is set by switchToGroup
         case .windowShouldClose:
             window?.close()
         }
+
+        closingTabIDs.remove(tabID)
     }
 
     func switchToTab(id tabID: UUID) {
@@ -380,11 +385,21 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private func closeActiveGroup() {
         guard let group = windowSession.activeGroup else { return }
 
+        // Mark all tabs as closing to prevent notification handler from double-deleting
+        let tabIDs = group.tabs.map { $0.id }
+        for tabID in tabIDs {
+            closingTabIDs.insert(tabID)
+        }
+
         // Destroy all surfaces in all tabs of this group
         for tab in group.tabs {
             for surfaceID in tab.registry.allIDs {
                 tab.registry.destroySurface(surfaceID)
             }
+        }
+
+        for tabID in tabIDs {
+            closingTabIDs.remove(tabID)
         }
 
         let result = windowSession.removeGroup(id: group.id)
@@ -536,10 +551,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard let (owningTab, owningGroup) = findTab(for: surfaceView) else { return }
         guard let surfaceID = owningTab.registry.id(for: surfaceView) else { return }
 
+        // Surface-level cleanup: update split tree and destroy surface
         let (newTree, focusTarget) = owningTab.splitTree.remove(surfaceID)
         owningTab.registry.destroySurface(surfaceID)
         owningTab.splitTree = newTree
 
+        // If closeTab is handling this tab, skip tab removal (closeTab will do it)
+        if closingTabIDs.contains(owningTab.id) {
+            return
+        }
+
+        // Below runs only for process-initiated closes (e.g. `exit` command)
         if owningTab.splitTree.isEmpty {
             let result = windowSession.removeTab(id: owningTab.id, fromGroup: owningGroup.id)
             if owningTab.id == activeTab?.id {
@@ -749,6 +771,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        // Mark all tabs as closing to prevent notification handler interference
+        for group in windowSession.groups {
+            for tab in group.tabs {
+                closingTabIDs.insert(tab.id)
+            }
+        }
+
         // Destroy all surfaces in all tabs
         for group in windowSession.groups {
             for tab in group.tabs {

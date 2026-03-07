@@ -38,19 +38,34 @@ class SplitContainerView: NSView {
 
         guard oldTree != tree else { return }
 
-        // Full rebuild for now — diff-based optimization can come later
-        subviews.forEach { $0.removeFromSuperview() }
+        // Don't move surface views into a zero-bounds container —
+        // setFrameSize(zero) kills Metal drawable and ghostty stops rendering.
+        // resizeSubviews/layout will handle it when we get proper bounds.
+        guard bounds.width > 0 && bounds.height > 0 else { return }
 
+        subviews.forEach { $0.removeFromSuperview() }
         guard let root = tree.root else { return }
         layoutNode(root, in: bounds)
     }
 
     override func resizeSubviews(withOldSize oldSize: NSSize) {
         super.resizeSubviews(withOldSize: oldSize)
+        guard bounds.width > 0 && bounds.height > 0 else { return }
         guard let root = currentTree.root else { return }
 
         subviews.forEach { $0.removeFromSuperview() }
         layoutNode(root, in: bounds)
+    }
+
+    override func layout() {
+        super.layout()
+        guard bounds.width > 0 && bounds.height > 0 else { return }
+        guard let root = currentTree.root else { return }
+
+        // Deferred layout: surface views haven't been added yet
+        if subviews.isEmpty {
+            layoutNode(root, in: bounds)
+        }
     }
 
     // MARK: - Recursive Layout
