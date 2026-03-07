@@ -2,6 +2,9 @@ import AppKit
 
 @MainActor
 class CalyxWindow: NSWindow {
+
+    var shortcutManager: ShortcutManager?
+
     override init(
         contentRect: NSRect,
         styleMask style: NSWindow.StyleMask,
@@ -19,11 +22,7 @@ class CalyxWindow: NSWindow {
         minSize = NSSize(width: 400, height: 300)
         isReleasedWhenClosed = false
 
-        // Enable full-size content view so the terminal renders
-        // behind the titlebar area.
         styleMask.insert(.fullSizeContentView)
-
-        // Allow the window to be tabbed using the system tabbing behavior.
         tabbingMode = .preferred
     }
 
@@ -31,9 +30,14 @@ class CalyxWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 
     override func sendEvent(_ event: NSEvent) {
-        // Phase 1: pass through to super.
-        // Future phases will intercept Cmd/Ctrl shortcuts here
-        // for keybind processing before the view hierarchy.
+        if event.type == .keyDown,
+           let manager = shortcutManager,
+           manager.shouldIntercept(event: event, firstResponder: firstResponder) {
+            if manager.handleEvent(event) {
+                return
+            }
+        }
+
         super.sendEvent(event)
     }
 }

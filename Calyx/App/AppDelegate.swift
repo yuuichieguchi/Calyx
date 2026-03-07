@@ -9,12 +9,12 @@ private let logger = Logger(
 
 @MainActor
 class AppDelegate: NSObject, NSApplicationDelegate {
+    private(set) var appSession = AppSession()
     private var windowControllers: [CalyxWindowController] = []
 
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // 1. Initialize the shared app controller (singleton init runs on first access)
         let controller = GhosttyAppController.shared
         guard controller.readiness == .ready else {
             logger.critical("GhosttyAppController initialization failed")
@@ -27,17 +27,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        // 2. Set color scheme based on system appearance
         if let app = controller.app {
             let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             let scheme: ghostty_color_scheme_e = isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT
             ghostty_app_set_color_scheme(app, scheme)
         }
 
-        // 3. Set up the main menu
         setupMainMenu()
-
-        // 4. Create the first window
+        registerNotificationObservers()
         createNewWindow()
     }
 
@@ -68,17 +65,41 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Clean up window controllers
         windowControllers.removeAll()
     }
 
     func applicationDidChangeOcclusionState(_ notification: Notification) {
-        // Update color scheme when system appearance changes
         if let app = GhosttyAppController.shared.app {
             let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
             let scheme: ghostty_color_scheme_e = isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT
             ghostty_app_set_color_scheme(app, scheme)
         }
+    }
+
+    // MARK: - Notification Observers
+
+    private func registerNotificationObservers() {
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(handleNewTab(_:)), name: .ghosttyNewTab, object: nil)
+        center.addObserver(self, selector: #selector(handleNewWindow(_:)), name: .ghosttyNewWindow, object: nil)
+    }
+
+    @objc private func handleNewTab(_ notification: Notification) {
+        // Find the window controller that owns the source surface
+        guard let surfaceView = notification.object as? SurfaceView,
+              let window = surfaceView.window,
+              let wc = windowControllers.first(where: { $0.window === window }) else {
+            // No source — create tab in the key window's controller
+            if let keyWC = windowControllers.first(where: { $0.window?.isKeyWindow == true }) {
+                keyWC.createNewTab(inheritedConfig: notification.userInfo?["inherited_config"])
+            }
+            return
+        }
+        wc.createNewTab(inheritedConfig: notification.userInfo?["inherited_config"])
+    }
+
+    @objc private func handleNewWindow(_ notification: Notification) {
+        createNewWindow()
     }
 
     // MARK: - Window Management
@@ -179,7 +200,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
 
     @objc private func openPreferences(_ sender: Any?) {
-        // Phase 1: Open the config file directly
         if let app = GhosttyAppController.shared.app {
             ghostty_app_open_config(app)
         }

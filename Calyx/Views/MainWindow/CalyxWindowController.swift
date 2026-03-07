@@ -87,6 +87,42 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .ghosttySetTitle, object: nil)
     }
 
+    // MARK: - Tab Operations
+
+    func createNewTab(inheritedConfig: Any? = nil) {
+        guard let app = GhosttyAppController.shared.app,
+              let window = self.window else { return }
+
+        var config: ghostty_surface_config_s
+        if let inherited = inheritedConfig as? ghostty_surface_config_s {
+            config = inherited
+        } else {
+            config = GhosttyFFI.surfaceConfigNew()
+        }
+        config.scale_factor = Double(window.backingScaleFactor)
+
+        guard let surfaceID = registry.createSurface(app: app, config: config) else {
+            logger.error("Failed to create surface for new tab")
+            return
+        }
+
+        // For now, create a new split tree with a single leaf for the new tab
+        // Full tab model integration will use the Tab/TabGroup session model
+        let newTree = SplitTree(leafID: surfaceID)
+
+        // Store the old tree's surfaces as occluded
+        for id in splitTree.allLeafIDs() {
+            registry.controller(for: id)?.setOcclusion(true)
+        }
+
+        splitTree = newTree
+        splitContainerView?.updateLayout(tree: splitTree)
+
+        if let surfaceView = registry.view(for: surfaceID) {
+            window.makeFirstResponder(surfaceView)
+        }
+    }
+
     // MARK: - Split Operations
 
     private func handleDividerDrag(leafID: UUID, delta: Double, direction: SplitDirection) {
