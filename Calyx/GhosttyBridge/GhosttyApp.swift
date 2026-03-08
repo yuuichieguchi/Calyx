@@ -344,12 +344,31 @@ private func ghosttyConfirmReadClipboardCallback(
 /// Write clipboard callback - writes to NSPasteboard.
 private func ghosttyWriteClipboardCallback(
     _ userdata: UnsafeMutableRawPointer?,
-    _ string: UnsafePointer<CChar>?,
     _ location: ghostty_clipboard_e,
+    _ contents: UnsafePointer<ghostty_clipboard_content_s>?,
+    _ contentsLen: Int,
     _ confirm: Bool
 ) {
-    guard let string else { return }
-    guard let valueStr = String(cString: string, encoding: .utf8) else { return }
+    guard let contents, contentsLen > 0 else { return }
+
+    // Find the first entry with a text/plain mime type, or fall back to the first entry.
+    var valueStr: String?
+    for i in 0..<contentsLen {
+        let entry = contents[i]
+        if let mime = entry.mime, let data = entry.data {
+            let mimeStr = String(cString: mime)
+            if mimeStr == "text/plain" {
+                valueStr = String(cString: data)
+                break
+            }
+        }
+    }
+    // Fallback: use the first entry's data if no text/plain was found.
+    if valueStr == nil, let data = contents[0].data {
+        valueStr = String(cString: data)
+    }
+
+    guard let valueStr else { return }
 
     MainActor.assumeIsolated {
         let pasteboard: NSPasteboard
