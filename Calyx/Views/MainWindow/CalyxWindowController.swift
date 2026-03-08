@@ -180,14 +180,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Content View Building
 
     private func buildMainContentView() -> MainContentView {
-        let group = windowSession.activeGroup
         return MainContentView(
-            groups: windowSession.groups,
-            activeGroupID: windowSession.activeGroupID,
-            activeTabs: group?.tabs ?? [],
-            activeTabID: group?.activeTabID,
-            showSidebar: windowSession.showSidebar,
-            showCommandPalette: windowSession.showCommandPalette,
+            windowSession: windowSession,
             commandRegistry: commandRegistry,
             splitContainerView: splitContainerView ?? SplitContainerView(registry: SurfaceRegistry()),
             onTabSelected: { [weak self] tabID in self?.switchToTab(id: tabID) },
@@ -208,21 +202,42 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     private func rebuildSplitContainer() {
         guard let tab = activeTab else { return }
-        guard let window = self.window, let contentView = window.contentView else { return }
-
-        let newContainer = SplitContainerView(registry: tab.registry)
-        newContainer.onRatioChange = { [weak self] leafID, delta, direction in
-            self?.handleDividerDrag(leafID: leafID, delta: delta, direction: direction)
+        if let container = splitContainerView {
+            container.updateRegistry(tab.registry)
+        } else {
+            let container = SplitContainerView(registry: tab.registry)
+            container.onRatioChange = { [weak self] leafID, delta, direction in
+                self?.handleDividerDrag(leafID: leafID, delta: delta, direction: direction)
+            }
+            self.splitContainerView = container
         }
+    }
 
-        // Replace old container reference
-        self.splitContainerView = newContainer
+    private func updateTerminalLayout() {
+        guard let tab = activeTab, let container = splitContainerView else { return }
+        container.updateLayout(tree: tab.splitTree)
     }
 
     private func updateLayout() {
-        guard let tab = activeTab, let container = splitContainerView else { return }
-        container.updateLayout(tree: tab.splitTree)
-        refreshHostingView()
+        updateTerminalLayout()
+    }
+
+    @discardableResult
+    private func focusActiveTabImmediately() -> Bool {
+        guard let tab = activeTab,
+              let focusedID = tab.splitTree.focusedLeafID,
+              let focusView = tab.registry.view(for: focusedID) else {
+            return false
+        }
+
+        let becameFirstResponder = window?.makeFirstResponder(focusView) ?? false
+        guard becameFirstResponder else { return false }
+
+        tab.registry.controller(for: focusedID)?.setFocus(true)
+        tab.registry.controller(for: focusedID)?.refresh()
+        focusView.needsDisplay = true
+        tab.unreadNotifications = 0
+        return true
     }
 
     // MARK: - Tab Operations
@@ -257,6 +272,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         rebuildSplitContainer()
         updateLayout()
+        refreshHostingView()
 
         restoreFocus()
         requestSave()
@@ -289,6 +305,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             window?.close()
         }
 
+        refreshHostingView()
         requestSave()
         closingTabIDs.remove(tabID)
     }
@@ -301,22 +318,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
         guard group.activeTabID != tabID else { return }
 
-        let oldTab = activeTab
-
-        // Pause old tab
-        oldTab?.registry.pauseAll()
+        focusedController?.setFocus(false)
 
         group.activeTabID = tabID
 
-        let newTab = activeTab
-
         rebuildSplitContainer()
-        updateLayout()
-        // Resume after attaching the new tab's views to avoid dropped render updates.
-        newTab?.registry.resumeAll()
-
-        restoreFocus()
-        requestSave()
+        updateTerminalLayout()
+        if !focusActiveTabImmediately() {
+            restoreFocus()
+        }
     }
 
     func switchToGroup(id groupID: UUID) {
@@ -326,18 +336,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
         guard windowSession.activeGroupID != groupID else { return }
 
-        // Pause old group's active tab
-        activeTab?.registry.pauseAll()
+        focusedController?.setFocus(false)
 
         windowSession.activeGroupID = groupID
 
         rebuildSplitContainer()
-        updateLayout()
-        // Resume after layout so the active tab is visible when render resumes.
-        activeTab?.registry.resumeAll()
-
-        restoreFocus()
-        requestSave()
+        updateTerminalLayout()
+        if !focusActiveTabImmediately() {
+            restoreFocus()
+        }
     }
 
     // MARK: - Group Operations
@@ -375,6 +382,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         rebuildSplitContainer()
         updateLayout()
+        refreshHostingView()
 
         restoreFocus()
         requestSave()
@@ -407,6 +415,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             rebuildSplitContainer()
             updateLayout()
             activeTab?.registry.resumeAll()
+            refreshHostingView()
             restoreFocus()
             requestSave()
         case .windowShouldClose:
@@ -422,7 +431,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         updateLayout()
         activeTab?.registry.resumeAll()
         restoreFocus()
-        requestSave()
     }
 
     private func switchToPreviousGroup() {
@@ -432,12 +440,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         updateLayout()
         activeTab?.registry.resumeAll()
         restoreFocus()
-        requestSave()
     }
 
     @objc func toggleSidebar() {
         windowSession.showSidebar.toggle()
-        refreshHostingView()
         requestSave()
     }
 
@@ -446,14 +452,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             dismissCommandPalette()
         } else {
             windowSession.showCommandPalette = true
-            refreshHostingView()
         }
     }
 
     private func dismissCommandPalette() {
         guard windowSession.showCommandPalette else { return }
         windowSession.showCommandPalette = false
-        refreshHostingView()
         restoreFocus()
     }
 
@@ -768,21 +772,23 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func selectNextTab(_ sender: Any?) {
-        activeTab?.registry.pauseAll()
+        focusedController?.setFocus(false)
         windowSession.nextTab()
         rebuildSplitContainer()
-        updateLayout()
-        activeTab?.registry.resumeAll()
-        restoreFocus()
+        updateTerminalLayout()
+        if !focusActiveTabImmediately() {
+            restoreFocus()
+        }
     }
 
     @objc func selectPreviousTab(_ sender: Any?) {
-        activeTab?.registry.pauseAll()
+        focusedController?.setFocus(false)
         windowSession.previousTab()
         rebuildSplitContainer()
-        updateLayout()
-        activeTab?.registry.resumeAll()
-        restoreFocus()
+        updateTerminalLayout()
+        if !focusActiveTabImmediately() {
+            restoreFocus()
+        }
     }
 
     @objc func selectTab1(_ sender: Any?) { selectTabByIndex(0) }
@@ -796,12 +802,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     @objc func selectTab9(_ sender: Any?) { selectTabByIndex(8) }
 
     private func selectTabByIndex(_ index: Int) {
-        activeTab?.registry.pauseAll()
+        focusedController?.setFocus(false)
         windowSession.selectTab(at: index)
         rebuildSplitContainer()
-        updateLayout()
-        activeTab?.registry.resumeAll()
-        restoreFocus()
+        updateTerminalLayout()
+        if !focusActiveTabImmediately() {
+            restoreFocus()
+        }
     }
 
     // MARK: - Session Persistence
@@ -834,8 +841,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func requestSave() {
-        if let appDelegate = NSApp.delegate as? AppDelegate {
-            appDelegate.requestSave()
+        DispatchQueue.main.async {
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.requestSave()
+            }
         }
     }
 

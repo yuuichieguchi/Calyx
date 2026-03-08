@@ -6,12 +6,7 @@
 import SwiftUI
 
 struct MainContentView: View {
-    let groups: [TabGroup]
-    let activeGroupID: UUID?
-    let activeTabs: [Tab]
-    let activeTabID: UUID?
-    let showSidebar: Bool
-    let showCommandPalette: Bool
+    @Bindable var windowSession: WindowSession
     let commandRegistry: CommandRegistry?
     let splitContainerView: SplitContainerView
 
@@ -26,12 +21,16 @@ struct MainContentView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
+        let activeGroup = windowSession.activeGroup
+        let activeTabs = activeGroup?.tabs ?? []
+        let activeTabID = activeGroup?.activeTabID
+
         GlassEffectContainer {
             HStack(spacing: 0) {
-                if showSidebar {
+                if windowSession.showSidebar {
                     SidebarContentView(
-                        groups: groups,
-                        activeGroupID: activeGroupID,
+                        groups: windowSession.groups,
+                        activeGroupID: windowSession.activeGroupID,
                         activeTabID: activeTabID,
                         onGroupSelected: onGroupSelected,
                         onTabSelected: onTabSelected,
@@ -61,7 +60,7 @@ struct MainContentView: View {
                             .opacity(0.85)
                     }
 
-                    if showCommandPalette, let commandRegistry {
+                    if windowSession.showCommandPalette, let commandRegistry {
                         Color.black.opacity(0.01)
                             .onTapGesture { onDismissCommandPalette?() }
 

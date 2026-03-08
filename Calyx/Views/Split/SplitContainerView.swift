@@ -11,7 +11,7 @@ private let logger = Logger(subsystem: "com.calyx.terminal", category: "SplitCon
 @MainActor
 class SplitContainerView: NSView {
 
-    private let registry: SurfaceRegistry
+    private var registry: SurfaceRegistry
     private var currentTree: SplitTree = SplitTree()
     var onRatioChange: ((UUID, Double, SplitDirection) -> Void)?
     var onDeferredLayoutComplete: (() -> Void)?
@@ -32,6 +32,14 @@ class SplitContainerView: NSView {
     override var isFlipped: Bool { true }
 
     // MARK: - Update
+
+    func updateRegistry(_ registry: SurfaceRegistry) {
+        guard self.registry !== registry else { return }
+        self.registry = registry
+        currentTree = SplitTree()
+        subviews.forEach { $0.removeFromSuperview() }
+        needsLayout = true
+    }
 
     func updateLayout(tree: SplitTree) {
         let oldTree = currentTree

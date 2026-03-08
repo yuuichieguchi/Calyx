@@ -16,20 +16,35 @@ struct TabBarContentView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 1) {
-                    ForEach(tabs) { tab in
-                        TabItemButton(
-                            tab: tab,
-                            isActive: tab.id == activeTabID,
-                            onSelected: { onTabSelected?(tab.id) },
-                            onClose: { onCloseTab?(tab.id) }
-                        )
+            ScrollViewReader { proxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 1) {
+                        ForEach(tabs) { tab in
+                            TabItemButton(
+                                tab: tab,
+                                isActive: tab.id == activeTabID,
+                                onSelected: { onTabSelected?(tab.id) },
+                                onClose: { onCloseTab?(tab.id) }
+                            )
+                            .id(tab.id)
+                        }
                     }
+                }
+                .onAppear {
+                    scrollToActiveTab(proxy: proxy, animated: false)
+                }
+                .onChange(of: activeTabID) { _, _ in
+                    scrollToActiveTab(proxy: proxy, animated: true)
+                }
+                .onChange(of: tabs.map(\.id)) { _, _ in
+                    scrollToActiveTab(proxy: proxy, animated: false)
                 }
             }
 
-            Spacer(minLength: 0)
+            Color.clear
+                .frame(maxWidth: .infinity, minHeight: 32)
+                .contentShape(Rectangle())
+                .onTapGesture(count: 2) { onNewTab?() }
 
             Button(action: { onNewTab?() }) {
                 Image(systemName: "plus")
@@ -41,8 +56,20 @@ struct TabBarContentView: View {
         .padding(.horizontal, 4)
         .frame(height: 32)
         .contentShape(Rectangle())
-        .onTapGesture(count: 2) { onNewTab?() }
         .modifier(TabBarBackgroundModifier(reduceTransparency: reduceTransparency))
+    }
+
+    private func scrollToActiveTab(proxy: ScrollViewProxy, animated: Bool) {
+        guard let activeTabID else { return }
+        DispatchQueue.main.async {
+            if animated {
+                withAnimation(.easeOut(duration: 0.12)) {
+                    proxy.scrollTo(activeTabID, anchor: .center)
+                }
+            } else {
+                proxy.scrollTo(activeTabID, anchor: .center)
+            }
+        }
     }
 }
 
