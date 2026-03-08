@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: mlugg/setup-zig@v1
+        with:
+          version-file: ghostty/build.zig.zon
+
+      - name: Build libghostty
+        run: cd ghostty && zig build -Doptimize=ReleaseFast
+
+      - name: Copy GhosttyKit.xcframework
+        run: cp -R ghostty/zig-out/lib/GhosttyKit.xcframework .
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build
+        run: xcodebuild -project Calyx.xcodeproj -scheme Calyx -configuration Debug build
+
+      - name: Test
+        run: xcodebuild -project Calyx.xcodeproj -scheme CalyxTests -configuration Debug -destination 'platform=macOS' test
