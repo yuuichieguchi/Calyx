@@ -51,7 +51,15 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 |---|---|
 | `Cmd+Shift+P` | Command palette |
 
-## Prerequisites
+## Installation
+
+1. Download `Calyx.zip` from the [latest release](https://github.com/yuuichieguchi/Calyx/releases/latest)
+2. Unzip the file
+3. Drag `Calyx.app` into `/Applications`
+
+## Building from Source
+
+### Prerequisites
 
 - macOS 26+ (Tahoe)
 - Xcode 26+
