@@ -109,6 +109,7 @@ final class GhosttyConfigManager {
         let presetBlock = """
         \(presetStart)
         background-opacity = 0.82
+        cursor-click-to-move = true
         \(presetEnd)
         """
 

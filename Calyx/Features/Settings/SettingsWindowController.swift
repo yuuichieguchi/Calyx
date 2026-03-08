@@ -13,8 +13,10 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     static let shared = SettingsWindowController()
     private let opacityLabel = NSTextField(labelWithString: "")
     private let opacitySlider = NSSlider(value: 0.82, minValue: 0.3, maxValue: 1.0, target: nil, action: nil)
+    private let clickToMoveCheckbox = NSButton(checkboxWithTitle: "Option+Clickでカーソル移動を有効化", target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
     private var lastLoadedOpacity = 0.82
+    private var lastLoadedClickToMove = true
 
     private init() {
         let window = NSWindow(
@@ -42,7 +44,8 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let root = NSStackView()
         root.orientation = .vertical
-        root.spacing = 12
+        root.alignment = .leading
+        root.spacing = 18
         root.translatesAutoresizingMaskIntoConstraints = false
         contentView.addSubview(root)
 
@@ -50,6 +53,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
             root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
             root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
+            root.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -24),
         ])
 
         let title = NSTextField(labelWithString: "Terminal Glass")
@@ -58,6 +62,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         let subtitle = NSTextField(labelWithString: "These values are saved to Calyx's dedicated glass preset file.")
         subtitle.textColor = .secondaryLabelColor
+        subtitle.font = .systemFont(ofSize: 13)
         root.addArrangedSubview(subtitle)
 
         opacitySlider.target = self
@@ -71,11 +76,31 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         opacityRow.spacing = 12
         opacityRow.alignment = .centerY
         let opacityText = NSTextField(labelWithString: "Background opacity")
+        opacityText.font = .systemFont(ofSize: 13, weight: .medium)
         opacityText.setContentHuggingPriority(.required, for: .horizontal)
         opacityRow.addArrangedSubview(opacityText)
         opacityRow.addArrangedSubview(opacitySlider)
         opacityRow.addArrangedSubview(opacityLabel)
         root.addArrangedSubview(opacityRow)
+
+        clickToMoveCheckbox.target = self
+        clickToMoveCheckbox.action = #selector(fieldDidChange(_:))
+        clickToMoveCheckbox.state = .on
+        root.addArrangedSubview(clickToMoveCheckbox)
+
+        let clickToMoveNote = NSTextField(wrappingLabelWithString:
+            "Note: This feature works best on English prompts. On Japanese or full-width text lines, cursor placement can be offset due to terminal cell-width limitations."
+        )
+        clickToMoveNote.textColor = .secondaryLabelColor
+        clickToMoveNote.font = .systemFont(ofSize: 12)
+        clickToMoveNote.maximumNumberOfLines = 3
+        root.addArrangedSubview(clickToMoveNote)
+
+        let divider = NSBox()
+        divider.boxType = .separator
+        divider.translatesAutoresizingMaskIntoConstraints = false
+        divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        root.addArrangedSubview(divider)
 
         let actions = NSStackView()
         actions.orientation = .horizontal
@@ -181,6 +206,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
 
         var opacity = 0.82
+        var clickToMove = true
 
         for line in text.split(separator: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -190,11 +216,14 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             switch parts[0] {
             case "background-opacity":
                 opacity = Double(parts[1]) ?? opacity
+            case "cursor-click-to-move":
+                clickToMove = NSString(string: parts[1]).boolValue
             default:
                 break
             }
         }
         opacitySlider.doubleValue = max(0.3, min(1.0, opacity))
+        clickToMoveCheckbox.state = clickToMove ? .on : .off
         updateOpacityLabel()
         snapshotCurrentAsLoaded()
         refreshSaveButtonState()
@@ -202,10 +231,12 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func savePresetFromUI() throws {
         let opacity = max(0.3, min(1.0, opacitySlider.doubleValue))
+        let clickToMove = (clickToMoveCheckbox.state == .on)
 
         let preset = """
         # --- Calyx Glass Preset (managed) ---
         background-opacity = \(String(format: "%.2f", opacity))
+        cursor-click-to-move = \(clickToMove ? "true" : "false")
         # --- End Calyx Glass Preset ---
         """
 
@@ -217,12 +248,15 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func snapshotCurrentAsLoaded() {
         lastLoadedOpacity = opacitySlider.doubleValue
+        lastLoadedClickToMove = (clickToMoveCheckbox.state == .on)
         refreshSaveButtonState()
     }
 
     private func hasUnsavedChanges() -> Bool {
         let currentOpacity = opacitySlider.doubleValue
-        return abs(currentOpacity - lastLoadedOpacity) > 0.0001
+        let currentClickToMove = (clickToMoveCheckbox.state == .on)
+        let opacityChanged = abs(currentOpacity - lastLoadedOpacity) > 0.0001
+        return opacityChanged || currentClickToMove != lastLoadedClickToMove
     }
 
     private func refreshSaveButtonState() {
