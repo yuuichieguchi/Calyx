@@ -15,8 +15,10 @@ jobs:
         with:
           submodules: recursive
 
-      - name: Install Zig
-        run: brew install zig
+      - name: Install Zig 0.14.1
+        run: |
+          curl -L https://ziglang.org/download/0.14.1/zig-macos-aarch64-0.14.1.tar.xz | tar xJ
+          echo "$PWD/zig-macos-aarch64-0.14.1" >> $GITHUB_PATH
 
       - name: Build libghostty
         run: cd ghostty && zig build -Doptimize=ReleaseFast
