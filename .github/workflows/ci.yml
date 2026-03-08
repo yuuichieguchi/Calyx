@@ -14,9 +14,8 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: mlugg/setup-zig@v1
-        with:
-          version: 0.14.1
+      - name: Install Zig
+        run: brew install zig
 
       - name: Build libghostty
         run: cd ghostty && zig build -Doptimize=ReleaseFast
