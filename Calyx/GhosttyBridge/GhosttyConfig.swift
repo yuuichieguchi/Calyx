@@ -63,6 +63,8 @@ final class GhosttyConfigManager {
             return nil
         }
 
+        applyCalyxVisualDefaultsIfPossible()
+
         // Load configuration from default file locations.
         GhosttyFFI.configLoadDefaultFiles(cfg)
 
@@ -84,6 +86,53 @@ final class GhosttyConfigManager {
         }
 
         return cfg
+    }
+
+    private static func applyCalyxVisualDefaultsIfPossible() {
+        let ghosttyPath = GhosttyFFI.configOpenPath()
+        defer { GhosttyFFI.freeString(ghosttyPath) }
+
+        guard let ptr = ghosttyPath.ptr else { return }
+        let data = Data(bytes: ptr, count: Int(ghosttyPath.len))
+        guard let path = String(data: data, encoding: .utf8), !path.isEmpty else { return }
+
+        let fileURL = URL(fileURLWithPath: path)
+        let startMarker = "# --- Calyx Visual Defaults (managed) ---"
+        let endMarker = "# --- End Calyx Visual Defaults ---"
+        let managedBlock = """
+        \(startMarker)
+        window-padding-x = 0
+        window-padding-y = 0
+        background-opacity = 0.82
+        background-opacity-cells = true
+        background-blur = true
+        \(endMarker)
+        """
+
+        do {
+            try FileManager.default.createDirectory(
+                at: fileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+
+            let existing = (try? String(contentsOf: fileURL, encoding: .utf8)) ?? ""
+            let updated: String
+
+            if let startRange = existing.range(of: startMarker),
+               let endRange = existing.range(of: endMarker, range: startRange.lowerBound..<existing.endIndex) {
+                let replacementRange = startRange.lowerBound..<endRange.upperBound
+                updated = existing.replacingCharacters(in: replacementRange, with: managedBlock)
+            } else {
+                let separator = existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n"
+                updated = existing + separator + "\n" + managedBlock + "\n"
+            }
+
+            if updated != existing {
+                try updated.write(to: fileURL, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            logger.warning("Failed to apply visual defaults: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     /// Reload the configuration from disk.
