@@ -92,6 +92,10 @@ class CommandPaletteView: NSView, NSTableViewDelegate, NSTableViewDataSource, NS
             resultsScrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
+        searchField.setAccessibilityIdentifier(AccessibilityID.CommandPalette.searchField)
+        resultsTableView.setAccessibilityIdentifier(AccessibilityID.CommandPalette.resultsTable)
+        self.setAccessibilityIdentifier(AccessibilityID.CommandPalette.container)
+
         updateResults()
     }
 

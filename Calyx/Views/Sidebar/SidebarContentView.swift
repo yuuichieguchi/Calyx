@@ -48,9 +48,11 @@ struct SidebarContentView: View {
             .modifier(GlassButtonModifier(reduceTransparency: reduceTransparency))
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            .accessibilityIdentifier(AccessibilityID.Sidebar.newGroupButton)
         }
         .frame(minWidth: 180)
         .modifier(SidebarBackgroundModifier(reduceTransparency: reduceTransparency))
+        .accessibilityIdentifier(AccessibilityID.Sidebar.container)
     }
 }
 
@@ -114,6 +116,7 @@ private struct GroupSectionView: View {
                 ))
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier(AccessibilityID.Sidebar.group(group.id))
 
             // Tabs in this group (only show if not collapsed)
             if !group.isCollapsed {
@@ -186,6 +189,7 @@ private struct TabRowItemView: View {
             )
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier(AccessibilityID.Sidebar.tab(tab.id))
     }
 }
 

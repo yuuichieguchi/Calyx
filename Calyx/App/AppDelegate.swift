@@ -37,7 +37,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         registerNotificationObservers()
         installKeyMonitor()
 
-        if !restoreSession() {
+        let isUITesting = ProcessInfo.processInfo.arguments.contains("--uitesting")
+        if isUITesting || !restoreSession() {
             createNewWindow()
         }
     }
