@@ -28,21 +28,25 @@ private struct BrowserToolbarView: View {
                 Image(systemName: "chevron.left")
             }
             .disabled(!controller.browserState.canGoBack)
+            .accessibilityIdentifier(AccessibilityID.Browser.backButton)
 
             Button(action: { controller.goForward() }) {
                 Image(systemName: "chevron.right")
             }
             .disabled(!controller.browserState.canGoForward)
+            .accessibilityIdentifier(AccessibilityID.Browser.forwardButton)
 
             Button(action: { controller.reload() }) {
                 Image(systemName: "arrow.clockwise")
             }
+            .accessibilityIdentifier(AccessibilityID.Browser.reloadButton)
 
             Text(controller.browserState.url.absoluteString)
                 .font(.system(size: 12, design: .monospaced))
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityIdentifier(AccessibilityID.Browser.urlDisplay)
 
             if controller.browserState.isLoading {
                 ProgressView()
@@ -52,6 +56,8 @@ private struct BrowserToolbarView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .glassEffect(.regular, in: .rect(cornerRadius: 0))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(AccessibilityID.Browser.toolbar)
     }
 }
 
@@ -72,6 +78,7 @@ private struct ErrorBannerView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color.red.opacity(0.15))
+        .accessibilityIdentifier(AccessibilityID.Browser.errorBanner)
     }
 }
 

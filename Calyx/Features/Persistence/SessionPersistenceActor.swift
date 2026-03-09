@@ -18,8 +18,13 @@ actor SessionPersistenceActor {
     static let shared = SessionPersistenceActor()
 
     init() {
-        let homeDir = FileManager.default.homeDirectoryForCurrentUser
-        let calyxDir = homeDir.appendingPathComponent(".calyx", isDirectory: true)
+        let calyxDir: URL
+        if let testDir = ProcessInfo.processInfo.environment["CALYX_UITEST_SESSION_DIR"] {
+            calyxDir = URL(fileURLWithPath: testDir, isDirectory: true)
+        } else {
+            let homeDir = FileManager.default.homeDirectoryForCurrentUser
+            calyxDir = homeDir.appendingPathComponent(".calyx", isDirectory: true)
+        }
 
         try? FileManager.default.createDirectory(at: calyxDir, withIntermediateDirectories: true, attributes: [
             .posixPermissions: 0o700

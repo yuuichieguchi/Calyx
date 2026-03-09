@@ -55,12 +55,14 @@ struct TabBarContentView: View {
             }
             .modifier(GlassButtonModifier(reduceTransparency: reduceTransparency))
             .padding(.horizontal, 8)
+            .accessibilityIdentifier(AccessibilityID.TabBar.newTabButton)
         }
         .padding(.horizontal, 4)
         .frame(height: 32)
         .contentShape(Rectangle())
         .modifier(TabBarBackgroundModifier(reduceTransparency: reduceTransparency))
         .clipped(antialiased: false)
+        .accessibilityIdentifier(AccessibilityID.TabBar.container)
     }
 
     private func scrollToActiveTab(proxy: ScrollViewProxy, animated: Bool) {
@@ -226,6 +228,8 @@ private struct TabItemButton: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier(AccessibilityID.TabBar.tab(tab.id))
+            .accessibilityLabel(tab.title)
 
             if tab.unreadNotifications > 0 {
                 Text(tab.unreadNotifications > 99 ? "99+" : "\(tab.unreadNotifications)")
@@ -246,6 +250,7 @@ private struct TabItemButton: View {
             .padding(.trailing, 6)
             .opacity(isHovering || isActive ? 1 : 0)
             .allowsHitTesting(isHovering || isActive)
+            .accessibilityIdentifier(AccessibilityID.TabBar.tabCloseButton(tab.id))
         }
         .frame(minWidth: 96, idealWidth: 140, maxWidth: 180)
         .padding(.vertical, 6)
