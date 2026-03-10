@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import GhosttyKit
 import OSLog
+import Security
 
 private let logger = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "com.calyx.terminal",
@@ -170,6 +171,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         commandRegistry.register(Command(id: "browser.reload", title: "Browser Reload", category: "Browser") { [weak self] in
             guard case .browser = self?.activeTab?.content else { return }
             self?.activeBrowserController?.reload()
+        })
+        commandRegistry.register(Command(id: "ipc.enable", title: "Enable Claude Code IPC", category: "IPC") { [weak self] in
+            self?.enableIPC()
+        })
+        commandRegistry.register(Command(id: "ipc.disable", title: "Disable Claude Code IPC", category: "IPC") { [weak self] in
+            self?.disableIPC()
         })
     }
 
@@ -1092,5 +1099,58 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidResize(_ notification: Notification) {
         // SplitContainerView handles resize via autoresizingMask + resizeSubviews
+    }
+
+    // MARK: - IPC
+
+    private func enableIPC() {
+        do {
+            // Generate token: 32 random bytes as hex
+            var bytes = [UInt8](repeating: 0, count: 32)
+            let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+            guard status == errSecSuccess else {
+                showIPCAlert(title: "IPC Error", message: "Failed to generate secure token.")
+                return
+            }
+            let token = bytes.map { String(format: "%02x", $0) }.joined()
+
+            // Start server first to get the port
+            try CalyxMCPServer.shared.start(token: token)
+            let port = CalyxMCPServer.shared.port
+
+            // Write config - if this fails, stop server and roll back
+            do {
+                try ClaudeConfigManager.enableIPC(port: port, token: token)
+            } catch {
+                CalyxMCPServer.shared.stop()
+                throw error
+            }
+
+            showIPCAlert(
+                title: "IPC Enabled",
+                message: "MCP server running on port \(port).\nRestart Claude Code instances to connect."
+            )
+        } catch {
+            showIPCAlert(title: "IPC Error", message: error.localizedDescription)
+        }
+    }
+
+    private func disableIPC() {
+        CalyxMCPServer.shared.stop()
+        do {
+            try ClaudeConfigManager.disableIPC()
+        } catch {
+            // Best-effort cleanup
+        }
+        showIPCAlert(title: "IPC Disabled", message: "MCP server stopped and configuration removed.")
+    }
+
+    private func showIPCAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
     }
 }
