@@ -120,20 +120,21 @@ enum EventTranslator {
 
     /// Translate scroll event modifiers into the ghostty packed scroll mods format.
     ///
-    /// The ghostty_input_scroll_mods_t is a packed int with the following layout:
-    /// - Bits 0-2: momentum phase (ghostty_input_mouse_momentum_e)
-    /// - Bit 3: precision scrolling flag
+    /// ghostty ScrollMods is packed struct(u8) (see ghostty/src/input/mouse.zig):
+    /// - Bit 0: precision scrolling flag (trackpad/Magic Mouse = true)
+    /// - Bits 1-3: momentum phase (shifted left by 1)
+    /// - Bits 4-7: padding
     static func translateScrollMods(_ event: NSEvent) -> ghostty_input_scroll_mods_t {
         var mods: Int32 = 0
 
-        // Set momentum phase bits (bits 0-2).
-        let momentum = translateMomentumPhase(event.momentumPhase)
-        mods |= Int32(momentum.rawValue)
-
-        // Set precision flag (bit 3).
+        // Bit 0: precision flag.
         if event.hasPreciseScrollingDeltas {
-            mods |= (1 << 3)
+            mods |= 1
         }
+
+        // Bits 1-3: momentum phase (shifted left by 1).
+        let momentum = translateMomentumPhase(event.momentumPhase)
+        mods |= Int32(momentum.rawValue) << 1
 
         return ghostty_input_scroll_mods_t(mods)
     }

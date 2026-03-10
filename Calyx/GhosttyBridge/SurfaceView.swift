@@ -595,17 +595,15 @@ class SurfaceView: NSView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        var x = event.scrollingDeltaX
-        var y = event.scrollingDeltaY
-
-        // Precise deltas (trackpad) are in pixels — convert to approximate line units.
-        if event.hasPreciseScrollingDeltas {
-            x /= 45.0
-            y /= 45.0
-        }
-
+        // Pass raw deltas to ghostty. With precision=true (bit 0 of scroll mods),
+        // ghostty treats values as pixels and converts to lines internally.
+        // With precision=false, ghostty treats values as wheel ticks.
         let mods = EventTranslator.translateScrollMods(event)
-        surfaceController?.sendMouseScroll(x: x, y: y, mods: mods)
+        surfaceController?.sendMouseScroll(
+            x: event.scrollingDeltaX,
+            y: event.scrollingDeltaY,
+            mods: mods
+        )
     }
 
     override func pressureChange(with event: NSEvent) {
