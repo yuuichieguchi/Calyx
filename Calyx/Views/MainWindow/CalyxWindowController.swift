@@ -172,10 +172,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             guard case .browser = self?.activeTab?.content else { return }
             self?.activeBrowserController?.reload()
         })
-        commandRegistry.register(Command(id: "ipc.enable", title: "Enable Claude Code IPC", category: "IPC") { [weak self] in
+        commandRegistry.register(Command(id: "ipc.enable", title: "Enable Claude Code IPC", category: "IPC", isAvailable: {
+            !CalyxMCPServer.shared.isRunning
+        }) { [weak self] in
             self?.enableIPC()
         })
-        commandRegistry.register(Command(id: "ipc.disable", title: "Disable Claude Code IPC", category: "IPC") { [weak self] in
+        commandRegistry.register(Command(id: "ipc.disable", title: "Disable Claude Code IPC", category: "IPC", isAvailable: {
+            CalyxMCPServer.shared.isRunning
+        }) { [weak self] in
             self?.disableIPC()
         })
     }

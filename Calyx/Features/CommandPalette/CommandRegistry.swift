@@ -17,6 +17,7 @@ class CommandRegistry {
 
     func search(query: String) -> [Command] {
         let scored = commands.compactMap { cmd -> (Command, Int)? in
+            guard cmd.isAvailable() else { return nil }
             let matchScore = FuzzyMatcher.score(query: query, candidate: cmd.title)
             guard matchScore > 0 else { return nil }
             let freqBoost = frequencyMap[cmd.id, default: 0]
