@@ -8,6 +8,7 @@ import Foundation
 enum TabContent: Sendable {
     case terminal
     case browser(url: URL)
+    case diff(source: DiffSource)
 }
 
 @MainActor @Observable

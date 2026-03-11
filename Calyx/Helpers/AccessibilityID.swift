@@ -39,4 +39,21 @@ enum AccessibilityID {
         static let urlDisplay = "calyx.browser.urlDisplay"
         static let errorBanner = "calyx.browser.errorBanner"
     }
+    enum Git {
+        static let changesContainer = "calyx.git.changes"
+        static let refreshButton = "calyx.git.refreshButton"
+        static let modeToggle = "calyx.git.modeToggle"
+        static let stagedSection = "calyx.git.staged"
+        static let unstagedSection = "calyx.git.unstaged"
+        static let untrackedSection = "calyx.git.untracked"
+        static let commitsSection = "calyx.git.commits"
+        static func fileEntry(_ path: String) -> String { "calyx.git.file.\(path)" }
+        static func commitRow(_ hash: String) -> String { "calyx.git.commit.\(hash)" }
+    }
+    enum Diff {
+        static let container = "calyx.diff"
+        static let toolbar = "calyx.diff.toolbar"
+        static let content = "calyx.diff.content"
+        static let lineNumberGutter = "calyx.diff.lineNumbers"
+    }
 }

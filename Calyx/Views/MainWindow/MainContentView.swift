@@ -11,6 +11,15 @@ struct MainContentView: View {
     let commandRegistry: CommandRegistry?
     let splitContainerView: SplitContainerView
     var activeBrowserController: BrowserTabController?
+    var activeDiffState: DiffLoadState?
+    var activeDiffSource: DiffSource?
+
+    @Binding var sidebarMode: SidebarMode
+    var gitChangesState: GitChangesState = .notLoaded
+    var gitEntries: [GitFileEntry] = []
+    var gitCommits: [GitCommit] = []
+    var expandedCommitIDs: Set<String> = []
+    var commitFiles: [String: [CommitFileEntry]] = [:]
 
     var onTabSelected: ((UUID) -> Void)?
     var onGroupSelected: ((UUID) -> Void)?
@@ -19,6 +28,11 @@ struct MainContentView: View {
     var onCloseTab: ((UUID) -> Void)?
     var onToggleSidebar: (() -> Void)?
     var onDismissCommandPalette: (() -> Void)?
+    var onWorkingFileSelected: ((GitFileEntry) -> Void)?
+    var onCommitFileSelected: ((CommitFileEntry) -> Void)?
+    var onRefreshGitStatus: (() -> Void)?
+    var onLoadMoreCommits: (() -> Void)?
+    var onExpandCommit: ((String) -> Void)?
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
@@ -34,10 +48,21 @@ struct MainContentView: View {
                         groups: windowSession.groups,
                         activeGroupID: windowSession.activeGroupID,
                         activeTabID: activeTabID,
+                        sidebarMode: $sidebarMode,
+                        gitChangesState: gitChangesState,
+                        gitEntries: gitEntries,
+                        gitCommits: gitCommits,
+                        expandedCommitIDs: expandedCommitIDs,
+                        commitFiles: commitFiles,
                         onGroupSelected: onGroupSelected,
                         onTabSelected: onTabSelected,
                         onNewGroup: onNewGroup,
-                        onCloseTab: onCloseTab
+                        onCloseTab: onCloseTab,
+                        onWorkingFileSelected: onWorkingFileSelected,
+                        onCommitFileSelected: onCommitFileSelected,
+                        onRefreshGitStatus: onRefreshGitStatus,
+                        onLoadMoreCommits: onLoadMoreCommits,
+                        onExpandCommit: onExpandCommit
                     )
                     .frame(width: 220)
                     .clipped(antialiased: false)
@@ -59,7 +84,9 @@ struct MainContentView: View {
                             )
                         }
 
-                        if let browserController = activeBrowserController {
+                        if let diffSource = activeDiffSource, let diffState = activeDiffState {
+                            DiffContainerView(source: diffSource, loadState: diffState)
+                        } else if let browserController = activeBrowserController {
                             BrowserContainerView(controller: browserController)
                         } else {
                             TerminalContainerView(

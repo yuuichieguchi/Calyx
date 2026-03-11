@@ -83,7 +83,7 @@ final class NotificationIntegrationTests: XCTestCase {
         tab.unreadNotifications = 7
 
         // Snapshot round-trip
-        let snapshot = tab.snapshot()
+        let snapshot = try XCTUnwrap(tab.snapshot())
         let restoredTab = Tab(snapshot: snapshot)
 
         XCTAssertEqual(restoredTab.unreadNotifications, 0,

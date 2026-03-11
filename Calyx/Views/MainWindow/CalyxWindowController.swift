@@ -19,6 +19,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var focusRequestID: UInt64 = 0
     private var isRestoring = false
     private var browserControllers: [UUID: BrowserTabController] = [:]
+    private var diffStates: [UUID: DiffLoadState] = [:]
+    private var diffTasks: [UUID: Task<Void, Never>] = [:]
+    private var refreshTask: Task<Void, Never>?
+    private var loadMoreTask: Task<Void, Never>?
+    private var expandTasks: [String: Task<Void, Never>] = [:]
+    private var hasMoreCommits = true
 
     // MARK: - Computed Properties
 
@@ -33,6 +39,16 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var activeBrowserController: BrowserTabController? {
         guard let tab = activeTab, case .browser = tab.content else { return nil }
         return browserController(for: tab.id)
+    }
+
+    private var activeDiffState: DiffLoadState? {
+        guard let tab = activeTab, case .diff = tab.content else { return nil }
+        return diffStates[tab.id]
+    }
+
+    private var activeDiffSource: DiffSource? {
+        guard let tab = activeTab, case .diff(let source) = tab.content else { return nil }
+        return source
     }
 
     private func browserController(for tabID: UUID) -> BrowserTabController? {
@@ -172,6 +188,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             guard case .browser = self?.activeTab?.content else { return }
             self?.activeBrowserController?.reload()
         })
+        commandRegistry.register(Command(id: "git.showChanges", title: "Show Git Changes", category: "Git") { [weak self] in
+            self?.windowSession.sidebarMode = .changes
+            self?.windowSession.showSidebar = true
+            self?.refreshGitStatus()
+            self?.refreshHostingView()
+        })
+        commandRegistry.register(Command(id: "git.refresh", title: "Refresh Git Changes", category: "Git") { [weak self] in
+            self?.refreshGitStatus()
+        })
         commandRegistry.register(Command(id: "ipc.enable", title: "Enable Claude Code IPC", category: "IPC", isAvailable: {
             !CalyxMCPServer.shared.isRunning
         }) { [weak self] in
@@ -242,13 +267,29 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             commandRegistry: commandRegistry,
             splitContainerView: splitContainerView ?? SplitContainerView(registry: SurfaceRegistry()),
             activeBrowserController: activeBrowserController,
+            activeDiffState: activeDiffState,
+            activeDiffSource: activeDiffSource,
+            sidebarMode: Binding(
+                get: { [weak self] in self?.windowSession.sidebarMode ?? .tabs },
+                set: { [weak self] in self?.windowSession.sidebarMode = $0 }
+            ),
+            gitChangesState: windowSession.gitChangesState,
+            gitEntries: windowSession.gitEntries,
+            gitCommits: windowSession.gitCommits,
+            expandedCommitIDs: windowSession.expandedCommitIDs,
+            commitFiles: windowSession.commitFiles,
             onTabSelected: { [weak self] tabID in self?.switchToTab(id: tabID) },
             onGroupSelected: { [weak self] groupID in self?.switchToGroup(id: groupID) },
             onNewTab: { [weak self] in self?.createNewTab() },
             onNewGroup: { [weak self] in self?.createNewGroup() },
             onCloseTab: { [weak self] tabID in self?.closeTab(id: tabID) },
             onToggleSidebar: { [weak self] in self?.toggleSidebar() },
-            onDismissCommandPalette: { [weak self] in self?.dismissCommandPalette() }
+            onDismissCommandPalette: { [weak self] in self?.dismissCommandPalette() },
+            onWorkingFileSelected: { [weak self] entry in self?.handleWorkingFileSelected(entry) },
+            onCommitFileSelected: { [weak self] entry in self?.handleCommitFileSelected(entry) },
+            onRefreshGitStatus: { [weak self] in self?.refreshGitStatus() },
+            onLoadMoreCommits: { [weak self] in self?.loadMoreCommits() },
+            onExpandCommit: { [weak self] hash in self?.expandCommit(hash: hash) }
         )
     }
 
@@ -316,6 +357,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                     self?.window?.makeFirstResponder(bv)
                 }
             }
+        case .diff:
+            break  // Diff tabs don't need special activation
         }
     }
 
@@ -435,6 +478,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // Clean up browser controller if present
         browserControllers.removeValue(forKey: tabID)
 
+        // Clean up diff state
+        diffTasks[tabID]?.cancel()
+        diffTasks.removeValue(forKey: tabID)
+        diffStates.removeValue(forKey: tabID)
+
         // Destroy all surfaces in the tab
         for surfaceID in tab.registry.allIDs {
             tab.registry.destroySurface(surfaceID)
@@ -533,6 +581,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         for tabID in tabIDs {
             browserControllers.removeValue(forKey: tabID)
         }
+        // Clean up diff states for all tabs in this group
+        for tabID in tabIDs {
+            diffTasks[tabID]?.cancel()
+            diffTasks.removeValue(forKey: tabID)
+            diffStates.removeValue(forKey: tabID)
+        }
         for tabID in tabIDs {
             closingTabIDs.insert(tabID)
         }
@@ -597,6 +651,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             if let bv = activeBrowserController?.browserView {
                 window?.makeFirstResponder(bv)
             }
+        case .diff:
+            break
         }
     }
 
@@ -976,13 +1032,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     func windowSnapshot() -> WindowSnapshot {
         let frame = window?.frame ?? .zero
         let groups = windowSession.groups.map { group in
-            let tabs = group.tabs.map { tab -> TabSnapshot in
+            let tabs = group.tabs.compactMap { tab -> TabSnapshot? in
+                // Skip diff tabs — they are not persisted
+                if case .diff = tab.content { return nil }
                 let browserURL: URL?
                 switch tab.content {
                 case .terminal:
                     browserURL = nil
                 case .browser(let configuredURL):
                     browserURL = browserControllers[tab.id]?.browserState.url ?? configuredURL
+                case .diff:
+                    return nil  // Already handled above, but needed for exhaustive switch
                 }
                 return TabSnapshot(
                     id: tab.id,
@@ -1049,6 +1109,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             if let bv = activeBrowserController?.browserView {
                 window?.makeFirstResponder(bv)
             }
+        } else if case .diff = activeTab?.content {
+            // No special focus needed for diff tabs
         } else {
             focusedController?.setFocus(true)
             restoreFocus()
@@ -1096,6 +1158,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         browserControllers.removeAll()
 
+        for (_, task) in diffTasks { task.cancel() }
+        diffTasks.removeAll()
+        diffStates.removeAll()
+        for (_, task) in expandTasks { task.cancel() }
+        expandTasks.removeAll()
+        refreshTask?.cancel()
+        loadMoreTask?.cancel()
+
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.removeWindowController(self)
         }
@@ -1103,6 +1173,214 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidResize(_ notification: Notification) {
         // SplitContainerView handles resize via autoresizingMask + resizeSubviews
+    }
+
+    // MARK: - Git Source Control
+
+    private func refreshGitStatus() {
+        refreshTask?.cancel()
+        refreshTask = Task { [weak self] in
+            guard let self else { return }
+
+            let workDir = self.findWorkDir()
+            guard let workDir else {
+                self.windowSession.gitChangesState = .error("No working directory found")
+                self.refreshHostingView()
+                return
+            }
+
+            self.windowSession.gitChangesState = .loading
+            self.refreshHostingView()
+
+            do {
+                let repoRoot = try await GitService.repoRoot(workDir: workDir)
+                guard !Task.isCancelled else { return }
+
+                self.windowSession.repoRoots[workDir] = repoRoot
+
+                async let statusResult = GitService.gitStatus(workDir: repoRoot)
+                async let logResult = GitService.commitLog(workDir: repoRoot, maxCount: 100, skip: 0)
+
+                let (entries, commits) = try await (statusResult, logResult)
+                guard !Task.isCancelled else { return }
+
+                self.windowSession.gitEntries = entries
+                self.windowSession.gitCommits = commits
+                self.hasMoreCommits = true
+                self.windowSession.expandedCommitIDs = []
+                self.windowSession.commitFiles = [:]
+                self.windowSession.gitChangesState = .loaded
+                self.refreshHostingView()
+            } catch let error as GitService.GitError {
+                guard !Task.isCancelled else { return }
+                if case .notARepository = error {
+                    self.windowSession.gitChangesState = .notRepository
+                } else {
+                    self.windowSession.gitChangesState = .error(error.localizedDescription)
+                }
+                self.refreshHostingView()
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.windowSession.gitChangesState = .error(error.localizedDescription)
+                self.refreshHostingView()
+            }
+        }
+    }
+
+    private func loadMoreCommits() {
+        guard hasMoreCommits else { return }
+        guard loadMoreTask == nil || loadMoreTask?.isCancelled == true else { return }
+        loadMoreTask = Task { [weak self] in
+            guard let self else { return }
+            let currentCount = self.windowSession.gitCommits.count
+
+            guard let workDir = self.findWorkDir(),
+                  let repoRoot = self.windowSession.repoRoots[workDir] else { return }
+
+            do {
+                let moreCommits = try await GitService.commitLog(
+                    workDir: repoRoot, maxCount: 50, skip: currentCount
+                )
+                guard !Task.isCancelled else { return }
+                guard !moreCommits.isEmpty else {
+                    self.hasMoreCommits = false
+                    return
+                }
+
+                self.windowSession.gitCommits.append(contentsOf: moreCommits)
+                self.refreshHostingView()
+            } catch {
+                // Silently ignore load-more errors
+            }
+            self.loadMoreTask = nil
+        }
+    }
+
+    private func expandCommit(hash: String) {
+        if windowSession.expandedCommitIDs.contains(hash) {
+            windowSession.expandedCommitIDs.remove(hash)
+            refreshHostingView()
+            return
+        }
+
+        windowSession.expandedCommitIDs.insert(hash)
+        refreshHostingView()
+
+        if windowSession.commitFiles[hash] != nil { return }
+
+        guard let workDir = findWorkDir(),
+              let repoRoot = windowSession.repoRoots[workDir] else { return }
+
+        expandTasks[hash] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let files = try await GitService.commitFiles(hash: hash, workDir: repoRoot)
+                self.windowSession.commitFiles[hash] = files
+                self.refreshHostingView()
+            } catch {
+                // Silently ignore
+            }
+            self.expandTasks.removeValue(forKey: hash)
+        }
+    }
+
+    private func handleWorkingFileSelected(_ entry: GitFileEntry) {
+        guard let workDir = findWorkDir(),
+              let repoRoot = windowSession.repoRoots[workDir] else { return }
+
+        let source: DiffSource = entry.isStaged
+            ? .staged(path: entry.path, workDir: repoRoot)
+            : .unstaged(path: entry.path, workDir: repoRoot)
+
+        openDiffTab(source: source)
+    }
+
+    private func handleCommitFileSelected(_ entry: CommitFileEntry) {
+        guard let workDir = findWorkDir(),
+              let repoRoot = windowSession.repoRoots[workDir] else { return }
+
+        let source: DiffSource = .commit(hash: entry.commitHash, path: entry.path, workDir: repoRoot)
+        openDiffTab(source: source)
+    }
+
+    private func openDiffTab(source: DiffSource) {
+        // Dedup: check if same source already open
+        if let group = windowSession.activeGroup {
+            for tab in group.tabs {
+                if case .diff(let existingSource) = tab.content, existingSource == source {
+                    switchToTab(id: tab.id)
+                    return
+                }
+            }
+        }
+
+        guard let group = windowSession.activeGroup else { return }
+
+        let fileName: String
+        switch source {
+        case .unstaged(let path, _), .staged(let path, _), .commit(_, let path, _):
+            fileName = (path as NSString).lastPathComponent
+        }
+
+        let tab = Tab(title: fileName, content: .diff(source: source))
+        deactivateCurrentTab()
+        group.addTab(tab)
+        group.activeTabID = tab.id
+
+        diffStates[tab.id] = .loading
+        refreshHostingView()
+
+        let tabID = tab.id
+        diffTasks[tabID] = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let rawDiff = try await GitService.fileDiff(source: source)
+                guard !Task.isCancelled else { return }
+
+                let path: String
+                switch source {
+                case .unstaged(let p, _), .staged(let p, _), .commit(_, let p, _):
+                    path = p
+                }
+                let parsed = DiffParser.parse(rawDiff, path: path)
+                guard !Task.isCancelled else { return }
+
+                // Verify tab still exists
+                guard self.windowSession.groups.flatMap(\.tabs).contains(where: { $0.id == tabID }) else { return }
+
+                self.diffStates[tabID] = .success(parsed)
+                self.refreshHostingView()
+            } catch {
+                guard !Task.isCancelled else { return }
+                self.diffStates[tabID] = .error(error.localizedDescription)
+                self.refreshHostingView()
+            }
+        }
+    }
+
+    private func findWorkDir() -> String? {
+        // 1. Active terminal tab's pwd
+        if let tab = activeTab, case .terminal = tab.content, let pwd = tab.pwd {
+            return pwd
+        }
+        // 2. Any terminal tab in same group
+        if let group = windowSession.activeGroup {
+            for tab in group.tabs {
+                if case .terminal = tab.content, let pwd = tab.pwd {
+                    return pwd
+                }
+            }
+        }
+        // 3. Any terminal tab in any group
+        for group in windowSession.groups {
+            for tab in group.tabs {
+                if case .terminal = tab.content, let pwd = tab.pwd {
+                    return pwd
+                }
+            }
+        }
+        // 4. Fallback from cached repo roots
+        return windowSession.repoRoots.values.first
     }
 
     // MARK: - IPC

@@ -9,46 +9,81 @@ struct SidebarContentView: View {
     let groups: [TabGroup]
     let activeGroupID: UUID?
     let activeTabID: UUID?
+    @Binding var sidebarMode: SidebarMode
+    var gitChangesState: GitChangesState = .notLoaded
+    var gitEntries: [GitFileEntry] = []
+    var gitCommits: [GitCommit] = []
+    var expandedCommitIDs: Set<String> = []
+    var commitFiles: [String: [CommitFileEntry]] = [:]
     var onGroupSelected: ((UUID) -> Void)?
     var onTabSelected: ((UUID) -> Void)?
     var onNewGroup: (() -> Void)?
     var onCloseTab: ((UUID) -> Void)?
+    var onWorkingFileSelected: ((GitFileEntry) -> Void)?
+    var onCommitFileSelected: ((CommitFileEntry) -> Void)?
+    var onRefreshGitStatus: (() -> Void)?
+    var onLoadMoreCommits: (() -> Void)?
+    var onExpandCommit: ((String) -> Void)?
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
         VStack(spacing: 0) {
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(groups) { group in
-                        GroupSectionView(
-                            group: group,
-                            isActiveGroup: group.id == activeGroupID,
-                            activeTabID: activeTabID,
-                            reduceTransparency: reduceTransparency,
-                            onGroupSelected: onGroupSelected,
-                            onTabSelected: onTabSelected,
-                            onCloseTab: onCloseTab
-                        )
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+            Picker("Mode", selection: $sidebarMode) {
+                Text("Tabs").tag(SidebarMode.tabs)
+                Text("Changes").tag(SidebarMode.changes)
             }
-
-            Rectangle()
-                .fill(Color.white.opacity(reduceTransparency ? 0.14 : 0.10))
-                .frame(height: 1)
-                .padding(.horizontal, 8)
-
-            Button(action: { onNewGroup?() }) {
-                Label("New Group", systemImage: "folder.badge.plus")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .modifier(GlassButtonModifier(reduceTransparency: reduceTransparency))
+            .pickerStyle(.segmented)
             .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .accessibilityIdentifier(AccessibilityID.Sidebar.newGroupButton)
+            .padding(.top, 8)
+            .accessibilityIdentifier(AccessibilityID.Git.modeToggle)
+
+            if sidebarMode == .tabs {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(groups) { group in
+                            GroupSectionView(
+                                group: group,
+                                isActiveGroup: group.id == activeGroupID,
+                                activeTabID: activeTabID,
+                                reduceTransparency: reduceTransparency,
+                                onGroupSelected: onGroupSelected,
+                                onTabSelected: onTabSelected,
+                                onCloseTab: onCloseTab
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                }
+
+                Rectangle()
+                    .fill(Color.white.opacity(reduceTransparency ? 0.14 : 0.10))
+                    .frame(height: 1)
+                    .padding(.horizontal, 8)
+
+                Button(action: { onNewGroup?() }) {
+                    Label("New Group", systemImage: "folder.badge.plus")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .modifier(GlassButtonModifier(reduceTransparency: reduceTransparency))
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .accessibilityIdentifier(AccessibilityID.Sidebar.newGroupButton)
+            } else {
+                GitChangesView(
+                    gitChangesState: gitChangesState,
+                    gitEntries: gitEntries,
+                    gitCommits: gitCommits,
+                    expandedCommitIDs: expandedCommitIDs,
+                    commitFiles: commitFiles,
+                    onWorkingFileSelected: onWorkingFileSelected,
+                    onCommitFileSelected: onCommitFileSelected,
+                    onRefresh: onRefreshGitStatus,
+                    onLoadMore: onLoadMoreCommits,
+                    onExpandCommit: onExpandCommit
+                )
+            }
         }
         .frame(minWidth: 180)
         .modifier(SidebarBackgroundModifier(reduceTransparency: reduceTransparency))
@@ -162,10 +197,18 @@ private struct TabRowItemView: View {
     var onSelected: (() -> Void)?
     var onClose: (() -> Void)?
 
+    private var tabIcon: String {
+        switch tab.content {
+        case .terminal: "terminal"
+        case .browser: "globe"
+        case .diff: "doc.text"
+        }
+    }
+
     var body: some View {
         Button(action: { onSelected?() }) {
             HStack(spacing: 4) {
-                Image(systemName: tab.content.isTerminal ? "terminal" : "globe")
+                Image(systemName: tabIcon)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text(tab.title)
@@ -196,6 +239,11 @@ private struct TabRowItemView: View {
 extension TabContent {
     var isTerminal: Bool {
         if case .terminal = self { return true }
+        return false
+    }
+
+    var isDiff: Bool {
+        if case .diff = self { return true }
         return false
     }
 }

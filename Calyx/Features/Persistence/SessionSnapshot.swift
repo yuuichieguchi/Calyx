@@ -154,7 +154,7 @@ extension TabGroup {
             id: id,
             name: name,
             color: color.rawValue,
-            tabs: tabs.map { $0.snapshot() },
+            tabs: tabs.compactMap { $0.snapshot() },
             activeTabID: activeTabID,
             isCollapsed: isCollapsed
         )
@@ -162,18 +162,15 @@ extension TabGroup {
 }
 
 extension Tab {
-    func snapshot() -> TabSnapshot {
-        let url: URL? = switch content {
-        case .terminal: nil
-        case .browser(url: let url): url
+    func snapshot() -> TabSnapshot? {
+        switch content {
+        case .diff:
+            return nil  // Diff tabs are not persisted
+        case .terminal:
+            return TabSnapshot(id: id, title: title, pwd: pwd, splitTree: splitTree, browserURL: nil)
+        case .browser(let url):
+            return TabSnapshot(id: id, title: title, pwd: pwd, splitTree: splitTree, browserURL: url)
         }
-        return TabSnapshot(
-            id: id,
-            title: title,
-            pwd: pwd,
-            splitTree: splitTree,
-            browserURL: url
-        )
     }
 
     convenience init(snapshot: TabSnapshot) {

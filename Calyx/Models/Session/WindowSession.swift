@@ -18,6 +18,13 @@ class WindowSession: Identifiable {
     var activeGroupID: UUID?
     var showSidebar: Bool
     var showCommandPalette: Bool = false
+    var sidebarMode: SidebarMode = .tabs
+    var gitChangesState: GitChangesState = .notLoaded
+    var gitEntries: [GitFileEntry] = []
+    var gitCommits: [GitCommit] = []
+    var expandedCommitIDs: Set<String> = []
+    var commitFiles: [String: [CommitFileEntry]] = [:]
+    var repoRoots: [String: String] = [:]
 
     var activeGroup: TabGroup? {
         groups.first { $0.id == activeGroupID }
