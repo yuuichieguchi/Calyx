@@ -271,7 +271,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             activeDiffSource: activeDiffSource,
             sidebarMode: Binding(
                 get: { [weak self] in self?.windowSession.sidebarMode ?? .tabs },
-                set: { [weak self] in self?.windowSession.sidebarMode = $0 }
+                set: { [weak self] in
+                    self?.windowSession.sidebarMode = $0
+                    if $0 == .changes {
+                        self?.refreshGitStatus()
+                    }
+                }
             ),
             gitChangesState: windowSession.gitChangesState,
             gitEntries: windowSession.gitEntries,
