@@ -22,6 +22,15 @@ final class GhosttyConfigManager {
     # --- End Calyx Glass Preset ---
     """
 
+    private static var calyxConfigDir: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/calyx", isDirectory: true)
+    }
+
+    private static var calyxGlassPresetURL: URL {
+        calyxConfigDir.appendingPathComponent("calyx-glass.conf", isDirectory: false)
+    }
+
     static func removeCursorClickToMoveLine(from text: String) -> String {
         text.split(separator: "\n", omittingEmptySubsequences: false)
             .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("cursor-click-to-move") }
@@ -67,6 +76,9 @@ final class GhosttyConfigManager {
         config = nil
     }
 
+    /// Ensures applyCalyxGlassPresetIfPossible runs only once (prevents file watcher cascading reloads).
+    private static var hasAppliedPreset = false
+
     // MARK: - Loading
 
     /// Creates a new configuration, loads default files, finalizes, and checks diagnostics.
@@ -77,13 +89,24 @@ final class GhosttyConfigManager {
             return nil
         }
 
-        applyCalyxGlassPresetIfPossible()
+        if !hasAppliedPreset {
+            applyCalyxGlassPresetIfPossible()
+            hasAppliedPreset = true
+        }
 
         // Load configuration from default file locations.
         GhosttyFFI.configLoadDefaultFiles(cfg)
 
         // Load recursively referenced configuration files.
         GhosttyFFI.configLoadRecursiveFiles(cfg)
+
+        // Explicitly load the Calyx glass preset (bypasses config-file include path issues).
+        do {
+            let presetPath = calyxGlassPresetURL.path
+            if FileManager.default.fileExists(atPath: presetPath) {
+                GhosttyFFI.configLoadFile(cfg, path: presetPath)
+            }
+        }
 
         // Finalize makes defaults available.
         GhosttyFFI.configFinalize(cfg)
@@ -111,12 +134,9 @@ final class GhosttyConfigManager {
         guard let effectiveConfigPath = String(data: pathData, encoding: .utf8), !effectiveConfigPath.isEmpty else { return }
 
         let effectiveConfigURL = URL(fileURLWithPath: effectiveConfigPath)
-        guard let bundleID = Bundle.main.bundleIdentifier else { return }
         let fm = FileManager.default
-        guard let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
-
-        let appConfigDir = appSupport.appendingPathComponent(bundleID, isDirectory: true)
-        let presetConfigURL = appConfigDir.appendingPathComponent("calyx-glass.conf", isDirectory: false)
+        let appConfigDir = calyxConfigDir
+        let presetConfigURL = calyxGlassPresetURL
 
         let presetStart = "# --- Calyx Glass Preset (managed) ---"
         let presetEnd = "# --- End Calyx Glass Preset ---"
@@ -130,8 +150,20 @@ final class GhosttyConfigManager {
         """
 
         do {
-            try fm.createDirectory(at: appConfigDir, withIntermediateDirectories: true)
+            try fm.createDirectory(at: calyxConfigDir, withIntermediateDirectories: true)
             try fm.createDirectory(at: effectiveConfigURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+            // Migrate from old Application Support path if needed
+            if let oldBundleID = Bundle.main.bundleIdentifier,
+               let oldAppSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+                let oldPath = oldAppSupport
+                    .appendingPathComponent(oldBundleID, isDirectory: true)
+                    .appendingPathComponent("calyx-glass.conf", isDirectory: false)
+                if fm.fileExists(atPath: oldPath.path) && !fm.fileExists(atPath: presetConfigURL.path) {
+                    try? fm.copyItem(at: oldPath, to: presetConfigURL)
+                    try? fm.removeItem(at: oldPath)
+                }
+            }
 
             if !fm.fileExists(atPath: presetConfigURL.path) {
                 try (glassPresetTemplate + "\n").write(to: presetConfigURL, atomically: true, encoding: .utf8)

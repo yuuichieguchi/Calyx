@@ -85,7 +85,12 @@ struct MainContentView: View {
                         }
 
                         if let diffSource = activeDiffSource, let diffState = activeDiffState {
-                            DiffContainerView(source: diffSource, loadState: diffState)
+                            DiffGlassContainerView(
+                                source: diffSource,
+                                loadState: diffState,
+                                reduceTransparency: reduceTransparency
+                            )
+                            .opacity(reduceTransparency ? 1.0 : 0.7)
                         } else if let browserController = activeBrowserController {
                             BrowserContainerView(controller: browserController)
                         } else {
@@ -115,6 +120,105 @@ struct MainContentView: View {
                     }
                 }
             }
+        }
+    }
+}
+
+struct DiffGlassContainerView: NSViewRepresentable {
+    let source: DiffSource
+    let loadState: DiffLoadState
+    let reduceTransparency: Bool
+
+    func makeNSView(context: Context) -> DiffGlassHostView {
+        let host = DiffGlassHostView(reduceTransparency: reduceTransparency)
+        host.updateDiff(source: source, loadState: loadState)
+        return host
+    }
+
+    func updateNSView(_ nsView: DiffGlassHostView, context: Context) {
+        nsView.configureAppearance(reduceTransparency: reduceTransparency)
+        nsView.updateDiff(source: source, loadState: loadState)
+    }
+}
+
+@MainActor
+final class DiffGlassHostView: NSView {
+    private let effectView = NSVisualEffectView()
+    private let tintOverlay = NSView()
+    private let diffContainerHost: NSHostingView<DiffContainerView>
+
+    init(reduceTransparency: Bool) {
+        diffContainerHost = NSHostingView(rootView: DiffContainerView(
+            source: .unstaged(path: "", workDir: ""),
+            loadState: .loading
+        ))
+        super.init(frame: .zero)
+        setupViews()
+        configureAppearance(reduceTransparency: reduceTransparency)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    func updateDiff(source: DiffSource, loadState: DiffLoadState) {
+        diffContainerHost.rootView = DiffContainerView(source: source, loadState: loadState)
+    }
+
+    private func setupViews() {
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+
+        effectView.translatesAutoresizingMaskIntoConstraints = false
+        effectView.blendingMode = .withinWindow
+        effectView.state = .followsWindowActiveState
+        addSubview(effectView)
+        NSLayoutConstraint.activate([
+            effectView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            effectView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            effectView.topAnchor.constraint(equalTo: topAnchor),
+            effectView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+
+        tintOverlay.translatesAutoresizingMaskIntoConstraints = false
+        tintOverlay.wantsLayer = true
+        tintOverlay.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.03).cgColor
+        addSubview(tintOverlay, positioned: .above, relativeTo: effectView)
+        NSLayoutConstraint.activate([
+            tintOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            tintOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            tintOverlay.topAnchor.constraint(equalTo: topAnchor),
+            tintOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+
+        diffContainerHost.translatesAutoresizingMaskIntoConstraints = false
+        diffContainerHost.wantsLayer = true
+        diffContainerHost.layer?.backgroundColor = NSColor.clear.cgColor
+        addSubview(diffContainerHost, positioned: .above, relativeTo: tintOverlay)
+        NSLayoutConstraint.activate([
+            diffContainerHost.leadingAnchor.constraint(equalTo: leadingAnchor),
+            diffContainerHost.trailingAnchor.constraint(equalTo: trailingAnchor),
+            diffContainerHost.topAnchor.constraint(equalTo: topAnchor),
+            diffContainerHost.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
+    func configureAppearance(reduceTransparency: Bool) {
+        if reduceTransparency {
+            effectView.isHidden = true
+            tintOverlay.isHidden = true
+            layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+            return
+        }
+
+        effectView.isHidden = false
+        tintOverlay.isHidden = false
+        layer?.backgroundColor = NSColor.clear.cgColor
+        if #available(macOS 26.0, *) {
+            effectView.material = .menu
+        } else {
+            effectView.material = .hudWindow
         }
     }
 }

@@ -24,6 +24,7 @@ final class DiffView: NSView {
 
     private func setupViews() {
         wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
 
         // Scroll view
         scrollView.translatesAutoresizingMaskIntoConstraints = false

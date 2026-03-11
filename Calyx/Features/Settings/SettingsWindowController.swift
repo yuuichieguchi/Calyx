@@ -168,13 +168,8 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func calyxConfigDirectory() throws -> URL {
-        guard let bundleID = Bundle.main.bundleIdentifier else {
-            throw NSError(domain: "Calyx.Settings", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing bundle identifier"])
-        }
-        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            throw NSError(domain: "Calyx.Settings", code: 2, userInfo: [NSLocalizedDescriptionKey: "Application Support directory not found"])
-        }
-        return appSupport.appendingPathComponent(bundleID, isDirectory: true)
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/calyx", isDirectory: true)
     }
 
     private func presetFileURL() throws -> URL {
@@ -213,16 +208,31 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private func savePresetFromUI() throws {
         let opacity = max(0.3, min(1.0, opacitySlider.doubleValue))
 
-        let preset = """
-        # --- Calyx Glass Preset (managed) ---
-        background-opacity = \(String(format: "%.2f", opacity))
-        # --- End Calyx Glass Preset ---
-        """
-
         let fm = FileManager.default
         let dir = try calyxConfigDirectory()
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        try (preset + "\n").write(to: try presetFileURL(), atomically: true, encoding: .utf8)
+
+        let url = try presetFileURL()
+        let startMarker = "# --- Calyx Glass Preset (managed) ---"
+        let endMarker = "# --- End Calyx Glass Preset ---"
+
+        // Preserve non-opacity settings from existing file
+        var preservedLines: [String] = []
+        if let existing = try? String(contentsOf: url, encoding: .utf8) {
+            for line in existing.split(separator: "\n", omittingEmptySubsequences: false) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
+                if trimmed.hasPrefix("background-opacity") { continue }
+                preservedLines.append(String(line))
+            }
+        }
+
+        var lines = [startMarker]
+        lines.append("background-opacity = \(String(format: "%.2f", opacity))")
+        lines.append(contentsOf: preservedLines)
+        lines.append(endMarker)
+
+        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     private func snapshotCurrentAsLoaded() {

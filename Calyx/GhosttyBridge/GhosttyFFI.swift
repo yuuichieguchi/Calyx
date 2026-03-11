@@ -69,6 +69,13 @@ enum GhosttyFFI {
         ghostty_config_load_recursive_files(config)
     }
 
+    /// Load a specific configuration file.
+    static func configLoadFile(_ config: ghostty_config_t, path: String) {
+        path.withCString { cStr in
+            ghostty_config_load_file(config, cStr)
+        }
+    }
+
     /// Finalize the configuration, making default values available.
     static func configFinalize(_ config: ghostty_config_t) {
         ghostty_config_finalize(config)
