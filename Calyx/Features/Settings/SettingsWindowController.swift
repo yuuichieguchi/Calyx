@@ -1,5 +1,4 @@
 import AppKit
-import GhosttyKit
 import OSLog
 
 private let logger = Logger(
@@ -12,9 +11,9 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     static let shared = SettingsWindowController()
     private let opacityLabel = NSTextField(labelWithString: "")
-    private let opacitySlider = NSSlider(value: 0.82, minValue: 0.3, maxValue: 1.0, target: nil, action: nil)
+    private let opacitySlider = NSSlider(value: 0.7, minValue: 0.1, maxValue: 1.0, target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
-    private var lastLoadedOpacity = 0.82
+    private var lastLoadedOpacity = 0.7
 
     private init() {
         let window = NSWindow(
@@ -58,7 +57,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         title.font = .systemFont(ofSize: 20, weight: .semibold)
         root.addArrangedSubview(title)
 
-        let subtitle = NSTextField(labelWithString: "These values are saved to ~/.config/calyx/calyx-glass.conf")
+        let subtitle = NSTextField(labelWithString: "Controls the transparency of the terminal glass effect.")
         subtitle.textColor = .secondaryLabelColor
         subtitle.font = .systemFont(ofSize: 13)
         root.addArrangedSubview(subtitle)
@@ -73,7 +72,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         opacityRow.orientation = .horizontal
         opacityRow.spacing = 12
         opacityRow.alignment = .centerY
-        let opacityText = NSTextField(labelWithString: "Background opacity")
+        let opacityText = NSTextField(labelWithString: "Glass opacity")
         opacityText.font = .systemFont(ofSize: 13, weight: .medium)
         opacityText.setContentHuggingPriority(.required, for: .horizontal)
         opacityRow.addArrangedSubview(opacityText)
@@ -114,9 +113,10 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func openConfigFile(_ sender: Any?) {
-        if let app = GhosttyAppController.shared.app {
-            GhosttyFFI.appOpenConfig(app)
-        }
+        let configDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".config/ghostty", isDirectory: true)
+        let configFile = configDir.appendingPathComponent("config", isDirectory: false)
+        NSWorkspace.shared.open(configFile)
     }
 
     @objc private func opacityDidChange(_ sender: Any?) {
@@ -125,20 +125,8 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func savePreset(_ sender: Any?) {
-        do {
-            try savePresetFromUI()
-            GhosttyAppController.shared.reloadConfig(soft: false)
-            if let appDelegate = NSApp.delegate as? AppDelegate {
-                appDelegate.applyCurrentGhosttyConfigToAllWindows()
-            }
-            snapshotCurrentAsLoaded()
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Failed to Save Settings"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .warning
-            alert.runModal()
-        }
+        savePresetFromUI()
+        snapshotCurrentAsLoaded()
     }
 
     @objc func reloadConfig() {
@@ -167,72 +155,17 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         opacityLabel.stringValue = String(format: "%.2f", opacitySlider.doubleValue)
     }
 
-    private func calyxConfigDirectory() throws -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/calyx", isDirectory: true)
-    }
-
-    private func presetFileURL() throws -> URL {
-        try calyxConfigDirectory().appendingPathComponent("calyx-glass.conf", isDirectory: false)
-    }
-
     private func loadPresetIntoUI() {
-        guard let url = try? presetFileURL(),
-              let text = try? String(contentsOf: url, encoding: .utf8) else {
-            opacitySlider.doubleValue = 0.82
-            updateOpacityLabel()
-            snapshotCurrentAsLoaded()
-            return
-        }
-
-        var opacity = 0.82
-
-        for line in text.split(separator: "\n") {
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
-            if trimmed.hasPrefix("#") || !trimmed.contains("=") { continue }
-            let parts = trimmed.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-            guard parts.count == 2 else { continue }
-            switch parts[0] {
-            case "background-opacity":
-                opacity = Double(parts[1]) ?? opacity
-            default:
-                break
-            }
-        }
-        opacitySlider.doubleValue = max(0.3, min(1.0, opacity))
+        let opacity = UserDefaults.standard.object(forKey: "terminalGlassOpacity") as? Double ?? 0.7
+        opacitySlider.doubleValue = max(0.1, min(1.0, opacity))
         updateOpacityLabel()
         snapshotCurrentAsLoaded()
         refreshSaveButtonState()
     }
 
-    private func savePresetFromUI() throws {
-        let opacity = max(0.3, min(1.0, opacitySlider.doubleValue))
-
-        let fm = FileManager.default
-        let dir = try calyxConfigDirectory()
-        try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-
-        let url = try presetFileURL()
-        let startMarker = "# --- Calyx Glass Preset (managed) ---"
-        let endMarker = "# --- End Calyx Glass Preset ---"
-
-        // Preserve non-opacity settings from existing file
-        var preservedLines: [String] = []
-        if let existing = try? String(contentsOf: url, encoding: .utf8) {
-            for line in existing.split(separator: "\n", omittingEmptySubsequences: false) {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.hasPrefix("#") || trimmed.isEmpty { continue }
-                if trimmed.hasPrefix("background-opacity") { continue }
-                preservedLines.append(String(line))
-            }
-        }
-
-        var lines = [startMarker]
-        lines.append("background-opacity = \(String(format: "%.2f", opacity))")
-        lines.append(contentsOf: preservedLines)
-        lines.append(endMarker)
-
-        try (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+    private func savePresetFromUI() {
+        let opacity = max(0.1, min(1.0, opacitySlider.doubleValue))
+        UserDefaults.standard.set(opacity, forKey: "terminalGlassOpacity")
     }
 
     private func snapshotCurrentAsLoaded() {
