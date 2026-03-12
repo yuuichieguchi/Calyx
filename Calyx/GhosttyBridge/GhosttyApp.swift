@@ -39,6 +39,9 @@ final class GhosttyAppController {
     /// Coordinator for debounced config reload.
     private var reloadCoordinator: ConfigReloadCoordinator?
 
+    /// File watcher for ghostty config file.
+    private var configFileWatcher: ConfigFileWatcher?
+
     /// True if the app needs confirmation before quitting.
     var needsConfirmQuit: Bool {
         guard let app else { return false }
@@ -97,6 +100,11 @@ final class GhosttyAppController {
         let adapter = ReloadDepsAdapter(controller: self)
         self.reloadCoordinator = ConfigReloadCoordinator(deps: adapter)
 
+        // Start watching ghostty config file for changes.
+        self.configFileWatcher = ConfigFileWatcher { [weak self] in
+            self?.reloadConfig(soft: false)
+        }
+
         logger.info("GhosttyAppController initialized successfully")
     }
 
@@ -135,8 +143,25 @@ final class GhosttyAppController {
 
     /// Reload configuration from disk.
     func reloadConfig(soft: Bool = false) {
-        guard app != nil else { return }
-        reloadCoordinator?.reloadConfig(soft: soft)
+        guard let app else { return }
+
+        // Read fresh config from disk.
+        let newConfigManager = GhosttyConfigManager()
+        guard newConfigManager.isLoaded, let newConfig = newConfigManager.config else {
+            logger.warning("Config reload failed — keeping previous config")
+            return
+        }
+
+        // Update ghostty's app-level config.
+        GhosttyFFI.appUpdateConfig(app, config: newConfig)
+        self.configManager = newConfigManager
+
+        // Propagate to all surfaces.
+        if !soft {
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.applyCurrentGhosttyConfigToAllWindows()
+            }
+        }
     }
 
     /// Request the surface to close.
@@ -221,6 +246,9 @@ final class GhosttyAppController {
 
                 let adapter = ReloadDepsAdapter(controller: self)
                 self.reloadCoordinator = ConfigReloadCoordinator(deps: adapter)
+                self.configFileWatcher = ConfigFileWatcher { [weak self] in
+                    self?.reloadConfig(soft: false)
+                }
             } else {
                 self.readiness = .error
             }
