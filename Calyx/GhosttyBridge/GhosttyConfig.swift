@@ -23,6 +23,17 @@ final class GhosttyConfigManager {
     # --- End Calyx Glass Preset ---
     """
 
+    /// Keys that Calyx manages (overrides from user's ghostty config).
+    /// Used for UI display in Settings and drift-prevention tests.
+    static let managedKeys: [String] = [
+        "background-opacity",
+        "background-blur",
+        "font-thicken",
+        "minimum-contrast",
+        "background-opacity-cells",
+        "font-codepoint-map",
+    ]
+
     private static var calyxConfigDir: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".config/calyx", isDirectory: true)

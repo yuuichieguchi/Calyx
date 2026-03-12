@@ -103,6 +103,34 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         actions.addArrangedSubview(NSView())
         root.addArrangedSubview(actions)
 
+        // Divider before config info section
+        let configDivider = NSBox()
+        configDivider.boxType = .separator
+        configDivider.translatesAutoresizingMaskIntoConstraints = false
+        configDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        root.addArrangedSubview(configDivider)
+
+        // Config info section
+        let configTitle = NSTextField(labelWithString: "Ghostty Config Compatibility")
+        configTitle.font = .systemFont(ofSize: 16, weight: .semibold)
+        root.addArrangedSubview(configTitle)
+
+        let configSubtitle = NSTextField(wrappingLabelWithString: "Calyx reads ~/.config/ghostty/config. Most settings are hot-reloaded when you save the file.")
+        configSubtitle.textColor = .secondaryLabelColor
+        configSubtitle.font = .systemFont(ofSize: 12)
+        root.addArrangedSubview(configSubtitle)
+
+        let managedLabel = NSTextField(wrappingLabelWithString: "The following keys are managed by Calyx for the Glass UI effect and will be overridden:")
+        managedLabel.textColor = .secondaryLabelColor
+        managedLabel.font = .systemFont(ofSize: 12)
+        root.addArrangedSubview(managedLabel)
+
+        let managedKeysText = GhosttyConfigManager.managedKeys.map { "  • \($0)" }.joined(separator: "\n")
+        let managedKeysList = NSTextField(wrappingLabelWithString: managedKeysText)
+        managedKeysList.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        managedKeysList.textColor = .tertiaryLabelColor
+        root.addArrangedSubview(managedKeysList)
+
         loadPresetIntoUI()
     }
 
@@ -113,10 +141,60 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc private func openConfigFile(_ sender: Any?) {
-        let configDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/ghostty", isDirectory: true)
-        let configFile = configDir.appendingPathComponent("config", isDirectory: false)
-        NSWorkspace.shared.open(configFile)
+        var opener = SystemConfigFileOpener()
+        let result = ConfigFileOpener.openConfigFile(using: &opener)
+
+        switch result {
+        case .opened, .createdAndOpened:
+            break // Success
+        case .error(let error):
+            showConfigFileError(error, opener: opener)
+        }
+    }
+
+    private func showConfigFileError(_ error: ConfigFileOpenError, opener: SystemConfigFileOpener) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Could not open config file"
+
+        let rawPath = opener.configOpenPath()
+        let hasPath = !rawPath.isEmpty
+
+        switch error {
+        case .emptyPath:
+            alert.informativeText = "Could not determine the config file path."
+        case .isDirectory:
+            alert.informativeText = "The config path points to a directory, not a file."
+        case .isSymlink:
+            alert.informativeText = "The config path is a symbolic link. For security, Calyx will not follow symlinks."
+        case .createFailed(let message):
+            alert.informativeText = "Failed to create config file: \(message)"
+        case .openFailed:
+            alert.informativeText = "The file exists but could not be opened."
+        }
+
+        if hasPath {
+            alert.addButton(withTitle: "Reveal in Finder")
+            alert.addButton(withTitle: "Copy Path")
+            alert.addButton(withTitle: "OK")
+        } else {
+            alert.addButton(withTitle: "OK")
+        }
+
+        let response = alert.runModal()
+
+        guard hasPath else { return }
+        let fileURL = URL(fileURLWithPath: rawPath)
+
+        switch response {
+        case .alertFirstButtonReturn:
+            opener.revealInFinder(url: fileURL)
+        case .alertSecondButtonReturn:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(rawPath, forType: .string)
+        default:
+            break
+        }
     }
 
     @objc private func opacityDidChange(_ sender: Any?) {
