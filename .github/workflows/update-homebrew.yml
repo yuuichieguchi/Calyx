@@ -1,0 +1,26 @@
+name: Update Homebrew Cask
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.HOMEBREW_APP_ID }}
+          private-key: ${{ secrets.HOMEBREW_APP_PRIVATE_KEY }}
+          owner: yuuichieguchi
+          repositories: homebrew-calyx
+
+      - name: Dispatch to homebrew-calyx
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: yuuichieguchi/homebrew-calyx
+          event-type: update-cask
+          client-payload: '{"tag": "${{ github.event.release.tag_name }}"}'

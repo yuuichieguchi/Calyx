@@ -24,5 +24,9 @@
 	<string>public.app-category.developer-tools</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>SUFeedURL</key>
+	<string>https://yuuichieguchi.github.io/Calyx/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>PCj8Kd8fh5sr8y4hhYbT7ER9hDOHUMLFRl9FBSzad2U=</string>
 </dict>
 </plist>

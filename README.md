@@ -19,7 +19,8 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **Cursor Click-to-Move** -- click on a prompt line to reposition cursor (requires shell integration)
 - **Git Source Control** -- sidebar Changes view with working changes (staged/unstaged/untracked), commit graph with branch visualization, and inline diff viewer
 - **Claude Code IPC** -- MCP server for communication between Claude Code instances across tabs and panes ([demo video](https://www.youtube.com/watch?v=3i3Enat9jPA))
-- **Ghostty config compatibility** -- reads `~/.config/ghostty/config`
+- **Ghostty config compatibility** -- reads `~/.config/ghostty/config` (most keys hot-reload on save; see Settings for Calyx-managed keys)
+- **Auto-update** -- Sparkle-based updates for direct downloads (Homebrew installs use `brew upgrade`)
 
 ## Keyboard Shortcuts
 
@@ -79,9 +80,20 @@ To disable, open the command palette and run **Disable Claude Code IPC**.
 
 ## Installation
 
+### Homebrew
+
+```bash
+brew tap yuuichieguchi/calyx
+brew install --cask calyx
+```
+
+### Manual
+
 1. Download `Calyx.zip` from the [latest release](https://github.com/yuuichieguchi/Calyx/releases/latest)
 2. Unzip the file
 3. Drag `Calyx.app` into `/Applications`
+
+Direct downloads include automatic update checking via Sparkle. Homebrew installs are updated via `brew upgrade`.
 
 ## Building from Source
 
@@ -125,6 +137,7 @@ Calyx uses AppKit for window, tab, and focus management with SwiftUI for view re
 ## Known Limitations
 
 - **Cursor click-to-move on full-width text** -- cursor placement may be offset on Japanese/full-width text lines because Ghostty's cursor-click-to-move internally translates clicks into arrow-key steps over terminal cells.
+- **Calyx-managed config keys** -- `background-opacity`, `background-blur`, `font-thicken`, `minimum-contrast`, `background-opacity-cells`, `font-codepoint-map` are overridden by Calyx for Glass UI. See Settings > Ghostty Config Compatibility for the full list.
 
 ## License
 

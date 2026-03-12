@@ -168,6 +168,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(withTitle: "About Calyx", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Preferences…", action: #selector(openPreferences(_:)), keyEquivalent: ",")
+        if !UpdateController.shared.isHomebrew {
+            let updateItem = NSMenuItem(title: "Check for Updates…", action: #selector(checkForUpdates(_:)), keyEquivalent: "")
+            appMenu.addItem(updateItem)
+        }
         appMenu.addItem(.separator())
 
         let servicesItem = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
@@ -490,6 +494,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openPreferences(_ sender: Any?) {
         SettingsWindowController.shared.showSettings()
+    }
+
+    @objc private func checkForUpdates(_ sender: Any?) {
+        UpdateController.shared.checkForUpdates()
     }
 
     @objc private func selectTabByNumber(_ sender: NSMenuItem) {
