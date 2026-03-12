@@ -1,0 +1,15 @@
+<?xml version="1.0" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+    <channel>
+        <title>Calyx</title>
+        <item>
+            <title>0.3.6</title>
+            <pubDate>Fri, 13 Mar 2026 04:10:14 +0900</pubDate>
+            <sparkle:version>1</sparkle:version>
+            <sparkle:shortVersionString>0.3.6</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <enclosure url="https://github.com/yuuichieguchi/Calyx/releases/download/v0.3.6/Calyx.zip" length="19280356" type="application/octet-stream" sparkle:edSignature="5ZnyOw8Uzrw/YCSp30uB7GxFUd9fZPrMN8J1bXS/qWJaht6XgTihLhrZ0W3bV1pYYiCHYPMYAA6FIPzRhWdNBA=="/>
+        </item>
+    </channel>
+</rss>
