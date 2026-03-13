@@ -18,7 +18,7 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **Native Scrollbar** -- system overlay scrollbar for terminal scrollback
 - **Cursor Click-to-Move** -- click on a prompt line to reposition cursor (requires shell integration)
 - **Git Source Control** -- sidebar Changes view with working changes (staged/unstaged/untracked), commit graph with branch visualization, and inline diff viewer
-- **Claude Code IPC** -- MCP server for communication between Claude Code instances across tabs and panes ([demo video](https://www.youtube.com/watch?v=3i3Enat9jPA))
+- **AI Agent IPC** -- MCP server for communication between AI agent instances (Claude Code, Codex CLI) across tabs and panes ([demo video](https://www.youtube.com/watch?v=3i3Enat9jPA))
 - **Ghostty config compatibility** -- reads `~/.config/ghostty/config` (most keys hot-reload on save; see Settings for Calyx-managed keys)
 - **Auto-update** -- Sparkle-based updates for direct downloads (Homebrew installs use `brew upgrade`)
 
@@ -68,15 +68,17 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 
 ## IPC (Inter-Pane Communication)
 
-Multiple Claude Code instances running in different Calyx tabs or panes can communicate with each other via a built-in MCP server.
+AI agent instances (Claude Code, Codex CLI) running in different Calyx tabs or panes can communicate with each other via a built-in MCP server.
 
-1. Open the command palette (`Cmd+Shift+P`) and run **Enable Claude Code IPC**
-2. Start Claude Code in two or more terminal panes
+1. Open the command palette (`Cmd+Shift+P`) and run **Enable AI Agent IPC**
+2. Start agents (Claude Code, Codex, or both) in two or more terminal panes
 3. Each instance automatically registers as a peer and can send/receive messages
+
+Config is auto-written to `~/.claude.json` and `~/.codex/config.toml` when the respective tool is installed. Restart running agent instances to pick up the new MCP server.
 
 Available MCP tools: `register_peer`, `list_peers`, `send_message`, `broadcast`, `receive_messages`, `ack_messages`, `get_peer_status`
 
-To disable, open the command palette and run **Disable Claude Code IPC**.
+To disable, open the command palette and run **Disable AI Agent IPC**.
 
 ## Installation
 
