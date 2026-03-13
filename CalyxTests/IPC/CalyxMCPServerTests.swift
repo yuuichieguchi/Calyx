@@ -26,6 +26,7 @@ final class CalyxMCPServerTests: XCTestCase {
 
     private var server: CalyxMCPServer!
     private let testToken = "test-token-12345"
+    private var mockTerminalControl: MockTerminalControlProvider!
 
     // MARK: - Lifecycle
 
@@ -34,11 +35,15 @@ final class CalyxMCPServerTests: XCTestCase {
         server = CalyxMCPServer()
         // Direct token set for testing, bypassing start() / NWListener
         server._testSetToken(testToken)
+        // Use mock terminal control so tests don't require a live window
+        mockTerminalControl = MockTerminalControlProvider()
+        server.terminalControl = mockTerminalControl
     }
 
     override func tearDown() {
         server.stop()
         server = nil
+        mockTerminalControl = nil
         super.tearDown()
     }
 
@@ -220,7 +225,7 @@ final class CalyxMCPServerTests: XCTestCase {
                        "instructions must not be empty")
     }
 
-    // 5. "tools/list" → result with 7 tools
+    // 5. "tools/list" → result with 9 tools
     func test_handleJSONRPC_toolsList_returnsAllTools() async throws {
         // Arrange
         let data = makeRequest(method: "tools/list")
@@ -234,16 +239,17 @@ final class CalyxMCPServerTests: XCTestCase {
 
         let tools = try XCTUnwrap(result["tools"] as? [[String: Any]],
                                   "tools/list result must contain 'tools' array")
-        XCTAssertEqual(tools.count, 7,
-                       "tools/list must return exactly 7 tools")
+        XCTAssertEqual(tools.count, 9,
+                       "tools/list must return exactly 9 tools")
 
         let toolNames = Set(tools.compactMap { $0["name"] as? String })
         let expectedNames: Set<String> = [
             "register_peer", "list_peers", "send_message",
             "broadcast", "receive_messages", "ack_messages", "get_peer_status",
+            "list_panes", "create_split",
         ]
         XCTAssertEqual(toolNames, expectedNames,
-                       "tools/list must return the 7 expected tool names")
+                       "tools/list must return the 9 expected tool names")
     }
 
     // 6. Unknown method → error code -32601
@@ -610,5 +616,195 @@ final class CalyxMCPServerTests: XCTestCase {
         XCTAssertFalse(srv.isRunning,
                        "Server should not be running after all toggle iterations")
         // The test passing without crash is itself a success
+    }
+
+    // ==================== Terminal Control Tool Tests ====================
+
+    // 20. list_panes routes to terminal control and returns panes array
+    func test_handleJSONRPC_listPanes_returnsPanesArray() async throws {
+        // Arrange — configure mock with two panes
+        let paneA = PaneInfo(id: UUID().uuidString, title: "Terminal", pwd: "/tmp", isFocused: true)
+        let paneB = PaneInfo(id: UUID().uuidString, title: "Terminal", pwd: "/var", isFocused: false)
+        mockTerminalControl.panesToReturn = [paneA, paneB]
+
+        let data = makeToolCallRequest(toolName: "list_panes", arguments: [:])
+
+        // Act
+        let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
+
+        // Assert
+        XCTAssertEqual(statusCode, 200)
+        let (json, isError) = try toolCallJSON(body)
+        XCTAssertFalse(isError, "list_panes must not be an error")
+
+        let panes = try XCTUnwrap(json["panes"] as? [[String: Any]],
+                                  "list_panes result must contain 'panes' array")
+        XCTAssertEqual(panes.count, 2,
+                       "list_panes should return exactly the 2 mock panes")
+        XCTAssertEqual(panes[0]["id"] as? String, paneA.id,
+                       "First pane id must match")
+        XCTAssertEqual(panes[1]["id"] as? String, paneB.id,
+                       "Second pane id must match")
+    }
+
+    // 21. list_panes returns empty array when no panes
+    func test_handleJSONRPC_listPanes_emptyWhenNoPanes() async throws {
+        // Arrange
+        mockTerminalControl.panesToReturn = []
+
+        let data = makeToolCallRequest(toolName: "list_panes", arguments: [:])
+
+        // Act
+        let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
+
+        // Assert
+        XCTAssertEqual(statusCode, 200)
+        let (json, isError) = try toolCallJSON(body)
+        XCTAssertFalse(isError, "list_panes must not be an error even when empty")
+
+        let panes = try XCTUnwrap(json["panes"] as? [[String: Any]],
+                                  "list_panes result must contain 'panes' array")
+        XCTAssertTrue(panes.isEmpty, "panes array must be empty")
+    }
+
+    // 22. create_split routes to terminal control and returns new pane ID
+    func test_handleJSONRPC_createSplit_vertical_success() async throws {
+        // Arrange
+        let newPaneID = UUID()
+        mockTerminalControl.splitToReturn = newPaneID
+
+        let data = makeToolCallRequest(toolName: "create_split", arguments: [
+            "direction": "vertical",
+        ])
+
+        // Act
+        let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
+
+        // Assert
+        XCTAssertEqual(statusCode, 200)
+        let (json, isError) = try toolCallJSON(body)
+        XCTAssertFalse(isError, "create_split must not be an error")
+        XCTAssertEqual(json["paneId"] as? String, newPaneID.uuidString,
+                       "create_split result must include the new pane ID")
+
+        // Verify direction was forwarded correctly
+        XCTAssertEqual(mockTerminalControl.lastSplitDirection, .vertical,
+                       "create_split must forward direction=vertical to service")
+    }
+
+    // 23. create_split horizontal with optional pane_id
+    func test_handleJSONRPC_createSplit_horizontal_withPaneId() async throws {
+        // Arrange
+        let targetID = UUID()
+        let newPaneID = UUID()
+        mockTerminalControl.splitToReturn = newPaneID
+
+        let data = makeToolCallRequest(toolName: "create_split", arguments: [
+            "direction": "horizontal",
+            "pane_id": targetID.uuidString,
+        ])
+
+        // Act
+        let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
+
+        // Assert
+        XCTAssertEqual(statusCode, 200)
+        let (json, isError) = try toolCallJSON(body)
+        XCTAssertFalse(isError, "create_split must not be an error")
+        XCTAssertEqual(json["paneId"] as? String, newPaneID.uuidString)
+        XCTAssertEqual(mockTerminalControl.lastSplitDirection, .horizontal)
+        XCTAssertEqual(mockTerminalControl.lastSplitTargetPaneId, targetID)
+    }
+
+    // 24. create_split without direction → isError
+    func test_handleJSONRPC_createSplit_missingDirection_isError() async throws {
+        // Arrange — no "direction" argument
+        let data = makeToolCallRequest(toolName: "create_split", arguments: [:])
+
+        // Act
+        let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
+
+        // Assert
+        XCTAssertEqual(statusCode, 200)
+        let (text, isError) = try toolCallText(body)
+        XCTAssertTrue(isError, "create_split without direction must set isError: true")
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("direction"),
+                      "Error text must mention 'direction', got: \(text)")
+    }
+
+    // 25. create_split with invalid direction value → isError
+    func test_handleJSONRPC_createSplit_invalidDirection_isError() async throws {
+        // Arrange
+        let data = makeToolCallRequest(toolName: "create_split", arguments: [
+            "direction": "diagonal",
+        ])
+
+        // Act
+        let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
+
+        // Assert
+        XCTAssertEqual(statusCode, 200)
+        let (text, isError) = try toolCallText(body)
+        XCTAssertTrue(isError, "create_split with invalid direction must set isError: true")
+        XCTAssertTrue(text.localizedCaseInsensitiveContains("diagonal") ||
+                      text.localizedCaseInsensitiveContains("invalid"),
+                      "Error text must describe the invalid value, got: \(text)")
+    }
+
+    // 26. create_split with invalid UUID for pane_id → isError
+    func test_handleJSONRPC_createSplit_invalidPaneId_isError() async throws {
+        // Arrange
+        let data = makeToolCallRequest(toolName: "create_split", arguments: [
+            "direction": "horizontal",
+            "pane_id": "not-a-uuid",
+        ])
+
+        // Act
+        let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
+
+        // Assert
+        XCTAssertEqual(statusCode, 200)
+        let (_, isError) = try toolCallText(body)
+        XCTAssertTrue(isError, "create_split with invalid pane_id must set isError: true")
+    }
+
+    // 27. create_split when service returns nil → isError
+    func test_handleJSONRPC_createSplit_serviceFails_isError() async throws {
+        // Arrange — mock returns nil to simulate failure
+        mockTerminalControl.splitToReturn = nil
+
+        let data = makeToolCallRequest(toolName: "create_split", arguments: [
+            "direction": "vertical",
+        ])
+
+        // Act
+        let (statusCode, body) = await server.handleJSONRPC(data: data, authToken: testToken)
+
+        // Assert
+        XCTAssertEqual(statusCode, 200)
+        let (_, isError) = try toolCallText(body)
+        XCTAssertTrue(isError, "create_split must set isError when service returns nil")
+    }
+}
+
+// MARK: - MockTerminalControlProvider
+
+/// Test double for TerminalControlProviding. Allows handler tests to run
+/// without a live window or UI state.
+@MainActor
+final class MockTerminalControlProvider: TerminalControlProviding {
+    var panesToReturn: [PaneInfo] = []
+    var splitToReturn: UUID? = nil
+    var lastSplitDirection: SplitDirection?
+    var lastSplitTargetPaneId: UUID?
+
+    func listPanes() -> [PaneInfo] {
+        panesToReturn
+    }
+
+    func createSplit(direction: SplitDirection, targetPaneId: UUID?) -> UUID? {
+        lastSplitDirection = direction
+        lastSplitTargetPaneId = targetPaneId
+        return splitToReturn
     }
 }

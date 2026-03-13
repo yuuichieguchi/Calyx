@@ -808,6 +808,65 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    // MARK: - Programmatic Split Creation
+
+    /// Creates a new split pane in the specified direction.
+    ///
+    /// This is the public entry point for MCP-triggered splits. It replicates the
+    /// logic from `handleNewSplitNotification` but accepts parameters directly
+    /// instead of reading them from a notification.
+    ///
+    /// - Parameters:
+    ///   - direction: The split direction (horizontal or vertical).
+    ///   - targetPaneId: The leaf pane to split. Defaults to the focused pane if nil.
+    /// - Returns: The UUID of the newly created pane, or nil on failure.
+    @discardableResult
+    func createSplit(direction: SplitDirection, targetPaneId: UUID? = nil) -> UUID? {
+        guard let tab = activeTab else {
+            logger.error("createSplit: no active tab")
+            return nil
+        }
+
+        guard let app = GhosttyAppController.shared.app else {
+            logger.error("createSplit: GhosttyAppController has no app")
+            return nil
+        }
+
+        let targetID: UUID
+        if let explicit = targetPaneId {
+            targetID = explicit
+        } else if let focused = tab.splitTree.focusedLeafID {
+            targetID = focused
+        } else if let first = tab.splitTree.allLeafIDs().first {
+            targetID = first
+        } else {
+            logger.error("createSplit: active tab has no panes")
+            return nil
+        }
+
+        var config = GhosttyFFI.surfaceConfigNew()
+        if let window = self.window {
+            config.scale_factor = Double(window.backingScaleFactor)
+        }
+
+        guard let newSurfaceID = tab.registry.createSurface(app: app, config: config) else {
+            logger.error("createSplit: failed to create surface")
+            return nil
+        }
+
+        let (newTree, _) = tab.splitTree.insert(at: targetID, direction: direction, newID: newSurfaceID)
+        tab.splitTree = newTree
+
+        splitContainerView?.updateLayout(tree: tab.splitTree)
+
+        if let newView = tab.registry.view(for: newSurfaceID) {
+            window?.makeFirstResponder(newView)
+        }
+
+        logger.info("createSplit: created pane \(newSurfaceID) direction=\(direction.rawValue)")
+        return newSurfaceID
+    }
+
     @objc private func handleCloseSurfaceNotification(_ notification: Notification) {
         guard let surfaceView = notification.object as? SurfaceView else { return }
         guard belongsToThisWindow(surfaceView) else { return }

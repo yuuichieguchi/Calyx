@@ -20,6 +20,7 @@ final class CalyxMCPServer {
     private(set) var port: Int = 0
     private(set) var token: String = ""
     let store = IPCStore()
+    var terminalControl: any TerminalControlProviding = TerminalControlService()
 
     // MARK: - Private
 
@@ -241,6 +242,12 @@ final class CalyxMCPServer {
         case "get_peer_status":
             return await handleGetPeerStatus(id: id, arguments: arguments)
 
+        case "list_panes":
+            return handleListPanes(id: id)
+
+        case "create_split":
+            return handleCreateSplit(id: id, arguments: arguments)
+
         default:
             return toolError(id: id, text: "Unknown tool: \(toolName)")
         }
@@ -372,6 +379,49 @@ final class CalyxMCPServer {
         return toolSuccess(id: id, text: json)
     }
 
+    private func handleListPanes(
+        id: JSONRPCId
+    ) -> (statusCode: Int, body: Data?) {
+        let panes = terminalControl.listPanes()
+        let paneDicts: [[String: Any]] = panes.map { paneToDict($0) }
+        let result: [String: Any] = ["panes": paneDicts]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: result),
+              let json = String(data: jsonData, encoding: .utf8) else {
+            return toolError(id: id, text: "Failed to serialize panes")
+        }
+        return toolSuccess(id: id, text: json)
+    }
+
+    private func handleCreateSplit(
+        id: JSONRPCId,
+        arguments: [String: Any]?
+    ) -> (statusCode: Int, body: Data?) {
+        guard let directionStr = arguments?["direction"] as? String else {
+            return toolError(id: id, text: "Missing required parameter: direction")
+        }
+
+        guard let direction = SplitDirection(rawValue: directionStr) else {
+            return toolError(id: id, text: "Invalid direction '\(directionStr)': must be 'horizontal' or 'vertical'")
+        }
+
+        let targetPaneId: UUID?
+        if let paneIdStr = arguments?["pane_id"] as? String {
+            guard let uuid = UUID(uuidString: paneIdStr) else {
+                return toolError(id: id, text: "Invalid pane_id '\(paneIdStr)': must be a valid UUID")
+            }
+            targetPaneId = uuid
+        } else {
+            targetPaneId = nil
+        }
+
+        guard let newPaneID = terminalControl.createSplit(direction: direction, targetPaneId: targetPaneId) else {
+            return toolError(id: id, text: "Failed to create split pane")
+        }
+
+        let json = "{\"paneId\":\"\(newPaneID.uuidString)\"}"
+        return toolSuccess(id: id, text: json)
+    }
+
     // MARK: - Response Helpers
 
     private func unauthorizedResponse() -> (statusCode: Int, body: Data?) {
@@ -406,6 +456,18 @@ final class CalyxMCPServer {
             "lastSeen": Self.iso8601.string(from: peer.lastSeen),
             "registeredAt": Self.iso8601.string(from: peer.registeredAt),
         ]
+    }
+
+    private func paneToDict(_ pane: PaneInfo) -> [String: Any] {
+        var dict: [String: Any] = [
+            "id": pane.id,
+            "title": pane.title,
+            "isFocused": pane.isFocused,
+        ]
+        if let pwd = pane.pwd {
+            dict["pwd"] = pwd
+        }
+        return dict
     }
 
     private func messageToDict(_ message: Message) -> [String: Any] {

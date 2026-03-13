@@ -343,6 +343,22 @@ struct MCPRouter: Sendable {
                     required: ["peer_id"]
                 )
             ),
+            MCPTool(
+                name: "list_panes",
+                description: "List all panes in the active window with their IDs, titles, working directories, and focus state",
+                inputSchema: schema(properties: [:])
+            ),
+            MCPTool(
+                name: "create_split",
+                description: "Create a new split pane in the specified direction",
+                inputSchema: schema(
+                    properties: [
+                        "direction": prop("string", "Split direction: 'horizontal' or 'vertical'"),
+                        "pane_id": prop("string", "Target pane ID to split (defaults to focused pane)"),
+                    ],
+                    required: ["direction"]
+                )
+            ),
         ]
     }
 
@@ -355,6 +371,10 @@ struct MCPRouter: Sendable {
     After completing any significant task, call receive_messages to check for messages from other peers. When you receive messages, process them and respond via send_message.
 
     Use list_peers to discover other connected instances. Use broadcast for announcements relevant to all peers.
+
+    You can also control the terminal layout:
+    - Use list_panes to see all open panes with their IDs and working directories.
+    - Use create_split to create new panes for parallel work (direction: 'horizontal' or 'vertical').
     """
 
     /// Build the response for `initialize`.
