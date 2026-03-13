@@ -20,7 +20,7 @@ final class CalyxMCPServer {
     private(set) var port: Int = 0
     private(set) var token: String = ""
     let store = IPCStore()
-    var terminalControl: any TerminalControlProviding = TerminalControlService()
+    private(set) var terminalControl: any TerminalControlProviding = TerminalControlService()
 
     // MARK: - Private
 
@@ -39,6 +39,11 @@ final class CalyxMCPServer {
     /// For testing only — sets the token without starting the listener.
     func _testSetToken(_ token: String) {
         self.token = token
+    }
+
+    /// For testing only — injects a mock terminal control provider.
+    func _testSetTerminalControl(_ provider: any TerminalControlProviding) {
+        self.terminalControl = provider
     }
 
     // MARK: - Lifecycle

@@ -37,7 +37,7 @@ final class CalyxMCPServerTests: XCTestCase {
         server._testSetToken(testToken)
         // Use mock terminal control so tests don't require a live window
         mockTerminalControl = MockTerminalControlProvider()
-        server.terminalControl = mockTerminalControl
+        server._testSetTerminalControl(mockTerminalControl)
     }
 
     override func tearDown() {

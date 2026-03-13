@@ -793,28 +793,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             config.scale_factor = Double(window.backingScaleFactor)
         }
 
-        guard let newSurfaceID = tab.registry.createSurface(app: app, config: config) else {
-            logger.error("Failed to create split surface")
-            return
-        }
-
-        let (newTree, _) = tab.splitTree.insert(at: surfaceID, direction: splitDir, newID: newSurfaceID)
-        tab.splitTree = newTree
-
-        splitContainerView?.updateLayout(tree: tab.splitTree)
-
-        if let newView = tab.registry.view(for: newSurfaceID) {
-            window?.makeFirstResponder(newView)
-        }
+        performSplit(tab: tab, targetID: surfaceID, direction: splitDir, config: config)
     }
 
     // MARK: - Programmatic Split Creation
 
     /// Creates a new split pane in the specified direction.
     ///
-    /// This is the public entry point for MCP-triggered splits. It replicates the
-    /// logic from `handleNewSplitNotification` but accepts parameters directly
-    /// instead of reading them from a notification.
+    /// This is the public entry point for MCP-triggered splits.
     ///
     /// - Parameters:
     ///   - direction: The split direction (horizontal or vertical).
@@ -849,8 +835,42 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             config.scale_factor = Double(window.backingScaleFactor)
         }
 
+        guard let newSurfaceID = performSplit(tab: tab, targetID: targetID, direction: direction, config: config) else {
+            return nil
+        }
+
+        logger.info("createSplit: created pane \(newSurfaceID) direction=\(direction.rawValue)")
+        return newSurfaceID
+    }
+
+    // MARK: - Shared Split Implementation
+
+    /// Core split execution. Creates the surface, inserts it into the split tree,
+    /// updates the layout, and sets first responder.
+    ///
+    /// Both `handleNewSplitNotification` and `createSplit` call this after doing
+    /// their own parameter preparation.
+    ///
+    /// - Parameters:
+    ///   - tab: The tab to split within.
+    ///   - targetID: The leaf node to split.
+    ///   - direction: The split direction.
+    ///   - config: The surface configuration to use for the new pane.
+    /// - Returns: The UUID of the newly created pane, or nil on failure.
+    @discardableResult
+    private func performSplit(
+        tab: Tab,
+        targetID: UUID,
+        direction: SplitDirection,
+        config: ghostty_surface_config_s
+    ) -> UUID? {
+        guard let app = GhosttyAppController.shared.app else {
+            logger.error("performSplit: GhosttyAppController has no app")
+            return nil
+        }
+
         guard let newSurfaceID = tab.registry.createSurface(app: app, config: config) else {
-            logger.error("createSplit: failed to create surface")
+            logger.error("performSplit: failed to create surface")
             return nil
         }
 
@@ -863,7 +883,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             window?.makeFirstResponder(newView)
         }
 
-        logger.info("createSplit: created pane \(newSurfaceID) direction=\(direction.rawValue)")
         return newSurfaceID
     }
 
