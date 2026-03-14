@@ -19,7 +19,7 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **Cursor Click-to-Move** -- click on a prompt line to reposition cursor (requires shell integration)
 - **Git Source Control** -- sidebar Changes view with working changes (staged/unstaged/untracked), commit graph with branch visualization, and inline diff viewer
 - **AI Agent IPC** -- MCP server for communication between AI agent instances (Claude Code, Codex CLI) across tabs and panes ([demo video](https://www.youtube.com/watch?v=3i3Enat9jPA))
-- **Scriptable Browser** -- 19 MCP tools for browser automation: snapshot accessibility trees, click elements, fill forms, evaluate JS, take screenshots, wait for conditions. Includes `calyx` CLI binary bundled in the app
+- **Scriptable Browser** -- CLI browser automation (like cmux): snapshot accessibility trees, click elements, fill forms, evaluate JS, take screenshots, wait for conditions. No enable step needed, commands work immediately. `calyx` CLI bundled in the app
 - **Ghostty config compatibility** -- reads `~/.config/ghostty/config` (most keys hot-reload on save; see Settings for Calyx-managed keys)
 - **Auto-update** -- Sparkle-based updates for direct downloads (Homebrew installs use `brew upgrade`)
 
@@ -85,9 +85,8 @@ To disable, open the command palette and run **Disable AI Agent IPC**.
 
 Agents can programmatically control browser tabs via 19 MCP tools, similar to cmux's browser automation.
 
-1. Open the command palette and run **Enable Browser Scripting**
-2. Open a browser tab and navigate to a page
-3. Use `calyx browser` commands from any terminal tab, or call the MCP tools directly from an agent
+1. Open a browser tab and navigate to a page
+2. Use `calyx browser` commands from any terminal tab — no enable step needed
 
 ### CLI Commands
 
@@ -104,7 +103,7 @@ calyx browser wait --selector ".loaded"    # Wait for condition
 
 The `calyx` CLI binary is bundled inside `Calyx.app/Contents/Resources/bin/`. To install it to your PATH, run **Install CLI to PATH** from the command palette.
 
-To disable, open the command palette and run **Disable Browser Scripting**.
+The browser server starts automatically with the app and listens on `localhost:41840`. Connection info is written to `~/.config/calyx/browser.json`.
 
 ## Installation
 
