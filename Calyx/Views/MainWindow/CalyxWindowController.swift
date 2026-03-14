@@ -25,8 +25,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var loadMoreTask: Task<Void, Never>?
     private var expandTasks: [String: Task<Void, Never>] = [:]
     private var hasMoreCommits = true
-    private var titleBarGlass: NSGlassEffectView?
-    private var titleBarFallback: NSView?
 
     // MARK: - Computed Properties
 
@@ -106,7 +104,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     deinit {
         NotificationCenter.default.removeObserver(self)
-        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     // MARK: - Setup
@@ -230,35 +227,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         contentView.addSubview(hosting)
         self.hostingView = hosting
 
-        // Add Liquid Glass title bar
-        let glass = NSGlassEffectView()
-        glass.cornerRadius = 0
-        glass.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(glass)
-        NSLayoutConstraint.activate([
-            glass.topAnchor.constraint(equalTo: contentView.topAnchor),
-            glass.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            glass.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            glass.bottomAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor),
-        ])
-        self.titleBarGlass = glass
-
-        // Solid fallback for Reduce Transparency
-        let fallback = NSView()
-        fallback.wantsLayer = true
-        fallback.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        fallback.translatesAutoresizingMaskIntoConstraints = false
-        fallback.isHidden = true
-        contentView.addSubview(fallback)
-        NSLayoutConstraint.activate([
-            fallback.topAnchor.constraint(equalTo: contentView.topAnchor),
-            fallback.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
-            fallback.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            fallback.bottomAnchor.constraint(equalTo: contentView.safeAreaLayoutGuide.topAnchor),
-        ])
-        self.titleBarFallback = fallback
-
-        applyTitleBarOpacity()
+        // Title bar glass is now handled by SwiftUI overlay in MainContentView
     }
 
     private func setupTerminalSurface() {
@@ -782,20 +751,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         center.addObserver(self, selector: #selector(handleDesktopNotification(_:)),
                            name: .ghosttyDesktopNotification, object: nil)
 
-        center.addObserver(self, selector: #selector(handleGlassOpacityChanged(_:)),
-                           name: .glassOpacityDidChange, object: nil)
-
-        NSWorkspace.shared.notificationCenter.addObserver(
-            self, selector: #selector(handleAccessibilityChanged(_:)),
-            name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification, object: nil)
-    }
-
-    @objc private func handleGlassOpacityChanged(_ notification: Notification) {
-        applyTitleBarOpacity()
-    }
-
-    @objc private func handleAccessibilityChanged(_ notification: Notification) {
-        applyTitleBarOpacity()
     }
 
     // MARK: - Notification Handlers
@@ -1512,17 +1467,4 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         alert.runModal()
     }
 
-    private func applyTitleBarOpacity() {
-        let opacity = UserDefaults.standard.object(forKey: "terminalGlassOpacity") as? Double ?? 0.7
-        let reduceTransparency = NSWorkspace.shared.accessibilityDisplayShouldReduceTransparency
-
-        if reduceTransparency {
-            titleBarGlass?.isHidden = true
-            titleBarFallback?.isHidden = false
-        } else {
-            titleBarGlass?.isHidden = false
-            titleBarFallback?.isHidden = true
-            titleBarGlass?.alphaValue = CGFloat(GlassEffectHelper.titleBarAlpha(for: opacity))
-        }
-    }
 }

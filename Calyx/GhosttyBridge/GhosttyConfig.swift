@@ -18,7 +18,7 @@ final class GhosttyConfigManager {
     # --- Calyx Glass Preset (managed) ---
     background-opacity = 0.82
     background-blur = macos-glass-regular
-    font-thicken = true
+    font-thicken = false
     minimum-contrast = 1.5
     # --- End Calyx Glass Preset ---
     """

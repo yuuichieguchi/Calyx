@@ -18,15 +18,17 @@ struct TabBarContentView: View {
         HStack(spacing: 0) {
             ScrollViewReader { proxy in
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 1) {
-                        ForEach(tabs) { tab in
-                            TabItemButton(
-                                tab: tab,
-                                isActive: tab.id == activeTabID,
-                                onSelected: { onTabSelected?(tab.id) },
-                                onClose: { onCloseTab?(tab.id) }
-                            )
-                            .id(tab.id)
+                    GlassEffectContainer(spacing: 10) {
+                        HStack(spacing: 10) {
+                            ForEach(tabs) { tab in
+                                TabItemButton(
+                                    tab: tab,
+                                    isActive: tab.id == activeTabID,
+                                    onSelected: { onTabSelected?(tab.id) },
+                                    onClose: { onCloseTab?(tab.id) }
+                                )
+                                .id(tab.id)
+                            }
                         }
                     }
                 }
@@ -45,7 +47,7 @@ struct TabBarContentView: View {
             .layoutPriority(1)
 
             Spacer(minLength: 40)
-                .frame(height: 32)
+                .frame(height: 38)
                 .contentShape(Rectangle())
                 .onTapGesture(count: 2) { onNewTab?() }
 
@@ -58,7 +60,7 @@ struct TabBarContentView: View {
             .accessibilityIdentifier(AccessibilityID.TabBar.newTabButton)
         }
         .padding(.horizontal, 4)
-        .frame(height: 32)
+        .frame(height: 38)
         .contentShape(Rectangle())
         .modifier(TabBarBackgroundModifier(reduceTransparency: reduceTransparency))
         .clipped(antialiased: false)
@@ -203,9 +205,26 @@ private struct TabBarBackgroundModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         if reduceTransparency {
-            content.background(Color(nsColor: .windowBackgroundColor))
+            content.background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea(.all, edges: .top))
         } else {
-            content.glassEffect(.clear.tint(.black.opacity(GlassEffectHelper.chromeTintOpacity(for: glassOpacity))), in: .rect)
+            content
+                .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
+                .overlay(alignment: .bottom) {
+                    Rectangle()
+                        .fill(GlassTheme.specularStroke.opacity(0.28))
+                        .frame(height: 1)
+                }
+                .overlay(alignment: .top) {
+                    Rectangle()
+                        .fill(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.20), Color.clear],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                        .frame(height: 18)
+                }
         }
     }
 }
@@ -216,51 +235,62 @@ private struct TabItemButton: View {
     var onSelected: (() -> Void)?
     var onClose: (() -> Void)?
     @State private var isHovering = false
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     var body: some View {
-        HStack(spacing: 0) {
-            Button(action: { onSelected?() }) {
-                Text(tab.title)
-                    .lineLimit(1)
-                    .font(.callout)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 10)
-                    .padding(.trailing, 4)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier(AccessibilityID.TabBar.tab(tab.id))
-            .accessibilityLabel(tab.title)
+        HStack(spacing: 6) {
+            Text(tab.title)
+                .lineLimit(1)
+                .font(.system(size: 12.5, weight: isActive ? .semibold : .medium, design: .rounded))
+                .tracking(0.18)
+                .foregroundStyle(isActive ? .primary : .secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
             if tab.unreadNotifications > 0 {
                 Text(tab.unreadNotifications > 99 ? "99+" : "\(tab.unreadNotifications)")
-                    .font(.system(size: 9, weight: .bold))
+                    .font(.system(size: 9, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
-                    .background(Capsule().fill(Color.red))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 2)
+                    .background(
+                        Capsule()
+                            .fill(
+                                LinearGradient(
+                                    colors: [Color.red.opacity(0.96), Color.orange.opacity(0.84)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                    )
+                    .overlay(
+                        Capsule()
+                            .stroke(Color.white.opacity(0.22), lineWidth: 1)
+                    )
             }
 
             Button(action: { onClose?() }) {
                 Image(systemName: "xmark")
                     .font(.system(size: 8, weight: .bold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isActive ? .secondary : .tertiary)
                     .frame(width: 16, height: 16)
             }
             .buttonStyle(.plain)
-            .padding(.trailing, 6)
             .opacity(isHovering || isActive ? 1 : 0)
             .allowsHitTesting(isHovering || isActive)
             .accessibilityIdentifier(AccessibilityID.TabBar.tabCloseButton(tab.id))
         }
-        .frame(minWidth: 96, idealWidth: 140, maxWidth: 180)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 4).fill(
-                isActive ? Color.accentColor.opacity(0.12) :
-                isHovering ? Color.white.opacity(0.06) : Color.clear
-            )
-        )
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
+        .frame(minWidth: 72, maxWidth: 180)
+        .contentShape(Rectangle())
+        .onTapGesture { onSelected?() }
+        .modifier(TabChromeModifier(
+            isActive: isActive,
+            cornerRadius: 8,
+            reduceTransparency: reduceTransparency
+        ))
         .onHover { isHovering = $0 }
+        .accessibilityIdentifier(AccessibilityID.TabBar.tab(tab.id))
+        .accessibilityLabel(tab.title)
     }
 }

@@ -34,28 +34,32 @@ struct SidebarContentView: View {
                 Text("Changes").tag(SidebarMode.changes)
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .padding(.horizontal, 12)
             .padding(.top, 8)
             .accessibilityIdentifier(AccessibilityID.Git.modeToggle)
 
             if sidebarMode == .tabs {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(groups) { group in
-                            GroupSectionView(
-                                group: group,
-                                isActiveGroup: group.id == activeGroupID,
-                                activeTabID: activeTabID,
-                                reduceTransparency: reduceTransparency,
-                                onGroupSelected: onGroupSelected,
-                                onTabSelected: onTabSelected,
-                                onCloseTab: onCloseTab
-                            )
+                    GlassEffectContainer(spacing: 8) {
+                        LazyVStack(alignment: .leading, spacing: 8) {
+                            ForEach(groups) { group in
+                                GroupSectionView(
+                                    group: group,
+                                    isActiveGroup: group.id == activeGroupID,
+                                    activeTabID: activeTabID,
+                                    reduceTransparency: reduceTransparency,
+                                    onGroupSelected: onGroupSelected,
+                                    onTabSelected: onTabSelected,
+                                    onCloseTab: onCloseTab
+                                )
+                            }
                         }
                     }
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
                 }
+                .padding(.top, 10)
 
                 Rectangle()
                     .fill(Color.white.opacity(reduceTransparency ? 0.14 : 0.10))
@@ -83,9 +87,10 @@ struct SidebarContentView: View {
                     onLoadMore: onLoadMoreCommits,
                     onExpandCommit: onExpandCommit
                 )
+                .padding(.top, 10)
             }
         }
-        .frame(minWidth: 180)
+        .frame(minWidth: 200)
         .modifier(SidebarBackgroundModifier(reduceTransparency: reduceTransparency))
         .accessibilityIdentifier(AccessibilityID.Sidebar.container)
     }
@@ -109,9 +114,24 @@ private struct SidebarBackgroundModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         if reduceTransparency {
-            content.background(Color(nsColor: .controlBackgroundColor))
+            content.background(Color(nsColor: .controlBackgroundColor).ignoresSafeArea(.all, edges: .top))
         } else {
-            content.glassEffect(.clear.tint(.black.opacity(GlassEffectHelper.chromeTintOpacity(for: glassOpacity))), in: .rect)
+            content
+                .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(GlassTheme.specularStroke.opacity(0.30))
+                        .frame(width: 1)
+                }
+                .overlay(alignment: .topLeading) {
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.20), Color.clear],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 32)
+                    .allowsHitTesting(false)
+                }
         }
     }
 }
@@ -126,7 +146,7 @@ private struct GroupSectionView: View {
     var onCloseTab: ((UUID) -> Void)?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
+        VStack(alignment: .leading, spacing: 6) {
             // Group header
             Button(action: { onGroupSelected?(group.id) }) {
                 HStack(spacing: 6) {
@@ -134,16 +154,17 @@ private struct GroupSectionView: View {
                         .fill(Color(nsColor: group.color.nsColor))
                         .frame(width: 8, height: 8)
                     Text(group.name)
-                        .font(.headline)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .tracking(0.4)
                         .lineLimit(1)
                     Spacer()
                     Text("\(group.tabs.count)")
-                        .font(.caption)
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
                         .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 6)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
                 .contentShape(Rectangle())
                 .modifier(GroupHeaderBackgroundModifier(
                     isActiveGroup: isActiveGroup,
@@ -176,18 +197,44 @@ private struct GroupHeaderBackgroundModifier: ViewModifier {
     let groupColor: TabGroupColor
 
     func body(content: Content) -> some View {
-        if isActiveGroup {
-            if reduceTransparency {
-                content.background(
-                    RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.15))
+        if reduceTransparency {
+            content
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(
+                            groupColor.color.opacity(isActiveGroup ? 0.18 : 0.08)
+                        )
                 )
-            } else {
-                content.background(
-                    RoundedRectangle(cornerRadius: 6).fill(groupColor.color.opacity(0.2))
+        } else if isActiveGroup {
+            content
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    groupColor.color.opacity(0.16),
+                                    Color.gray.opacity(0.10),
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
                 )
-            }
+                .glassEffect(
+                    .clear.tint(groupColor.color.opacity(0.12)).interactive(),
+                    in: .rect(cornerRadius: 12)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.white.opacity(0.22), lineWidth: 1)
+                        .allowsHitTesting(false)
+                }
         } else {
             content
+                .background(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(groupColor.color.opacity(0.08))
+                )
         }
     }
 }
@@ -197,6 +244,7 @@ private struct TabRowItemView: View {
     let isActive: Bool
     var onSelected: (() -> Void)?
     var onClose: (() -> Void)?
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private var tabIcon: String {
         switch tab.content {
@@ -214,7 +262,7 @@ private struct TabRowItemView: View {
                     .foregroundStyle(.secondary)
                 Text(tab.title)
                     .lineLimit(1)
-                    .font(.body)
+                    .font(.system(size: 12.5, weight: isActive ? .semibold : .medium, design: .rounded))
                 Spacer()
                 if tab.unreadNotifications > 0 {
                     Text(tab.unreadNotifications > 99 ? "99+" : "\(tab.unreadNotifications)")
@@ -224,13 +272,13 @@ private struct TabRowItemView: View {
                         .background(Circle().fill(Color.red))
                 }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
-            .background(
-                isActive
-                    ? RoundedRectangle(cornerRadius: 4).fill(Color.accentColor.opacity(0.1))
-                    : nil
-            )
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .modifier(TabChromeModifier(
+                isActive: isActive,
+                cornerRadius: 12,
+                reduceTransparency: reduceTransparency
+            ))
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier(AccessibilityID.Sidebar.tab(tab.id))

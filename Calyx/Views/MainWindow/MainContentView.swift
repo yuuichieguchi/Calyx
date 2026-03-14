@@ -68,14 +68,13 @@ struct MainContentView: View {
                         onExpandCommit: onExpandCommit
                     )
                     .frame(width: windowSession.sidebarWidth)
-                    .clipped(antialiased: false)
                     .overlay(alignment: .trailing) {
                         SidebarResizeHandle(
                             currentWidth: windowSession.sidebarWidth,
                             onWidthChanged: { onSidebarWidthChanged?($0) },
                             onDragCommitted: { onSidebarDragCommitted?() }
                         )
-                        .offset(x: 4)
+                        .offset(x: 0)
                         .zIndex(1)
                     }
 
@@ -134,6 +133,9 @@ struct MainContentView: View {
                                 reduceTransparency: reduceTransparency,
                                 glassOpacity: glassOpacity
                             )
+                            .padding(.top, -1)
+                            .padding(.leading, 8)
+                            .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
                         }
                     }
 
@@ -153,6 +155,40 @@ struct MainContentView: View {
                         }
                         .padding(.top, 40)
                     }
+                }
+            }
+            .overlay(alignment: .top) {
+                GeometryReader { geo in
+                    Color.white.opacity(0.001)
+                        .frame(height: geo.safeAreaInsets.top + 1)
+                        .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
+                        .offset(y: -geo.safeAreaInsets.top)
+                }
+                .allowsHitTesting(false)
+            }
+            .background {
+                if !reduceTransparency {
+                    Rectangle()
+                        .fill(
+                            LinearGradient(
+                                colors: [GlassTheme.atmosphereTop, GlassTheme.atmosphereBottom],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                        .overlay(
+                            RadialGradient(
+                                colors: [Color.cyan.opacity(0.18), Color.clear],
+                                center: .bottomTrailing,
+                                startRadius: 20,
+                                endRadius: 420
+                            )
+                        )
+                        .overlay(
+                            Rectangle()
+                                .stroke(GlassTheme.specularStroke.opacity(0.30), lineWidth: 1)
+                        )
+                        .ignoresSafeArea()
                 }
             }
         }
@@ -286,12 +322,11 @@ struct TerminalContainerView: NSViewRepresentable {
 
 @MainActor
 private final class TerminalGlassHostView: NSView {
-    private let effectView = NSVisualEffectView()
-    private let tintOverlay = NSView()
 
     init(splitContainerView: SplitContainerView, reduceTransparency: Bool, glassOpacity: Double) {
         super.init(frame: .zero)
-        setupViews()
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
         update(
             splitContainerView: splitContainerView,
             reduceTransparency: reduceTransparency,
@@ -305,7 +340,11 @@ private final class TerminalGlassHostView: NSView {
     }
 
     func update(splitContainerView: SplitContainerView, reduceTransparency: Bool, glassOpacity: Double) {
-        configureAppearance(reduceTransparency: reduceTransparency, glassOpacity: glassOpacity)
+        if reduceTransparency {
+            layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        } else {
+            layer?.backgroundColor = NSColor.clear.cgColor
+        }
 
         if splitContainerView.superview !== self {
             splitContainerView.removeFromSuperview()
@@ -317,56 +356,6 @@ private final class TerminalGlassHostView: NSView {
                 splitContainerView.topAnchor.constraint(equalTo: topAnchor),
                 splitContainerView.bottomAnchor.constraint(equalTo: bottomAnchor),
             ])
-        }
-    }
-
-    private func setupViews() {
-        wantsLayer = true
-        layer?.backgroundColor = NSColor.clear.cgColor
-
-        effectView.translatesAutoresizingMaskIntoConstraints = false
-        effectView.blendingMode = .behindWindow
-        effectView.state = .followsWindowActiveState
-        addSubview(effectView)
-        NSLayoutConstraint.activate([
-            effectView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            effectView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            effectView.topAnchor.constraint(equalTo: topAnchor),
-            effectView.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-
-        tintOverlay.translatesAutoresizingMaskIntoConstraints = false
-        tintOverlay.wantsLayer = true
-        tintOverlay.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.03).cgColor
-        addSubview(tintOverlay, positioned: .above, relativeTo: effectView)
-        NSLayoutConstraint.activate([
-            tintOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            tintOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            tintOverlay.topAnchor.constraint(equalTo: topAnchor),
-            tintOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-    }
-
-    private func configureAppearance(reduceTransparency: Bool, glassOpacity: Double) {
-        if reduceTransparency {
-            effectView.isHidden = true
-            tintOverlay.isHidden = true
-            effectView.alphaValue = 1.0
-            tintOverlay.alphaValue = 1.0
-            layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-            return
-        }
-
-        let clampedOpacity = CGFloat(max(0.0, min(1.0, glassOpacity)))
-        effectView.isHidden = false
-        tintOverlay.isHidden = false
-        effectView.alphaValue = clampedOpacity
-        tintOverlay.alphaValue = clampedOpacity
-        layer?.backgroundColor = NSColor.clear.cgColor
-        if #available(macOS 26.0, *) {
-            effectView.material = .menu
-        } else {
-            effectView.material = .hudWindow
         }
     }
 }
