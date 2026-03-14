@@ -43,7 +43,10 @@ struct TabChromeModifier: ViewModifier {
         } else {
             if isActive {
                 content
-                    .glassEffect(.regular.interactive(), in: .rect(cornerRadius: cornerRadius))
+                    .background(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(Color.white.opacity(0.2))
+                    )
             } else {
                 content
             }
