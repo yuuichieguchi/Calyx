@@ -82,6 +82,7 @@ targets:
       - sdk: UserNotifications.framework
       - package: Sparkle
       - target: CalyxCLI
+        embed: false
 
   CalyxTests:
     type: bundle.unit-test
@@ -116,6 +117,13 @@ targets:
         PRODUCT_NAME: calyx
         SWIFT_VERSION: "6.2"
         MACOSX_DEPLOYMENT_TARGET: "26.0"
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: YES
+      configs:
+        release:
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
+          OTHER_CODE_SIGN_FLAGS: "--timestamp"
     dependencies:
       - package: swift-argument-parser
         product: ArgumentParser
