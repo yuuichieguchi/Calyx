@@ -45,7 +45,7 @@ struct TabChromeModifier: ViewModifier {
                 content
                     .background(
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .fill(Color.white.opacity(0.2))
+                            .fill(Color.black.opacity(0.2))
                     )
             } else {
                 content
