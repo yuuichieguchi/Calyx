@@ -1,87 +1,131 @@
-// SelectionEditUITests.swift
-// CalyxUITests
-//
-// E2E tests for terminal select+cut (Cmd+X) and select+delete behaviour.
-// Verifies clipboard integration and app stability.
-
 import XCTest
 
 final class SelectionEditUITests: CalyxUITestCase {
 
-    func test_cmdXCopiesSelectedTextToClipboard() {
-        waitFor(app.windows.firstMatch)
-        sleep(2) // wait for shell ready
+    // MARK: - Helpers
 
-        // Clear clipboard
-        NSPasteboard.general.clearContents()
-
-        // Paste a long string
-        let testString = "echo AAAAAA BBBBBB CCCCCC"
-        NSPasteboard.general.setString(testString, forType: .string)
+    private func pasteToTerminal(_ text: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
         app.typeKey("v", modifierFlags: .command)
-        usleep(500_000)
-
-        // Mouse drag to select middle portion
-        let window = app.windows.firstMatch
-        let startPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.03))
-        let endPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.50, dy: 0.03))
-        startPoint.click(forDuration: 0.1, thenDragTo: endPoint)
-        usleep(300_000)
-
-        // Clear clipboard before cut
-        NSPasteboard.general.clearContents()
-
-        // Cmd+X to cut
-        app.typeKey("x", modifierFlags: .command)
-        usleep(300_000)
-
-        // Clipboard should have content
-        let clipboardContent = NSPasteboard.general.string(forType: .string) ?? ""
-        XCTAssertFalse(clipboardContent.isEmpty, "Clipboard should contain selected text after Cmd+X")
+        Thread.sleep(forTimeInterval: 0.5)
     }
 
-    func test_deleteWithSelectionKeepsAppAlive() {
+    private func pollFile(_ path: String, timeout: TimeInterval = 10) -> String {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.5)
+            if FileManager.default.fileExists(atPath: path),
+               let s = try? String(contentsOfFile: path, encoding: .utf8),
+               !s.isEmpty {
+                return s.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return (try? String(contentsOfFile: path, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// Use the app's debug select mechanism (Ctrl+Shift+D) to create a terminal selection
+    /// via ghostty FFI. The app reads selection params from the pasteboard as JSON.
+    private func selectTerminalText(fromCol: Int, toCol: Int, row: Int) {
+        let json = "{\"fromCol\":\(fromCol),\"toCol\":\(toCol),\"row\":\(row)}"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(json, forType: .string)
+        app.typeKey("d", modifierFlags: [.control, .shift])
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    private func pushPromptDown(lines: Int) {
+        for _ in 0..<lines {
+            app.typeKey(.return, modifierFlags: [])
+        }
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    // MARK: - Tests
+
+    /// Paste "echo TESTWORD >/tmp/e1", select TESTWORD via debug select,
+    /// Cmd+X -> clipboard has TESTWORD, file output lacks it.
+    func test_cmdX_cutsSelectedText() {
+        let outFile = "/tmp/e1"
+        try? FileManager.default.removeItem(atPath: outFile)
+
         waitFor(app.windows.firstMatch)
-        sleep(2)
+        Thread.sleep(forTimeInterval: 2)
 
-        // Paste text
-        let testString = "echo XXXXXXXXXX YYYYYYYYYY"
-        NSPasteboard.general.setString(testString, forType: .string)
-        app.typeKey("v", modifierFlags: .command)
-        usleep(500_000)
+        pushPromptDown(lines: 3)
 
-        // Mouse drag to select portion
-        let window = app.windows.firstMatch
-        let startPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.2, dy: 0.03))
-        let endPoint = window.coordinate(withNormalizedOffset: CGVector(dx: 0.4, dy: 0.03))
-        startPoint.click(forDuration: 0.1, thenDragTo: endPoint)
-        usleep(300_000)
+        // Prompt ~32 chars + "echo " = 37 chars before TESTWORD.
+        // TESTWORD = 8 chars at cols 37-44. " >/tmp/e1" follows.
+        let targetWord = "TESTWORD"
+        pasteToTerminal("echo \(targetWord) >/tmp/e1")
+        Thread.sleep(forTimeInterval: 0.5)
 
-        // Press Delete
+        // Select TESTWORD using debug select (row 3, cols 37-44)
+        selectTerminalText(fromCol: 37, toCol: 44, row: 3)
+
+        // Cut
+        NSPasteboard.general.clearContents()
+        app.typeKey("x", modifierFlags: .command)
+        Thread.sleep(forTimeInterval: 0.3)
+
+        // Verify clipboard
+        let clip = NSPasteboard.general.string(forType: .string) ?? ""
+        XCTAssertEqual(clip, targetWord, "Clipboard should contain the cut word")
+
+        // Execute and verify
+        app.typeKey(.return, modifierFlags: [])
+        let output = pollFile(outFile)
+        XCTAssertFalse(output.contains(targetWord),
+                        "Output must NOT contain the cut word")
+    }
+
+    /// Select+Delete: removes selected text from input.
+    func test_delete_removesSelectedText() {
+        let outFile = "/tmp/e2"
+        try? FileManager.default.removeItem(atPath: outFile)
+
+        waitFor(app.windows.firstMatch)
+        Thread.sleep(forTimeInterval: 2)
+
+        pushPromptDown(lines: 3)
+
+        let targetWord = "DELETEME"
+        pasteToTerminal("echo \(targetWord) >/tmp/e2")
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // Select DELETEME using debug select (row 3, cols 37-44)
+        selectTerminalText(fromCol: 37, toCol: 44, row: 3)
+
         app.typeKey(XCUIKeyboardKey.delete, modifierFlags: [])
-        usleep(500_000)
+        Thread.sleep(forTimeInterval: 0.3)
 
-        // App should still be alive
-        XCTAssertTrue(app.windows.firstMatch.exists, "App should not crash after delete with selection")
+        app.typeKey(.return, modifierFlags: [])
+
+        Thread.sleep(forTimeInterval: 2)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outFile),
+                       "Output file must exist")
+        let output = pollFile(outFile)
+        XCTAssertFalse(output.contains(targetWord),
+                        "Output must NOT contain the deleted word")
     }
 
-    func test_noSelectionCmdXPassesThrough() {
+    /// Cmd+X without selection: clipboard unchanged, no crash.
+    func test_noSelection_cmdXPassesThrough() {
         waitFor(app.windows.firstMatch)
-        sleep(2)
+        Thread.sleep(forTimeInterval: 2)
 
-        // Clear clipboard
+        pasteToTerminal("echo hello")
+        Thread.sleep(forTimeInterval: 0.3)
+
         NSPasteboard.general.clearContents()
 
-        // Type something (no selection)
-        app.typeKey("a", modifierFlags: [])
-        usleep(200_000)
-
-        // Cmd+X without selection
         app.typeKey("x", modifierFlags: .command)
-        usleep(300_000)
+        Thread.sleep(forTimeInterval: 0.3)
 
-        // Clipboard should still be empty (no selection to cut)
-        let clipboardContent = NSPasteboard.general.string(forType: .string)
-        XCTAssertNil(clipboardContent, "Clipboard should remain empty when Cmd+X with no selection")
+        let clip = NSPasteboard.general.string(forType: .string)
+        XCTAssertNil(clip, "Clipboard should remain empty without selection")
+        XCTAssertTrue(app.windows.firstMatch.exists, "App should not crash")
     }
 }

@@ -1158,6 +1158,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         return tab.registry.controller(for: focusedID)
     }
 
+    /// Exposes the focused surface controller for UI testing only.
+    var focusedControllerForTesting: GhosttySurfaceController? {
+        focusedController
+    }
+
     // MARK: - NSWindowDelegate
 
     func windowDidBecomeKey(_ notification: Notification) {

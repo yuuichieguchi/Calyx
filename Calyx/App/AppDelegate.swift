@@ -483,6 +483,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
 
     private func installKeyMonitor() {
+        let isUITesting = ProcessInfo.processInfo.arguments.contains("--uitesting")
+
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             let mods = event.modifierFlags.intersection([.command, .shift, .control, .option])
             if mods == [.command, .shift],
@@ -504,8 +506,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     return nil // consume the event
                 }
             }
+
+            // Debug Select: Ctrl+Shift+D — only in UI testing mode.
+            // Reads selection parameters from the pasteboard and simulates a mouse drag
+            // via ghostty FFI to create a terminal selection.
+            if isUITesting,
+               mods == [.control, .shift],
+               event.charactersIgnoringModifiers?.lowercased() == "d" {
+                self?.performDebugSelect()
+                return nil
+            }
+
             return event
         }
+    }
+
+    // MARK: - UI Testing Support
+
+    /// Simulates a mouse drag on the focused terminal surface to create a text selection.
+    /// Reads selection parameters (fromCol, toCol, row) from the general pasteboard as JSON.
+    /// Only available when launched with --uitesting flag.
+    private func performDebugSelect() {
+        guard let jsonStr = NSPasteboard.general.string(forType: .string),
+              let data = jsonStr.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Int],
+              let fromCol = json["fromCol"],
+              let toCol = json["toCol"],
+              let row = json["row"] else {
+            logger.warning("Debug select: failed to parse JSON from pasteboard")
+            return
+        }
+
+        guard let wc = windowControllers.first(where: { $0.window?.isKeyWindow == true }),
+              let controller = wc.focusedControllerForTesting,
+              let surface = controller.surface else {
+            logger.warning("Debug select: no focused surface")
+            return
+        }
+
+        // Use cellSize (view-point coordinates, same space as mouse events).
+        let cellSize = controller.cellSize
+        guard cellSize.width > 0, cellSize.height > 0 else {
+            logger.warning("Debug select: cellSize is zero")
+            return
+        }
+
+        let cellW = Double(cellSize.width)
+        let cellH = Double(cellSize.height)
+
+        let startX = (Double(fromCol) + 0.5) * cellW
+        let endX = (Double(toCol) + 0.5) * cellW
+        let y = (Double(row) + 0.5) * cellH
+
+        // Simulate drag: move to start, press, move to end, release.
+        GhosttyFFI.surfaceMousePos(surface, x: startX, y: y, mods: GHOSTTY_MODS_NONE)
+        _ = GhosttyFFI.surfaceMouseButton(surface, state: GHOSTTY_MOUSE_PRESS, button: GHOSTTY_MOUSE_LEFT, mods: GHOSTTY_MODS_NONE)
+
+        GhosttyFFI.surfaceMousePos(surface, x: endX, y: y, mods: GHOSTTY_MODS_NONE)
+
+        _ = GhosttyFFI.surfaceMouseButton(surface, state: GHOSTTY_MOUSE_RELEASE, button: GHOSTTY_MOUSE_LEFT, mods: GHOSTTY_MODS_NONE)
+
+        logger.info("Debug select: simulated drag from col \(fromCol) to \(toCol) on row \(row)")
     }
 
     @objc private func openPreferences(_ sender: Any?) {
