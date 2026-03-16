@@ -219,4 +219,34 @@ final class ShortcutManagerTests: XCTestCase {
         XCTAssertFalse(actionExecuted,
                        "Action should NOT execute when keyCode does not match")
     }
+
+    // ==================== 8. Cmd+Shift+]/[ KeyCode Verification ====================
+
+    func test_handleEvent_matches_cmdShift_rightBracket_keyCode30() {
+        var executed = false
+        manager.register(modifiers: [.command, .shift], keyCode: 30) {
+            executed = true
+        }
+        guard let event = makeKeyEvent(modifiers: [.command, .shift], keyCode: 30) else {
+            XCTFail("Failed to create synthetic NSEvent")
+            return
+        }
+        let result = manager.handleEvent(event)
+        XCTAssertTrue(result, "handleEvent should return true for Cmd+Shift+] (keyCode 30)")
+        XCTAssertTrue(executed, "Action should execute for Cmd+Shift+] (keyCode 30)")
+    }
+
+    func test_handleEvent_matches_cmdShift_leftBracket_keyCode33() {
+        var executed = false
+        manager.register(modifiers: [.command, .shift], keyCode: 33) {
+            executed = true
+        }
+        guard let event = makeKeyEvent(modifiers: [.command, .shift], keyCode: 33) else {
+            XCTFail("Failed to create synthetic NSEvent")
+            return
+        }
+        let result = manager.handleEvent(event)
+        XCTAssertTrue(result, "handleEvent should return true for Cmd+Shift+[ (keyCode 33)")
+        XCTAssertTrue(executed, "Action should execute for Cmd+Shift+[ (keyCode 33)")
+    }
 }

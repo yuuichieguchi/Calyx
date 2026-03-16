@@ -134,6 +134,9 @@ enum GhosttyActionRouter {
         case GHOSTTY_ACTION_SEARCH_SELECTED:
             return handleSearchSelected(app, target: target, value: action.action.search_selected)
 
+        case GHOSTTY_ACTION_GOTO_TAB:
+            return handleGotoTab(app, target: target, tab: action.action.goto_tab)
+
         case GHOSTTY_ACTION_KEY_SEQUENCE:
             logger.debug("Key sequence action (stub)")
             return true
@@ -159,7 +162,6 @@ enum GhosttyActionRouter {
              GHOSTTY_ACTION_RENDER_INSPECTOR,
              GHOSTTY_ACTION_SHOW_GTK_INSPECTOR,
              GHOSTTY_ACTION_MOVE_TAB,
-             GHOSTTY_ACTION_GOTO_TAB,
              GHOSTTY_ACTION_RESET_WINDOW_SIZE,
              GHOSTTY_ACTION_CHECK_FOR_UPDATES,
              GHOSTTY_ACTION_UNDO,
@@ -676,6 +678,22 @@ enum GhosttyActionRouter {
             name: .ghosttySearchSelected,
             object: surfaceView,
             userInfo: ["selected": Int(value.selected)]
+        )
+        return true
+    }
+
+    // MARK: - Tab Navigation
+
+    private static func handleGotoTab(
+        _ app: ghostty_app_t,
+        target: ghostty_target_s,
+        tab: ghostty_action_goto_tab_e
+    ) -> Bool {
+        let surfaceView = surfaceView(from: target)
+        NotificationCenter.default.post(
+            name: .ghosttyGotoTab,
+            object: surfaceView,
+            userInfo: ["tab": tab.rawValue]
         )
         return true
     }

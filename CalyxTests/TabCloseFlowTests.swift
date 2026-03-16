@@ -155,4 +155,33 @@ final class TabCloseFlowTests: XCTestCase {
             XCTFail("Expected .windowShouldClose, got \(result)")
         }
     }
+
+    // ==================== 5. Remove Tab Works Regardless of View Window ====================
+
+    func test_removeTab_succeeds_when_tab_exists_in_session() {
+        // This test verifies that tab removal at the model level works correctly.
+        // The bug was that handleCloseSurfaceNotification checked belongsToThisWindow
+        // (view.window === self.window) which fails when ghostty detaches the view.
+        // The fix removes that guard, relying on findTab(for:) which checks the
+        // tab registry (object identity, not view hierarchy).
+        //
+        // At the model level, removeTab works by ID alone — no view hierarchy involved.
+        let tab = makeTab(title: "Detached")
+        let group = makeGroup(tabs: [tab], activeTabID: tab.id)
+        let otherTab = makeTab(title: "Other")
+        let group2 = makeGroup(name: "G2", tabs: [otherTab], activeTabID: otherTab.id)
+        let session = WindowSession(groups: [group, group2], activeGroupID: group.id)
+
+        // Act — remove the tab (simulating what happens after belongsToThisWindow guard is removed)
+        let result = session.removeTab(id: tab.id, fromGroup: group.id)
+
+        // Assert — tab removed successfully, switches to other group
+        XCTAssertEqual(session.groups.count, 1, "Empty group should be removed")
+        XCTAssertEqual(session.activeGroupID, group2.id, "Should switch to remaining group")
+        if case .switchedGroup(let gid, _) = result {
+            XCTAssertEqual(gid, group2.id, "Should switch to group2")
+        } else {
+            XCTFail("Expected .switchedGroup, got \(result)")
+        }
+    }
 }

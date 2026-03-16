@@ -494,5 +494,6 @@ extension Notification.Name {
     static let ghosttyEndSearch = Notification.Name("com.calyx.ghostty.endSearch")
     static let ghosttySearchTotal = Notification.Name("com.calyx.ghostty.searchTotal")
     static let ghosttySearchSelected = Notification.Name("com.calyx.ghostty.searchSelected")
+    static let ghosttyGotoTab = Notification.Name("com.calyx.ghostty.gotoTab")
     static let glassOpacityDidChange = Notification.Name("com.calyx.glassOpacityDidChange")
 }

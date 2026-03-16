@@ -796,6 +796,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .ghosttySetPwd, object: nil)
         center.addObserver(self, selector: #selector(handleDesktopNotification(_:)),
                            name: .ghosttyDesktopNotification, object: nil)
+        center.addObserver(self, selector: #selector(handleGotoTabNotification(_:)),
+                           name: .ghosttyGotoTab, object: nil)
 
     }
 
@@ -847,7 +849,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func handleCloseSurfaceNotification(_ notification: Notification) {
         guard let surfaceView = notification.object as? SurfaceView else { return }
-        guard belongsToThisWindow(surfaceView) else { return }
 
         // Find the tab that owns this surface (may be a background tab)
         guard let (owningTab, owningGroup) = findTab(for: surfaceView) else { return }
@@ -988,6 +989,26 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard let (owningTab, _) = findTab(for: surfaceView) else { return }
         owningTab.pwd = pwd
         requestSave()
+    }
+
+    @objc private func handleGotoTabNotification(_ notification: Notification) {
+        guard let surfaceView = notification.object as? SurfaceView else { return }
+        guard findTab(for: surfaceView) != nil else { return }
+        guard let rawValue = notification.userInfo?["tab"] as? Int32 else { return }
+
+        switch rawValue {
+        case GHOSTTY_GOTO_TAB_NEXT.rawValue:
+            selectNextTab(nil)
+        case GHOSTTY_GOTO_TAB_PREVIOUS.rawValue:
+            selectPreviousTab(nil)
+        case GHOSTTY_GOTO_TAB_LAST.rawValue:
+            let lastIndex = (windowSession.activeGroup?.tabs.count ?? 1) - 1
+            selectTabByIndex(lastIndex)
+        default:
+            if rawValue >= 0 {
+                selectTabByIndex(Int(rawValue))
+            }
+        }
     }
 
     @objc private func handleDesktopNotification(_ notification: Notification) {
