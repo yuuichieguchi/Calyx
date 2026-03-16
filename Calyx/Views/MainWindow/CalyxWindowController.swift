@@ -866,13 +866,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         // Below runs only for process-initiated closes (e.g. `exit` command)
         if owningTab.splitTree.isEmpty {
+            let wasActiveTab = (owningTab.id == activeTab?.id)
             let result = windowSession.removeTab(id: owningTab.id, fromGroup: owningGroup.id)
-            if owningTab.id == activeTab?.id {
+            if wasActiveTab {
                 switch result {
-                case .switchedTab(_, let newTabID):
-                    switchToTab(id: newTabID)
-                case .switchedGroup(let newGroupID, _):
-                    switchToGroup(id: newGroupID)
+                case .switchedTab, .switchedGroup:
+                    activateCurrentTab()
                 case .windowShouldClose:
                     window?.close()
                 }
