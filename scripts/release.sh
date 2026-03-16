@@ -32,14 +32,71 @@ xcodebuild \
   clean build
 echo "Build succeeded."
 
-# 3.5. Re-sign Sparkle framework binaries with Developer ID + timestamp
-echo "Signing Sparkle framework binaries..."
+# 3.5a. Validate Sparkle.framework structure
+echo "Validating Sparkle.framework structure..."
 SIGN_IDENTITY="Developer ID Application: Yuuichi Eguchi (PQQBSRKD72)"
-SPARKLE_DIR="$APP_PATH/Contents/Frameworks/Sparkle.framework/Versions/B"
-find "$SPARKLE_DIR" -type f -perm +111 | while read -r binary; do
-  codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime "$binary"
+SPARKLE_FW="$APP_PATH/Contents/Frameworks/Sparkle.framework"
+
+if [ ! -d "$SPARKLE_FW" ]; then
+  echo "ERROR: Sparkle.framework not found at $SPARKLE_FW"
+  exit 1
+fi
+
+if [ ! -L "$SPARKLE_FW/Versions/Current" ]; then
+  echo "ERROR: Sparkle.framework/Versions/Current symlink missing"
+  exit 1
+fi
+SPARKLE_VER="$SPARKLE_FW/Versions/$(readlink "$SPARKLE_FW/Versions/Current")"
+if [ ! -d "$SPARKLE_VER" ]; then
+  echo "ERROR: Active Sparkle version directory not found: $SPARKLE_VER"
+  exit 1
+fi
+echo "Sparkle.framework structure validated (version: $(basename "$SPARKLE_VER"))."
+
+# 3.5b. Check for unexpected entries in framework root
+echo "Checking Sparkle.framework root for unexpected entries..."
+ALLOWED_ROOT="Versions Sparkle Resources Headers Modules Autoupdate Updater.app XPCServices"
+for entry in "$SPARKLE_FW"/*; do
+  name=$(basename "$entry")
+  if ! echo "$ALLOWED_ROOT" | grep -qw "$name"; then
+    echo "ERROR: Unexpected entry in Sparkle.framework root: $name"
+    echo "Update the whitelist in release.sh if this is expected."
+    exit 1
+  fi
 done
-echo "Sparkle binaries signed."
+echo "No unexpected entries found."
+
+# 3.5c. Inside-out re-signing of Sparkle framework
+echo "Signing Sparkle framework (inside-out)..."
+
+# 1. Sign XPC service bundles (innermost)
+for xpc in "$SPARKLE_VER"/XPCServices/*.xpc; do
+  [ -d "$xpc" ] && codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime "$xpc"
+done
+
+# 2. Sign nested app bundles
+for app in "$SPARKLE_VER"/*.app; do
+  [ -d "$app" ] && codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime "$app"
+done
+
+# 3. Sign standalone executables (not inside bundles)
+for bin in "$SPARKLE_VER"/Autoupdate "$SPARKLE_VER"/Sparkle; do
+  [ -f "$bin" ] && codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime "$bin"
+done
+
+# 4. Sign the framework itself
+codesign --force --sign "$SIGN_IDENTITY" --timestamp "$SPARKLE_FW"
+
+# 5. Re-sign the outer app (inner re-signing invalidates outer seal)
+codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime \
+  --entitlements Calyx/Calyx.entitlements "$APP_PATH"
+echo "Sparkle framework and app signed."
+
+# 3.5d. Pre-notarization verification gate
+echo "Verifying code signature..."
+codesign --verify --deep --strict "$APP_PATH"
+spctl --assess --type exec "$APP_PATH"
+echo "Signature verification passed."
 
 # 4. Zip for notarization
 echo "Creating zip for notarization..."
@@ -60,10 +117,25 @@ echo "Stapling notarization ticket..."
 xcrun stapler staple "$APP_PATH"
 echo "Stapling complete."
 
-# 7. Re-zip with staple
+# 6.5. Post-staple verification
+echo "Verifying stapled app..."
+codesign --verify --deep --strict "$APP_PATH"
+xcrun stapler validate "$APP_PATH"
+echo "Stapled app verification passed."
+
+# 7. Re-zip with stapled ticket
 echo "Creating final zip with stapled ticket..."
 ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
 echo "Final zip created at $ZIP_PATH."
+
+# 7.1. Post-zip verification
+echo "Verifying final distributed artifact..."
+VERIFY_DIR=$(mktemp -d)
+ditto -x -k "$ZIP_PATH" "$VERIFY_DIR"
+codesign --verify --deep --strict "$VERIFY_DIR/Calyx.app"
+spctl --assess --type exec "$VERIFY_DIR/Calyx.app"
+rm -rf "$VERIFY_DIR"
+echo "Distributed artifact verification passed."
 
 # 7.5. Sparkle EdDSA signing (must be AFTER re-zip so signature matches the final artifact)
 echo "Signing final zip with Sparkle EdDSA..."
