@@ -11,6 +11,7 @@ enum AccessibilityID {
         static let newGroupButton = "calyx.sidebar.newGroupButton"
         static func group(_ id: UUID) -> String { "calyx.sidebar.group.\(id.uuidString)" }
         static func tab(_ id: UUID) -> String { "calyx.sidebar.tab.\(id.uuidString)" }
+        static func groupNameTextField(_ id: UUID) -> String { "calyx.sidebar.groupNameTextField.\(id.uuidString)" }
     }
     enum TabBar {
         static let container = "calyx.tabBar"

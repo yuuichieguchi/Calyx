@@ -342,6 +342,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             onNewTab: { [weak self] in self?.createNewTab() },
             onNewGroup: { [weak self] in self?.createNewGroup() },
             onCloseTab: { [weak self] tabID in self?.closeTab(id: tabID) },
+            onGroupRenamed: { [weak self] in self?.requestSave() },
             onToggleSidebar: { [weak self] in self?.toggleSidebar() },
             onDismissCommandPalette: { [weak self] in self?.dismissCommandPalette() },
             onWorkingFileSelected: { [weak self] entry in self?.handleWorkingFileSelected(entry) },

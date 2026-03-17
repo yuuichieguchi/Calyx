@@ -19,6 +19,7 @@ struct SidebarContentView: View {
     var onTabSelected: ((UUID) -> Void)?
     var onNewGroup: (() -> Void)?
     var onCloseTab: ((UUID) -> Void)?
+    var onGroupRenamed: (() -> Void)?
     var onWorkingFileSelected: ((GitFileEntry) -> Void)?
     var onCommitFileSelected: ((CommitFileEntry) -> Void)?
     var onRefreshGitStatus: (() -> Void)?
@@ -51,7 +52,8 @@ struct SidebarContentView: View {
                                     reduceTransparency: reduceTransparency,
                                     onGroupSelected: onGroupSelected,
                                     onTabSelected: onTabSelected,
-                                    onCloseTab: onCloseTab
+                                    onCloseTab: onCloseTab,
+                                    onGroupRenamed: onGroupRenamed
                                 )
                             }
                         }
@@ -145,6 +147,125 @@ private struct SidebarBackgroundModifier: ViewModifier {
     }
 }
 
+private struct GroupNameTextField: NSViewRepresentable {
+    let initialText: String
+    let accessibilityID: String
+    var onCommit: (String) -> Void
+    var onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onCommit: onCommit, onCancel: onCancel)
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let textField = NSTextField()
+        textField.isBordered = false
+        textField.drawsBackground = false
+        textField.focusRingType = .none
+        textField.cell?.isScrollable = true
+        textField.cell?.lineBreakMode = .byTruncatingTail
+        textField.stringValue = initialText
+        textField.delegate = context.coordinator
+        textField.setAccessibilityIdentifier(accessibilityID)
+
+        let systemFont = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        if let rounded = systemFont.fontDescriptor.withDesign(.rounded) {
+            textField.font = NSFont(descriptor: rounded, size: 12)
+        } else {
+            textField.font = systemFont
+        }
+
+        context.coordinator.textField = textField
+
+        DispatchQueue.main.async {
+            textField.selectText(nil)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            context.coordinator.installClickMonitor()
+        }
+
+        return textField
+    }
+
+    func updateNSView(_ nsView: NSTextField, context: Context) {
+        context.coordinator.onCommit = onCommit
+        context.coordinator.onCancel = onCancel
+    }
+
+    class Coordinator: NSObject, NSTextFieldDelegate {
+        weak var textField: NSTextField?
+        var onCommit: (String) -> Void
+        var onCancel: () -> Void
+        private var clickMonitor: Any?
+        private var didEnd = false
+
+        init(onCommit: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+            self.onCommit = onCommit
+            self.onCancel = onCancel
+        }
+
+        func installClickMonitor() {
+            clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown]) { [weak self] event in
+                guard let self, !self.didEnd else { return event }
+                if let textField = self.textField,
+                   let eventWindow = event.window,
+                   eventWindow == textField.window {
+                    let point = textField.convert(event.locationInWindow, from: nil)
+                    if textField.bounds.contains(point) {
+                        return event
+                    }
+                    if let editor = textField.currentEditor() as? NSView {
+                        let editorPoint = editor.convert(event.locationInWindow, from: nil)
+                        if editor.bounds.contains(editorPoint) {
+                            return event
+                        }
+                    }
+                }
+                self.finish(commit: true)
+                return event
+            }
+        }
+
+        private func finish(commit: Bool) {
+            guard !didEnd else { return }
+            didEnd = true
+            removeClickMonitor()
+            if commit {
+                onCommit(textField?.stringValue ?? "")
+            } else {
+                onCancel()
+            }
+        }
+
+        private func removeClickMonitor() {
+            if let monitor = clickMonitor {
+                NSEvent.removeMonitor(monitor)
+                clickMonitor = nil
+            }
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                finish(commit: true)
+                return true
+            }
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                finish(commit: false)
+                return true
+            }
+            return false
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            finish(commit: true)
+        }
+
+        deinit {
+            removeClickMonitor()
+        }
+    }
+}
+
 private struct GroupSectionView: View {
     let group: TabGroup
     let isActiveGroup: Bool
@@ -153,23 +274,34 @@ private struct GroupSectionView: View {
     var onGroupSelected: ((UUID) -> Void)?
     var onTabSelected: ((UUID) -> Void)?
     var onCloseTab: ((UUID) -> Void)?
+    var onGroupRenamed: (() -> Void)?
+
+    @State private var isEditing = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             // Group header
-            Button(action: { onGroupSelected?(group.id) }) {
+            if isEditing {
                 HStack(spacing: 6) {
                     Circle()
                         .fill(Color(nsColor: group.color.nsColor))
                         .frame(width: 8, height: 8)
-                    Text(group.name)
-                        .font(.system(size: 12, weight: .semibold, design: .rounded))
-                        .tracking(0.4)
-                        .lineLimit(1)
+                    GroupNameTextField(
+                        initialText: group.name,
+                        accessibilityID: AccessibilityID.Sidebar.groupNameTextField(group.id),
+                        onCommit: { text in
+                            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty {
+                                group.name = trimmed
+                            }
+                            isEditing = false
+                            onGroupRenamed?()
+                        },
+                        onCancel: {
+                            isEditing = false
+                        }
+                    )
                     Spacer()
-                    Text("\(group.tabs.count)")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .foregroundStyle(.secondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 14)
@@ -180,9 +312,35 @@ private struct GroupSectionView: View {
                     reduceTransparency: reduceTransparency,
                     groupColor: group.color
                 ))
+            } else {
+                Button(action: { onGroupSelected?(group.id) }) {
+                    HStack(spacing: 6) {
+                        Circle()
+                            .fill(Color(nsColor: group.color.nsColor))
+                            .frame(width: 8, height: 8)
+                        Text(group.name)
+                            .font(.system(size: 12, weight: .semibold, design: .rounded))
+                            .tracking(0.4)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(group.tabs.count)")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                    .modifier(GroupHeaderBackgroundModifier(
+                        isActiveGroup: isActiveGroup,
+                        reduceTransparency: reduceTransparency,
+                        groupColor: group.color
+                    ))
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier(AccessibilityID.Sidebar.group(group.id))
+                .highPriorityGesture(TapGesture(count: 2).onEnded { isEditing = true })
             }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier(AccessibilityID.Sidebar.group(group.id))
 
             // Tabs in this group (only show if not collapsed)
             if !group.isCollapsed {

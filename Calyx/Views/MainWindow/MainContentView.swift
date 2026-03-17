@@ -26,6 +26,7 @@ struct MainContentView: View {
     var onNewTab: (() -> Void)?
     var onNewGroup: (() -> Void)?
     var onCloseTab: ((UUID) -> Void)?
+    var onGroupRenamed: (() -> Void)?
     var onToggleSidebar: (() -> Void)?
     var onDismissCommandPalette: (() -> Void)?
     var onWorkingFileSelected: ((GitFileEntry) -> Void)?
@@ -61,6 +62,7 @@ struct MainContentView: View {
                         onTabSelected: onTabSelected,
                         onNewGroup: onNewGroup,
                         onCloseTab: onCloseTab,
+                        onGroupRenamed: onGroupRenamed,
                         onWorkingFileSelected: onWorkingFileSelected,
                         onCommitFileSelected: onCommitFileSelected,
                         onRefreshGitStatus: onRefreshGitStatus,
