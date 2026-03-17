@@ -61,6 +61,12 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 | `Cmd+Shift+G` | Previous match |
 | `Escape` | Close search bar |
 
+### Notifications
+
+| Shortcut | Action |
+|---|---|
+| `Cmd+Shift+U` | Jump to most recent unread notification tab |
+
 ### Global
 
 | Shortcut | Action |
