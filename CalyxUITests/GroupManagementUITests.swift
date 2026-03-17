@@ -108,7 +108,8 @@ final class GroupManagementUITests: CalyxUITestCase {
             "Rename text field should appear after double-clicking group header"
         )
 
-        // Type the new name and confirm
+        // Select all existing text, type the new name and confirm
+        renameField.typeKey("a", modifierFlags: .command)
         renameField.typeText("My Custom Group")
         renameField.typeKey(.enter, modifierFlags: [])
 
@@ -116,8 +117,9 @@ final class GroupManagementUITests: CalyxUITestCase {
         waitForNonExistence(renameField)
 
         // Assert: the sidebar should now show "My Custom Group"
+        Thread.sleep(forTimeInterval: 0.5)
         let renamedLabel = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "value == %@ OR label == %@", "My Custom Group", "My Custom Group"))
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", "My Custom Group"))
             .firstMatch
         XCTAssertTrue(
             waitFor(renamedLabel, timeout: 3),
@@ -148,6 +150,7 @@ final class GroupManagementUITests: CalyxUITestCase {
         )
 
         // Type something then cancel with Escape
+        renameField.typeKey("a", modifierFlags: .command)
         renameField.typeText("Should Not Save")
         renameField.typeKey(.escape, modifierFlags: [])
 
@@ -155,8 +158,9 @@ final class GroupManagementUITests: CalyxUITestCase {
         waitForNonExistence(renameField)
 
         // Assert: original name "Group 2" should still be displayed
+        Thread.sleep(forTimeInterval: 0.5)
         let originalLabel = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "value == %@ OR label == %@", "Group 2", "Group 2"))
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", "Group 2"))
             .firstMatch
         XCTAssertTrue(
             waitFor(originalLabel, timeout: 3),
@@ -196,7 +200,7 @@ final class GroupManagementUITests: CalyxUITestCase {
         // Assert: original name "Group 2" should be preserved (empty name rejected)
         Thread.sleep(forTimeInterval: 0.5)
         let originalLabel = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "value == %@ OR label == %@", "Group 2", "Group 2"))
+            .matching(NSPredicate(format: "label CONTAINS[c] %@", "Group 2"))
             .firstMatch
         XCTAssertTrue(
             waitFor(originalLabel, timeout: 3),

@@ -128,5 +128,25 @@ targets:
       - package: swift-argument-parser
         product: ArgumentParser
 
+schemes:
+  CalyxTests:
+    build:
+      targets:
+        Calyx: [run, test]
+        CalyxTests: test
+    test:
+      config: Debug
+      targets:
+        - CalyxTests
+  CalyxUITests:
+    build:
+      targets:
+        Calyx: [run, test]
+        CalyxUITests: test
+    test:
+      config: Debug
+      targets:
+        - CalyxUITests
+
 fileGroups:
   - Calyx-Bridging-Header.h
