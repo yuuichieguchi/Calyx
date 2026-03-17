@@ -255,11 +255,7 @@ private struct TabItemButton: View {
                     .background(
                         Capsule()
                             .fill(
-                                LinearGradient(
-                                    colors: [Color.red.opacity(0.96), Color.orange.opacity(0.84)],
-                                    startPoint: .topLeading,
-                                    endPoint: .bottomTrailing
-                                )
+                                Color.red
                             )
                     )
                     .overlay(
