@@ -1691,8 +1691,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             alert.addButton(withTitle: "Cancel")
 
             let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
-            for tab in claudeTabs {
-                popup.addItem(withTitle: tab.title)
+            for (i, tab) in claudeTabs.enumerated() {
+                let groupName = windowSession.groups.first { $0.tabs.contains { $0.id == tab.id } }?.name ?? ""
+                let label = "\(tab.title) — \(groupName) (#\(i + 1))"
+                popup.addItem(withTitle: label)
             }
             alert.accessoryView = popup
 
