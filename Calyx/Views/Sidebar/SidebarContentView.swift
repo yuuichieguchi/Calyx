@@ -77,6 +77,7 @@ struct SidebarContentView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
+                        .contentShape(Rectangle())
                 }
                 .modifier(GlassButtonModifier(reduceTransparency: reduceTransparency))
                 .padding(.horizontal, 12)

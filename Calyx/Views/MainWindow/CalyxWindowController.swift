@@ -616,11 +616,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // Pause current tab
         activeTab?.registry.pauseAll()
 
-        let groupColors: [TabGroupColor] = TabGroupColor.allCases
-        let colorIndex = windowSession.groups.count % groupColors.count
+        let newColor = TabGroupColor.nextColor(excluding: windowSession.groups.map { $0.color })
         let group = TabGroup(
             name: "Group \(windowSession.groups.count + 1)",
-            color: groupColors[colorIndex],
+            color: newColor,
             tabs: [tab],
             activeTabID: tab.id
         )

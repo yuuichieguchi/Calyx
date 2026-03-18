@@ -274,4 +274,19 @@ final class GroupManagementUITests: CalyxUITestCase {
             "At least one tab should be visible after expanding the group"
         )
     }
+
+    func test_newGroupButtonClickOnEdge() {
+        let newGroupBtn = app.descendants(matching: .any)
+            .matching(identifier: "calyx.sidebar.newGroupButton")
+            .firstMatch
+        XCTAssertTrue(waitFor(newGroupBtn), "New Group button should exist")
+
+        // Click near the right edge (padding area) to verify contentShape covers full button
+        let edgePoint = CGVector(dx: 0.95, dy: 0.5)
+        newGroupBtn.coordinate(withNormalizedOffset: edgePoint).click()
+
+        Thread.sleep(forTimeInterval: 0.5)
+        let groupCount = countElements(matching: "calyx.sidebar.group.")
+        XCTAssertEqual(groupCount, 2, "Clicking near the edge of New Group button should create a new group")
+    }
 }
