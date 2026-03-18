@@ -1711,7 +1711,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             return
         }
 
-        controller.sendText(payload + "\n")
+        controller.sendText(payload + "\r")
 
         // Switch to the target terminal tab
         switchToTab(id: targetTab.id)
