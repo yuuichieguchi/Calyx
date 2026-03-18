@@ -126,6 +126,7 @@ struct MainContentView: View {
                                         glassOpacity: glassOpacity,
                                         reviewStore: activeDiffReviewStore
                                     )
+                                        .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
                                         .accessibilityIdentifier(AccessibilityID.Diff.content)
                                 case .error(let message):
                                     VStack(spacing: 12) {
@@ -243,8 +244,6 @@ struct DiffGlassContentView: NSViewRepresentable {
 
 @MainActor
 final class DiffGlassHostView: NSView {
-    private let effectView = NSVisualEffectView()
-    private let tintOverlay = NSView()
     let diffView = DiffView(frame: .zero)
 
     init(reduceTransparency: Bool, glassOpacity: Double) {
@@ -262,30 +261,8 @@ final class DiffGlassHostView: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
 
-        effectView.translatesAutoresizingMaskIntoConstraints = false
-        effectView.blendingMode = .behindWindow
-        effectView.state = .followsWindowActiveState
-        addSubview(effectView)
-        NSLayoutConstraint.activate([
-            effectView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            effectView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            effectView.topAnchor.constraint(equalTo: topAnchor),
-            effectView.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-
-        tintOverlay.translatesAutoresizingMaskIntoConstraints = false
-        tintOverlay.wantsLayer = true
-        tintOverlay.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.03).cgColor
-        addSubview(tintOverlay, positioned: .above, relativeTo: effectView)
-        NSLayoutConstraint.activate([
-            tintOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            tintOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            tintOverlay.topAnchor.constraint(equalTo: topAnchor),
-            tintOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-
         diffView.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(diffView, positioned: .above, relativeTo: tintOverlay)
+        addSubview(diffView)
         NSLayoutConstraint.activate([
             diffView.leadingAnchor.constraint(equalTo: leadingAnchor),
             diffView.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -296,24 +273,9 @@ final class DiffGlassHostView: NSView {
 
     func configureAppearance(reduceTransparency: Bool, glassOpacity: Double) {
         if reduceTransparency {
-            effectView.isHidden = true
-            tintOverlay.isHidden = true
-            effectView.alphaValue = 1.0
-            tintOverlay.alphaValue = 1.0
             layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-            return
-        }
-
-        let clampedOpacity = CGFloat(max(0.0, min(1.0, glassOpacity)))
-        effectView.isHidden = false
-        tintOverlay.isHidden = false
-        effectView.alphaValue = clampedOpacity
-        tintOverlay.alphaValue = clampedOpacity
-        layer?.backgroundColor = NSColor.clear.cgColor
-        if #available(macOS 26.0, *) {
-            effectView.material = .menu
         } else {
-            effectView.material = .hudWindow
+            layer?.backgroundColor = NSColor.clear.cgColor
         }
     }
 }
