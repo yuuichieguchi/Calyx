@@ -3,13 +3,13 @@
     <channel>
         <title>Calyx</title>
         <item>
-            <title>0.11.0</title>
-            <pubDate>Thu, 19 Mar 2026 02:36:20 +0900</pubDate>
-            <sparkle:version>6</sparkle:version>
-            <sparkle:shortVersionString>0.11.0</sparkle:shortVersionString>
+            <title>0.11.1</title>
+            <pubDate>Thu, 19 Mar 2026 02:49:18 +0900</pubDate>
+            <sparkle:version>7</sparkle:version>
+            <sparkle:shortVersionString>0.11.1</sparkle:shortVersionString>
             <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
             <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://github.com/yuuichieguchi/Calyx/releases/download/v0.11.0/Calyx.zip" length="19709890" type="application/octet-stream" sparkle:edSignature="aehqj3y4SKx/vPfnJvLpEKYv9sSptMRPiU2v/iCj96arVQqBfi7ghH6e/RRMHr64oISYSnf4Gpwngr2EpCOcDg=="/>
+            <enclosure url="https://github.com/yuuichieguchi/Calyx/releases/download/v0.11.1/Calyx.zip" length="19709798" type="application/octet-stream" sparkle:edSignature="BDPpi+KUQcJyk45EcEeWMxCJfadJXKkbR0Eq9qR6br3RkmjS+3j84xjzuVcX9oZP8tMPQilt7jgzB463ee1ZCA=="/>
         </item>
     </channel>
 </rss>
