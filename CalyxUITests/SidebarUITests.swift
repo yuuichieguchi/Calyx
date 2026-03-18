@@ -28,7 +28,7 @@ final class SidebarUITests: CalyxUITestCase {
     }
 
     func test_sidebarShowsGroupAndTab() {
-        let groupCount = countElements(matching: "calyx.sidebar.group.")
+        let groupCount = countElements(matching: "calyx.sidebar.group.", excludingSuffix: "Button")
         XCTAssertEqual(groupCount, 1, "Should have one group initially")
 
         let tabCount = countElements(matching: "calyx.sidebar.tab.", excludingSuffix: ".closeButton")

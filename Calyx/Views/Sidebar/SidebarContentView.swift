@@ -346,11 +346,11 @@ private struct GroupSectionView: View {
                         Image(systemName: "xmark.circle.fill")
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
+                            .opacity(isHoveringHeader ? 1 : 0)
                             .frame(width: 20, height: 20)
+                            .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .opacity(isHoveringHeader ? 1 : 0)
-                    .allowsHitTesting(isHoveringHeader)
                     .accessibilityIdentifier(AccessibilityID.Sidebar.groupCloseAllButton(group.id))
 
                     // Right: collapse toggle button
@@ -381,7 +381,7 @@ private struct GroupSectionView: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier(AccessibilityID.Sidebar.group(group.id))
                 .highPriorityGesture(TapGesture(count: 2).onEnded { isEditing = true })
-                .onHover { isHoveringHeader = $0 }
+                .onAssumeInsideHover($isHoveringHeader)
             }
 
             // Tabs in this group (only show if not collapsed)
@@ -484,11 +484,11 @@ private struct TabRowItemView: View {
                 Image(systemName: "xmark")
                     .font(.system(size: 8, weight: .bold))
                     .foregroundStyle(isActive ? .secondary : .tertiary)
+                    .opacity(isHovering || isActive ? 1 : 0)
                     .frame(width: 16, height: 16)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .opacity(isHovering || isActive ? 1 : 0)
-            .allowsHitTesting(isHovering || isActive)
             .accessibilityIdentifier(AccessibilityID.Sidebar.tabCloseButton(tab.id))
         }
         .contentShape(Rectangle())
@@ -500,7 +500,7 @@ private struct TabRowItemView: View {
             reduceTransparency: reduceTransparency
         ))
         .onTapGesture { onSelected?() }
-        .onHover { isHovering = $0 }
+        .onAssumeInsideHover($isHovering)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.Sidebar.tab(tab.id))
     }

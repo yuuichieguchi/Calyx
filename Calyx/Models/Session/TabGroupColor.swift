@@ -29,16 +29,21 @@ enum TabGroupColor: String, CaseIterable, Codable, Sendable {
         self = TabGroupColor(rawValue: raw) ?? .blue
     }
 
+    /// Visually distinct assignment order (avoids consecutive similar colors).
+    private static let assignmentOrder: [TabGroupColor] = [
+        .red, .blue, .yellow, .purple, .green, .orange, .indigo, .mint, .cyan, .teal,
+    ]
+
     /// Returns the next color that avoids duplicating existing group colors.
-    /// If an unused color exists, returns the first one in allCases order.
+    /// If an unused color exists, returns the first one in assignmentOrder.
     /// If all colors are used, returns the least frequently used color.
     static func nextColor(excluding usedColors: [TabGroupColor]) -> TabGroupColor {
         let usedSet = Set(usedColors)
-        if let available = allCases.first(where: { !usedSet.contains($0) }) {
+        if let available = assignmentOrder.first(where: { !usedSet.contains($0) }) {
             return available
         }
         let counts = Dictionary(usedColors.map { ($0, 1) }, uniquingKeysWith: +)
         let minCount = counts.values.min() ?? 0
-        return allCases.first(where: { counts[$0, default: 0] == minCount }) ?? .blue
+        return assignmentOrder.first(where: { counts[$0, default: 0] == minCount }) ?? .blue
     }
 }
