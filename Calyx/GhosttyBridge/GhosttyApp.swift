@@ -351,8 +351,8 @@ private func ghosttyReadClipboardCallback(
     _ userdata: UnsafeMutableRawPointer?,
     _ location: ghostty_clipboard_e,
     _ state: UnsafeMutableRawPointer?
-) {
-    guard let userdata else { return }
+) -> Bool {
+    guard let userdata else { return false }
     nonisolated(unsafe) let safeUserdata = userdata
     nonisolated(unsafe) let safeState = state
     MainActor.assumeIsolated {
@@ -374,6 +374,7 @@ private func ghosttyReadClipboardCallback(
             GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: safeState, confirmed: false)
         }
     }
+    return true
 }
 
 /// Confirm read clipboard callback.
