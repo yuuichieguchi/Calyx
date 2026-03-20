@@ -13,6 +13,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) var browserTabBroker = BrowserTabBroker()
     private var windowControllers: [CalyxWindowController] = []
     private var pendingURLs: [URL] = []
+    private var quickTerminalController: QuickTerminalController?
 
     var allWindowControllers: [CalyxWindowController] {
         windowControllers
@@ -48,6 +49,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         registerNotificationObservers()
         installKeyMonitor()
+        installGlobalEventTap()
 
         browserTabBroker.appDelegate = self
         let browserHandler = BrowserToolHandler(broker: browserTabBroker)
@@ -70,7 +72,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        true
+        quickTerminalController == nil
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -196,6 +198,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wc.showWindow(nil)
     }
 
+    func toggleQuickTerminal() {
+        if quickTerminalController == nil {
+            quickTerminalController = QuickTerminalController()
+        }
+        quickTerminalController?.toggle()
+    }
+
     func openWindowAtPath(_ pwd: String) {
         let initialTab = Tab(pwd: pwd)
         let windowSession = WindowSession(initialTab: initialTab)
@@ -249,6 +258,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.servicesMenu = servicesMenu
         appMenu.addItem(servicesItem)
 
+        let secureInputItem = NSMenuItem(title: "Secure Keyboard Entry", action: #selector(toggleSecureInput(_:)), keyEquivalent: "")
+        appMenu.addItem(secureInputItem)
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Calyx", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthersItem = NSMenuItem(title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
@@ -351,6 +362,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         windowMenu.addItem(.separator())
         windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: "Toggle Quick Terminal", action: #selector(handleToggleQuickTerminal), keyEquivalent: "")
 
         NSApp.mainMenu = mainMenu
     }
@@ -544,6 +557,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         application(NSApp, open: urls)
+    }
+
+    // MARK: - Global Keybinds
+
+    /// Enable the global CGEvent tap if ghostty has global keybindings configured.
+    /// This allows keybindings like quick terminal toggle to work from any app.
+    private func installGlobalEventTap() {
+        guard let app = GhosttyAppController.shared.app else {
+            logger.warning("installGlobalEventTap: no ghostty app available")
+            return
+        }
+        let hasGlobal = GhosttyFFI.appHasGlobalKeybinds(app)
+        logger.info("installGlobalEventTap: hasGlobalKeybinds=\(hasGlobal)")
+        if hasGlobal {
+            // Delay slightly on fresh launch to avoid burying the Accessibility
+            // permissions dialog behind initial windows.
+            DispatchQueue.main.asyncAfter(deadline: .now() + .seconds(2)) {
+                GlobalEventTap.shared.enable(app: app)
+            }
+        }
     }
 
     // MARK: - Actions
@@ -748,6 +781,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func checkForUpdates(_ sender: Any?) {
         UpdateController.shared.checkForUpdates()
+    }
+
+    @objc private func toggleSecureInput(_ sender: NSMenuItem) {
+        let input = SecureInput.shared
+        input.global.toggle()
+        UserDefaults.standard.set(input.global, forKey: "SecureInput")
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(toggleSecureInput(_:)) {
+            menuItem.state = SecureInput.shared.global ? .on : .off
+            return true
+        }
+        return true
+    }
+
+    @objc private func handleToggleQuickTerminal() {
+        toggleQuickTerminal()
     }
 
     @objc private func selectTabByNumber(_ sender: NSMenuItem) {

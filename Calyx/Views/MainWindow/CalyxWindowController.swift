@@ -26,6 +26,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var expandTasks: [String: Task<Void, Never>] = [:]
     private var hasMoreCommits = true
     private var reviewStores: [UUID: DiffReviewStore] = [:]
+    private var clipboardConfirmationController: ClipboardConfirmationController?
 
     // MARK: - Computed Properties
 
@@ -909,7 +910,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .ghosttyDesktopNotification, object: nil)
         center.addObserver(self, selector: #selector(handleGotoTabNotification(_:)),
                            name: .ghosttyGotoTab, object: nil)
-
+        center.addObserver(self, selector: #selector(handleConfirmClipboardNotification(_:)),
+                           name: .ghosttyConfirmClipboard, object: nil)
     }
 
     // MARK: - Notification Handlers
@@ -1118,6 +1120,30 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             if rawValue >= 0 {
                 selectTabByIndex(Int(rawValue))
             }
+        }
+    }
+
+    @objc private func handleConfirmClipboardNotification(_ notification: Notification) {
+        guard let surfaceView = notification.object as? SurfaceView else { return }
+        guard belongsToThisWindow(surfaceView) else { return }
+        guard let userInfo = notification.userInfo else { return }
+        guard let contents = userInfo["contents"] as? String else { return }
+        guard let surface = userInfo["surface"] as? ghostty_surface_t else { return }
+        guard let requestRaw = userInfo["request"] as? ghostty_clipboard_request_e else { return }
+        guard let request = ClipboardRequest.from(requestRaw) else { return }
+        let state = userInfo["state"] as? UnsafeMutableRawPointer
+
+        let controller = ClipboardConfirmationController(
+            surface: surface,
+            contents: contents,
+            request: request,
+            state: state
+        )
+        self.clipboardConfirmationController = controller
+
+        guard let parentWindow = window, let sheet = controller.window else { return }
+        parentWindow.beginSheet(sheet) { [weak self] _ in
+            self?.clipboardConfirmationController = nil
         }
     }
 

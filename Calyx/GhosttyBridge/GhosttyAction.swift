@@ -145,18 +145,22 @@ enum GhosttyActionRouter {
             logger.debug("Progress report action (stub)")
             return true
 
+        case GHOSTTY_ACTION_SECURE_INPUT:
+            return handleSecureInput(app, target: target, mode: action.action.secure_input)
+
+        case GHOSTTY_ACTION_TOGGLE_QUICK_TERMINAL:
+            return handleToggleQuickTerminal(app, target: target)
+
         case GHOSTTY_ACTION_CLOSE_ALL_WINDOWS,
              GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW,
              GHOSTTY_ACTION_TOGGLE_WINDOW_DECORATIONS,
              GHOSTTY_ACTION_TOGGLE_MAXIMIZE,
              GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM,
-             GHOSTTY_ACTION_TOGGLE_QUICK_TERMINAL,
              GHOSTTY_ACTION_TOGGLE_COMMAND_PALETTE,
              GHOSTTY_ACTION_TOGGLE_VISIBILITY,
              GHOSTTY_ACTION_PRESENT_TERMINAL,
              GHOSTTY_ACTION_QUIT_TIMER,
              GHOSTTY_ACTION_FLOAT_WINDOW,
-             GHOSTTY_ACTION_SECURE_INPUT,
              GHOSTTY_ACTION_PROMPT_TITLE,
              GHOSTTY_ACTION_INSPECTOR,
              GHOSTTY_ACTION_RENDER_INSPECTOR,
@@ -695,6 +699,59 @@ enum GhosttyActionRouter {
             object: surfaceView,
             userInfo: ["tab": tab.rawValue]
         )
+        return true
+    }
+
+    // MARK: - Secure Input
+
+    private static func handleSecureInput(
+        _ app: ghostty_app_t,
+        target: ghostty_target_s,
+        mode: ghostty_action_secure_input_e
+    ) -> Bool {
+        switch target.tag {
+        case GHOSTTY_TARGET_APP:
+            let input = SecureInput.shared
+            switch mode {
+            case GHOSTTY_SECURE_INPUT_ON:
+                input.global = true
+            case GHOSTTY_SECURE_INPUT_OFF:
+                input.global = false
+            case GHOSTTY_SECURE_INPUT_TOGGLE:
+                input.global.toggle()
+            default:
+                return false
+            }
+            UserDefaults.standard.set(input.global, forKey: "SecureInput")
+            return true
+
+        case GHOSTTY_TARGET_SURFACE:
+            guard let surfaceView = surfaceView(from: target) else { return false }
+            switch mode {
+            case GHOSTTY_SECURE_INPUT_ON:
+                surfaceView.passwordInput = true
+            case GHOSTTY_SECURE_INPUT_OFF:
+                surfaceView.passwordInput = false
+            case GHOSTTY_SECURE_INPUT_TOGGLE:
+                surfaceView.passwordInput.toggle()
+            default:
+                return false
+            }
+            return true
+
+        default:
+            return false
+        }
+    }
+
+    // MARK: - Quick Terminal
+
+    private static func handleToggleQuickTerminal(
+        _ app: ghostty_app_t,
+        target: ghostty_target_s
+    ) -> Bool {
+        guard let appDelegate = NSApp.delegate as? AppDelegate else { return false }
+        appDelegate.toggleQuickTerminal()
         return true
     }
 

@@ -43,6 +43,24 @@ class SurfaceView: NSView {
     /// surfaceController is nil during ghostty_surface_new.
     var cachedCellSize: NSSize = .zero
 
+    /// Whether the surface is on a password input. Detected by ghostty's secure input action.
+    var passwordInput: Bool = false {
+        didSet {
+            let input = SecureInput.shared
+            let id = ObjectIdentifier(self)
+            if passwordInput {
+                input.setScoped(id, focused: focused)
+                _hasSecureInput = true
+            } else {
+                input.removeScoped(id)
+                _hasSecureInput = false
+            }
+        }
+    }
+
+    /// Nonisolated mirror of passwordInput for deinit cleanup.
+    nonisolated(unsafe) private var _hasSecureInput = false
+
     /// Accumulator for text generated during a keyDown event.
     /// Non-nil when we are inside a keyDown handler.
     private var keyTextAccumulator: [String]? = nil
@@ -70,6 +88,9 @@ class SurfaceView: NSView {
 
     deinit {
         trackingAreas.forEach { removeTrackingArea($0) }
+        if _hasSecureInput {
+            SecureInput.shared.removeScoped(ObjectIdentifier(self))
+        }
     }
 
     // MARK: - Setup
@@ -215,6 +236,9 @@ class SurfaceView: NSView {
         guard focused != newFocused else { return }
         focused = newFocused
         surfaceController?.setFocus(newFocused)
+        if passwordInput {
+            SecureInput.shared.setScoped(ObjectIdentifier(self), focused: newFocused)
+        }
     }
 
     // MARK: - Cursor Shape

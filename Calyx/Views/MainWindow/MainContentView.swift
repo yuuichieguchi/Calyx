@@ -48,6 +48,7 @@ struct MainContentView: View {
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
+    @ObservedObject private var secureInput = SecureInput.shared
 
     var body: some View {
         let activeGroup = windowSession.activeGroup
@@ -160,6 +161,11 @@ struct MainContentView: View {
                             .padding(.top, -1)
                             .padding(.leading, 8)
                             .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
+                            .overlay(alignment: .topTrailing) {
+                                if secureInput.enabled {
+                                    SecureInputOverlay()
+                                }
+                            }
                         }
                     }
 

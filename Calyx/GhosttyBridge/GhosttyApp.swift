@@ -347,6 +347,10 @@ private func ghosttyActionCallback(
 }
 
 /// Read clipboard callback - reads from NSPasteboard.
+/// If the clipboard content is potentially unsafe (contains newlines or
+/// bracketed-paste-end sequences), we show a confirmation dialog directly
+/// as a sheet on the surface's window. This bypasses NotificationCenter
+/// to avoid type-casting issues with C types in userInfo dictionaries.
 private func ghosttyReadClipboardCallback(
     _ userdata: UnsafeMutableRawPointer?,
     _ location: ghostty_clipboard_e,
@@ -370,14 +374,40 @@ private func ghosttyReadClipboardCallback(
         }
 
         let str = pasteboard.string(forType: .string) ?? ""
-        str.withCString { ptr in
-            GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: safeState, confirmed: false)
+
+        // Check if the content needs confirmation before pasting.
+        // Per ghostty's paste.h, data is unsafe if it contains newlines
+        // or the bracketed paste end sequence (\x1b[201~).
+        let needsConfirm = str.contains("\n") || str.contains("\u{1b}[201~")
+
+        if !needsConfirm {
+            // Safe content - pass through directly.
+            str.withCString { ptr in
+                GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: safeState, confirmed: false)
+            }
+            return
+        }
+
+        // Show a modal confirmation alert synchronously.
+        let preview = str.prefix(500)
+        let alert = NSAlert()
+        alert.messageText = "Confirm Paste"
+        alert.informativeText = "The clipboard contains potentially unsafe content:\n\n\(preview)"
+        alert.addButton(withTitle: "Paste")
+        alert.addButton(withTitle: "Cancel")
+        alert.alertStyle = .warning
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            str.withCString { ptr in
+                GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: safeState, confirmed: true)
+            }
         }
     }
     return true
 }
 
-/// Confirm read clipboard callback.
+/// Confirm read clipboard callback - posts notification to show confirmation UI.
 private func ghosttyConfirmReadClipboardCallback(
     _ userdata: UnsafeMutableRawPointer?,
     _ string: UnsafePointer<CChar>?,
@@ -386,22 +416,28 @@ private func ghosttyConfirmReadClipboardCallback(
 ) {
     guard let userdata else { return }
     nonisolated(unsafe) let safeUserdata = userdata
-    nonisolated(unsafe) let safeString = string
     nonisolated(unsafe) let safeState = state
+    // Copy the string to a Swift String since the C memory may be freed after callback returns.
+    let contents: String
+    if let string {
+        contents = String(cString: string)
+    } else {
+        contents = ""
+    }
     MainActor.assumeIsolated {
         let surfaceView = GhosttyAppController.surfaceView(fromUserdata: safeUserdata)
         guard let surface = surfaceView.surfaceController?.surface else { return }
 
-        // For Phase 1, we auto-confirm clipboard reads.
-        // A proper implementation would show a confirmation dialog.
-        guard let str = safeString else {
-            "".withCString { ptr in
-                GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: safeState, confirmed: true)
-            }
-            return
-        }
-
-        GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: str, state: safeState, confirmed: true)
+        NotificationCenter.default.post(
+            name: .ghosttyConfirmClipboard,
+            object: surfaceView,
+            userInfo: [
+                "contents": contents,
+                "surface": surface,
+                "state": safeState as Any,
+                "request": request,
+            ]
+        )
     }
 }
 
@@ -443,7 +479,7 @@ private func ghosttyWriteClipboardCallback(
             pasteboard = .general
         }
 
-        // For Phase 1, we always write without confirmation.
+        // Write to clipboard (confirmation for writes would be handled separately if needed).
         pasteboard.declareTypes([.string], owner: nil)
         pasteboard.setString(valueStr, forType: .string)
     }
@@ -497,4 +533,5 @@ extension Notification.Name {
     static let ghosttySearchSelected = Notification.Name("com.calyx.ghostty.searchSelected")
     static let ghosttyGotoTab = Notification.Name("com.calyx.ghostty.gotoTab")
     static let glassOpacityDidChange = Notification.Name("com.calyx.glassOpacityDidChange")
+    static let ghosttyConfirmClipboard = Notification.Name("com.calyx.ghostty.confirmClipboard")
 }
