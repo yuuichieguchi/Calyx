@@ -416,7 +416,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             onDiscardAllReviews: { [weak self] in
                 self?.discardAllDiffReviews()
             },
-            onComposeOverlaySend: { [weak self] text in self?.sendComposeText(text) },
+            onComposeOverlaySend: { [weak self] text in self?.sendComposeText(text) ?? false },
             onDismissComposeOverlay: { [weak self] in self?.dismissComposeOverlay() },
             totalReviewCommentCount: totalReviewCommentCount,
             reviewFileCount: reviewFileCount
@@ -490,6 +490,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         case .diff:
             break  // Diff tabs don't need special activation
         }
+        retargetComposeOverlayIfNeeded()
     }
 
     private func deactivateCurrentTab() {
@@ -536,6 +537,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         refreshHostingView()
 
         restoreFocus()
+        retargetComposeOverlayIfNeeded()
         requestSave()
     }
 
@@ -714,6 +716,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         refreshHostingView()
 
         restoreFocus()
+        retargetComposeOverlayIfNeeded()
         requestSave()
     }
 
@@ -859,6 +862,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    private func retargetComposeOverlayIfNeeded() {
+        guard windowSession.showComposeOverlay else { return }
+        composeOverlayTargetSurfaceID = focusedController?.id
+    }
+
     private func dismissComposeOverlay() {
         guard windowSession.showComposeOverlay else { return }
         windowSession.showComposeOverlay = false
@@ -869,18 +877,20 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func sendComposeText(_ text: String) {
-        guard !text.isEmpty else { return }
+    @discardableResult
+    private func sendComposeText(_ text: String) -> Bool {
+        guard !text.isEmpty else { return false }
 
         let targetController: GhosttySurfaceController?
         if let targetID = composeOverlayTargetSurfaceID,
-           let tab = activeTab {
-            targetController = tab.registry.controller(for: targetID)
+           let tab = activeTab,
+           let controller = tab.registry.controller(for: targetID) {
+            targetController = controller
         } else {
             targetController = focusedController
         }
 
-        guard let controller = targetController else { return }
+        guard let controller = targetController else { return false }
 
         // Check if the target is an AI agent (same detection as sendReviewToAgent)
         let isAgent = activeTab.map { tab -> Bool in
@@ -922,6 +932,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             keyEvent.action = GHOSTTY_ACTION_RELEASE
             controller.sendKey(keyEvent)
         }
+        return true
     }
 
     private func restoreFocus() {

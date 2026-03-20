@@ -22,6 +22,8 @@ private class ComposeTextView: NSTextView {
         super.unmarkText()
         onMarkedTextChanged?()
     }
+
+
 }
 
 @MainActor
@@ -33,7 +35,7 @@ class ComposeOverlayView: NSView {
     private(set) var textView: NSTextView = ComposeTextView()
     private let placeholderLabel = NSTextField(labelWithString: "Compose...")
 
-    var onSend: ((String) -> Void)?
+    var onSend: ((String) -> Bool)?
     var onDismiss: (() -> Void)?
 
     // MARK: - Initializers
@@ -150,9 +152,11 @@ class ComposeOverlayView: NSView {
         // Trim only for emptiness check; send raw text to preserve user formatting.
         let trimmed = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        onSend?(textView.string)
-        textView.string = ""
-        updatePlaceholder()
+        let sent = onSend?(textView.string) ?? false
+        if sent {
+            textView.string = ""
+            updatePlaceholder()
+        }
     }
 
     override func insertNewlineIgnoringFieldEditor(_ sender: Any?) {

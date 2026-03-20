@@ -7,7 +7,7 @@ import SwiftUI
 import AppKit
 
 struct ComposeOverlayContainerView: NSViewRepresentable {
-    var onSend: ((String) -> Void)?
+    var onSend: ((String) -> Bool)?
     var onDismiss: (() -> Void)?
 
     func makeNSView(context: Context) -> ComposeOverlayView {

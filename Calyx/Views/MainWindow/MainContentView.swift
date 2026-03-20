@@ -44,7 +44,7 @@ struct MainContentView: View {
     var onDiscardReview: (() -> Void)?
     var onSubmitAllReviews: (() -> Void)?
     var onDiscardAllReviews: (() -> Void)?
-    var onComposeOverlaySend: ((String) -> Void)?
+    var onComposeOverlaySend: ((String) -> Bool)?
     var onDismissComposeOverlay: (() -> Void)?
     var totalReviewCommentCount: Int = 0
     var reviewFileCount: Int = 0
