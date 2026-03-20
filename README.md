@@ -178,7 +178,7 @@ Calyx uses AppKit for window, tab, and focus management with SwiftUI for view re
 ## Known Limitations
 
 - **Cursor click-to-move on full-width text** -- cursor placement may be offset on Japanese/full-width text lines because Ghostty's cursor-click-to-move internally translates clicks into arrow-key steps over terminal cells.
-- **Calyx-managed config keys** -- `background-opacity`, `background-blur`, `font-thicken`, `minimum-contrast`, `background-opacity-cells`, `font-codepoint-map` are overridden by Calyx for Glass UI. See Settings > Ghostty Config Compatibility for the full list.
+- **Calyx-managed config keys** -- `background-opacity`, `background-blur`, `background-opacity-cells`, `font-codepoint-map` are overridden by Calyx for Glass UI. See Settings > Ghostty Config Compatibility for the full list.
 
 ## License
 

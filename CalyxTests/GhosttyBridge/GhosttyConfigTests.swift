@@ -2,7 +2,7 @@
 // CalyxTests
 //
 // Tests for GhosttyConfigManager preset template and migration helpers.
-// Verifies cursor-click-to-move is removed from preset and existing configs.
+// Verifies deprecated keys are removed from preset and existing configs.
 
 import Testing
 @testable import Calyx
@@ -18,6 +18,20 @@ struct GhosttyConfigTests {
         let template = GhosttyConfigManager.glassPresetTemplate
         #expect(!template.contains("cursor-click-to-move"),
                 "Glass preset template should not contain cursor-click-to-move (ghostty default is used)")
+    }
+
+    @Test("Glass preset template does not contain font-thicken")
+    func glassPresetTemplateDoesNotContainFontThicken() {
+        let template = GhosttyConfigManager.glassPresetTemplate
+        #expect(!template.contains("font-thicken"),
+                "Glass preset template should not contain font-thicken (ghostty default is used)")
+    }
+
+    @Test("Glass preset template does not contain minimum-contrast")
+    func glassPresetTemplateDoesNotContainMinimumContrast() {
+        let template = GhosttyConfigManager.glassPresetTemplate
+        #expect(!template.contains("minimum-contrast"),
+                "Glass preset template should not contain minimum-contrast (ghostty default is used)")
     }
 
     // MARK: - Migration Tests
@@ -69,6 +83,94 @@ struct GhosttyConfigTests {
         #expect(result.contains("background-opacity = 0.82"))
     }
 
+    // MARK: - removeConfigKeys Tests
+
+    @Test("removeConfigKeys removes exact key matches")
+    func removeConfigKeysRemovesExactKeyMatch() {
+        let input = """
+        background-opacity = 0.82
+        font-thicken = true
+        background-blur = macos-glass-regular
+        minimum-contrast = 1.5
+        background-opacity-cells = false
+        """
+        let result = GhosttyConfigManager.removeConfigKeys(
+            ["font-thicken", "minimum-contrast"], from: input
+        )
+        #expect(!result.contains("font-thicken"))
+        #expect(!result.contains("minimum-contrast"))
+        #expect(result.contains("background-opacity = 0.82"))
+        #expect(result.contains("background-blur = macos-glass-regular"))
+        #expect(result.contains("background-opacity-cells = false"))
+    }
+
+    @Test("removeConfigKeys preserves comment lines containing key names")
+    func removeConfigKeysPreservesCommentLines() {
+        let input = """
+        # font-thicken = true
+        background-opacity = 0.82
+        """
+        let result = GhosttyConfigManager.removeConfigKeys(
+            ["font-thicken"], from: input
+        )
+        #expect(result.contains("# font-thicken = true"))
+        #expect(result.contains("background-opacity = 0.82"))
+    }
+
+    @Test("removeConfigKeys handles leading and trailing whitespace")
+    func removeConfigKeysHandlesLeadingTrailingWhitespace() {
+        let input = "  font-thicken = true  \nbackground-opacity = 0.82\n"
+        let result = GhosttyConfigManager.removeConfigKeys(
+            ["font-thicken"], from: input
+        )
+        #expect(!result.contains("font-thicken"))
+        #expect(result.contains("background-opacity = 0.82"))
+    }
+
+    @Test("removeConfigKeys is no-op when target keys are absent")
+    func removeConfigKeysNoOpWhenKeysAbsent() {
+        let input = """
+        background-opacity = 0.82
+        background-blur = macos-glass-regular
+        """
+        let result = GhosttyConfigManager.removeConfigKeys(
+            ["font-thicken", "minimum-contrast"], from: input
+        )
+        #expect(result == input)
+    }
+
+    @Test("removeConfigKeys preserves blank lines")
+    func removeConfigKeysPreservesBlankLines() {
+        let input = "background-opacity = 0.82\n\nbackground-blur = macos-glass-regular\n"
+        let result = GhosttyConfigManager.removeConfigKeys(
+            ["font-thicken"], from: input
+        )
+        #expect(result == input)
+    }
+
+    // MARK: - File-Backed Migration Test
+
+    @Test("removeConfigKeys migrates old format file correctly")
+    func removeConfigKeysMigratesOldFormatFile() {
+        let input = """
+        # --- Calyx Glass Preset (managed) ---
+        background-opacity = 0.82
+        background-blur = macos-glass-regular
+        font-thicken = true
+        minimum-contrast = 1.5
+        # --- End Calyx Glass Preset ---
+        """
+        let result = GhosttyConfigManager.removeConfigKeys(
+            ["font-thicken", "minimum-contrast", "cursor-click-to-move"], from: input
+        )
+        #expect(!result.contains("font-thicken"))
+        #expect(!result.contains("minimum-contrast"))
+        #expect(result.contains("background-opacity = 0.82"))
+        #expect(result.contains("background-blur = macos-glass-regular"))
+        #expect(result.contains("# --- Calyx Glass Preset (managed) ---"))
+        #expect(result.contains("# --- End Calyx Glass Preset ---"))
+    }
+
     // MARK: - Managed Keys Tests
 
     @Test("managedKeys contains all expected keys")
@@ -76,8 +178,6 @@ struct GhosttyConfigTests {
         let expectedKeys = [
             "background-opacity",
             "background-blur",
-            "font-thicken",
-            "minimum-contrast",
             "background-opacity-cells",
             "font-codepoint-map",
         ]

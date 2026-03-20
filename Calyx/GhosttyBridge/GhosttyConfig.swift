@@ -18,8 +18,6 @@ final class GhosttyConfigManager {
     # --- Calyx Glass Preset (managed) ---
     background-opacity = 0.82
     background-blur = macos-glass-regular
-    font-thicken = false
-    minimum-contrast = 1.5
     # --- End Calyx Glass Preset ---
     """
 
@@ -28,8 +26,6 @@ final class GhosttyConfigManager {
     static let managedKeys: [String] = [
         "background-opacity",
         "background-blur",
-        "font-thicken",
-        "minimum-contrast",
         "background-opacity-cells",
         "font-codepoint-map",
     ]
@@ -47,10 +43,26 @@ final class GhosttyConfigManager {
         calyxConfigDir.appendingPathComponent("calyx-runtime.conf", isDirectory: false)
     }
 
-    static func removeCursorClickToMoveLine(from text: String) -> String {
-        text.split(separator: "\n", omittingEmptySubsequences: false)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("cursor-click-to-move") }
+    /// Remove lines whose key (left-hand side of `=`) matches any entry in `keys`.
+    /// Comment lines (starting with `#`) are preserved. Blank lines are preserved.
+    static func removeConfigKeys(_ keys: [String], from text: String) -> String {
+        let keySet = Set(keys)
+        return text.split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { line in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard !trimmed.isEmpty, !trimmed.hasPrefix("#"),
+                      let eqIndex = trimmed.firstIndex(of: "=") else {
+                    return true  // keep blank lines, comments, and non-assignment lines
+                }
+                let key = trimmed[trimmed.startIndex..<eqIndex]
+                    .trimmingCharacters(in: .whitespaces)
+                return !keySet.contains(key)
+            }
             .joined(separator: "\n")
+    }
+
+    static func removeCursorClickToMoveLine(from text: String) -> String {
+        removeConfigKeys(["cursor-click-to-move"], from: text)
     }
 
     /// The underlying ghostty configuration handle.
@@ -197,9 +209,12 @@ final class GhosttyConfigManager {
             if !fm.fileExists(atPath: presetConfigURL.path) {
                 try (glassPresetTemplate + "\n").write(to: presetConfigURL, atomically: true, encoding: .utf8)
             } else {
-                // 4. Remove cursor-click-to-move lines from existing calyx-glass.conf (migration).
+                // 4. Remove deprecated keys from existing calyx-glass.conf (migration).
                 let existing = try String(contentsOf: presetConfigURL, encoding: .utf8)
-                let migrated = removeCursorClickToMoveLine(from: existing)
+                let migrated = removeConfigKeys(
+                    ["cursor-click-to-move", "font-thicken", "minimum-contrast"],
+                    from: existing
+                )
                 if migrated != existing {
                     try migrated.write(to: presetConfigURL, atomically: true, encoding: .utf8)
                 }
