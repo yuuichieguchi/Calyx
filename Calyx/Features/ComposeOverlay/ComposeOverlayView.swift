@@ -8,13 +8,29 @@ import os
 
 private let logger = Logger(subsystem: "com.calyx.terminal", category: "ComposeOverlay")
 
+/// NSTextView subclass that notifies when IME composition state changes.
+@MainActor
+private class ComposeTextView: NSTextView {
+    var onMarkedTextChanged: (() -> Void)?
+
+    override func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
+        super.setMarkedText(string, selectedRange: selectedRange, replacementRange: replacementRange)
+        onMarkedTextChanged?()
+    }
+
+    override func unmarkText() {
+        super.unmarkText()
+        onMarkedTextChanged?()
+    }
+}
+
 @MainActor
 class ComposeOverlayView: NSView {
 
     // MARK: - Properties
 
     private let scrollView = NSScrollView()
-    private(set) var textView = NSTextView()
+    private(set) var textView: NSTextView = ComposeTextView()
     private let placeholderLabel = NSTextField(labelWithString: "Compose...")
 
     var onSend: ((String) -> Void)?
@@ -25,6 +41,8 @@ class ComposeOverlayView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         setupView()
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 
     convenience init() {
@@ -46,9 +64,9 @@ class ComposeOverlayView: NSView {
 
     // MARK: - Setup
 
-    private func setupView() {
-        wantsLayer = true
+    override var isOpaque: Bool { false }
 
+    private func setupView() {
         // Text view setup
         textView.isRichText = false
         textView.allowsUndo = true
@@ -66,11 +84,21 @@ class ComposeOverlayView: NSView {
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
         textView.delegate = self
+        (textView as? ComposeTextView)?.onMarkedTextChanged = { [weak self] in
+            self?.updatePlaceholder()
+        }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(textViewDidChangeNotification(_:)),
+            name: NSText.didChangeNotification,
+            object: textView
+        )
 
         // Scroll view
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
         scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(scrollView)
 
@@ -85,7 +113,7 @@ class ComposeOverlayView: NSView {
         addSubview(placeholderLabel)
 
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: topAnchor),
+            scrollView.topAnchor.constraint(equalTo: topAnchor, constant: 4),
             scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -96,11 +124,17 @@ class ComposeOverlayView: NSView {
 
         setAccessibilityIdentifier(AccessibilityID.Compose.container)
         textView.setAccessibilityIdentifier(AccessibilityID.Compose.textView)
+        placeholderLabel.setAccessibilityIdentifier(AccessibilityID.Compose.placeholder)
     }
 
     // MARK: - Key Handling (overrides on the view itself for when textView doesn't handle)
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Escape dismiss
+        if event.keyCode == 53 {
+            onDismiss?()
+            return true
+        }
         // Cmd+Shift+E toggle (even when textView has focus)
         if event.modifierFlags.contains([.command, .shift]),
            event.charactersIgnoringModifiers?.lowercased() == "e" {
@@ -117,10 +151,13 @@ class ComposeOverlayView: NSView {
         let trimmed = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         onSend?(textView.string)
+        textView.string = ""
+        updatePlaceholder()
     }
 
     override func insertNewlineIgnoringFieldEditor(_ sender: Any?) {
         textView.insertNewlineIgnoringFieldEditor(sender)
+        updatePlaceholder()
     }
 
     override func cancelOperation(_ sender: Any?) {
@@ -129,8 +166,12 @@ class ComposeOverlayView: NSView {
 
     // MARK: - Placeholder
 
+    @objc private func textViewDidChangeNotification(_ notification: Notification) {
+        updatePlaceholder()
+    }
+
     private func updatePlaceholder() {
-        placeholderLabel.isHidden = !textView.string.isEmpty
+        placeholderLabel.isHidden = !textView.string.isEmpty || textView.hasMarkedText()
     }
 }
 

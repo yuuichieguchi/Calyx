@@ -19,6 +19,7 @@ class WindowSession: Identifiable {
     var showSidebar: Bool
     var showCommandPalette: Bool = false
     var showComposeOverlay: Bool = false
+    var composeOverlayHeight: CGFloat = 120
     var sidebarMode: SidebarMode = .tabs
     var gitChangesState: GitChangesState = .notLoaded
     var gitEntries: [GitFileEntry] = []
@@ -30,6 +31,8 @@ class WindowSession: Identifiable {
 
     static let minSidebarWidth: CGFloat = SidebarLayout.minWidth
     static let maxSidebarWidth: CGFloat = SidebarLayout.maxWidth
+    static let composeMinHeight: CGFloat = 60
+    static let composeMaxHeight: CGFloat = 400
 
     var activeGroup: TabGroup? {
         groups.first { $0.id == activeGroupID }

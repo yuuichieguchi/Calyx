@@ -161,30 +161,36 @@ struct MainContentView: View {
                         } else if let browserController = activeBrowserController {
                             BrowserContainerView(controller: browserController)
                         } else {
-                            TerminalContainerView(
-                                splitContainerView: splitContainerView,
-                                reduceTransparency: reduceTransparency,
-                                glassOpacity: glassOpacity
-                            )
-                            .padding(.top, -1)
-                            .padding(.leading, 8)
-                            .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
-                            .overlay(alignment: .topTrailing) {
-                                if secureInput.enabled {
-                                    SecureInputOverlay()
+                            VStack(spacing: 0) {
+                                TerminalContainerView(
+                                    splitContainerView: splitContainerView,
+                                    reduceTransparency: reduceTransparency,
+                                    glassOpacity: glassOpacity
+                                )
+                                .padding(.top, -1)
+                                .padding(.leading, 8)
+                                .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
+                                .layoutPriority(1)
+                                .overlay(alignment: .topTrailing) {
+                                    if secureInput.enabled {
+                                        SecureInputOverlay()
+                                    }
                                 }
-                            }
-                            .overlay(alignment: .bottom) {
+
                                 if windowSession.showComposeOverlay {
-                                    ComposeOverlayContainerView(
-                                        onSend: onComposeOverlaySend,
-                                        onDismiss: onDismissComposeOverlay
-                                    )
-                                    .frame(height: 120)
-                                    .glassEffect(.regular, in: .rect(cornerRadius: 8))
-                                    .padding(.horizontal, 8)
-                                    .padding(.bottom, 4)
-                                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                                    VStack(spacing: 0) {
+                                        ComposeResizeHandle(
+                                            currentHeight: windowSession.composeOverlayHeight,
+                                            onHeightChanged: { windowSession.composeOverlayHeight = $0 }
+                                        )
+
+                                        ComposeOverlayContainerView(
+                                            onSend: onComposeOverlaySend,
+                                            onDismiss: onDismissComposeOverlay
+                                        )
+                                        .frame(height: windowSession.composeOverlayHeight)
+                                    }
+                                    .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
                                 }
                             }
                         }

@@ -34,6 +34,7 @@ enum AccessibilityID {
     enum Compose {
         static let container = "calyx.compose"
         static let textView = "calyx.compose.textView"
+        static let placeholder = "calyx.compose.placeholder"
     }
     enum Search {
         static let container = "calyx.search"

@@ -297,6 +297,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
 
+        editMenu.addItem(.separator())
+        let composeItem = NSMenuItem(
+            title: "Compose Input",
+            action: #selector(CalyxWindowController.toggleComposeOverlay),
+            keyEquivalent: "e"
+        )
+        composeItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(composeItem)
+
         // View menu
         let viewMenuItem = NSMenuItem()
         mainMenu.addItem(viewMenuItem)

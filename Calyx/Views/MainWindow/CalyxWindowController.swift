@@ -152,6 +152,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         manager.register(modifiers: [.control, .shift], keyCode: 13) { [weak self] in
             self?.closeActiveGroup()
         }
+        // Cmd+Shift+E → compose overlay (keyCode 14 = E)
+        manager.register(modifiers: [.command, .shift], keyCode: 14) { [weak self] in
+            self?.toggleComposeOverlay()
+        }
 
         calyxWindow.shortcutManager = manager
     }
@@ -876,17 +880,47 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             targetController = focusedController
         }
 
-        dismissComposeOverlay()
-
         guard let controller = targetController else { return }
 
-        if text.contains("\n") {
-            GhosttyAppController.shared.trustedPasteContent = text
-            if !controller.performAction("paste_from_clipboard") {
-                GhosttyAppController.shared.trustedPasteContent = nil
+        // Check if the target is an AI agent (same detection as sendReviewToAgent)
+        let isAgent = activeTab.map { tab -> Bool in
+            guard case .terminal = tab.content else { return false }
+            let title = tab.title
+            return title.localizedCaseInsensitiveContains("claude") ||
+                   title.localizedCaseInsensitiveContains("codex")
+        } ?? false
+
+        controller.sendText(text)
+
+        var keyEvent = ghostty_input_key_s()
+        keyEvent.keycode = 0x24
+        keyEvent.mods = GHOSTTY_MODS_NONE
+        keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+        keyEvent.text = nil
+        keyEvent.unshifted_codepoint = 0
+        keyEvent.composing = false
+
+        if isAgent {
+            // AI agent: same timing as sendReviewToAgent (confirm paste + submit)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                keyEvent.action = GHOSTTY_ACTION_PRESS
+                controller.sendKey(keyEvent)
+                keyEvent.action = GHOSTTY_ACTION_RELEASE
+                controller.sendKey(keyEvent)
+
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    keyEvent.action = GHOSTTY_ACTION_PRESS
+                    controller.sendKey(keyEvent)
+                    keyEvent.action = GHOSTTY_ACTION_RELEASE
+                    controller.sendKey(keyEvent)
+                }
             }
         } else {
-            controller.sendText(text)
+            // Regular terminal: single Enter, immediate
+            keyEvent.action = GHOSTTY_ACTION_PRESS
+            controller.sendKey(keyEvent)
+            keyEvent.action = GHOSTTY_ACTION_RELEASE
+            controller.sendKey(keyEvent)
         }
     }
 
@@ -1439,9 +1473,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         focusedController?.setFocus(false)
         if windowSession.showCommandPalette {
             dismissCommandPalette()
-        }
-        if windowSession.showComposeOverlay {
-            dismissComposeOverlay()
         }
     }
 
