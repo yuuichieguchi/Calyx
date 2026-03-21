@@ -14,10 +14,15 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let opacitySlider = NSSlider(value: 0.7, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
     private var lastLoadedOpacity = 0.7
+    private let presetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let colorWell = NSColorWell()
+    private let hexField = NSTextField()
+    private var lastLoadedPreset: String = "original"
+    private var lastLoadedCustomHex: String = ThemeColorPreset.defaultCustomHex
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 550),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -53,6 +58,48 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             root.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -24),
         ])
 
+        // --- Theme Color Section ---
+        let themeTitle = NSTextField(labelWithString: "Theme Color")
+        themeTitle.font = .systemFont(ofSize: 20, weight: .semibold)
+        root.addArrangedSubview(themeTitle)
+
+        let themeSubtitle = NSTextField(labelWithString: "Choose a preset or pick a custom color.")
+        themeSubtitle.textColor = .secondaryLabelColor
+        themeSubtitle.font = .systemFont(ofSize: 13)
+        root.addArrangedSubview(themeSubtitle)
+
+        // Preset popup
+        let presets = ThemeColorPreset.allCases.filter { $0 != .custom }
+        for preset in presets {
+            presetPopup.addItem(withTitle: preset.displayName)
+        }
+        presetPopup.addItem(withTitle: "Custom")
+        presetPopup.target = self
+        presetPopup.action = #selector(presetDidChange(_:))
+        root.addArrangedSubview(row(label: "Preset", control: presetPopup))
+
+        // Color well
+        colorWell.color = ThemeColorPreset.original.color
+        colorWell.target = self
+        colorWell.action = #selector(colorWellDidChange(_:))
+        root.addArrangedSubview(row(label: "Color", control: colorWell))
+
+        // Hex field
+        hexField.stringValue = ThemeColorPreset.defaultCustomHex
+        hexField.placeholderString = "#RRGGBB"
+        hexField.target = self
+        hexField.action = #selector(hexFieldDidCommit(_:))
+        hexField.widthAnchor.constraint(equalToConstant: 100).isActive = true
+        root.addArrangedSubview(row(label: "Hex", control: hexField))
+
+        // Separator between Theme Color and Glass
+        let themeDivider = NSBox()
+        themeDivider.boxType = .separator
+        themeDivider.translatesAutoresizingMaskIntoConstraints = false
+        themeDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        root.addArrangedSubview(themeDivider)
+
+        // --- Glass Section ---
         let title = NSTextField(labelWithString: "Glass")
         title.font = .systemFont(ofSize: 20, weight: .semibold)
         root.addArrangedSubview(title)
@@ -206,6 +253,52 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         fieldDidChange(sender)
     }
 
+    @objc private func presetDidChange(_ sender: Any?) {
+        let index = presetPopup.indexOfSelectedItem
+        let presets = ThemeColorPreset.allCases.filter { $0 != .custom }
+        if index < presets.count {
+            let preset = presets[index]
+            UserDefaults.standard.set(preset.rawValue, forKey: "themeColorPreset")
+            colorWell.color = preset.color
+            hexField.stringValue = HexColor.toHex(preset.color)
+            hexField.textColor = .labelColor
+        }
+        // If "Custom" selected (last item), just set preset to custom
+        else {
+            UserDefaults.standard.set("custom", forKey: "themeColorPreset")
+        }
+        fieldDidChange(sender)
+    }
+
+    @objc private func colorWellDidChange(_ sender: Any?) {
+        let color = colorWell.color
+        let hex = HexColor.toHex(color)
+        hexField.stringValue = hex
+        hexField.textColor = .labelColor
+        UserDefaults.standard.set(hex, forKey: "themeColorCustomHex")
+        UserDefaults.standard.set("custom", forKey: "themeColorPreset")
+        // Update popup to show "Custom"
+        presetPopup.selectItem(at: presetPopup.numberOfItems - 1)
+        fieldDidChange(sender)
+    }
+
+    @objc private func hexFieldDidCommit(_ sender: Any?) {
+        let text = hexField.stringValue
+        if let color = HexColor.parse(text) {
+            let normalized = HexColor.toHex(color)
+            hexField.stringValue = normalized
+            hexField.textColor = .labelColor
+            colorWell.color = color
+            UserDefaults.standard.set(normalized, forKey: "themeColorCustomHex")
+            UserDefaults.standard.set("custom", forKey: "themeColorPreset")
+            presetPopup.selectItem(at: presetPopup.numberOfItems - 1)
+        } else {
+            // Invalid hex - show red text, do NOT write to UserDefaults
+            hexField.textColor = .systemRed
+        }
+        fieldDidChange(sender)
+    }
+
     @objc private func savePreset(_ sender: Any?) {
         savePresetFromUI()
         snapshotCurrentAsLoaded()
@@ -241,11 +334,30 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let opacity = UserDefaults.standard.object(forKey: "terminalGlassOpacity") as? Double ?? 0.7
         opacitySlider.doubleValue = max(0.0, min(1.0, opacity))
         updateOpacityLabel()
+
+        // Load theme color state
+        let preset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"
+        let customHex = UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex
+        let presets = ThemeColorPreset.allCases.filter { $0 != .custom }
+        if let idx = presets.firstIndex(where: { $0.rawValue == preset }) {
+            presetPopup.selectItem(at: idx)
+            colorWell.color = presets[idx].color
+            hexField.stringValue = HexColor.toHex(presets[idx].color)
+        } else {
+            // Custom
+            presetPopup.selectItem(at: presetPopup.numberOfItems - 1)
+            colorWell.color = HexColor.parse(customHex) ?? ThemeColorPreset.original.color
+            hexField.stringValue = customHex
+        }
+        hexField.textColor = .labelColor
+
         snapshotCurrentAsLoaded()
         refreshSaveButtonState()
     }
 
     private func savePresetFromUI() {
+        // Theme color changes are written to UserDefaults immediately for live preview.
+        // Only glass opacity needs explicit persistence here.
         let opacity = max(0.0, min(1.0, opacitySlider.doubleValue))
         UserDefaults.standard.set(opacity, forKey: "terminalGlassOpacity")
         NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": opacity])
@@ -260,13 +372,18 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func snapshotCurrentAsLoaded() {
         lastLoadedOpacity = opacitySlider.doubleValue
+        lastLoadedPreset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"
+        lastLoadedCustomHex = UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex
         refreshSaveButtonState()
     }
 
     private func hasUnsavedChanges() -> Bool {
         let currentOpacity = opacitySlider.doubleValue
         let opacityChanged = abs(currentOpacity - lastLoadedOpacity) > 0.0001
-        return opacityChanged
+        let currentPreset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"
+        let currentCustomHex = UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex
+        let themeChanged = currentPreset != lastLoadedPreset || currentCustomHex != lastLoadedCustomHex
+        return opacityChanged || themeChanged
     }
 
     private func refreshSaveButtonState() {
@@ -291,11 +408,15 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         case .alertSecondButtonReturn:
             UserDefaults.standard.set(lastLoadedOpacity, forKey: "terminalGlassOpacity")
             NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": lastLoadedOpacity])
+            UserDefaults.standard.set(lastLoadedPreset, forKey: "themeColorPreset")
+            UserDefaults.standard.set(lastLoadedCustomHex, forKey: "themeColorCustomHex")
             loadPresetIntoUI()
             return true
         default:
             UserDefaults.standard.set(lastLoadedOpacity, forKey: "terminalGlassOpacity")
             NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": lastLoadedOpacity])
+            UserDefaults.standard.set(lastLoadedPreset, forKey: "themeColorPreset")
+            UserDefaults.standard.set(lastLoadedCustomHex, forKey: "themeColorCustomHex")
             loadPresetIntoUI()
             return false
         }

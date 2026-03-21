@@ -129,13 +129,19 @@ private struct GlassButtonModifier: ViewModifier {
 private struct SidebarBackgroundModifier: ViewModifier {
     let reduceTransparency: Bool
     @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
+    @AppStorage("themeColorPreset") private var themePreset = "original"
+    @AppStorage("themeColorCustomHex") private var customHex = "#050D1C"
+
+    private var themeColor: NSColor {
+        ThemeColorPreset.resolve(preset: themePreset, customHex: customHex)
+    }
 
     func body(content: Content) -> some View {
         if reduceTransparency {
             content.background(Color(nsColor: .controlBackgroundColor).ignoresSafeArea(.all, edges: .top))
         } else {
             content
-                .glassEffect(.clear.tint(GlassTheme.chromeTint(for: glassOpacity)), in: .rect)
+                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
                 .overlay(alignment: .trailing) {
                     Rectangle()
                         .fill(GlassTheme.specularStroke.opacity(0.30))
