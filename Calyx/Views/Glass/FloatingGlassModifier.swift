@@ -4,6 +4,7 @@
 // Shared modifier for floating Liquid Glass styling on tab/group items.
 
 import SwiftUI
+import AppKit
 
 enum GlassTheme {
     static func chromeTintOpacity(for glassOpacity: Double) -> Double {
@@ -11,22 +12,55 @@ enum GlassTheme {
         return 0.20 + (clamped * 0.80)
     }
 
-    static func chromeTint(for glassOpacity: Double) -> Color {
-        Color(red: 0.02, green: 0.05, blue: 0.11).opacity(chromeTintOpacity(for: glassOpacity))
+    /// Derive chrome tint from theme color.
+    static func chromeTint(for themeColor: NSColor, glassOpacity: Double) -> NSColor {
+        let hsb = toHSB(themeColor)
+        let opacity = chromeTintOpacity(for: glassOpacity)
+        if hsb.saturation < 0.05 {
+            // Neutral: use brightness only
+            return NSColor(hue: 0, saturation: 0, brightness: hsb.brightness, alpha: opacity)
+        }
+        return NSColor(hue: hsb.hue, saturation: hsb.saturation, brightness: hsb.brightness, alpha: opacity)
     }
 
-    static var atmosphereTop: Color {
-        Color(red: 0.66, green: 0.86, blue: 1.00).opacity(0.28)
+    /// Derive atmosphere top gradient color from theme color.
+    static func atmosphereTop(for themeColor: NSColor) -> NSColor {
+        let hsb = toHSB(themeColor)
+        if hsb.saturation < 0.05 {
+            return NSColor(hue: 0, saturation: 0, brightness: 0.84, alpha: 0.28)
+        }
+        return NSColor(hue: hsb.hue, saturation: hsb.saturation * 0.6, brightness: 0.84, alpha: 0.28)
     }
 
-    static var atmosphereBottom: Color {
-        Color(red: 0.02, green: 0.03, blue: 0.08).opacity(0.34)
+    /// Derive atmosphere bottom gradient color from theme color.
+    static func atmosphereBottom(for themeColor: NSColor) -> NSColor {
+        let hsb = toHSB(themeColor)
+        if hsb.saturation < 0.05 {
+            return NSColor(hue: 0, saturation: 0, brightness: 0.05, alpha: 0.34)
+        }
+        return NSColor(hue: hsb.hue, saturation: hsb.saturation * 0.8, brightness: 0.05, alpha: 0.34)
+    }
+
+    /// Derive accent gradient color from theme color.
+    static func accentGradient(for themeColor: NSColor) -> NSColor {
+        let hsb = toHSB(themeColor)
+        if hsb.saturation < 0.05 {
+            return NSColor(hue: 0, saturation: 0, brightness: hsb.brightness, alpha: 0.18)
+        }
+        return NSColor(hue: hsb.hue, saturation: max(0.6, hsb.saturation), brightness: 0.8, alpha: 0.18)
     }
 
     static var specularStroke: Color {
         Color.white.opacity(0.24)
     }
 
+    // HSB extraction helper
+    private static func toHSB(_ color: NSColor) -> (hue: CGFloat, saturation: CGFloat, brightness: CGFloat) {
+        let converted = color.usingColorSpace(.sRGB) ?? color
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        converted.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return (h, s, b)
+    }
 }
 
 struct TabChromeModifier: ViewModifier {
