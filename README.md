@@ -7,7 +7,7 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 ## Features
 
 - **libghostty terminal engine** -- Metal GPU-accelerated rendering via Ghostty v1.3.1 submodule
-- **Liquid Glass UI** -- native macOS 26 Tahoe design language
+- **Liquid Glass UI** -- native macOS 26 Tahoe design language with customizable theme color (8 presets + custom hex/color picker; Ghostty preset reads your Ghostty config's background color)
 - **Tab Groups** -- 10 color presets, collapsible/expandable sections with chevron toggle, double-click to rename, drag-to-reorder tabs in tab bar and sidebar
 - **Split Panes** -- horizontal and vertical splits with directional focus navigation
 - **Command Palette** -- search and execute all operations with `Cmd+Shift+P`
