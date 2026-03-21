@@ -54,9 +54,14 @@ struct MainContentView: View {
     @AppStorage("themeColorPreset") private var themePreset = "original"
     @AppStorage("themeColorCustomHex") private var customHex = "#050D1C"
     @ObservedObject private var secureInput = SecureInput.shared
+    @State private var ghosttyProvider = GhosttyThemeProvider.shared
 
     private var themeColor: NSColor {
-        ThemeColorPreset.resolve(preset: themePreset, customHex: customHex)
+        ThemeColorPreset.resolve(
+            preset: themePreset,
+            customHex: customHex,
+            ghosttyBackground: ghosttyProvider.ghosttyBackground
+        )
     }
 
     var body: some View {
@@ -234,7 +239,7 @@ struct MainContentView: View {
                     Rectangle()
                         .fill(
                             LinearGradient(
-                                colors: [Color(nsColor: GlassTheme.atmosphereTop(for: themeColor)), Color(nsColor: GlassTheme.atmosphereBottom(for: themeColor))],
+                                colors: [Color(nsColor: GlassTheme.atmosphereTop(for: themeColor, glassOpacity: glassOpacity)), Color(nsColor: GlassTheme.atmosphereBottom(for: themeColor, glassOpacity: glassOpacity))],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
                             )

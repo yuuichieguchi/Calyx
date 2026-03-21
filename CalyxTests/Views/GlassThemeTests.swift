@@ -102,7 +102,7 @@ struct GlassThemeColorDerivationTests {
     @Test("atmosphereTop with Original preset returns a blue-ish color")
     func atmosphereTopOriginalPreset() {
         let baseColor = ThemeColorPreset.original.color
-        let top = GlassTheme.atmosphereTop(for: baseColor)
+        let top = GlassTheme.atmosphereTop(for: baseColor, glassOpacity: 0.7)
         let (r, _, b) = components(of: top)
         // Original theme atmosphere top should lean blue
         #expect(b > r, "Blue should exceed red for original atmosphere top")
@@ -111,7 +111,7 @@ struct GlassThemeColorDerivationTests {
     @Test("atmosphereTop with Ghostty preset returns a neutral color")
     func atmosphereTopGhosttyPreset() {
         let baseColor = ThemeColorPreset.ghostty.color
-        let top = GlassTheme.atmosphereTop(for: baseColor)
+        let top = GlassTheme.atmosphereTop(for: baseColor, glassOpacity: 0.7)
         #expect(
             isNeutral(top),
             "Ghostty atmosphere top should be neutral (saturation < 0.05)"
@@ -123,7 +123,7 @@ struct GlassThemeColorDerivationTests {
     @Test("atmosphereBottom with Black preset returns a neutral color")
     func atmosphereBottomBlackPreset() {
         let baseColor = ThemeColorPreset.black.color
-        let bottom = GlassTheme.atmosphereBottom(for: baseColor)
+        let bottom = GlassTheme.atmosphereBottom(for: baseColor, glassOpacity: 0.7)
         #expect(
             isNeutral(bottom),
             "Black atmosphere bottom should be neutral (saturation < 0.05)"

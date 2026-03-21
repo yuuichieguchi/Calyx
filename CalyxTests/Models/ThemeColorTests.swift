@@ -206,3 +206,53 @@ struct HexColorTests {
         }
     }
 }
+
+// MARK: - ThemeColorPreset resolve with Ghostty background Tests
+
+@Suite("ThemeColorPreset resolve with Ghostty background")
+struct ThemeColorResolveGhosttyTests {
+
+    @Test("resolve returns ghosttyBackground when preset is ghostty and background provided")
+    func resolveGhosttyWithBackground() {
+        let bg = NSColor(red: 0.1, green: 0.2, blue: 0.3, alpha: 1.0)
+        let result = ThemeColorPreset.resolve(preset: "ghostty", customHex: "", ghosttyBackground: bg)
+        let converted = result.usingColorSpace(.sRGB) ?? result
+        let bgConverted = bg.usingColorSpace(.sRGB) ?? bg
+        #expect(abs(converted.redComponent - bgConverted.redComponent) < 0.01)
+        #expect(abs(converted.greenComponent - bgConverted.greenComponent) < 0.01)
+        #expect(abs(converted.blueComponent - bgConverted.blueComponent) < 0.01)
+    }
+
+    @Test("resolve returns hardcoded ghostty color when preset is ghostty but no background")
+    func resolveGhosttyWithoutBackground() {
+        let result = ThemeColorPreset.resolve(preset: "ghostty", customHex: "", ghosttyBackground: nil)
+        let expected = ThemeColorPreset.ghostty.color
+        let r = result.usingColorSpace(.sRGB) ?? result
+        let e = expected.usingColorSpace(.sRGB) ?? expected
+        #expect(abs(r.redComponent - e.redComponent) < 0.01)
+        #expect(abs(r.greenComponent - e.greenComponent) < 0.01)
+        #expect(abs(r.blueComponent - e.blueComponent) < 0.01)
+    }
+
+    @Test("resolve ignores ghosttyBackground when preset is not ghostty")
+    func resolveNonGhosttyIgnoresBackground() {
+        let bg = NSColor(red: 0.9, green: 0.9, blue: 0.9, alpha: 1.0)
+        let result = ThemeColorPreset.resolve(preset: "original", customHex: "", ghosttyBackground: bg)
+        let expected = ThemeColorPreset.original.color
+        let r = result.usingColorSpace(.sRGB) ?? result
+        let e = expected.usingColorSpace(.sRGB) ?? expected
+        #expect(abs(r.redComponent - e.redComponent) < 0.01)
+        #expect(abs(r.greenComponent - e.greenComponent) < 0.01)
+        #expect(abs(r.blueComponent - e.blueComponent) < 0.01)
+    }
+
+    @Test("resolve with default ghosttyBackground nil matches existing behavior")
+    func resolveDefaultParameterMatchesExisting() {
+        // When ghosttyBackground is omitted (defaults to nil), behavior unchanged
+        let result = ThemeColorPreset.resolve(preset: "red", customHex: "")
+        let expected = ThemeColorPreset.red.color
+        let r = result.usingColorSpace(.sRGB) ?? result
+        let e = expected.usingColorSpace(.sRGB) ?? expected
+        #expect(abs(r.redComponent - e.redComponent) < 0.01)
+    }
+}

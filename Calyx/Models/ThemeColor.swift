@@ -24,7 +24,7 @@ enum ThemeColorPreset: String, CaseIterable, Codable, Sendable {
     var color: NSColor {
         switch self {
         case .original: NSColor(red: 0.02, green: 0.05, blue: 0.11, alpha: 1.0)  // #050D1C dark navy
-        case .ghostty: NSColor(red: 0.1, green: 0.1, blue: 0.1, alpha: 1.0)      // #1A1A1A neutral gray
+        case .ghostty: NSColor(red: 0.16, green: 0.16, blue: 0.16, alpha: 1.0)    // #282828 Ghostty dark gray
         case .red: NSColor(red: 0.11, green: 0.02, blue: 0.02, alpha: 1.0)        // #1C0505
         case .blue: NSColor(red: 0.02, green: 0.02, blue: 0.11, alpha: 1.0)       // #05051C
         case .yellow: NSColor(red: 0.11, green: 0.10, blue: 0.02, alpha: 1.0)     // #1C1A05
@@ -38,8 +38,13 @@ enum ThemeColorPreset: String, CaseIterable, Codable, Sendable {
 
 extension ThemeColorPreset {
     /// Resolve the current theme color from preset name and custom hex.
-    static func resolve(preset: String, customHex: String) -> NSColor {
+    /// When the ghostty preset is active and a live background color is available,
+    /// that color is used instead of the hardcoded fallback.
+    static func resolve(preset: String, customHex: String, ghosttyBackground: NSColor? = nil) -> NSColor {
         if let p = ThemeColorPreset(rawValue: preset), p != .custom {
+            if p == .ghostty, let bg = ghosttyBackground {
+                return bg
+            }
             return p.color
         }
         return HexColor.parse(customHex) ?? ThemeColorPreset.original.color

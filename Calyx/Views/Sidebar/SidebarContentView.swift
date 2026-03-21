@@ -131,9 +131,14 @@ private struct SidebarBackgroundModifier: ViewModifier {
     @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
     @AppStorage("themeColorPreset") private var themePreset = "original"
     @AppStorage("themeColorCustomHex") private var customHex = "#050D1C"
+    @State private var ghosttyProvider = GhosttyThemeProvider.shared
 
     private var themeColor: NSColor {
-        ThemeColorPreset.resolve(preset: themePreset, customHex: customHex)
+        ThemeColorPreset.resolve(
+            preset: themePreset,
+            customHex: customHex,
+            ghosttyBackground: ghosttyProvider.ghosttyBackground
+        )
     }
 
     func body(content: Content) -> some View {

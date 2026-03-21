@@ -24,19 +24,21 @@ enum GlassTheme {
     }
 
     /// Derive atmosphere top gradient color from theme color.
-    static func atmosphereTop(for themeColor: NSColor) -> NSColor {
+    static func atmosphereTop(for themeColor: NSColor, glassOpacity: Double) -> NSColor {
         let hsb = toHSB(themeColor)
         if hsb.saturation < 0.05 {
-            return NSColor(hue: 0, saturation: 0, brightness: 0.84, alpha: 0.28)
+            let alpha = 0.28 + (max(0, min(1, glassOpacity)) * 0.64)
+            return NSColor(hue: 0, saturation: 0, brightness: hsb.brightness, alpha: alpha)
         }
         return NSColor(hue: hsb.hue, saturation: hsb.saturation * 0.6, brightness: 0.84, alpha: 0.28)
     }
 
     /// Derive atmosphere bottom gradient color from theme color.
-    static func atmosphereBottom(for themeColor: NSColor) -> NSColor {
+    static func atmosphereBottom(for themeColor: NSColor, glassOpacity: Double) -> NSColor {
         let hsb = toHSB(themeColor)
         if hsb.saturation < 0.05 {
-            return NSColor(hue: 0, saturation: 0, brightness: 0.05, alpha: 0.34)
+            let alpha = 0.34 + (max(0, min(1, glassOpacity)) * 0.58)
+            return NSColor(hue: 0, saturation: 0, brightness: hsb.brightness, alpha: alpha)
         }
         return NSColor(hue: hsb.hue, saturation: hsb.saturation * 0.8, brightness: 0.05, alpha: 0.34)
     }
@@ -45,7 +47,7 @@ enum GlassTheme {
     static func accentGradient(for themeColor: NSColor) -> NSColor {
         let hsb = toHSB(themeColor)
         if hsb.saturation < 0.05 {
-            return NSColor(hue: 0, saturation: 0, brightness: hsb.brightness, alpha: 0.18)
+            return NSColor(hue: 0, saturation: 0, brightness: 0, alpha: 0.0)
         }
         return NSColor(hue: hsb.hue, saturation: max(0.6, hsb.saturation), brightness: 0.8, alpha: 0.18)
     }
