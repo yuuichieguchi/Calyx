@@ -1253,7 +1253,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         )
         self.clipboardConfirmationController = controller
 
-        guard let parentWindow = window, let sheet = controller.window else { return }
+        guard let parentWindow = window, let sheet = controller.window else {
+            // Cannot present confirmation UI; cancel the paste to avoid hanging.
+            contents.withCString { ptr in
+                GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: state, confirmed: false)
+            }
+            return
+        }
         parentWindow.beginSheet(sheet) { [weak self] _ in
             self?.clipboardConfirmationController = nil
         }

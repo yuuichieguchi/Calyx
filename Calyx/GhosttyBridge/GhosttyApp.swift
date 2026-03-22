@@ -389,33 +389,8 @@ private func ghosttyReadClipboardCallback(
 
         let str = pasteboard.string(forType: .string) ?? ""
 
-        // Check if the content needs confirmation before pasting.
-        // Per ghostty's paste.h, data is unsafe if it contains newlines
-        // or the bracketed paste end sequence (\x1b[201~).
-        let needsConfirm = str.contains("\n") || str.contains("\u{1b}[201~")
-
-        if !needsConfirm {
-            // Safe content - pass through directly.
-            str.withCString { ptr in
-                GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: safeState, confirmed: false)
-            }
-            return
-        }
-
-        // Show a modal confirmation alert synchronously.
-        let preview = str.prefix(500)
-        let alert = NSAlert()
-        alert.messageText = "Confirm Paste"
-        alert.informativeText = "The clipboard contains potentially unsafe content:\n\n\(preview)"
-        alert.addButton(withTitle: "Paste")
-        alert.addButton(withTitle: "Cancel")
-        alert.alertStyle = .warning
-
-        let response = alert.runModal()
-        if response == .alertFirstButtonReturn {
-            str.withCString { ptr in
-                GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: safeState, confirmed: true)
-            }
+        str.withCString { ptr in
+            GhosttyFFI.surfaceCompleteClipboardRequest(surface, data: ptr, state: safeState, confirmed: false)
         }
     }
     return true
