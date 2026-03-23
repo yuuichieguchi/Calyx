@@ -177,7 +177,7 @@ final class GhosttyConfigManager {
         do {
             try fm.createDirectory(at: calyxConfigDir, withIntermediateDirectories: true)
 
-            let sliderOpacity = UserDefaults.standard.object(forKey: "terminalGlassOpacity") as? Double ?? 0.7
+            let sliderOpacity = CalyxConfig.shared.glassOpacity
             let clampedOpacity = max(0.0, min(1.0, sliderOpacity))
             let text = """
             # --- Calyx Runtime Override (managed) ---
@@ -197,8 +197,8 @@ final class GhosttyConfigManager {
 
             var finalText = text
             if let fgLine = foregroundOverrideLine(
-                preset: UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original",
-                customHex: UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex,
+                preset: CalyxConfig.shared.themeColorPreset,
+                customHex: CalyxConfig.shared.themeColorCustomHex,
                 glassOpacity: clampedOpacity
             ) {
                 finalText += "\n\(fgLine)"
