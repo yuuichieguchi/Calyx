@@ -5,15 +5,13 @@ struct QuickTerminalContentView: View {
     let splitContainerView: SplitContainerView
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
-    @AppStorage("themeColorPreset") private var themePreset = "original"
-    @AppStorage("themeColorCustomHex") private var customHex = "#050D1C"
+    @ObservedObject private var calyxConfig = CalyxConfig.shared
     @State private var ghosttyProvider = GhosttyThemeProvider.shared
 
     private var themeColor: NSColor {
         ThemeColorPreset.resolve(
-            preset: themePreset,
-            customHex: customHex,
+            preset: calyxConfig.themeColorPreset,
+            customHex: calyxConfig.themeColorCustomHex,
             ghosttyBackground: ghosttyProvider.ghosttyBackground
         )
     }
@@ -23,18 +21,18 @@ struct QuickTerminalContentView: View {
             TerminalContainerView(
                 splitContainerView: splitContainerView,
                 reduceTransparency: reduceTransparency,
-                glassOpacity: glassOpacity
+                glassOpacity: calyxConfig.glassOpacity
             )
             .padding(.top, -1)
             .padding(.leading, 8)
-            .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+            .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: calyxConfig.glassOpacity))), in: .rect)
         }
         .background {
             if !reduceTransparency {
                 Rectangle()
                     .fill(
                         LinearGradient(
-                            colors: [Color(nsColor: GlassTheme.atmosphereTop(for: themeColor, glassOpacity: glassOpacity)), Color(nsColor: GlassTheme.atmosphereBottom(for: themeColor, glassOpacity: glassOpacity))],
+                            colors: [Color(nsColor: GlassTheme.atmosphereTop(for: themeColor, glassOpacity: calyxConfig.glassOpacity)), Color(nsColor: GlassTheme.atmosphereBottom(for: themeColor, glassOpacity: calyxConfig.glassOpacity))],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         )

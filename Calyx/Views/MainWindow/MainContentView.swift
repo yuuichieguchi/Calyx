@@ -50,16 +50,14 @@ struct MainContentView: View {
     var reviewFileCount: Int = 0
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-    @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
-    @AppStorage("themeColorPreset") private var themePreset = "original"
-    @AppStorage("themeColorCustomHex") private var customHex = "#050D1C"
+    @ObservedObject private var calyxConfig = CalyxConfig.shared
     @ObservedObject private var secureInput = SecureInput.shared
     @State private var ghosttyProvider = GhosttyThemeProvider.shared
 
     private var themeColor: NSColor {
         ThemeColorPreset.resolve(
-            preset: themePreset,
-            customHex: customHex,
+            preset: calyxConfig.themeColorPreset,
+            customHex: calyxConfig.themeColorCustomHex,
             ghosttyBackground: ghosttyProvider.ghosttyBackground
         )
     }
@@ -151,7 +149,7 @@ struct MainContentView: View {
                                     DiffGlassContentView(
                                         diff: diff,
                                         reduceTransparency: reduceTransparency,
-                                        glassOpacity: glassOpacity,
+                                        glassOpacity: calyxConfig.glassOpacity,
                                         reviewStore: activeDiffReviewStore
                                     )
                                         .accessibilityIdentifier(AccessibilityID.Diff.content)
@@ -167,7 +165,7 @@ struct MainContentView: View {
                                     }
                                 }
                             }
-                            .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                            .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: calyxConfig.glassOpacity))), in: .rect)
                             .accessibilityIdentifier(AccessibilityID.Diff.container)
                         } else if let browserController = activeBrowserController {
                             BrowserContainerView(controller: browserController)
@@ -176,11 +174,11 @@ struct MainContentView: View {
                                 TerminalContainerView(
                                     splitContainerView: splitContainerView,
                                     reduceTransparency: reduceTransparency,
-                                    glassOpacity: glassOpacity
+                                    glassOpacity: calyxConfig.glassOpacity
                                 )
                                 .padding(.top, -1)
                                 .padding(.leading, 8)
-                                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: calyxConfig.glassOpacity))), in: .rect)
                                 .layoutPriority(1)
                                 .overlay(alignment: .topTrailing) {
                                     if secureInput.enabled {
@@ -201,7 +199,7 @@ struct MainContentView: View {
                                         )
                                         .frame(height: windowSession.composeOverlayHeight)
                                     }
-                                    .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                                    .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: calyxConfig.glassOpacity))), in: .rect)
                                 }
                             }
                         }
@@ -229,7 +227,7 @@ struct MainContentView: View {
                 GeometryReader { geo in
                     Color.white.opacity(0.001)
                         .frame(height: geo.safeAreaInsets.top + 1)
-                        .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                        .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: calyxConfig.glassOpacity))), in: .rect)
                         .offset(y: -geo.safeAreaInsets.top)
                 }
                 .allowsHitTesting(false)
@@ -239,7 +237,7 @@ struct MainContentView: View {
                     Rectangle()
                         .fill(
                             LinearGradient(
-                                colors: [Color(nsColor: GlassTheme.atmosphereTop(for: themeColor, glassOpacity: glassOpacity)), Color(nsColor: GlassTheme.atmosphereBottom(for: themeColor, glassOpacity: glassOpacity))],
+                                colors: [Color(nsColor: GlassTheme.atmosphereTop(for: themeColor, glassOpacity: calyxConfig.glassOpacity)), Color(nsColor: GlassTheme.atmosphereBottom(for: themeColor, glassOpacity: calyxConfig.glassOpacity))],
                                 startPoint: .topLeading,
                                 endPoint: .bottomTrailing
                             )

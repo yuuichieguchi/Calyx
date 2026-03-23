@@ -301,21 +301,19 @@ private struct GlassButtonModifier: ViewModifier {
 
 private struct TabBarBackgroundModifier: ViewModifier {
     let reduceTransparency: Bool
-    @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
-    @AppStorage("themeColorPreset") private var themePreset = "original"
-    @AppStorage("themeColorCustomHex") private var customHex = "#050D1C"
+    @ObservedObject private var calyxConfig = CalyxConfig.shared
     @State private var ghosttyProvider = GhosttyThemeProvider.shared
 
     private var themeColor: NSColor {
         ThemeColorPreset.resolve(
-            preset: themePreset,
-            customHex: customHex,
+            preset: calyxConfig.themeColorPreset,
+            customHex: calyxConfig.themeColorCustomHex,
             ghosttyBackground: ghosttyProvider.ghosttyBackground
         )
     }
 
     private var chromeScheme: ColorScheme {
-        let tint = GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)
+        let tint = GlassTheme.chromeTint(for: themeColor, glassOpacity: calyxConfig.glassOpacity)
         return ColorLuminance.prefersDarkText(for: tint) ? .light : .dark
     }
 
@@ -324,7 +322,7 @@ private struct TabBarBackgroundModifier: ViewModifier {
             content.background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea(.all, edges: .top))
         } else {
             content
-                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: calyxConfig.glassOpacity))), in: .rect)
                 .overlay(alignment: .bottom) {
                     Rectangle()
                         .fill(GlassTheme.specularStroke.opacity(0.28))
@@ -342,7 +340,7 @@ private struct TabBarBackgroundModifier: ViewModifier {
                         .frame(height: 18)
                 }
                 .environment(\.colorScheme, chromeScheme)
-                .foregroundStyle(themePreset == "ghostty"
+                .foregroundStyle(calyxConfig.themeColorPreset == "ghostty"
                     ? AnyShapeStyle(Color(nsColor: ghosttyProvider.ghosttyForeground))
                     : AnyShapeStyle(.primary))
         }
