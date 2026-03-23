@@ -1774,14 +1774,25 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     private func enableIPC() {
         do {
-            // Generate token: 32 random bytes as hex
-            var bytes = [UInt8](repeating: 0, count: 32)
-            let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
-            guard status == errSecSuccess else {
-                showIPCAlert(title: "IPC Error", message: "Failed to generate secure token.")
-                return
+            let ud = UserDefaults.standard
+            let randomize = ud.object(forKey: "ipcRandomToken") as? Bool ?? true
+            let savedToken = ud.string(forKey: "ipcToken") ?? ""
+            let token: String
+
+            if !randomize && !savedToken.isEmpty {
+                // Reuse the persisted token
+                token = savedToken
+            } else {
+                // Generate token: 32 random bytes as hex
+                var bytes = [UInt8](repeating: 0, count: 32)
+                let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+                guard status == errSecSuccess else {
+                    showIPCAlert(title: "IPC Error", message: "Failed to generate secure token.")
+                    return
+                }
+                token = bytes.map { String(format: "%02x", $0) }.joined()
+                ud.set(token, forKey: "ipcToken")
             }
-            let token = bytes.map { String(format: "%02x", $0) }.joined()
 
             // Start server first to get the port
             try CalyxMCPServer.shared.start(token: token)
