@@ -200,15 +200,15 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             snapshotCurrentAsLoaded()
             return true
         case .alertSecondButtonReturn:
-            UserDefaults.standard.set(lastLoadedOpacity, forKey: "terminalGlassOpacity")
+            CalyxConfig.shared.glassOpacity = lastLoadedOpacity
             NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": lastLoadedOpacity])
-            UserDefaults.standard.set(lastLoadedPreset, forKey: "themeColorPreset")
-            UserDefaults.standard.set(lastLoadedCustomHex, forKey: "themeColorCustomHex")
+            CalyxConfig.shared.themeColorPreset = lastLoadedPreset
+            CalyxConfig.shared.themeColorCustomHex = lastLoadedCustomHex
             loadPresetIntoUI()
             GhosttyAppController.shared.reloadConfig()
             return true
         default:
-            // Do not revert UserDefaults here (unlike windowShouldClose Cancel).
+            // Do not revert CalyxConfig here (unlike windowShouldClose Cancel).
             // The user wants to keep editing their in-progress changes.
             return false
         }
@@ -280,7 +280,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     @objc private func opacityDidChange(_ sender: Any?) {
         updateOpacityLabel()
         let opacity = max(0.0, min(1.0, opacitySlider.doubleValue))
-        UserDefaults.standard.set(opacity, forKey: "terminalGlassOpacity")
+        CalyxConfig.shared.glassOpacity = opacity
         NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": opacity])
         applyOpacityToRunningSurfaces()
         fieldDidChange(sender)
@@ -291,14 +291,14 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let presets = ThemeColorPreset.allCases.filter { $0 != .custom }
         if index < presets.count {
             let preset = presets[index]
-            UserDefaults.standard.set(preset.rawValue, forKey: "themeColorPreset")
+            CalyxConfig.shared.themeColorPreset = preset.rawValue
             colorWell.color = preset.color
             hexField.stringValue = HexColor.toHex(preset.color)
             hexField.textColor = .labelColor
         }
         // If "Custom" selected (last item), just set preset to custom
         else {
-            UserDefaults.standard.set("custom", forKey: "themeColorPreset")
+            CalyxConfig.shared.themeColorPreset = "custom"
         }
         fieldDidChange(sender)
         GhosttyAppController.shared.reloadConfig()
@@ -309,8 +309,8 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let hex = HexColor.toHex(color)
         hexField.stringValue = hex
         hexField.textColor = .labelColor
-        UserDefaults.standard.set(hex, forKey: "themeColorCustomHex")
-        UserDefaults.standard.set("custom", forKey: "themeColorPreset")
+        CalyxConfig.shared.themeColorCustomHex = hex
+        CalyxConfig.shared.themeColorPreset = "custom"
         // Update popup to show "Custom"
         presetPopup.selectItem(at: presetPopup.numberOfItems - 1)
         fieldDidChange(sender)
@@ -324,12 +324,12 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             hexField.stringValue = normalized
             hexField.textColor = .labelColor
             colorWell.color = color
-            UserDefaults.standard.set(normalized, forKey: "themeColorCustomHex")
-            UserDefaults.standard.set("custom", forKey: "themeColorPreset")
+            CalyxConfig.shared.themeColorCustomHex = normalized
+            CalyxConfig.shared.themeColorPreset = "custom"
             presetPopup.selectItem(at: presetPopup.numberOfItems - 1)
             GhosttyAppController.shared.reloadConfig()
         } else {
-            // Invalid hex - show red text, do NOT write to UserDefaults
+            // Invalid hex - show red text, do NOT write to CalyxConfig
             hexField.textColor = .systemRed
         }
         fieldDidChange(sender)
@@ -367,13 +367,13 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func loadPresetIntoUI() {
-        let opacity = UserDefaults.standard.object(forKey: "terminalGlassOpacity") as? Double ?? 0.7
+        let opacity = CalyxConfig.shared.glassOpacity
         opacitySlider.doubleValue = max(0.0, min(1.0, opacity))
         updateOpacityLabel()
 
         // Load theme color state
-        let preset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"
-        let customHex = UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex
+        let preset = CalyxConfig.shared.themeColorPreset
+        let customHex = CalyxConfig.shared.themeColorCustomHex
         let presets = ThemeColorPreset.allCases.filter { $0 != .custom }
         if let idx = presets.firstIndex(where: { $0.rawValue == preset }) {
             presetPopup.selectItem(at: idx)
@@ -392,10 +392,10 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func savePresetFromUI() {
-        // Theme color changes are written to UserDefaults immediately for live preview.
+        // Theme color changes are written to CalyxConfig immediately for live preview.
         // Only glass opacity needs explicit persistence here.
         let opacity = max(0.0, min(1.0, opacitySlider.doubleValue))
-        UserDefaults.standard.set(opacity, forKey: "terminalGlassOpacity")
+        CalyxConfig.shared.glassOpacity = opacity
         NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": opacity])
         applyOpacityToRunningSurfaces()
     }
@@ -408,16 +408,16 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     private func snapshotCurrentAsLoaded() {
         lastLoadedOpacity = opacitySlider.doubleValue
-        lastLoadedPreset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"
-        lastLoadedCustomHex = UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex
+        lastLoadedPreset = CalyxConfig.shared.themeColorPreset
+        lastLoadedCustomHex = CalyxConfig.shared.themeColorCustomHex
         refreshSaveButtonState()
     }
 
     private func hasUnsavedChanges() -> Bool {
         let currentOpacity = opacitySlider.doubleValue
         let opacityChanged = abs(currentOpacity - lastLoadedOpacity) > 0.0001
-        let currentPreset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"
-        let currentCustomHex = UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex
+        let currentPreset = CalyxConfig.shared.themeColorPreset
+        let currentCustomHex = CalyxConfig.shared.themeColorCustomHex
         let themeChanged = currentPreset != lastLoadedPreset || currentCustomHex != lastLoadedCustomHex
         return opacityChanged || themeChanged
     }
@@ -442,18 +442,18 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             savePreset(nil)
             return !hasUnsavedChanges()
         case .alertSecondButtonReturn:
-            UserDefaults.standard.set(lastLoadedOpacity, forKey: "terminalGlassOpacity")
+            CalyxConfig.shared.glassOpacity = lastLoadedOpacity
             NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": lastLoadedOpacity])
-            UserDefaults.standard.set(lastLoadedPreset, forKey: "themeColorPreset")
-            UserDefaults.standard.set(lastLoadedCustomHex, forKey: "themeColorCustomHex")
+            CalyxConfig.shared.themeColorPreset = lastLoadedPreset
+            CalyxConfig.shared.themeColorCustomHex = lastLoadedCustomHex
             loadPresetIntoUI()
             GhosttyAppController.shared.reloadConfig()
             return true
         default:
-            UserDefaults.standard.set(lastLoadedOpacity, forKey: "terminalGlassOpacity")
+            CalyxConfig.shared.glassOpacity = lastLoadedOpacity
             NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": lastLoadedOpacity])
-            UserDefaults.standard.set(lastLoadedPreset, forKey: "themeColorPreset")
-            UserDefaults.standard.set(lastLoadedCustomHex, forKey: "themeColorCustomHex")
+            CalyxConfig.shared.themeColorPreset = lastLoadedPreset
+            CalyxConfig.shared.themeColorCustomHex = lastLoadedCustomHex
             loadPresetIntoUI()
             GhosttyAppController.shared.reloadConfig()
             return false
