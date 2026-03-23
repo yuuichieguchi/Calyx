@@ -1,5 +1,6 @@
 import AppKit
 import OSLog
+import Security
 
 private let logger = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "com.calyx.terminal",
@@ -19,10 +20,12 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let hexField = NSTextField()
     private var lastLoadedPreset: String = "original"
     private var lastLoadedCustomHex: String = ThemeColorPreset.defaultCustomHex
+    private var ipcRandomCheckbox: NSButton?
+    private var ipcTokenField: NSTextField?
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 550),
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 650),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -177,6 +180,51 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         managedKeysList.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         managedKeysList.textColor = .tertiaryLabelColor
         root.addArrangedSubview(managedKeysList)
+
+        // --- IPC Section ---
+        let ipcDivider = NSBox()
+        ipcDivider.boxType = .separator
+        ipcDivider.translatesAutoresizingMaskIntoConstraints = false
+        ipcDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        root.addArrangedSubview(ipcDivider)
+
+        let ipcTitle = NSTextField(labelWithString: "AI Agent IPC")
+        ipcTitle.font = .systemFont(ofSize: 20, weight: .semibold)
+        root.addArrangedSubview(ipcTitle)
+
+        let ipcSubtitle = NSTextField(wrappingLabelWithString: "Controls how AI agents authenticate to the Calyx MCP server.")
+        ipcSubtitle.textColor = .secondaryLabelColor
+        ipcSubtitle.font = .systemFont(ofSize: 13)
+        root.addArrangedSubview(ipcSubtitle)
+
+        // Random token checkbox
+        let randomCheckbox = NSButton(checkboxWithTitle: "Generate random token on each enable", target: self, action: #selector(ipcRandomTokenDidChange(_:)))
+        randomCheckbox.state = CalyxConfig.shared.ipcRandomToken ? .on : .off
+        self.ipcRandomCheckbox = randomCheckbox
+        root.addArrangedSubview(randomCheckbox)
+
+        // Token display row
+        let tokenField = NSTextField(string: CalyxConfig.shared.ipcToken)
+        tokenField.isEditable = false
+        tokenField.isSelectable = true
+        tokenField.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        tokenField.textColor = .secondaryLabelColor
+        tokenField.placeholderString = "(no token yet)"
+        tokenField.lineBreakMode = .byTruncatingMiddle
+        tokenField.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
+        self.ipcTokenField = tokenField
+
+        let copyButton = NSButton(title: "Copy", target: self, action: #selector(copyIPCToken(_:)))
+        copyButton.bezelStyle = .rounded
+
+        let regenButton = NSButton(title: "Regenerate", target: self, action: #selector(regenerateIPCToken(_:)))
+        regenButton.bezelStyle = .rounded
+
+        let tokenRow = NSStackView(views: [tokenField, copyButton, regenButton])
+        tokenRow.orientation = .horizontal
+        tokenRow.spacing = 8
+        tokenRow.alignment = .centerY
+        root.addArrangedSubview(row(label: "Token", control: tokenRow))
 
         loadPresetIntoUI()
     }
@@ -387,6 +435,9 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
         hexField.textColor = .labelColor
 
+        ipcRandomCheckbox?.state = CalyxConfig.shared.ipcRandomToken ? .on : .off
+        ipcTokenField?.stringValue = CalyxConfig.shared.ipcToken
+
         snapshotCurrentAsLoaded()
         refreshSaveButtonState()
     }
@@ -458,5 +509,24 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             GhosttyAppController.shared.reloadConfig()
             return false
         }
+    }
+
+    @objc private func ipcRandomTokenDidChange(_ sender: NSButton) {
+        CalyxConfig.shared.ipcRandomToken = (sender.state == .on)
+    }
+
+    @objc private func copyIPCToken(_ sender: Any?) {
+        let token = CalyxConfig.shared.ipcToken
+        guard !token.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(token, forType: .string)
+    }
+
+    @objc private func regenerateIPCToken(_ sender: Any?) {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return }
+        let token = bytes.map { String(format: "%02x", $0) }.joined()
+        CalyxConfig.shared.ipcToken = token
+        ipcTokenField?.stringValue = token
     }
 }
