@@ -22,6 +22,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        CalyxConfig.shared.migrateFromUserDefaultsIfNeeded()
+
         // Add CLI to PATH for terminals launched within Calyx
         if let binPath = Bundle.main.resourceURL?.appendingPathComponent("bin").path {
             let currentPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
