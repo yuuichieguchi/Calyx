@@ -61,6 +61,9 @@ class SurfaceView: NSView {
     /// Nonisolated mirror of passwordInput for deinit cleanup.
     nonisolated(unsafe) private var _hasSecureInput = false
 
+    /// Pasteboard types accepted for drag-and-drop into the terminal surface.
+    private static let dropTypes: [NSPasteboard.PasteboardType] = [.string, .fileURL, .URL]
+
     /// Accumulator for text generated during a keyDown event.
     /// Non-nil when we are inside a keyDown handler.
     private var keyTextAccumulator: [String]? = nil
@@ -150,6 +153,8 @@ class SurfaceView: NSView {
                 self?.resetSmoothScrollOffset()
             }
         }
+
+        registerForDraggedTypes(Self.dropTypes)
     }
 
     /// Initialize the ghostty surface for this view.
@@ -1173,5 +1178,47 @@ extension SurfaceView {
 
     @IBAction func performFindAction(_ sender: Any?) {
         surfaceController?.performAction("start_search")
+    }
+}
+
+// MARK: - NSDraggingDestination
+
+extension SurfaceView {
+
+    override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
+        guard let types = sender.draggingPasteboard.types else { return [] }
+        if Set(types).isDisjoint(with: Set(Self.dropTypes)) {
+            return []
+        }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
+        guard let surfaceController else { return false }
+        let pb = sender.draggingPasteboard
+
+        let content: String?
+        if let url = pb.string(forType: .URL) {
+            content = ShellEscape.escape(url)
+        } else if let urls = pb.readObjects(forClasses: [NSURL.self]) as? [URL],
+                  !urls.isEmpty {
+            content = urls
+                .map { ShellEscape.escape($0.path) }
+                .joined(separator: " ")
+        } else if let str = pb.string(forType: .string) {
+            // Intentional: plain text is not escaped (Ghostty parity).
+            // Dropped text may be a command the user wants to execute,
+            // matching the security model of paste operations.
+            content = str
+        } else {
+            content = nil
+        }
+
+        if let content {
+            surfaceController.sendText(content)
+            return true
+        }
+
+        return false
     }
 }
