@@ -25,6 +25,7 @@ private class OverlayScrollView: NSScrollView {
         }
         return nil
     }
+
 }
 
 @MainActor

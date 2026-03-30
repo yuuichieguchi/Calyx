@@ -5,6 +5,7 @@
 
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct MainContentView: View {
     @Bindable var windowSession: WindowSession
@@ -181,6 +182,7 @@ struct MainContentView: View {
                                 .padding(.top, -1)
                                 .padding(.leading, 8)
                                 .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                                .onDrop(of: [.fileURL, .url, .plainText], delegate: TerminalDropDelegate(splitContainerView: splitContainerView))
                                 .layoutPriority(1)
                                 .overlay(alignment: .topTrailing) {
                                     if secureInput.enabled {
@@ -392,5 +394,91 @@ private final class TerminalGlassHostView: NSView {
                 splitContainerView.bottomAnchor.constraint(equalTo: bottomAnchor),
             ])
         }
+    }
+}
+
+// MARK: - Drag and Drop
+
+@MainActor
+struct TerminalDropDelegate: DropDelegate {
+    let splitContainerView: SplitContainerView
+
+    func validateDrop(info: DropInfo) -> Bool {
+        info.hasItemsConforming(to: [.fileURL, .url, .plainText])
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        // Find the focused SurfaceView via the window's firstResponder.
+        guard let window = splitContainerView.window,
+              let surfaceView = window.firstResponder as? SurfaceView,
+              let surfaceController = surfaceView.surfaceController else {
+            return false
+        }
+
+        let providers = info.itemProviders(for: [.fileURL, .url, .plainText])
+        guard !providers.isEmpty else { return false }
+
+        // Collect file URL providers to handle multiple files.
+        let fileProviders = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }
+
+        if !fileProviders.isEmpty {
+            let group = DispatchGroup()
+            var paths: [(Int, String)] = []  // (index, escaped path) to preserve order
+            let lock = NSLock()
+
+            for (i, provider) in fileProviders.enumerated() {
+                group.enter()
+                provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier) { data, _ in
+                    defer { group.leave() }
+                    guard let data = data as? Data,
+                          let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                    let escaped = ShellEscape.escape(url.path)
+                    lock.lock()
+                    paths.append((i, escaped))
+                    lock.unlock()
+                }
+            }
+
+            group.notify(queue: .main) {
+                let joined = paths.sorted { $0.0 < $1.0 }.map(\.1).joined(separator: " ")
+                if !joined.isEmpty {
+                    surfaceController.sendText(joined)
+                }
+            }
+            return true
+        }
+
+        // Single URL (not file).
+        if let provider = providers.first(where: {
+            $0.hasItemConformingToTypeIdentifier(UTType.url.identifier)
+        }) {
+            provider.loadItem(forTypeIdentifier: UTType.url.identifier) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                let escaped = ShellEscape.escape(url.absoluteString)
+                DispatchQueue.main.async {
+                    surfaceController.sendText(escaped)
+                }
+            }
+            return true
+        }
+
+        // Plain text fallback.
+        if let provider = providers.first(where: {
+            $0.hasItemConformingToTypeIdentifier(UTType.plainText.identifier)
+        }) {
+            provider.loadItem(forTypeIdentifier: UTType.plainText.identifier) { data, _ in
+                guard let data = data as? Data,
+                      let text = String(data: data, encoding: .utf8) else { return }
+                DispatchQueue.main.async {
+                    surfaceController.sendText(text)
+                }
+            }
+            return true
+        }
+
+        return false
     }
 }
