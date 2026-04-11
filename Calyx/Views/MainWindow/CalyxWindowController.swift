@@ -607,6 +607,21 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }) else { return }
         guard let tab = group.tabs.first(where: { $0.id == tabID }) else { return }
 
+        closingTabIDs.insert(tabID)
+
+        // Quit confirmation: if this is the last tab in the last group, closing it
+        // would terminate the app. Confirm BEFORE destroying anything.
+        if group.tabs.count == 1 && windowSession.groups.count == 1 {
+            if let appDelegate = NSApp.delegate as? AppDelegate,
+               appDelegate.closingWouldTerminate(self),
+               !appDelegate.isTerminationConfirmed {
+                if !appDelegate.confirmQuitIfNeeded() {
+                    closingTabIDs.remove(tabID)
+                    return
+                }
+            }
+        }
+
         // Check for unsent review comments
         if let store = reviewStores[tabID], store.hasUnsubmittedComments {
             let alert = NSAlert()
@@ -616,11 +631,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             alert.addButton(withTitle: "Cancel")
             let response = alert.runModal()
             if response != .alertFirstButtonReturn {
+                closingTabIDs.remove(tabID)
                 return
             }
         }
-
-        closingTabIDs.insert(tabID)
 
         // Clean up browser controller if present
         browserControllers.removeValue(forKey: tabID)
@@ -642,6 +656,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         case .switchedTab, .switchedGroup:
             activateCurrentTab()
         case .windowShouldClose:
+            if let appDelegate = NSApp.delegate as? AppDelegate,
+               appDelegate.closingWouldTerminate(self) {
+                appDelegate.isTerminationConfirmed = true
+            }
             window?.close()
         }
 
@@ -726,6 +744,25 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         // Mark all tabs as closing to prevent notification handler from double-deleting
         let tabIDs = group.tabs.map { $0.id }
+        for tabID in tabIDs {
+            closingTabIDs.insert(tabID)
+        }
+
+        // Quit confirmation: if this is the last group, closing it would terminate
+        // the app. Confirm BEFORE destroying anything.
+        if windowSession.groups.count == 1 {
+            if let appDelegate = NSApp.delegate as? AppDelegate,
+               appDelegate.closingWouldTerminate(self),
+               !appDelegate.isTerminationConfirmed {
+                if !appDelegate.confirmQuitIfNeeded() {
+                    for tabID in tabIDs {
+                        closingTabIDs.remove(tabID)
+                    }
+                    return
+                }
+            }
+        }
+
         // Clean up browser controllers for all tabs in this group
         for tabID in tabIDs {
             browserControllers.removeValue(forKey: tabID)
@@ -738,9 +775,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
         for tabID in tabIDs {
             reviewStores.removeValue(forKey: tabID)
-        }
-        for tabID in tabIDs {
-            closingTabIDs.insert(tabID)
         }
 
         // Destroy all surfaces in all tabs of this group
@@ -762,6 +796,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             refreshHostingView()
             requestSave()
         case .windowShouldClose:
+            if let appDelegate = NSApp.delegate as? AppDelegate,
+               appDelegate.closingWouldTerminate(self) {
+                appDelegate.isTerminationConfirmed = true
+            }
             window?.close()
             requestSave()
         }
@@ -771,19 +809,36 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard let group = windowSession.groups.first(where: { $0.id == groupID }) else { return }
 
         let wasActiveGroup = (groupID == windowSession.activeGroupID)
+        let tabIDs = group.tabs.map { $0.id }
+        for tabID in tabIDs {
+            closingTabIDs.insert(tabID)
+        }
+
+        // Quit confirmation: if this is the last group, closing it would terminate
+        // the app. Confirm BEFORE destroying anything.
+        if windowSession.groups.count == 1 {
+            if let appDelegate = NSApp.delegate as? AppDelegate,
+               appDelegate.closingWouldTerminate(self),
+               !appDelegate.isTerminationConfirmed {
+                if !appDelegate.confirmQuitIfNeeded() {
+                    for tabID in tabIDs {
+                        closingTabIDs.remove(tabID)
+                    }
+                    return
+                }
+            }
+        }
 
         if wasActiveGroup {
             deactivateCurrentTab()
         }
 
-        let tabIDs = group.tabs.map { $0.id }
         for tabID in tabIDs {
             browserControllers.removeValue(forKey: tabID)
             diffTasks[tabID]?.cancel()
             diffTasks.removeValue(forKey: tabID)
             diffStates.removeValue(forKey: tabID)
             reviewStores.removeValue(forKey: tabID)
-            closingTabIDs.insert(tabID)
         }
 
         for tab in group.tabs {
@@ -806,6 +861,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             refreshHostingView()
             requestSave()
         case .windowShouldClose:
+            if let appDelegate = NSApp.delegate as? AppDelegate,
+               appDelegate.closingWouldTerminate(self) {
+                appDelegate.isTerminationConfirmed = true
+            }
             window?.close()
             requestSave()
         }
