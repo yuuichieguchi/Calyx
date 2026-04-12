@@ -957,7 +957,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             guard case .terminal = tab.content else { return false }
             let title = tab.title
             return title.localizedCaseInsensitiveContains("claude") ||
-                   title.localizedCaseInsensitiveContains("codex")
+                   title.localizedCaseInsensitiveContains("codex") ||
+                   title.localizedCaseInsensitiveContains("opencode")
         } ?? false
 
         controller.sendText(text)
@@ -1902,21 +1903,23 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
         return [
             label(result.claudeCode, name: "Claude Code"),
-            label(result.codex, name: "Codex")
+            label(result.codex, name: "Codex"),
+            label(result.openCode, name: "OpenCode"),
         ].joined(separator: "\n")
     }
 
     private func sendReviewToAgent(_ payload: String) -> ReviewSendResult {
-        // Find terminal tabs running Claude Code (title contains "claude" or "codex")
+        // Find terminal tabs running an AI agent (title contains "claude", "codex", or "opencode")
         let agentTabs = windowSession.groups.flatMap(\.tabs).filter {
             guard case .terminal = $0.content else { return false }
             let title = $0.title
             return title.localizedCaseInsensitiveContains("claude") ||
-                   title.localizedCaseInsensitiveContains("codex")
+                   title.localizedCaseInsensitiveContains("codex") ||
+                   title.localizedCaseInsensitiveContains("opencode")
         }
 
         guard !agentTabs.isEmpty else {
-            showIPCAlert(title: "No AI Agent", message: "No terminal tabs running Claude Code or Codex found. Start an AI agent first.")
+            showIPCAlert(title: "No AI Agent", message: "No terminal tabs running Claude Code, Codex, or OpenCode found. Start an AI agent first.")
             return .failed
         }
 
@@ -1926,8 +1929,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             targetTab = agentTabs[0]
         } else {
             let alert = NSAlert()
-            alert.messageText = "Select Claude Code Tab"
-            alert.informativeText = "Choose which Claude Code instance to send the review to:"
+            alert.messageText = "Select AI Agent Tab"
+            alert.informativeText = "Choose which AI agent instance to send the review to:"
             alert.addButton(withTitle: "Send")
             alert.addButton(withTitle: "Cancel")
 
