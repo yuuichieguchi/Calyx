@@ -81,12 +81,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if ProcessInfo.processInfo.arguments.contains("--uitesting") {
+            markAllControllersClosingForShutdown()
             return .terminateNow
         }
 
         // Already confirmed (from windowShouldClose on last-window close path)
         if isTerminationConfirmed {
             isTerminationConfirmed = false
+            markAllControllersClosingForShutdown()
             return .terminateNow
         }
 
@@ -96,7 +98,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         isTerminationConfirmed = true
+        // Flag all controllers so windowDidExitFullScreen preserves tracking state
+        // during app teardown (the red-button / Cmd+W path sets its own flag).
+        markAllControllersClosingForShutdown()
         return .terminateNow
+    }
+
+    private func markAllControllersClosingForShutdown() {
+        for wc in windowControllers {
+            wc.isClosingForShutdown = true
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -539,10 +550,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
 
-        wc.activateRestoredSession()
-        wc.showWindow(nil)
+        if clampedSnap.isFullScreen {
+            // Keep isRestoring=true until the window finishes entering fullscreen,
+            // then activate. This prevents windowDidEnterFullScreen from triggering
+            // a save that captures an intermediate (non-fullscreen) frame.
+            let box = FullScreenRestoreBox()
+            box.activate = { [weak wc, weak box] in
+                guard let box, !box.didActivate else { return }
+                box.didActivate = true
+                if let token = box.observer {
+                    NotificationCenter.default.removeObserver(token)
+                    box.observer = nil
+                }
+                wc?.activateRestoredSession()
+            }
+            box.observer = NotificationCenter.default.addObserver(
+                forName: NSWindow.didEnterFullScreenNotification,
+                object: window,
+                queue: .main
+            ) { [weak box] _ in
+                MainActor.assumeIsolated {
+                    box?.activate?()
+                }
+            }
+
+            // Safety timeout: if fullscreen transition never completes, activate anyway.
+            // Strong-capture `box` so its lifetime extends until this closure fires.
+            // The notification callback above is [weak box]; it only fires if box is
+            // still alive via this strong reference. After activate() runs (either via
+            // notification or timeout), didActivate guards against double-invocation.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [box] in
+                MainActor.assumeIsolated {
+                    box.activate?()
+                }
+            }
+
+            wc.showWindow(nil)
+
+            // toggleFullScreen must be scheduled after the current run-loop cycle
+            // so the window is fully shown before AppKit begins the transition.
+            DispatchQueue.main.async { [weak wc] in
+                MainActor.assumeIsolated {
+                    wc?.window?.toggleFullScreen(nil)
+                }
+            }
+        } else {
+            wc.activateRestoredSession()
+            wc.showWindow(nil)
+        }
 
         return true
+    }
+
+    /// Holds the mutable observer / activation state for the fullscreen-restore
+    /// coordination in `restoreWindow`. A reference-typed box lets multiple
+    /// escaping closures (notification callback, timeout) share a single
+    /// one-shot activation flag without inout captures.
+    @MainActor
+    private final class FullScreenRestoreBox {
+        var observer: NSObjectProtocol?
+        var didActivate: Bool = false
+        var activate: (() -> Void)?
     }
 
     private func restoreTabSurfaces(tab: Tab, app: ghostty_app_t, window: NSWindow) -> Bool {

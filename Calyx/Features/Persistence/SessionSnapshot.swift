@@ -6,7 +6,7 @@
 import Foundation
 
 struct SessionSnapshot: Codable, Equatable {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 5
 
     let schemaVersion: Int
     let windows: [WindowSnapshot]
@@ -32,18 +32,20 @@ struct WindowSnapshot: Codable, Equatable {
     let activeGroupID: UUID?
     let showSidebar: Bool
     let sidebarWidth: CGFloat
+    let isFullScreen: Bool
 
     private enum CodingKeys: String, CodingKey {
-        case id, frame, groups, activeGroupID, showSidebar, sidebarWidth
+        case id, frame, groups, activeGroupID, showSidebar, sidebarWidth, isFullScreen
     }
 
-    init(id: UUID = UUID(), frame: CGRect = .zero, groups: [TabGroupSnapshot] = [], activeGroupID: UUID? = nil, showSidebar: Bool = true, sidebarWidth: CGFloat = SidebarLayout.defaultWidth) {
+    init(id: UUID = UUID(), frame: CGRect = .zero, groups: [TabGroupSnapshot] = [], activeGroupID: UUID? = nil, showSidebar: Bool = true, sidebarWidth: CGFloat = SidebarLayout.defaultWidth, isFullScreen: Bool = false) {
         self.id = id
         self.frame = frame
         self.groups = groups
         self.activeGroupID = activeGroupID
         self.showSidebar = showSidebar
         self.sidebarWidth = sidebarWidth
+        self.isFullScreen = isFullScreen
     }
 
     init(from decoder: Decoder) throws {
@@ -55,6 +57,7 @@ struct WindowSnapshot: Codable, Equatable {
         showSidebar = try container.decodeIfPresent(Bool.self, forKey: .showSidebar) ?? true
         let rawWidth = try container.decodeIfPresent(CGFloat.self, forKey: .sidebarWidth) ?? SidebarLayout.defaultWidth
         sidebarWidth = SidebarLayout.clampWidth(rawWidth)
+        isFullScreen = try container.decodeIfPresent(Bool.self, forKey: .isFullScreen) ?? false
     }
 
     func clampedToScreen(screenFrame: CGRect) -> WindowSnapshot {
@@ -67,7 +70,7 @@ struct WindowSnapshot: Codable, Equatable {
                 y: screenFrame.midY - h / 2,
                 width: w, height: h
             )
-            return WindowSnapshot(id: id, frame: centered, groups: groups, activeGroupID: activeGroupID, showSidebar: showSidebar, sidebarWidth: sidebarWidth)
+            return WindowSnapshot(id: id, frame: centered, groups: groups, activeGroupID: activeGroupID, showSidebar: showSidebar, sidebarWidth: sidebarWidth, isFullScreen: isFullScreen)
         }
 
         var f = frame
@@ -78,7 +81,7 @@ struct WindowSnapshot: Codable, Equatable {
         if f.origin.y < screenFrame.origin.y { f.origin.y = screenFrame.origin.y }
         if f.maxX > screenFrame.maxX { f.origin.x = screenFrame.maxX - f.width }
         if f.maxY > screenFrame.maxY { f.origin.y = screenFrame.maxY - f.height }
-        return WindowSnapshot(id: id, frame: f, groups: groups, activeGroupID: activeGroupID, showSidebar: showSidebar, sidebarWidth: sidebarWidth)
+        return WindowSnapshot(id: id, frame: f, groups: groups, activeGroupID: activeGroupID, showSidebar: showSidebar, sidebarWidth: sidebarWidth, isFullScreen: isFullScreen)
     }
 }
 

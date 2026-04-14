@@ -467,12 +467,6 @@ final class SessionPersistenceTests: XCTestCase {
 
     // MARK: - Schema v4 — WindowSnapshot gains sidebarWidth
 
-    /// currentSchemaVersion should be 4 for the v4 schema.
-    func test_v4_schema_version_is_4() {
-        XCTAssertEqual(SessionSnapshot.currentSchemaVersion, 4,
-                       "Schema version should be 4 after sidebarWidth addition")
-    }
-
     /// A full encode-decode roundtrip should preserve sidebarWidth.
     func test_v4_windowSnapshot_roundtrip_preserves_sidebarWidth() throws {
         let window = WindowSnapshot(
@@ -647,5 +641,134 @@ final class SessionPersistenceTests: XCTestCase {
 
         XCTAssertEqual(tab.titleOverride, "My Tab",
                        "Tab(snapshot:) should restore titleOverride from the snapshot")
+    }
+
+    // MARK: - Schema v5 — WindowSnapshot gains isFullScreen
+
+    /// currentSchemaVersion should be 5 for the v5 schema that introduces isFullScreen.
+    func test_v5_schema_version_is_5() {
+        XCTAssertEqual(SessionSnapshot.currentSchemaVersion, 5,
+                       "Schema version should be 5 after isFullScreen addition")
+    }
+
+    /// WindowSnapshot should expose an isFullScreen property that stores the
+    /// value passed to the initializer.
+    func test_v5_windowSnapshot_includes_isFullScreen() {
+        let window = WindowSnapshot(
+            id: UUID(),
+            frame: CGRect(x: 0, y: 0, width: 800, height: 600),
+            groups: [],
+            activeGroupID: nil,
+            showSidebar: true,
+            sidebarWidth: SidebarLayout.defaultWidth,
+            isFullScreen: true
+        )
+
+        XCTAssertTrue(window.isFullScreen,
+                      "isFullScreen should be true when explicitly set to true")
+    }
+
+    /// A full encode-decode roundtrip should preserve isFullScreen = true.
+    func test_v5_windowSnapshot_roundtrip_preserves_isFullScreen() throws {
+        let window = WindowSnapshot(
+            id: UUID(),
+            frame: CGRect(x: 0, y: 0, width: 1200, height: 800),
+            groups: [],
+            activeGroupID: nil,
+            showSidebar: true,
+            sidebarWidth: 280,
+            isFullScreen: true
+        )
+
+        let data = try JSONEncoder().encode(window)
+        let decoded = try JSONDecoder().decode(WindowSnapshot.self, from: data)
+
+        XCTAssertTrue(decoded.isFullScreen,
+                      "isFullScreen = true should survive encode-decode roundtrip")
+    }
+
+    /// A full encode-decode roundtrip should preserve isFullScreen = false.
+    func test_v5_windowSnapshot_roundtrip_preserves_isFullScreen_false() throws {
+        let window = WindowSnapshot(
+            id: UUID(),
+            frame: CGRect(x: 0, y: 0, width: 1200, height: 800),
+            groups: [],
+            activeGroupID: nil,
+            showSidebar: true,
+            sidebarWidth: 280,
+            isFullScreen: false
+        )
+
+        let data = try JSONEncoder().encode(window)
+        let decoded = try JSONDecoder().decode(WindowSnapshot.self, from: data)
+
+        XCTAssertFalse(decoded.isFullScreen,
+                       "isFullScreen = false should survive encode-decode roundtrip")
+    }
+
+    /// v4 JSON that lacks isFullScreen should decode with default value of false.
+    func test_v4_json_decodes_with_default_isFullScreen_false() throws {
+        // Simulate v4 JSON: no "isFullScreen" key in the window object
+        let v4JSON = """
+        {
+            "schemaVersion": 4,
+            "windows": [
+                {
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "frame": [[0, 0], [800, 600]],
+                    "groups": [],
+                    "activeGroupID": null,
+                    "showSidebar": true,
+                    "sidebarWidth": 220
+                }
+            ]
+        }
+        """
+        let data = Data(v4JSON.utf8)
+        let decoded = try JSONDecoder().decode(SessionSnapshot.self, from: data)
+
+        XCTAssertEqual(decoded.windows.count, 1)
+        XCTAssertFalse(decoded.windows[0].isFullScreen,
+                       "Missing isFullScreen should default to false for v4 backward compat")
+    }
+
+    /// When the frame partially intersects the screen, clampedToScreen must
+    /// preserve isFullScreen through the clamping branch.
+    func test_clampedToScreen_preserves_isFullScreen_on_intersect_branch() {
+        let window = WindowSnapshot(
+            id: UUID(),
+            frame: CGRect(x: -50, y: -50, width: 800, height: 600),
+            groups: [],
+            activeGroupID: nil,
+            showSidebar: true,
+            sidebarWidth: SidebarLayout.defaultWidth,
+            isFullScreen: true
+        )
+        let screen = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+
+        let clamped = window.clampedToScreen(screenFrame: screen)
+
+        XCTAssertTrue(clamped.isFullScreen,
+                      "clampedToScreen must preserve isFullScreen on the intersect branch")
+    }
+
+    /// When the frame does not intersect the screen at all, clampedToScreen
+    /// must still preserve isFullScreen through the center-on-screen branch.
+    func test_clampedToScreen_preserves_isFullScreen_on_no_intersect_branch() {
+        let window = WindowSnapshot(
+            id: UUID(),
+            frame: CGRect(x: 5000, y: 5000, width: 800, height: 600),
+            groups: [],
+            activeGroupID: nil,
+            showSidebar: true,
+            sidebarWidth: SidebarLayout.defaultWidth,
+            isFullScreen: true
+        )
+        let screen = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+
+        let clamped = window.clampedToScreen(screenFrame: screen)
+
+        XCTAssertTrue(clamped.isFullScreen,
+                      "clampedToScreen must preserve isFullScreen on the no-intersect (center) branch")
     }
 }

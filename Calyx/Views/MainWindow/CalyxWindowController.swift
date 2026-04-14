@@ -18,6 +18,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var closingTabIDs: Set<UUID> = []
     private var focusRequestID: UInt64 = 0
     private var isRestoring = false
+    var trackedFullScreen: Bool = false
+    var preFullScreenFrame: NSRect? = nil
+    var isClosingForShutdown: Bool = false
     private var browserControllers: [UUID: BrowserTabController] = [:]
     private var diffStates: [UUID: DiffLoadState] = [:]
     private var diffTasks: [UUID: Task<Void, Never>] = [:]
@@ -1454,7 +1457,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowSnapshot() -> WindowSnapshot {
-        let frame = window?.frame ?? .zero
+        let frame: NSRect
+        if trackedFullScreen {
+            frame = preFullScreenFrame ?? window?.frame ?? .zero
+        } else {
+            frame = window?.frame ?? .zero
+        }
         let groups = windowSession.groups.map { group in
             let tabs = group.tabs.compactMap { tab -> TabSnapshot? in
                 // Skip diff tabs — they are not persisted
@@ -1492,7 +1500,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             groups: groups,
             activeGroupID: windowSession.activeGroupID,
             showSidebar: windowSession.showSidebar,
-            sidebarWidth: windowSession.sidebarWidth
+            sidebarWidth: windowSession.sidebarWidth,
+            isFullScreen: trackedFullScreen
         )
     }
 
@@ -1564,6 +1573,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         // Already confirmed (from Cmd+Q → applicationShouldTerminate)
         if appDelegate.isTerminationConfirmed {
+            isClosingForShutdown = true
             return true
         }
 
@@ -1573,6 +1583,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
 
         appDelegate.isTerminationConfirmed = true
+        isClosingForShutdown = true
         return true
     }
 
@@ -1625,6 +1636,27 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidResize(_ notification: Notification) {
         // SplitContainerView handles resize via autoresizingMask + resizeSubviews
+    }
+
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        preFullScreenFrame = window?.frame
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        trackedFullScreen = true
+        if !isRestoring {
+            requestSave()
+        }
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        // Preserve tracked fullscreen state during close sequence so shutdown snapshot records fullscreen.
+        guard !isClosingForShutdown else { return }
+        trackedFullScreen = false
+        preFullScreenFrame = nil
+        if !isRestoring {
+            requestSave()
+        }
     }
 
     // MARK: - Git Source Control
