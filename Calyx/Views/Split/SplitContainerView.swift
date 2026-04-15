@@ -14,6 +14,7 @@ class SplitContainerView: NSView {
     private var registry: SurfaceRegistry
     private var currentTree: SplitTree = SplitTree()
     private var scrollWrappers: [UUID: SurfaceScrollView] = [:]
+    private var activeLeafID: UUID?
     var onRatioChange: ((UUID, Double, SplitDirection) -> Void)?
     var onDeferredLayoutComplete: (() -> Void)?
 
@@ -40,6 +41,7 @@ class SplitContainerView: NSView {
         currentTree = SplitTree()
         scrollWrappers.removeAll()
         subviews.forEach { $0.removeFromSuperview() }
+        activeLeafID = nil
         needsLayout = true
     }
 
@@ -57,10 +59,17 @@ class SplitContainerView: NSView {
         removeDividers()
         guard let root = tree.root else {
             subviews.forEach { $0.removeFromSuperview() }
+            activeLeafID = nil
+            applyActiveDimming()
             return
         }
         layoutNode(root, in: bounds)
         removeOrphanedSurfaces()
+
+        if activeLeafID == nil || scrollWrappers[activeLeafID!] == nil {
+            activeLeafID = tree.focusedLeafID
+        }
+        applyActiveDimming()
     }
 
     override func resizeSubviews(withOldSize oldSize: NSSize) {
@@ -70,6 +79,7 @@ class SplitContainerView: NSView {
         removeDividers()
         layoutNode(root, in: bounds)
         removeOrphanedSurfaces()
+        applyActiveDimming()
     }
 
     override func layout() {
@@ -82,9 +92,38 @@ class SplitContainerView: NSView {
             removeDividers()
             layoutNode(root, in: bounds)
             removeOrphanedSurfaces()
+            applyActiveDimming()
             let callback = onDeferredLayoutComplete
             onDeferredLayoutComplete = nil
             callback?()
+        }
+    }
+
+    // MARK: - Active Pane Dimming
+
+    private func applyActiveDimming() {
+        let inactiveAlpha: CGFloat = 0.75
+        let count = scrollWrappers.count
+
+        if count <= 1 {
+            for (_, wrapper) in scrollWrappers where wrapper.surfaceView.alphaValue != 1.0 {
+                wrapper.surfaceView.alphaValue = 1.0
+            }
+            return
+        }
+
+        guard let active = activeLeafID, scrollWrappers[active] != nil else {
+            for (_, wrapper) in scrollWrappers where wrapper.surfaceView.alphaValue != 1.0 {
+                wrapper.surfaceView.alphaValue = 1.0
+            }
+            return
+        }
+
+        for (id, wrapper) in scrollWrappers {
+            let desired: CGFloat = (id == active) ? 1.0 : inactiveAlpha
+            if wrapper.surfaceView.alphaValue != desired {
+                wrapper.surfaceView.alphaValue = desired
+            }
         }
     }
 
@@ -101,6 +140,7 @@ class SplitContainerView: NSView {
                     wrapper = SurfaceScrollView(surfaceView: surfaceView)
                     scrollWrappers[id] = wrapper
                 }
+                surfaceView.focusHost = self
                 wrapper.frame = rect
                 wrapper.autoresizingMask = []
                 if wrapper.superview !== self {
@@ -229,5 +269,16 @@ class SplitContainerView: NSView {
             scrollWrappers[id]?.removeFromSuperview()
             scrollWrappers.removeValue(forKey: id)
         }
+    }
+}
+
+// MARK: - SurfaceFocusHost
+
+extension SplitContainerView: SurfaceFocusHost {
+    func surfaceDidBecomeActive(_ surfaceView: SurfaceView) {
+        guard let id = registry.id(for: surfaceView) else { return }
+        guard activeLeafID != id else { return }
+        activeLeafID = id
+        applyActiveDimming()
     }
 }

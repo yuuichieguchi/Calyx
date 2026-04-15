@@ -12,10 +12,26 @@ import os
 private let logger = Logger(subsystem: "com.calyx.terminal", category: "SurfaceView")
 
 
+// MARK: - SurfaceFocusHost
+
+/// Delegate that receives notifications when a `SurfaceView` becomes the
+/// active (focused) pane. Implemented by `SplitContainerView` so it can
+/// propagate per-pane dimming state without reading any config or broadcasting
+/// notifications.
+@MainActor
+protocol SurfaceFocusHost: AnyObject {
+    func surfaceDidBecomeActive(_ surfaceView: SurfaceView)
+}
+
+
 // MARK: - SurfaceView
 
 @MainActor
 class SurfaceView: NSView {
+
+    /// Weak back-reference to the container that should be told when this
+    /// surface gains focus. Held weakly so the container owns the lifetime.
+    weak var focusHost: (any SurfaceFocusHost)?
 
     /// The surface controller managing the ghostty surface for this view.
     var surfaceController: GhosttySurfaceController?
@@ -292,6 +308,9 @@ class SurfaceView: NSView {
         surfaceController?.setFocus(newFocused)
         if passwordInput {
             SecureInput.shared.setScoped(ObjectIdentifier(self), focused: newFocused)
+        }
+        if newFocused {
+            focusHost?.surfaceDidBecomeActive(self)
         }
     }
 

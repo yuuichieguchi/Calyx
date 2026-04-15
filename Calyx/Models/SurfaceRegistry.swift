@@ -28,6 +28,18 @@ final class SurfaceRegistry {
 
     private var entries: [UUID: RegistryEntry] = [:]
 
+    #if DEBUG
+    /// Test-only storage for injected `SurfaceView` fixtures. Populated
+    /// via `_testInsert(view:id:)` and consulted as a fallback by
+    /// `view(for:)` / `id(for:)` when the main `entries` dictionary does
+    /// not contain the queried key. Inert in Release because
+    /// `_testViewsByID` is never populated outside test hosts — the
+    /// `#if DEBUG` gate is preserved so this storage is only compiled in
+    /// when the `DEBUG` compilation condition is set. DO NOT use from
+    /// production code.
+    private var _testViewsByID: [UUID: SurfaceView] = [:]
+    #endif
+
     var count: Int { entries.count }
 
     var allIDs: [UUID] { Array(entries.keys) }
@@ -109,7 +121,12 @@ final class SurfaceRegistry {
     // MARK: - Lookup
 
     func view(for id: UUID) -> SurfaceView? {
-        entries[id]?.view
+        if let v = entries[id]?.view { return v }
+        #if DEBUG
+        return _testViewsByID[id]
+        #else
+        return nil
+        #endif
     }
 
     func controller(for id: UUID) -> GhosttySurfaceController? {
@@ -121,7 +138,14 @@ final class SurfaceRegistry {
     }
 
     func id(for surfaceView: SurfaceView) -> UUID? {
-        entries.first(where: { $0.value.view === surfaceView })?.key
+        if let match = entries.first(where: { $0.value.view === surfaceView })?.key {
+            return match
+        }
+        #if DEBUG
+        return _testViewsByID.first(where: { $0.value === surfaceView })?.key
+        #else
+        return nil
+        #endif
     }
 
     // MARK: - Tab Lifecycle
@@ -152,4 +176,14 @@ final class SurfaceRegistry {
             entry.view.needsDisplay = true
         }
     }
+
+    #if DEBUG
+    /// Test-only: inject a `SurfaceView` with a fixed UUID, bypassing the
+    /// ghostty FFI surface-creation path. Both `view(for:)` and
+    /// `id(for:)` will resolve the injected view. DO NOT call from
+    /// production code.
+    func _testInsert(view: SurfaceView, id: UUID) {
+        _testViewsByID[id] = view
+    }
+    #endif
 }
