@@ -4,6 +4,7 @@
 // NSView subclass for the split divider line with drag handling.
 
 import AppKit
+import SwiftUI
 
 @MainActor
 class SplitDividerView: NSView {
@@ -18,11 +19,14 @@ class SplitDividerView: NSView {
     private let visibleThickness: CGFloat = 1
     private let hitAreaThickness: CGFloat = 7
 
+    private let glassHost: PassThroughHostingView<SplitDividerGlassStrip>
+
     init(direction: SplitDirection) {
         self.direction = direction
+        self.glassHost = PassThroughHostingView(rootView: SplitDividerGlassStrip())
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.separatorColor.cgColor
+        addSubview(glassHost)
     }
 
     @available(*, unavailable)
@@ -35,6 +39,26 @@ class SplitDividerView: NSView {
     var thickness: CGFloat { hitAreaThickness }
 
     override var isFlipped: Bool { true }
+
+    override func layout() {
+        super.layout()
+        switch direction {
+        case .horizontal:
+            glassHost.frame = CGRect(
+                x: (bounds.width - visibleThickness) / 2,
+                y: 0,
+                width: visibleThickness,
+                height: bounds.height
+            )
+        case .vertical:
+            glassHost.frame = CGRect(
+                x: 0,
+                y: (bounds.height - visibleThickness) / 2,
+                width: bounds.width,
+                height: visibleThickness
+            )
+        }
+    }
 
     // MARK: - Cursor
 
@@ -77,5 +101,43 @@ class SplitDividerView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         isDragging = false
+    }
+}
+
+private struct SplitDividerGlassStrip: View {
+    @AppStorage("terminalGlassOpacity") private var glassOpacity: Double = 0.7
+    @AppStorage("themeColorPreset") private var themePreset: String = "original"
+    @AppStorage("themeColorCustomHex") private var customHex: String = "#050D1C"
+    @State private var ghosttyProvider = GhosttyThemeProvider.shared
+
+    private var themeColor: NSColor {
+        ThemeColorPreset.resolve(
+            preset: themePreset,
+            customHex: customHex,
+            ghosttyBackground: ghosttyProvider.ghosttyBackground
+        )
+    }
+
+    var body: some View {
+        Color.clear
+            .glassEffect(
+                .clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))),
+                in: .rect
+            )
+            .opacity(0.5)
+            .allowsHitTesting(false)
+    }
+}
+
+private final class PassThroughHostingView<Content: View>: NSHostingView<Content> {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    required init(rootView: Content) {
+        super.init(rootView: rootView)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
     }
 }

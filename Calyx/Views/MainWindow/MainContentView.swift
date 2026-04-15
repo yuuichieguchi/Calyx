@@ -183,7 +183,6 @@ struct MainContentView: View {
                                     glassOpacity: glassOpacity
                                 )
                                 .padding(.top, -1)
-                                .padding(.leading, 8)
                                 .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
                                 .onDrop(of: [.fileURL], delegate: TerminalDropDelegate(splitContainerView: splitContainerView))
                                 .layoutPriority(1)
