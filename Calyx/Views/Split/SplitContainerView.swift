@@ -17,6 +17,7 @@ class SplitContainerView: NSView {
     private var activeLeafID: UUID?
     var onRatioChange: ((UUID, Double, SplitDirection) -> Void)?
     var onDeferredLayoutComplete: (() -> Void)?
+    var onActiveLeafChange: ((UUID) -> Void)?
 
     private static let minPaneSize: CGFloat = 50
 
@@ -280,5 +281,6 @@ extension SplitContainerView: SurfaceFocusHost {
         guard activeLeafID != id else { return }
         activeLeafID = id
         applyActiveDimming()
+        onActiveLeafChange?(id)
     }
 }

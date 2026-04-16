@@ -475,4 +475,240 @@ final class SplitContainerViewDimmingTests: XCTestCase {
             "The host must receive the exact SurfaceView that invoked it"
         )
     }
+
+    // MARK: - 7. onActiveLeafChange fires on a real focus transition
+    //
+    // Contract pinned by this test (Issue #29):
+    //
+    //   `SplitContainerView` must expose a settable public closure property
+    //   `var onActiveLeafChange: ((UUID) -> Void)?` which is invoked from
+    //   `surfaceDidBecomeActive(_:)` AFTER the existing
+    //   `activeLeafID != id` guard short-circuits a no-op, with the
+    //   newly-active leaf's UUID as its argument.
+    //
+    //   Rationale: the persistent `SplitTree.focusedLeafID` (Source of Truth)
+    //   and the ephemeral `SplitContainerView.activeLeafID` (view state) fall
+    //   out of sync when the user clicks a pane. The callback lets the window
+    //   controller propagate the click into the tab's split-tree model so the
+    //   next `restoreFocus()` reads a current value.
+    //
+    // Red-phase expectation: this test FAILS TO COMPILE because
+    // `container.onActiveLeafChange` does not exist yet.
+
+    /// Given: a 2-pane tree with `focusedLeafID = firstLeafID`, laid out in
+    ///        the container, and `onActiveLeafChange` assigned.
+    /// When:  `container.surfaceDidBecomeActive(secondSurface)` is invoked
+    ///        (simulating the user clicking the second pane).
+    /// Then:  the callback fires exactly once with `secondLeafID`.
+    func testOnActiveLeafChangeFiresOnRealTransition() {
+        // Arrange
+        let fixture = makeFixture()
+        let firstLeafID = UUID()
+        let secondLeafID = UUID()
+        let firstSurface = registerLeaf(firstLeafID, in: fixture.registry)
+        let secondSurface = registerLeaf(secondLeafID, in: fixture.registry)
+        let root = SplitNode.split(SplitData(
+            direction: .horizontal,
+            ratio: 0.5,
+            first: .leaf(id: firstLeafID),
+            second: .leaf(id: secondLeafID)
+        ))
+        fixture.container.updateLayout(tree: SplitTree(root: root, focusedLeafID: firstLeafID))
+        _ = firstSurface // silence unused-variable warning; used only to seed the registry
+
+        var received: [UUID] = []
+        fixture.container.onActiveLeafChange = { leafID in
+            received.append(leafID)
+        }
+
+        // Act — simulate the second pane gaining focus (user click).
+        fixture.container.surfaceDidBecomeActive(secondSurface)
+
+        // Assert — exactly one invocation, carrying the new leaf's UUID.
+        XCTAssertEqual(
+            received.count,
+            1,
+            "onActiveLeafChange must fire exactly once for a real focus transition"
+        )
+        XCTAssertEqual(
+            received.first,
+            secondLeafID,
+            "onActiveLeafChange must receive the newly-active leaf's UUID"
+        )
+    }
+
+    // MARK: - 8. onActiveLeafChange is NOT fired on a no-op reactivation
+
+    /// Given: same two-pane layout as test 7, with the callback assigned, and
+    ///        `surfaceDidBecomeActive(secondSurface)` already invoked once so
+    ///        `activeLeafID == secondLeafID`.
+    /// When:  `surfaceDidBecomeActive(secondSurface)` is invoked AGAIN with
+    ///        the same surface.
+    /// Then:  the callback does not fire a second time — the existing
+    ///        `activeLeafID != id` guard short-circuits the method before
+    ///        reaching the callback invocation. The recorded-invocations
+    ///        array length stays at 1.
+    func testOnActiveLeafChangeNotFiredOnNoOpReactivation() {
+        // Arrange
+        let fixture = makeFixture()
+        let firstLeafID = UUID()
+        let secondLeafID = UUID()
+        registerLeaf(firstLeafID, in: fixture.registry)
+        let secondSurface = registerLeaf(secondLeafID, in: fixture.registry)
+        let root = SplitNode.split(SplitData(
+            direction: .horizontal,
+            ratio: 0.5,
+            first: .leaf(id: firstLeafID),
+            second: .leaf(id: secondLeafID)
+        ))
+        fixture.container.updateLayout(tree: SplitTree(root: root, focusedLeafID: firstLeafID))
+
+        var received: [UUID] = []
+        fixture.container.onActiveLeafChange = { leafID in
+            received.append(leafID)
+        }
+
+        // Act — first activation establishes activeLeafID == secondLeafID.
+        fixture.container.surfaceDidBecomeActive(secondSurface)
+        XCTAssertEqual(
+            received.count,
+            1,
+            "Precondition: the first call to surfaceDidBecomeActive must fire the callback once"
+        )
+
+        // Act — second activation with the same surface must be a no-op.
+        fixture.container.surfaceDidBecomeActive(secondSurface)
+
+        // Assert — invocation count did not increase.
+        XCTAssertEqual(
+            received.count,
+            1,
+            "onActiveLeafChange must NOT fire when surfaceDidBecomeActive is called with the already-active surface"
+        )
+    }
+
+    // MARK: - 9. onActiveLeafChange is NOT fired for an unregistered surface
+
+    /// Given: a two-pane layout with the callback assigned.
+    /// When:  `surfaceDidBecomeActive(_:)` is invoked with a brand-new
+    ///        `SurfaceView` that has NOT been registered in the registry, so
+    ///        `registry.id(for: surfaceView)` returns nil.
+    /// Then:  the method exits at the `guard let id = registry.id(for:)` line
+    ///        and never invokes the callback.
+    func testOnActiveLeafChangeNotFiredForUnregisteredSurface() {
+        // Arrange
+        let fixture = makeFixture()
+        let firstLeafID = UUID()
+        let secondLeafID = UUID()
+        registerLeaf(firstLeafID, in: fixture.registry)
+        registerLeaf(secondLeafID, in: fixture.registry)
+        let root = SplitNode.split(SplitData(
+            direction: .horizontal,
+            ratio: 0.5,
+            first: .leaf(id: firstLeafID),
+            second: .leaf(id: secondLeafID)
+        ))
+        fixture.container.updateLayout(tree: SplitTree(root: root, focusedLeafID: firstLeafID))
+
+        var received: [UUID] = []
+        fixture.container.onActiveLeafChange = { leafID in
+            received.append(leafID)
+        }
+
+        // A brand-new SurfaceView never inserted into the registry.
+        let unregisteredSurface = SurfaceView(frame: .zero)
+        XCTAssertNil(
+            fixture.registry.id(for: unregisteredSurface),
+            "Precondition: the unregistered surface must not be resolvable in the registry"
+        )
+
+        // Act
+        fixture.container.surfaceDidBecomeActive(unregisteredSurface)
+
+        // Assert
+        XCTAssertTrue(
+            received.isEmpty,
+            "onActiveLeafChange must NOT fire when the surface is not resolvable in the registry"
+        )
+    }
+
+    // MARK: - 10. onActiveLeafChange fires after a registry swap
+    //
+    // Reviewer's note: the original intent was "first activation after
+    // updateRegistry". However, after the fresh registry is installed and
+    // `updateLayout(tree:)` is called with a new tree, SplitContainerView
+    // reseeds `activeLeafID` from `tree.focusedLeafID` (lines 69-71). So if
+    // we then call `surfaceDidBecomeActive(newFirstSurface)` with the same
+    // leaf that was just reseeded, the `activeLeafID != id` guard will
+    // short-circuit — no callback. To verify the callback is wired AFTER the
+    // registry swap, we must transition to a *different* leaf than the one
+    // the tree reseeded onto. Hence this test renames to reflect the actual
+    // contract: "fires on transition to a different leaf in the fresh
+    // registry".
+
+    /// Given: an old 2-pane layout is replaced with a fresh registry, a new
+    ///        pair of leaves is registered in that fresh registry, and a new
+    ///        tree with `focusedLeafID = newFirstID` is laid out — so
+    ///        `activeLeafID` is reseeded to `newFirstID`. The callback is
+    ///        then assigned.
+    /// When:  `surfaceDidBecomeActive(newSecondSurface)` is invoked to force
+    ///        a real transition past the reseeded active leaf.
+    /// Then:  the callback fires exactly once with `newSecondLeafID`.
+    ///        (This proves the callback is still wired AFTER an
+    ///        `updateRegistry` + `updateLayout` cycle.)
+    func testOnActiveLeafChangeFiresOnTransitionToDifferentLeafInFreshRegistry() {
+        // Arrange — start with an old tree/registry.
+        let fixture = makeFixture()
+        let oldFirstID = UUID()
+        let oldSecondID = UUID()
+        registerLeaf(oldFirstID, in: fixture.registry)
+        registerLeaf(oldSecondID, in: fixture.registry)
+        let oldRoot = SplitNode.split(SplitData(
+            direction: .horizontal,
+            ratio: 0.5,
+            first: .leaf(id: oldFirstID),
+            second: .leaf(id: oldSecondID)
+        ))
+        fixture.container.updateLayout(tree: SplitTree(root: oldRoot, focusedLeafID: oldFirstID))
+
+        // Swap to a fresh registry — this nils `activeLeafID` inside the
+        // container per `SplitContainerView.updateRegistry(_:)`.
+        let freshRegistry = SurfaceRegistry()
+        fixture.container.updateRegistry(freshRegistry)
+
+        // Register two NEW leaves in the fresh registry and lay out a new
+        // tree. `activeLeafID` is reseeded to `newFirstID` via lines 69-71.
+        let newFirstID = UUID()
+        let newSecondID = UUID()
+        registerLeaf(newFirstID, in: freshRegistry)
+        let newSecondSurface = registerLeaf(newSecondID, in: freshRegistry)
+        let newRoot = SplitNode.split(SplitData(
+            direction: .horizontal,
+            ratio: 0.5,
+            first: .leaf(id: newFirstID),
+            second: .leaf(id: newSecondID)
+        ))
+        fixture.container.updateLayout(tree: SplitTree(root: newRoot, focusedLeafID: newFirstID))
+
+        // Assign the callback AFTER the reseed so it can't fire during setup.
+        var received: [UUID] = []
+        fixture.container.onActiveLeafChange = { leafID in
+            received.append(leafID)
+        }
+
+        // Act — transition to the OTHER leaf so the guard allows through.
+        fixture.container.surfaceDidBecomeActive(newSecondSurface)
+
+        // Assert
+        XCTAssertEqual(
+            received.count,
+            1,
+            "onActiveLeafChange must fire on a real transition in the fresh registry"
+        )
+        XCTAssertEqual(
+            received.first,
+            newSecondID,
+            "onActiveLeafChange must carry the newly-active leaf's UUID after the registry swap"
+        )
+    }
 }

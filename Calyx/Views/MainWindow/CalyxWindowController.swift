@@ -309,6 +309,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         container.onRatioChange = { [weak self] leafID, delta, direction in
             self?.handleDividerDrag(leafID: leafID, delta: delta, direction: direction)
         }
+        container.onActiveLeafChange = { [weak self] leafID in
+            self?.activeTab?.splitTree.focusedLeafID = leafID
+        }
         self.splitContainerView = container
 
         let mainContent = buildMainContentView()
@@ -441,6 +444,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             let container = SplitContainerView(registry: tab.registry)
             container.onRatioChange = { [weak self] leafID, delta, direction in
                 self?.handleDividerDrag(leafID: leafID, delta: delta, direction: direction)
+            }
+            container.onActiveLeafChange = { [weak self] leafID in
+                self?.activeTab?.splitTree.focusedLeafID = leafID
             }
             self.splitContainerView = container
         }
