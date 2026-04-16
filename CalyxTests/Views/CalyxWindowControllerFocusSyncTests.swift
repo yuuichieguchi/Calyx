@@ -314,4 +314,75 @@ final class CalyxWindowControllerFocusSyncTests: XCTestCase {
             "Repeated activations on the same pane must leave focusedLeafID consistent"
         )
     }
+
+    // MARK: - 6. Production closure must request a session save (cross-restart persistence)
+
+    /// Pins that the production `onActiveLeafChange` closure (in
+    /// `CalyxWindowController.setupUI()` and `rebuildSplitContainer()`)
+    /// MUST call `self?.requestSave()` after updating `focusedLeafID`, so
+    /// that the new focus survives an app restart.
+    ///
+    /// Background:
+    ///   The earlier Issue #29 fix wired the callback to assign
+    ///   `tab.splitTree.focusedLeafID` — that covers IN-SESSION restoration
+    ///   (e.g. window deactivate/reactivate) but NOT cross-restart
+    ///   persistence. If the user clicks pane A and quits with Cmd+Q before
+    ///   any other save-triggering action fires, the on-disk session file
+    ///   still records pane B's `focusedLeafID`, and next launch refocuses
+    ///   the wrong pane. `SessionPersistenceActor.save(_:)` debounces 2s,
+    ///   so calling `requestSave()` on every focus change is safe.
+    ///
+    /// Why this is a CONTRACT-PIN test, not a strict Red:
+    ///   `CalyxWindowController` cannot be instantiated in a unit test
+    ///   (it requires a live `ghostty_app_t` and `NSWindow`). The other
+    ///   five tests in this file work around that by reconstructing the
+    ///   production closure verbatim against a `Tab`. This test follows
+    ///   the same pattern: it rebuilds the EXPECTED closure SHAPE
+    ///   (focusedLeafID write + save request) and verifies BOTH steps
+    ///   fire. The actual Red signal — confirming the production closure
+    ///   is missing the save call — comes from code review and manual
+    ///   E2E (click pane, Cmd+Q within 2s, relaunch, observe wrong pane
+    ///   focused). The implementer (swift-specialist) MUST mirror this
+    ///   pinned shape in BOTH production sites.
+    func testActiveLeafChangeClosureWritesBothFocusedLeafIDAndTriggersSave() {
+        // Arrange
+        let fixture = makeTwoPaneFixture(initialFocus: .second)
+        var saveRequestCount = 0
+
+        // Replace the fixture's default closure with one that mirrors the
+        // FULL expected production shape: write focusedLeafID, then request
+        // a session save. `saveRequestCount` is a stand-in for
+        // `self?.requestSave()` so the test can observe the save step.
+        fixture.container.onActiveLeafChange = { [weak tab = fixture.tab] leafID in
+            tab?.splitTree.focusedLeafID = leafID
+            saveRequestCount += 1 // stand-in for self?.requestSave()
+        }
+
+        // Act — user clicks pane A.
+        fixture.container.surfaceDidBecomeActive(fixture.firstSurface)
+
+        // Assert — both the focusedLeafID write AND the save request fire.
+        XCTAssertEqual(
+            fixture.tab.splitTree.focusedLeafID,
+            fixture.firstLeafID,
+            "Focus transition must update tab.splitTree.focusedLeafID (existing invariant)"
+        )
+        XCTAssertEqual(
+            saveRequestCount,
+            1,
+            "Every real focus transition must request a session save exactly once " +
+            "so the new focus survives an app restart"
+        )
+
+        // Act — re-activate the same pane (no-op per the existing
+        // `activeLeafID != id` guard in `surfaceDidBecomeActive`).
+        fixture.container.surfaceDidBecomeActive(fixture.firstSurface)
+
+        // Assert — no-op re-activation must NOT trigger a redundant save.
+        XCTAssertEqual(
+            saveRequestCount,
+            1,
+            "No-op re-activation on the already-active pane must NOT request another save"
+        )
+    }
 }

@@ -311,6 +311,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
         container.onActiveLeafChange = { [weak self] leafID in
             self?.activeTab?.splitTree.focusedLeafID = leafID
+            self?.requestSave()
         }
         self.splitContainerView = container
 
@@ -447,6 +448,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             }
             container.onActiveLeafChange = { [weak self] leafID in
                 self?.activeTab?.splitTree.focusedLeafID = leafID
+                self?.requestSave()
             }
             self.splitContainerView = container
         }
