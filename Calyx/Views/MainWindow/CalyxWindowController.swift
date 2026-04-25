@@ -966,10 +966,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // Check if the target is an AI agent (same detection as sendReviewToAgent)
         let isAgent = activeTab.map { tab -> Bool in
             guard case .terminal = tab.content else { return false }
-            let title = tab.title
-            return title.localizedCaseInsensitiveContains("claude") ||
-                   title.localizedCaseInsensitiveContains("codex") ||
-                   title.localizedCaseInsensitiveContains("opencode")
+            return Self.isAIAgentTitle(tab.title)
         } ?? false
 
         controller.sendText(text)
@@ -1945,21 +1942,32 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             label(result.claudeCode, name: "Claude Code"),
             label(result.codex, name: "Codex"),
             label(result.openCode, name: "OpenCode"),
+            label(result.hermes, name: "Hermes"),
         ].joined(separator: "\n")
     }
 
+    // MARK: - AI Agent Tab Detection
+
+    /// Returns true if a terminal tab title indicates it is running one of the
+    /// supported AI agents (Claude Code, Codex, OpenCode, Hermes). Centralizes
+    /// the title-substring check used by both compose and review send paths.
+    /// Keep the agent list in sync with `IPCConfigResult` axes.
+    private static func isAIAgentTitle(_ title: String) -> Bool {
+        title.localizedCaseInsensitiveContains("claude") ||
+        title.localizedCaseInsensitiveContains("codex") ||
+        title.localizedCaseInsensitiveContains("opencode") ||
+        title.localizedCaseInsensitiveContains("hermes")
+    }
+
     private func sendReviewToAgent(_ payload: String) -> ReviewSendResult {
-        // Find terminal tabs running an AI agent (title contains "claude", "codex", or "opencode")
+        // Find terminal tabs running a supported AI agent.
         let agentTabs = windowSession.groups.flatMap(\.tabs).filter {
             guard case .terminal = $0.content else { return false }
-            let title = $0.title
-            return title.localizedCaseInsensitiveContains("claude") ||
-                   title.localizedCaseInsensitiveContains("codex") ||
-                   title.localizedCaseInsensitiveContains("opencode")
+            return Self.isAIAgentTitle($0.title)
         }
 
         guard !agentTabs.isEmpty else {
-            showIPCAlert(title: "No AI Agent", message: "No terminal tabs running Claude Code, Codex, or OpenCode found. Start an AI agent first.")
+            showIPCAlert(title: "No AI Agent", message: "No terminal tabs running Claude Code, Codex, OpenCode, or Hermes found. Start an AI agent first.")
             return .failed
         }
 
