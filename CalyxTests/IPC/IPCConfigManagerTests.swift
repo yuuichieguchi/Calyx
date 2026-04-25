@@ -9,7 +9,8 @@ final class IPCConfigManagerTests: XCTestCase {
         let result = IPCConfigResult(
             claudeCode: .success,
             codex: .success,
-            openCode: .skipped(reason: "not installed")
+            openCode: .skipped(reason: "not installed"),
+            hermes: .skipped(reason: "not installed")
         )
         XCTAssertTrue(result.anySucceeded)
     }
@@ -18,7 +19,8 @@ final class IPCConfigManagerTests: XCTestCase {
         let result = IPCConfigResult(
             claudeCode: .success,
             codex: .skipped(reason: "not installed"),
-            openCode: .skipped(reason: "not installed")
+            openCode: .skipped(reason: "not installed"),
+            hermes: .skipped(reason: "not installed")
         )
         XCTAssertTrue(result.anySucceeded)
     }
@@ -27,7 +29,8 @@ final class IPCConfigManagerTests: XCTestCase {
         let result = IPCConfigResult(
             claudeCode: .skipped(reason: "not installed"),
             codex: .success,
-            openCode: .skipped(reason: "not installed")
+            openCode: .skipped(reason: "not installed"),
+            hermes: .skipped(reason: "not installed")
         )
         XCTAssertTrue(result.anySucceeded)
     }
@@ -36,7 +39,8 @@ final class IPCConfigManagerTests: XCTestCase {
         let result = IPCConfigResult(
             claudeCode: .skipped(reason: "not installed"),
             codex: .skipped(reason: "not installed"),
-            openCode: .skipped(reason: "not installed")
+            openCode: .skipped(reason: "not installed"),
+            hermes: .skipped(reason: "not installed")
         )
         XCTAssertFalse(result.anySucceeded)
     }
@@ -46,7 +50,8 @@ final class IPCConfigManagerTests: XCTestCase {
         let result = IPCConfigResult(
             claudeCode: .failed(error),
             codex: .skipped(reason: "not installed"),
-            openCode: .skipped(reason: "not installed")
+            openCode: .skipped(reason: "not installed"),
+            hermes: .skipped(reason: "not installed")
         )
         XCTAssertFalse(result.anySucceeded)
     }
@@ -58,7 +63,8 @@ final class IPCConfigManagerTests: XCTestCase {
         let result = IPCConfigResult(
             claudeCode: .skipped(reason: "not installed"),
             codex: .skipped(reason: "not installed"),
-            openCode: .success
+            openCode: .success,
+            hermes: .skipped(reason: "not installed")
         )
         // Then
         XCTAssertTrue(result.anySucceeded,
@@ -66,15 +72,16 @@ final class IPCConfigManagerTests: XCTestCase {
     }
 
     func test_anySucceeded_allThreeSkipped() {
-        // Given: all three skipped
+        // Given: all four skipped
         let result = IPCConfigResult(
             claudeCode: .skipped(reason: "not installed"),
             codex: .skipped(reason: "not installed"),
-            openCode: .skipped(reason: "not installed")
+            openCode: .skipped(reason: "not installed"),
+            hermes: .skipped(reason: "not installed")
         )
         // Then
         XCTAssertFalse(result.anySucceeded,
-                       "anySucceeded should return false when all three are skipped")
+                       "anySucceeded should return false when all four are skipped")
     }
 
     func test_anySucceeded_openCodeFailedOthersSkipped() {
@@ -83,7 +90,8 @@ final class IPCConfigManagerTests: XCTestCase {
         let result = IPCConfigResult(
             claudeCode: .skipped(reason: "not installed"),
             codex: .skipped(reason: "not installed"),
-            openCode: .failed(error)
+            openCode: .failed(error),
+            hermes: .skipped(reason: "not installed")
         )
         // Then
         XCTAssertFalse(result.anySucceeded,
@@ -96,11 +104,55 @@ final class IPCConfigManagerTests: XCTestCase {
         let result = IPCConfigResult(
             claudeCode: .failed(error),
             codex: .failed(error),
-            openCode: .success
+            openCode: .success,
+            hermes: .failed(error)
         )
         // Then
         XCTAssertTrue(result.anySucceeded,
                       "anySucceeded should return true when openCode succeeded despite other failures")
+    }
+
+    // MARK: - IPCConfigResult.anySucceeded (hermes axis)
+
+    func test_anySucceeded_onlyHermes() {
+        // Given: only hermes is .success, others skipped
+        let result = IPCConfigResult(
+            claudeCode: .skipped(reason: "not installed"),
+            codex: .skipped(reason: "not installed"),
+            openCode: .skipped(reason: "not installed"),
+            hermes: .success
+        )
+        // Then
+        XCTAssertTrue(result.anySucceeded,
+                      "anySucceeded should return true when only hermes succeeded")
+    }
+
+    func test_anySucceeded_hermesFailedOthersSkipped() {
+        // Given: hermes failed, others skipped
+        let error = NSError(domain: "test", code: 4)
+        let result = IPCConfigResult(
+            claudeCode: .skipped(reason: "not installed"),
+            codex: .skipped(reason: "not installed"),
+            openCode: .skipped(reason: "not installed"),
+            hermes: .failed(error)
+        )
+        // Then
+        XCTAssertFalse(result.anySucceeded,
+                       "anySucceeded should return false when hermes failed and others skipped")
+    }
+
+    func test_anySucceeded_hermesSuccessOthersFailed() {
+        // Given: hermes success, others failed
+        let error = NSError(domain: "test", code: 5)
+        let result = IPCConfigResult(
+            claudeCode: .failed(error),
+            codex: .failed(error),
+            openCode: .failed(error),
+            hermes: .success
+        )
+        // Then
+        XCTAssertTrue(result.anySucceeded,
+                      "anySucceeded should return true when hermes succeeded despite other failures")
     }
 
     // MARK: - ConfigStatus pattern matching

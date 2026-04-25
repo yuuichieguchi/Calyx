@@ -20,9 +20,9 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **Native Scrollbar** -- system overlay scrollbar for terminal scrollback
 - **Cursor Click-to-Move** -- click on a prompt line to reposition cursor (requires shell integration)
 - **Git Source Control** -- sidebar Changes view with working changes (staged/unstaged/untracked), commit graph with branch visualization, and inline diff viewer with review comments
-- **Diff Review Comments** -- click the gutter `+` button to add inline comments to diff lines, then Submit Review to send directly to a Claude Code or Codex terminal tab
+- **Diff Review Comments** -- click the gutter `+` button to add inline comments to diff lines, then Submit Review to send directly to a Claude Code, Codex, OpenCode, or Hermes terminal tab
 ([demo video](https://www.youtube.com/watch?v=_O2Lr4oFf4c))
-- **AI Agent IPC** -- MCP server for communication between AI agent instances (Claude Code, Codex CLI) across tabs and panes ([demo video](https://www.youtube.com/watch?v=Xty0ad9gGcM))
+- **AI Agent IPC** -- MCP server for communication between AI agent instances (Claude Code, Codex CLI, OpenCode, Hermes) across tabs and panes ([demo video](https://www.youtube.com/watch?v=Xty0ad9gGcM))
 - **Scriptable Browser** -- 25 CLI commands for browser automation (like cmux): snapshot, click, fill, eval, screenshot, wait, get-attribute, get-links, get-inputs, is-visible, hover, scroll. No enable step needed. `calyx` CLI bundled in the app
 - **Ghostty config compatibility** -- reads `~/.config/ghostty/config` (most keys hot-reload on save; see Settings for Calyx-managed keys)
 - **Compose Overlay** -- floating text editor over the terminal for comfortable multiline input (`Cmd+Shift+E`), useful for writing long commands or AI prompts ([demo video](https://www.youtube.com/watch?v=qhwYnk8adF4))
@@ -92,13 +92,13 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 
 ## IPC (Inter-Pane Communication)
 
-AI agent instances (Claude Code, Codex CLI) running in different Calyx tabs or panes can communicate with each other via a built-in MCP server.
+AI agent instances (Claude Code, Codex CLI, OpenCode, Hermes) running in different Calyx tabs or panes can communicate with each other via a built-in MCP server.
 
 1. Open the command palette (`Cmd+Shift+P`) and run **Enable AI Agent IPC**
-2. Start agents (Claude Code, Codex, or both) in two or more terminal panes
+2. Start agents (Claude Code, Codex, OpenCode, or Hermes) in two or more terminal panes
 3. Each instance automatically registers as a peer and can send/receive messages
 
-Config is auto-written to `~/.claude.json` and `~/.codex/config.toml` when the respective tool is installed. Restart running agent instances to pick up the new MCP server.
+Config is auto-written to `~/.claude.json`, `~/.codex/config.toml`, `~/.config/opencode/{opencode.json,AGENTS.md}`, and `~/.hermes/config.yaml` when the respective tool is installed. Restart running agent instances to pick up the new MCP server.
 
 Available MCP tools: `register_peer`, `list_peers`, `send_message`, `broadcast`, `receive_messages`, `ack_messages`, `get_peer_status`
 
