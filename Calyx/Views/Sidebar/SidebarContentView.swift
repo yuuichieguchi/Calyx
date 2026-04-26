@@ -247,6 +247,7 @@ private struct GroupSectionView: View {
                                 .font(.system(size: 10, weight: .bold, design: .rounded))
                                 .foregroundStyle(.secondary)
                         }
+                        .padding(.vertical, 13)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -284,7 +285,6 @@ private struct GroupSectionView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 14)
-                .padding(.vertical, 10)
                 .modifier(GroupHeaderBackgroundModifier(
                     isActiveGroup: isActiveGroup,
                     reduceTransparency: reduceTransparency,
