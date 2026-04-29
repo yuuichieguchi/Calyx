@@ -120,10 +120,7 @@ private struct SplitDividerGlassStrip: View {
 
     var body: some View {
         Color.clear
-            .glassEffect(
-                .clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))),
-                in: .rect
-            )
+            .stableGlassTint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)))
             .opacity(0.5)
             .allowsHitTesting(false)
     }

@@ -27,8 +27,9 @@ struct QuickTerminalContentView: View {
             )
             .padding(.top, -1)
             .padding(.leading, 8)
-            .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+            .stableGlassTint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)))
         }
+        .environment(\.controlActiveState, .key)
         .background {
             if !reduceTransparency {
                 Rectangle()

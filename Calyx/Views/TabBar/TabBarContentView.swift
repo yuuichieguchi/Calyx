@@ -326,22 +326,11 @@ private struct TabBarBackgroundModifier: ViewModifier {
             content.background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea(.all, edges: .top))
         } else {
             content
-                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                .stableGlassTint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)))
                 .overlay(alignment: .bottom) {
                     Rectangle()
                         .fill(GlassTheme.specularStroke.opacity(0.28))
                         .frame(height: 1)
-                }
-                .overlay(alignment: .top) {
-                    Rectangle()
-                        .fill(
-                            LinearGradient(
-                                colors: [Color.white.opacity(0.20), Color.clear],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                        .frame(height: 18)
                 }
                 .environment(\.colorScheme, chromeScheme)
                 .foregroundStyle(themePreset == "ghostty"

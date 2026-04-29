@@ -69,7 +69,6 @@ struct TabChromeModifier: ViewModifier {
     let isActive: Bool
     let cornerRadius: CGFloat
     let reduceTransparency: Bool
-    @Environment(\.controlActiveState) private var controlActiveState
 
     func body(content: Content) -> some View {
         if reduceTransparency {
@@ -84,10 +83,47 @@ struct TabChromeModifier: ViewModifier {
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                             .fill(Color.black.opacity(0.2))
                     )
-                    .opacity(controlActiveState == .key ? 1.0 : 0.5)
             } else {
                 content
-                    .opacity(controlActiveState == .key ? 1.0 : 0.5)
+            }
+        }
+    }
+}
+
+extension View {
+    func stableGlassTint(_ tint: Color, cornerRadius: CGFloat = 0) -> some View {
+        modifier(StableGlassTintModifier(tint: tint, cornerRadius: cornerRadius))
+    }
+
+    func stableGlassPanel(cornerRadius: CGFloat = 0) -> some View {
+        modifier(StableGlassTintModifier(tint: Color.black.opacity(0.72), cornerRadius: cornerRadius))
+    }
+}
+
+private struct StableGlassTintModifier: ViewModifier {
+    let tint: Color
+    let cornerRadius: CGFloat
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if cornerRadius > 0 {
+            content.background {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(tint)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .fill(Color.black.opacity(0.10))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+            }
+        } else {
+            content.background {
+                Rectangle()
+                    .fill(tint)
+                    .overlay(Color.black.opacity(0.10))
             }
         }
     }

@@ -55,7 +55,7 @@ private struct BrowserToolbarView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-        .glassEffect(.regular, in: .rect(cornerRadius: 0))
+        .stableGlassPanel()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.Browser.toolbar)
     }

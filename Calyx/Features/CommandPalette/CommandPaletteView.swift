@@ -2,7 +2,7 @@
 // Calyx
 //
 // Overlay panel at top of window for command palette UI.
-// Glass styling is applied on the SwiftUI side via .glassEffect(.regular).
+// Glass styling is applied by the SwiftUI host.
 
 import AppKit
 import os

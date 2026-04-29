@@ -171,7 +171,7 @@ struct MainContentView: View {
                                     }
                                 }
                             }
-                            .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                            .stableGlassTint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)))
                             .accessibilityIdentifier(AccessibilityID.Diff.container)
                         } else if let browserController = activeBrowserController {
                             BrowserContainerView(controller: browserController)
@@ -183,7 +183,7 @@ struct MainContentView: View {
                                     glassOpacity: glassOpacity
                                 )
                                 .padding(.top, -1)
-                                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                                .stableGlassTint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)))
                                 .onDrop(of: [.fileURL], delegate: TerminalDropDelegate(splitContainerView: splitContainerView))
                                 .layoutPriority(1)
                                 .overlay(alignment: .topTrailing) {
@@ -205,7 +205,7 @@ struct MainContentView: View {
                                         )
                                         .frame(height: windowSession.composeOverlayHeight)
                                     }
-                                    .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                                    .stableGlassTint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)))
                                 }
                             }
                         }
@@ -221,7 +221,7 @@ struct MainContentView: View {
                                 onDismiss: onDismissCommandPalette
                             )
                             .frame(width: 500, height: 340)
-                            .glassEffect(.regular, in: .rect(cornerRadius: 12))
+                            .stableGlassPanel(cornerRadius: 12)
 
                             Spacer()
                         }
@@ -231,9 +231,24 @@ struct MainContentView: View {
             }
             .overlay(alignment: .top) {
                 GeometryReader { geo in
-                    Color.white.opacity(0.001)
-                        .frame(height: geo.safeAreaInsets.top + 1)
-                        .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                    let titlebarHeight = max(geo.safeAreaInsets.top, 28)
+                    Rectangle()
+                        .fill(
+                            reduceTransparency
+                                ? Color(nsColor: .windowBackgroundColor)
+                                : Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))
+                        )
+                        .overlay {
+                            if !reduceTransparency {
+                                Color.black.opacity(0.10)
+                            }
+                        }
+                        .overlay(alignment: .bottom) {
+                            Rectangle()
+                                .fill(GlassTheme.specularStroke.opacity(0.28))
+                                .frame(height: 1)
+                        }
+                        .frame(height: titlebarHeight + 1)
                         .offset(y: -geo.safeAreaInsets.top)
                 }
                 .allowsHitTesting(false)
@@ -264,6 +279,7 @@ struct MainContentView: View {
                 }
             }
         }
+        .environment(\.controlActiveState, .key)
     }
 }
 

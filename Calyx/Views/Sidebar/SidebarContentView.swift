@@ -111,7 +111,6 @@ struct SidebarContentView: View {
 
 private struct GlassButtonModifier: ViewModifier {
     let reduceTransparency: Bool
-    @Environment(\.controlActiveState) private var controlActiveState
 
     func body(content: Content) -> some View {
         if reduceTransparency {
@@ -123,7 +122,6 @@ private struct GlassButtonModifier: ViewModifier {
                     RoundedRectangle(cornerRadius: 8, style: .continuous)
                         .fill(Color.black.opacity(0.2))
                 )
-                .opacity(controlActiveState == .key ? 1.0 : 0.5)
         }
     }
 }
@@ -153,20 +151,11 @@ private struct SidebarBackgroundModifier: ViewModifier {
             content.background(Color(nsColor: .controlBackgroundColor).ignoresSafeArea(.all, edges: .top))
         } else {
             content
-                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
+                .stableGlassTint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)))
                 .overlay(alignment: .trailing) {
                     Rectangle()
                         .fill(GlassTheme.specularStroke.opacity(0.30))
                         .frame(width: 1)
-                }
-                .overlay(alignment: .topLeading) {
-                    LinearGradient(
-                        colors: [Color.white.opacity(0.20), Color.clear],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .frame(height: 32)
-                    .allowsHitTesting(false)
                 }
                 .environment(\.colorScheme, chromeScheme)
                 .foregroundStyle(themePreset == "ghostty"
@@ -410,23 +399,7 @@ private struct GroupHeaderBackgroundModifier: ViewModifier {
                 )
         } else if isActiveGroup {
             content
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    groupColor.color.opacity(0.16),
-                                    Color.gray.opacity(0.10),
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                )
-                .glassEffect(
-                    .clear.tint(groupColor.color.opacity(0.12)).interactive(),
-                    in: .rect(cornerRadius: 12)
-                )
+                .stableGlassTint(groupColor.color.opacity(0.12), cornerRadius: 12)
                 .overlay {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
                         .stroke(Color.white.opacity(0.22), lineWidth: 1)
