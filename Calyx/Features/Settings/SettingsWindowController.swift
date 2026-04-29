@@ -17,12 +17,13 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let presetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let colorWell = NSColorWell()
     private let hexField = NSTextField()
+    private let closeConfirmationSwitch = NSSwitch()
     private var lastLoadedPreset: String = "original"
     private var lastLoadedCustomHex: String = ThemeColorPreset.defaultCustomHex
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 550),
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 620),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -166,6 +167,22 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         smoothScrollSwitch.target = self
         smoothScrollSwitch.action = #selector(smoothScrollDidChange(_:))
         root.addArrangedSubview(row(label: "Smooth Scrolling", control: smoothScrollSwitch))
+
+        // --- Confirmations Section ---
+        let confirmationDivider = NSBox()
+        confirmationDivider.boxType = .separator
+        confirmationDivider.translatesAutoresizingMaskIntoConstraints = false
+        confirmationDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        root.addArrangedSubview(confirmationDivider)
+
+        let confirmationTitle = NSTextField(labelWithString: "Confirmations")
+        confirmationTitle.font = .systemFont(ofSize: 20, weight: .semibold)
+        root.addArrangedSubview(confirmationTitle)
+
+        closeConfirmationSwitch.state = CloseConfirmationSettings.isEnabled ? .on : .off
+        closeConfirmationSwitch.target = self
+        closeConfirmationSwitch.action = #selector(closeConfirmationDidChange(_:))
+        root.addArrangedSubview(row(label: "Ask before closing tabs and windows", control: closeConfirmationSwitch))
 
         // Divider before config info section
         let configDivider = NSBox()
@@ -311,6 +328,10 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    @objc private func closeConfirmationDidChange(_ sender: NSSwitch) {
+        CloseConfirmationSettings.isEnabled = sender.state == .on
+    }
+
     @objc private func presetDidChange(_ sender: Any?) {
         let index = presetPopup.indexOfSelectedItem
         let presets = ThemeColorPreset.allCases.filter { $0 != .custom }
@@ -395,6 +416,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let opacity = UserDefaults.standard.object(forKey: "terminalGlassOpacity") as? Double ?? 0.7
         opacitySlider.doubleValue = max(0.0, min(1.0, opacity))
         updateOpacityLabel()
+        closeConfirmationSwitch.state = CloseConfirmationSettings.isEnabled ? .on : .off
 
         // Load theme color state
         let preset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"

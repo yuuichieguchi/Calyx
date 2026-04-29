@@ -31,6 +31,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
     private var composeOverlayTargetSurfaceID: UUID?
+    private var skipNextWindowCloseConfirmation = false
 
     // MARK: - Computed Properties
 
@@ -618,6 +619,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }) else { return }
         guard let tab = group.tabs.first(where: { $0.id == tabID }) else { return }
 
+        guard confirmCloseTabIfNeeded(tab) else { return }
+
         closingTabIDs.insert(tabID)
 
         // Quit confirmation: if this is the last tab in the last group, closing it
@@ -626,7 +629,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             if let appDelegate = NSApp.delegate as? AppDelegate,
                appDelegate.closingWouldTerminate(self),
                !appDelegate.isTerminationConfirmed {
-                if !appDelegate.confirmQuitIfNeeded() {
+                if !appDelegate.confirmQuitIfNeeded(includeCloseConfirmation: false) {
                     closingTabIDs.remove(tabID)
                     return
                 }
@@ -671,6 +674,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                appDelegate.closingWouldTerminate(self) {
                 appDelegate.isTerminationConfirmed = true
             }
+            skipNextWindowCloseConfirmation = true
             window?.close()
         }
 
@@ -752,6 +756,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     private func closeActiveGroup() {
         guard let group = windowSession.activeGroup else { return }
+        guard confirmCloseGroupIfNeeded(group) else { return }
 
         // Mark all tabs as closing to prevent notification handler from double-deleting
         let tabIDs = group.tabs.map { $0.id }
@@ -765,7 +770,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             if let appDelegate = NSApp.delegate as? AppDelegate,
                appDelegate.closingWouldTerminate(self),
                !appDelegate.isTerminationConfirmed {
-                if !appDelegate.confirmQuitIfNeeded() {
+                if !appDelegate.confirmQuitIfNeeded(includeCloseConfirmation: false) {
                     for tabID in tabIDs {
                         closingTabIDs.remove(tabID)
                     }
@@ -811,6 +816,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                appDelegate.closingWouldTerminate(self) {
                 appDelegate.isTerminationConfirmed = true
             }
+            skipNextWindowCloseConfirmation = true
             window?.close()
             requestSave()
         }
@@ -818,6 +824,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     private func closeAllTabsInGroup(id groupID: UUID) {
         guard let group = windowSession.groups.first(where: { $0.id == groupID }) else { return }
+        guard confirmCloseGroupIfNeeded(group) else { return }
 
         let wasActiveGroup = (groupID == windowSession.activeGroupID)
         let tabIDs = group.tabs.map { $0.id }
@@ -831,7 +838,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             if let appDelegate = NSApp.delegate as? AppDelegate,
                appDelegate.closingWouldTerminate(self),
                !appDelegate.isTerminationConfirmed {
-                if !appDelegate.confirmQuitIfNeeded() {
+                if !appDelegate.confirmQuitIfNeeded(includeCloseConfirmation: false) {
                     for tabID in tabIDs {
                         closingTabIDs.remove(tabID)
                     }
@@ -876,6 +883,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                appDelegate.closingWouldTerminate(self) {
                 appDelegate.isTerminationConfirmed = true
             }
+            skipNextWindowCloseConfirmation = true
             window?.close()
             requestSave()
         }
@@ -1535,6 +1543,54 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         return nil
     }
 
+    private func confirmCloseTabIfNeeded(_ tab: Tab) -> Bool {
+        guard CloseConfirmationSettings.isEnabled else { return true }
+
+        let title = displayTitle(for: tab)
+        let alert = NSAlert()
+        alert.messageText = "Close Tab?"
+        alert.informativeText = "Close \"\(title)\"?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Close Tab")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func confirmCloseGroupIfNeeded(_ group: TabGroup) -> Bool {
+        guard CloseConfirmationSettings.isEnabled else { return true }
+
+        let tabCount = group.tabs.count
+        let alert = NSAlert()
+        alert.messageText = tabCount == 1 ? "Close Group?" : "Close Group and Tabs?"
+        alert.informativeText = tabCount == 1
+            ? "Close \"\(group.name)\"?"
+            : "Close \"\(group.name)\" and its \(tabCount) tabs?"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: tabCount == 1 ? "Close Group" : "Close Group and Tabs")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func confirmCloseWindowIfNeeded() -> Bool {
+        guard CloseConfirmationSettings.isEnabled else { return true }
+
+        let tabCount = windowSession.groups.reduce(0) { $0 + $1.tabs.count }
+        let alert = NSAlert()
+        alert.messageText = "Close Window?"
+        alert.informativeText = tabCount == 1
+            ? "This will close 1 tab in this window."
+            : "This will close \(tabCount) tabs in this window."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Close Window")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private func displayTitle(for tab: Tab) -> String {
+        let title = (tab.titleOverride ?? tab.title).trimmingCharacters(in: .whitespacesAndNewlines)
+        return title.isEmpty ? "Untitled" : title
+    }
+
     private var focusedController: GhosttySurfaceController? {
         guard let tab = activeTab,
               let focusedID = tab.splitTree.focusedLeafID else { return nil }
@@ -1571,6 +1627,16 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
+        if isClosingForShutdown {
+            return true
+        }
+
+        if skipNextWindowCloseConfirmation {
+            skipNextWindowCloseConfirmation = false
+        } else if !confirmCloseWindowIfNeeded() {
+            return false
+        }
+
         guard let appDelegate = NSApp.delegate as? AppDelegate,
               appDelegate.closingWouldTerminate(self) else {
             return true
@@ -1583,7 +1649,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
 
         // Last-window close via X button: run confirmations
-        if !appDelegate.confirmQuitIfNeeded() {
+        if !appDelegate.confirmQuitIfNeeded(includeCloseConfirmation: false) {
             return false
         }
 

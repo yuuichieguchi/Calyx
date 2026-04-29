@@ -87,7 +87,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Already confirmed (from windowShouldClose on last-window close path)
         if isTerminationConfirmed {
-            isTerminationConfirmed = false
             markAllControllersClosingForShutdown()
             return .terminateNow
         }
@@ -233,6 +232,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !windowControllers.isEmpty {
             requestSave()
         } else if quickTerminalController == nil {
+            // The last managed window has already passed windowShouldClose.
+            // Avoid a second app-level confirmation after the window is gone.
+            isTerminationConfirmed = true
             NSApp.terminate(nil)
         }
     }
@@ -242,10 +244,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Returns true if the app should proceed with quit, false if user cancelled.
-    func confirmQuitIfNeeded() -> Bool {
+    func confirmQuitIfNeeded(includeCloseConfirmation: Bool = true) -> Bool {
+        let needsProcessConfirmation: Bool = {
+            guard let app = GhosttyAppController.shared.app else { return false }
+            return ghostty_app_needs_confirm_quit(app)
+        }()
+
+        if includeCloseConfirmation && CloseConfirmationSettings.isEnabled && !needsProcessConfirmation {
+            let alert = NSAlert()
+            alert.messageText = "Quit Calyx?"
+            alert.informativeText = "This will close all Calyx windows and tabs."
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Quit")
+            alert.addButton(withTitle: "Cancel")
+
+            if alert.runModal() == .alertSecondButtonReturn {
+                return false
+            }
+        }
+
         // 1. Check for running processes
-        if let app = GhosttyAppController.shared.app,
-           ghostty_app_needs_confirm_quit(app) {
+        if needsProcessConfirmation {
             let alert = NSAlert()
             alert.messageText = "Quit Calyx?"
             alert.informativeText = "A process is still running. Do you want to quit?"
