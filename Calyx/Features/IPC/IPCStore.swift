@@ -51,12 +51,46 @@ actor IPCStore {
 
     /// Peer TTL: 10 minutes
     private let peerTTL: TimeInterval = 600
-    /// Message TTL: 5 minutes
-    private let messageTTL: TimeInterval = 300
     /// Max messages per peer inbox
     private let maxMessagesPerPeer: Int = 100
     /// Max content size per message: 64KB
     private let maxContentSize: Int = 65_536
+
+    // MARK: - Liveness
+
+    /// A peer is alive if its `lastSeen` is within `peerTTL` OR it is pinned by
+    /// being the sender or recipient of any in-flight (un-acked) message.
+    private func isAlive(_ peer: Peer) -> Bool {
+        let now = Date()
+        if now.timeIntervalSince(peer.lastSeen) <= peerTTL { return true }
+        // Pin: this peer is sender or recipient of any in-flight message
+        for (_, msgs) in inbox {
+            if msgs.contains(where: { $0.from == peer.id || $0.to == peer.id }) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Returns the peer if alive; otherwise tears down peer and inbox and
+    /// returns nil. Every public API gates on this to prevent revival of
+    /// expired peers.
+    private func aliveOrPurge(_ id: UUID) -> Peer? {
+        guard let peer = peers[id] else { return nil }
+        if isAlive(peer) { return peer }
+        peers.removeValue(forKey: id)
+        inbox.removeValue(forKey: id)
+        return nil
+    }
+
+    /// Appends `message` to `recipientID`'s inbox, dropping the oldest entries
+    /// when the inbox would exceed `maxMessagesPerPeer`.
+    private func appendCapped(_ message: Message, to recipientID: UUID) {
+        inbox[recipientID, default: []].append(message)
+        if let count = inbox[recipientID]?.count, count > maxMessagesPerPeer {
+            inbox[recipientID]?.removeFirst(count - maxMessagesPerPeer)
+        }
+    }
 
     // MARK: - Peer Management
 
@@ -82,120 +116,130 @@ actor IPCStore {
         inbox.removeValue(forKey: id)
     }
 
-    /// Returns all peers whose `lastSeen` is within `peerTTL`.
-    /// Lazily purges expired peers.
+    /// Returns all peers that are alive. A peer is alive when its `lastSeen`
+    /// is within `peerTTL` OR it is pinned by an in-flight message (sender or
+    /// recipient). Lazily purges any peer that is no longer alive.
     func listPeers() -> [Peer] {
-        let now = Date()
-        let expiredIDs = peers.filter { now.timeIntervalSince($0.value.lastSeen) > peerTTL }.map(\.key)
-        for id in expiredIDs {
-            peers.removeValue(forKey: id)
-            inbox.removeValue(forKey: id)
+        let allIDs = Array(peers.keys)
+        var result: [Peer] = []
+        result.reserveCapacity(allIDs.count)
+        for id in allIDs {
+            if let peer = aliveOrPurge(id) {
+                result.append(peer)
+            }
         }
-        return Array(peers.values)
+        return result
     }
 
-    /// Returns the peer if it exists and has not TTL-expired.
+    /// Returns the peer if alive; otherwise nil. Tears down peer and inbox
+    /// when expired (consistent with listPeers' lazy purge).
     func peerStatus(id: UUID) -> Peer? {
-        guard let peer = peers[id] else { return nil }
-        let now = Date()
-        if now.timeIntervalSince(peer.lastSeen) > peerTTL {
-            return nil
-        }
-        return peer
+        return aliveOrPurge(id)
     }
 
     // MARK: - Messaging
 
     /// Sends a message from one peer to another.
-    /// Validates that the sender is registered and the recipient exists.
-    /// Updates the sender's `lastSeen`. Caps recipient inbox at `maxMessagesPerPeer`.
+    /// Both sender and recipient must be alive (within `peerTTL` or pinned by
+    /// an in-flight message). Bumps BOTH sender's and recipient's `lastSeen`
+    /// after successful delivery. Caps recipient inbox at `maxMessagesPerPeer`.
     func sendMessage(from senderID: UUID, to recipientID: UUID, content: String) throws -> Message {
         guard content.utf8.count <= maxContentSize else {
             throw IPCError.contentTooLarge
         }
-        guard peers[senderID] != nil else {
+        guard aliveOrPurge(senderID) != nil else {
             throw IPCError.unregisteredPeer
         }
-        guard peers[recipientID] != nil else {
+        guard aliveOrPurge(recipientID) != nil else {
             throw IPCError.peerNotFound(recipientID)
         }
 
+        let now = Date()
         let message = Message(
             id: UUID(),
             from: senderID,
             to: recipientID,
             content: content,
-            timestamp: Date()
+            timestamp: now
         )
+        appendCapped(message, to: recipientID)
 
-        inbox[recipientID, default: []].append(message)
-
-        // Cap inbox at maxMessagesPerPeer, dropping oldest
-        if let count = inbox[recipientID]?.count, count > maxMessagesPerPeer {
-            inbox[recipientID]?.removeFirst(count - maxMessagesPerPeer)
-        }
-
-        // Update sender's lastSeen
-        peers[senderID]?.lastSeen = Date()
+        // Bidirectional bump: both sender and recipient remain alive.
+        peers[senderID]?.lastSeen = now
+        peers[recipientID]?.lastSeen = now
 
         return message
     }
 
-    /// Broadcasts a message from one peer to all other registered peers.
-    /// Validates that the sender is registered.
+    /// Broadcasts a message from one peer to all other alive peers.
+    /// Sender must be alive. Recipients are filtered by liveness (expired
+    /// peers are purged in the process). Bumps `lastSeen` on the sender and
+    /// every successful recipient.
     /// Returns the array of created messages.
     func broadcast(from senderID: UUID, content: String) throws -> [Message] {
         guard content.utf8.count <= maxContentSize else {
             throw IPCError.contentTooLarge
         }
-        guard peers[senderID] != nil else {
+        guard aliveOrPurge(senderID) != nil else {
             throw IPCError.unregisteredPeer
         }
 
+        let now = Date()
+        let candidateIDs = Array(peers.keys).filter { $0 != senderID }
         var messages: [Message] = []
-        for recipientID in peers.keys where recipientID != senderID {
+
+        for recipientID in candidateIDs {
+            guard aliveOrPurge(recipientID) != nil else { continue }
+
             let message = Message(
                 id: UUID(),
                 from: senderID,
                 to: recipientID,
                 content: content,
-                timestamp: Date()
+                timestamp: now
             )
-            inbox[recipientID, default: []].append(message)
-
-            if let count = inbox[recipientID]?.count, count > maxMessagesPerPeer {
-                inbox[recipientID]?.removeFirst(count - maxMessagesPerPeer)
-            }
-
+            appendCapped(message, to: recipientID)
+            // Bidirectional bump: each alive recipient.
+            peers[recipientID]?.lastSeen = now
             messages.append(message)
         }
 
-        // Update sender's lastSeen
-        peers[senderID]?.lastSeen = Date()
+        peers[senderID]?.lastSeen = now
+        return messages
+    }
+
+    /// Returns all messages currently in the peer's inbox. Message retention is
+    /// governed solely by recipient peer liveness (no time-based drop). Bumps
+    /// the recipient's `lastSeen` and the `lastSeen` of every distinct sender
+    /// of returned messages. If the peer is not alive, returns [] and purges.
+    func receiveMessages(for peerID: UUID) -> [Message] {
+        guard aliveOrPurge(peerID) != nil else { return [] }
+
+        let now = Date()
+        let messages = inbox[peerID] ?? []
+        peers[peerID]?.lastSeen = now
+
+        // Bump every distinct sender (no-op if a sender has since been purged).
+        var seenSenders: Set<UUID> = []
+        for msg in messages {
+            if seenSenders.insert(msg.from).inserted {
+                peers[msg.from]?.lastSeen = now
+            }
+        }
 
         return messages
     }
 
-    /// Returns all non-expired messages in a peer's inbox.
-    /// Purges expired messages. Updates peer's `lastSeen`.
-    func receiveMessages(for peerID: UUID) -> [Message] {
-        let now = Date()
-
-        // Filter out expired messages
-        inbox[peerID] = inbox[peerID]?.filter { now.timeIntervalSince($0.timestamp) <= messageTTL }
-
-        // Update peer's lastSeen
-        if peers[peerID] != nil {
-            peers[peerID]?.lastSeen = now
-        }
-
-        return inbox[peerID] ?? []
-    }
-
-    /// Removes messages with the given IDs from a peer's inbox.
+    /// Removes messages with the given IDs from a peer's inbox. Acks are an
+    /// explicit liveness signal: bumps the peer's `lastSeen`. If the peer is
+    /// not alive, this is a no-op and the peer is purged.
     func ackMessages(ids: [UUID], for peerID: UUID) {
+        guard aliveOrPurge(peerID) != nil else { return }
+
         let idSet = Set(ids)
         inbox[peerID]?.removeAll { idSet.contains($0.id) }
+
+        peers[peerID]?.lastSeen = Date()
     }
 
     // MARK: - Cleanup

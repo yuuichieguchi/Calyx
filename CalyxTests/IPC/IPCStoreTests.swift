@@ -316,6 +316,8 @@ final class IPCStoreTests: XCTestCase {
         let freshPeer = await store.registerPeer(name: "fresh", role: "terminal")
         let stalePeer = await store.registerPeer(name: "stale", role: "terminal")
 
+        // Note: stale peer has no in-flight message → unread-message pin rule does
+        // not apply. Pure lastSeen TTL expiration is the only relevant signal here.
         // Artificially set stalePeer's lastSeen to 11 minutes ago
         let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
         await store._testSetPeerLastSeen(peerId: stalePeer.id, date: elevenMinutesAgo)
@@ -330,22 +332,25 @@ final class IPCStoreTests: XCTestCase {
                        "The fresh peer should remain")
     }
 
-    // ==================== 12. Message TTL ====================
+    // ==================== 12. Old Timestamp Message Still Returned (rewrite of message TTL test) ====================
 
-    func test_messageTTL_expiresOldMessages() async throws {
+    func test_oldTimestampMessage_isStillReturned_whenRecipientAlive() async throws {
+        // After Change 3, message retention is governed by recipient peer
+        // liveness, not by individual message timestamps. A 6-minute-old message
+        // must still be delivered as long as the recipient peer is alive.
         // Arrange
         let store = makeStore()
         let peerA = await store.registerPeer(name: "A", role: "terminal")
         let peerB = await store.registerPeer(name: "B", role: "terminal")
 
         let oldMsg = try await store.sendMessage(
-            from: peerA.id, to: peerB.id, content: "expired"
+            from: peerA.id, to: peerB.id, content: "still here"
         )
         let freshMsg = try await store.sendMessage(
             from: peerA.id, to: peerB.id, content: "fresh"
         )
 
-        // Artificially set oldMsg's timestamp to 6 minutes ago
+        // Artificially age oldMsg's timestamp to 6 minutes ago
         let sixMinutesAgo = Date().addingTimeInterval(-6 * 60)
         await store._testSetMessageTimestamp(
             messageId: oldMsg.id, peerId: peerB.id, date: sixMinutesAgo
@@ -354,11 +359,14 @@ final class IPCStoreTests: XCTestCase {
         // Act
         let inbox = await store.receiveMessages(for: peerB.id)
 
-        // Assert
-        XCTAssertEqual(inbox.count, 1,
-                       "Only non-expired messages should be returned")
-        XCTAssertEqual(inbox.first?.id, freshMsg.id,
-                       "The fresh message should remain")
+        // Assert — both messages must be returned (no time-based drop)
+        XCTAssertEqual(inbox.count, 2,
+                       "Both messages should be returned regardless of message timestamp; recipient peer liveness is the only retention rule")
+        let messageIDs = Set(inbox.map(\.id))
+        XCTAssertTrue(messageIDs.contains(oldMsg.id),
+                      "Old-timestamp message should still be delivered")
+        XCTAssertTrue(messageIDs.contains(freshMsg.id),
+                      "Fresh message should still be delivered")
     }
 
     // ==================== 13. Cleanup ====================
@@ -475,5 +483,523 @@ final class IPCStoreTests: XCTestCase {
         XCTAssertNotNil(updatedPeer)
         XCTAssertTrue(updatedPeer!.lastSeen > oneSecondAgo,
                       "lastSeen should be updated after receiving messages")
+    }
+
+    // ============================================================
+    // MARK: - Issue #31: New TTL auto-extension contract
+    // ============================================================
+
+    // ==================== Change 1: Bidirectional Bump ====================
+
+    // Test 1
+    func test_sendMessage_bumpsRecipientLastSeen() async throws {
+        // Contract: sendMessage(from: A, to: B) must bump BOTH A and B's lastSeen.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        let oneSecondAgo = Date().addingTimeInterval(-1)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: oneSecondAgo)
+
+        // Act — A sends to B; under the new contract, B's lastSeen must bump too.
+        _ = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "ping"
+        )
+
+        // Assert
+        let updatedB = await store.peerStatus(id: peerB.id)
+        XCTAssertNotNil(updatedB, "Recipient should still exist")
+        XCTAssertTrue(updatedB!.lastSeen > oneSecondAgo,
+                      "Recipient's lastSeen should bump on sendMessage")
+    }
+
+    // Test 2
+    func test_broadcast_bumpsAllRecipientsLastSeen() async throws {
+        // Contract: broadcast(from: A) must bump A and ALL alive recipients' lastSeen.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        let peerC = await store.registerPeer(name: "C", role: "plugin")
+
+        let oneSecondAgo = Date().addingTimeInterval(-1)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: oneSecondAgo)
+        await store._testSetPeerLastSeen(peerId: peerC.id, date: oneSecondAgo)
+
+        // Act
+        _ = try await store.broadcast(from: peerA.id, content: "announcement")
+
+        // Assert
+        let updatedB = await store.peerStatus(id: peerB.id)
+        let updatedC = await store.peerStatus(id: peerC.id)
+        XCTAssertNotNil(updatedB)
+        XCTAssertNotNil(updatedC)
+        XCTAssertTrue(updatedB!.lastSeen > oneSecondAgo,
+                      "Recipient B's lastSeen should bump on broadcast")
+        XCTAssertTrue(updatedC!.lastSeen > oneSecondAgo,
+                      "Recipient C's lastSeen should bump on broadcast")
+    }
+
+    // Test 3
+    func test_receiveMessages_bumpsAllSendersLastSeen() async throws {
+        // Contract: receiveMessages(for: B) bumps B and ALL distinct senders'
+        // lastSeen for messages returned in this call.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        let peerC = await store.registerPeer(name: "C", role: "plugin")
+
+        // A and C both send to B
+        _ = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "from A"
+        )
+        _ = try await store.sendMessage(
+            from: peerC.id, to: peerB.id, content: "from C"
+        )
+
+        // Now age both A and C's lastSeen to 1 second ago
+        let oneSecondAgo = Date().addingTimeInterval(-1)
+        await store._testSetPeerLastSeen(peerId: peerA.id, date: oneSecondAgo)
+        await store._testSetPeerLastSeen(peerId: peerC.id, date: oneSecondAgo)
+
+        // Act — B reads its inbox
+        _ = await store.receiveMessages(for: peerB.id)
+
+        // Assert — both senders should be bumped
+        let updatedA = await store.peerStatus(id: peerA.id)
+        let updatedC = await store.peerStatus(id: peerC.id)
+        XCTAssertNotNil(updatedA)
+        XCTAssertNotNil(updatedC)
+        XCTAssertTrue(updatedA!.lastSeen > oneSecondAgo,
+                      "Sender A's lastSeen should bump when B receives A's message")
+        XCTAssertTrue(updatedC!.lastSeen > oneSecondAgo,
+                      "Sender C's lastSeen should bump when B receives C's message")
+    }
+
+    // Test 4
+    func test_ackMessages_bumpsRecipientLastSeen() async throws {
+        // Contract: ackMessages(for: B) bumps B's lastSeen because ack is an
+        // explicit liveness signal.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        let msg = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "ack me"
+        )
+
+        let oneSecondAgo = Date().addingTimeInterval(-1)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: oneSecondAgo)
+
+        // Act
+        await store.ackMessages(ids: [msg.id], for: peerB.id)
+
+        // Assert
+        let updatedB = await store.peerStatus(id: peerB.id)
+        XCTAssertNotNil(updatedB)
+        XCTAssertTrue(updatedB!.lastSeen > oneSecondAgo,
+                      "Recipient's lastSeen should bump on ackMessages")
+    }
+
+    // ==================== Change 2: Unread Message Pinning ====================
+
+    // Test 5
+    func test_unreadMessage_pinsRecipientAlive_inListPeers() async throws {
+        // Contract: An in-flight (unread) message pins its recipient alive even
+        // when the recipient's lastSeen exceeds peerTTL.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        // A → B (creates unread message in B's inbox)
+        _ = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "you have mail"
+        )
+
+        // Age only B's lastSeen to 11 min ago (do NOT touch A; this test asserts
+        // about B's pinning specifically).
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
+
+        // Act
+        let peers = await store.listPeers()
+
+        // Assert
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertTrue(peerIDs.contains(peerB.id),
+                      "Recipient B must be pinned alive while it has an unread message")
+    }
+
+    // Test 6
+    func test_unreadMessage_pinsSenderAlive_inListPeers() async throws {
+        // Contract: An in-flight message also pins its sender alive (so the
+        // sender is still around to receive a reply).
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        _ = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "hi"
+        )
+
+        // Age A's lastSeen to 11 min ago
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerA.id, date: elevenMinutesAgo)
+
+        // Act
+        let peers = await store.listPeers()
+
+        // Assert
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertTrue(peerIDs.contains(peerA.id),
+                      "Sender A must be pinned alive while its message is unread")
+    }
+
+    // Test 7
+    func test_unreadMessage_pinsRecipientAlive_inPeerStatus() async throws {
+        // Contract: Pin must also be visible via peerStatus, not only listPeers.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        _ = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "hi"
+        )
+
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
+
+        // Act
+        let status = await store.peerStatus(id: peerB.id)
+
+        // Assert
+        XCTAssertNotNil(status,
+                        "peerStatus must return non-nil while the peer is pinned by an unread message")
+        XCTAssertEqual(status?.id, peerB.id)
+    }
+
+    // Test 8
+    func test_pinLifts_afterAck_recipientThenPurged() async throws {
+        // Contract: Once the unread message is ack'd, the pin is lifted.
+        // After the pin is lifted, the recipient's stale lastSeen makes it
+        // purgeable on the next listPeers call.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        let msg = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "hi"
+        )
+
+        // B acks the message → pin lifts
+        await store.ackMessages(ids: [msg.id], for: peerB.id)
+
+        // Now age B's lastSeen to 11 min ago (note: ack also bumps B, so we
+        // override that here)
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
+
+        // Act
+        let peers = await store.listPeers()
+
+        // Assert
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertFalse(peerIDs.contains(peerB.id),
+                       "Recipient B should be purged after pin lifts and TTL elapses")
+    }
+
+    // Test 9
+    func test_pinLifts_afterAck_senderThenPurged() async throws {
+        // Contract (mirror of test 8): once the unread message is gone, the
+        // sender is no longer pinned and its stale lastSeen makes it purgeable.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        let msg = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "hi"
+        )
+
+        // B acks → no in-flight messages remain
+        await store.ackMessages(ids: [msg.id], for: peerB.id)
+
+        // Age A's lastSeen to 11 min ago
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerA.id, date: elevenMinutesAgo)
+
+        // Act
+        let peers = await store.listPeers()
+
+        // Assert
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertFalse(peerIDs.contains(peerA.id),
+                       "Sender A should be purged after pin lifts and TTL elapses")
+    }
+
+    // Test 10
+    func test_broadcast_pinsSenderWhileAnyRecipientUnread() async throws {
+        // Contract: A broadcaster is pinned alive as long as any recipient
+        // still has an unread copy of the broadcast.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        let peerC = await store.registerPeer(name: "C", role: "plugin")
+
+        _ = try await store.broadcast(from: peerA.id, content: "broadcast")
+
+        // Age A's lastSeen to 11 min ago. Neither B nor C has acked.
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerA.id, date: elevenMinutesAgo)
+
+        // Act
+        let peers = await store.listPeers()
+
+        // Assert
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertTrue(peerIDs.contains(peerA.id),
+                      "Broadcaster A should be pinned alive while any recipient still has the unread broadcast")
+    }
+
+    // Test 11
+    func test_broadcast_partialAck_keepsSenderPinned() async throws {
+        // Contract: Pin holds while at least ONE recipient still has the
+        // broadcast unread.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        let peerC = await store.registerPeer(name: "C", role: "plugin")
+
+        let messages = try await store.broadcast(from: peerA.id, content: "broadcast")
+
+        // B acks its copy; C has not.
+        guard let msgForB = messages.first(where: { $0.to == peerB.id }) else {
+            XCTFail("Expected broadcast message for B")
+            return
+        }
+        await store.ackMessages(ids: [msgForB.id], for: peerB.id)
+
+        // Age A's lastSeen to 11 min ago
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerA.id, date: elevenMinutesAgo)
+
+        // Act
+        let peers = await store.listPeers()
+
+        // Assert
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertTrue(peerIDs.contains(peerA.id),
+                      "A should remain pinned while C still has the broadcast unread")
+    }
+
+    // Test 12
+    func test_broadcast_fullAck_unpinsSender() async throws {
+        // Contract: Once ALL recipients have acked, the pin lifts and A's stale
+        // lastSeen makes it purgeable.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        let peerC = await store.registerPeer(name: "C", role: "plugin")
+
+        let messages = try await store.broadcast(from: peerA.id, content: "broadcast")
+
+        // B and C both ack
+        for msg in messages {
+            await store.ackMessages(ids: [msg.id], for: msg.to)
+        }
+
+        // Age A's lastSeen to 11 min ago
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerA.id, date: elevenMinutesAgo)
+
+        // Act
+        let peers = await store.listPeers()
+
+        // Assert
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertFalse(peerIDs.contains(peerA.id),
+                       "A should be purged once all recipients have acked")
+    }
+
+    // ==================== Change 3: No Time-Based Drop ====================
+
+    // Test 14 (test 13 is the rewritten existing #12 above)
+    func test_messageRetention_governedByPeerLiveness_purgedWithRecipient() async throws {
+        // Contract: Removing a recipient must also remove their inbox.
+        // receiveMessages on a removed peer returns [].
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        _ = try await store.sendMessage(
+            from: peerA.id, to: peerB.id, content: "doomed"
+        )
+
+        // Act — remove B
+        await store.removePeer(id: peerB.id)
+
+        // Assert — B's inbox is empty (peer + inbox were torn down together)
+        let inbox = await store.receiveMessages(for: peerB.id)
+        XCTAssertTrue(inbox.isEmpty,
+                      "Removed recipient's inbox must be empty; message retention is governed by recipient liveness")
+    }
+
+    // ==================== Change 0: Revive Prevention ====================
+
+    // Test 15
+    func test_expiredPeer_noUnread_cannotSendMessage() async throws {
+        // Contract: An expired peer with no in-flight message must NOT be able
+        // to revive itself by calling sendMessage. The call must throw
+        // unregisteredPeer, and the peer must be purged.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        // Age A to 11 min ago. No unread messages exist.
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerA.id, date: elevenMinutesAgo)
+
+        // Act & Assert — sendMessage must throw unregisteredPeer
+        do {
+            _ = try await store.sendMessage(
+                from: peerA.id, to: peerB.id, content: "should not go"
+            )
+            XCTFail("Expected IPCError.unregisteredPeer because A is expired with no pin")
+        } catch let error as IPCError {
+            if case .unregisteredPeer = error {
+                // Expected
+            } else {
+                XCTFail("Expected .unregisteredPeer, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+
+        // A must be purged from the store
+        let peers = await store.listPeers()
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertFalse(peerIDs.contains(peerA.id),
+                       "Expired sender must be purged after the rejected sendMessage call")
+    }
+
+    // Test 16
+    func test_expiredPeer_noUnread_cannotReceiveMessages() async {
+        // Contract: An expired peer with no in-flight message must NOT be able
+        // to revive itself via receiveMessages. The call must return [] AND the
+        // peer must be purged (not bumped).
+        // Arrange
+        let store = makeStore()
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
+
+        // Act
+        let result = await store.receiveMessages(for: peerB.id)
+
+        // Assert
+        XCTAssertTrue(result.isEmpty,
+                      "Expired peer with no unread should receive []")
+        let peers = await store.listPeers()
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertFalse(peerIDs.contains(peerB.id),
+                       "Expired peer must be purged on receiveMessages, not silently bumped")
+    }
+
+    // Test 17
+    func test_expiredPeer_noUnread_cannotAckMessages() async {
+        // Contract: An expired peer with no in-flight message must NOT be able
+        // to revive via ackMessages. ack is no-op and the peer is purged.
+        // Arrange
+        let store = makeStore()
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
+
+        // Act — call ack with arbitrary ID
+        await store.ackMessages(ids: [UUID()], for: peerB.id)
+
+        // Assert
+        let peers = await store.listPeers()
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertFalse(peerIDs.contains(peerB.id),
+                       "Expired peer must be purged on ackMessages, not silently bumped")
+    }
+
+    // Test 18
+    func test_expiredRecipient_noUnread_sendThrowsPeerNotFound() async throws {
+        // Contract: An alive sender targeting an expired recipient (with no pin)
+        // must get peerNotFound. The lazy purge in aliveOrPurge removes the
+        // expired recipient before the dictionary check.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        // Only B is stale
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
+
+        // Act & Assert
+        do {
+            _ = try await store.sendMessage(
+                from: peerA.id, to: peerB.id, content: "should fail"
+            )
+            XCTFail("Expected IPCError.peerNotFound because B is expired with no pin")
+        } catch let error as IPCError {
+            if case .peerNotFound(let id) = error {
+                XCTAssertEqual(id, peerB.id,
+                               "peerNotFound should carry the expired recipient's UUID")
+            } else {
+                XCTFail("Expected .peerNotFound, got \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    // ==================== Change 4: peerStatus Purge Unification ====================
+
+    // Test 19
+    func test_peerStatus_expiredPeer_purgesPeerAndInbox() async throws {
+        // Contract: peerStatus on an expired peer with no pin must return nil
+        // AND tear down the peer + inbox (consistent with listPeers' purge).
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerA.id, date: elevenMinutesAgo)
+
+        // Act — call peerStatus, which under the new contract should also purge
+        let status = await store.peerStatus(id: peerA.id)
+
+        // Assert: returns nil
+        XCTAssertNil(status,
+                     "peerStatus should return nil for an expired peer with no pin")
+
+        // Assert: A is gone from listPeers (purge happened, not just nil)
+        let peers = await store.listPeers()
+        let peerIDs = Set(peers.map(\.id))
+        XCTAssertFalse(peerIDs.contains(peerA.id),
+                       "peerStatus should purge the expired peer, so subsequent listPeers does not see it")
+
+        // Assert: A's inbox is gone — receiveMessages returns []
+        let inbox = await store.receiveMessages(for: peerA.id)
+        XCTAssertTrue(inbox.isEmpty,
+                      "peerStatus should also tear down the inbox of an expired peer")
     }
 }
