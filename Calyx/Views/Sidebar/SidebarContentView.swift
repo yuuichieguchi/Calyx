@@ -247,7 +247,7 @@ private struct GroupSectionView: View {
                                 .font(.system(size: 10, weight: .bold, design: .rounded))
                                 .foregroundStyle(.secondary)
                         }
-                        .padding(.vertical, 13)
+                        .padding(.vertical, 10)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
