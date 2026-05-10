@@ -46,24 +46,22 @@ struct SidebarContentView: View {
 
             if sidebarMode == .tabs {
                 ScrollView {
-                    GlassEffectContainer(spacing: 8) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            ForEach(groups) { group in
-                                GroupSectionView(
-                                    group: group,
-                                    isActiveGroup: group.id == activeGroupID,
-                                    activeTabID: activeTabID,
-                                    reduceTransparency: reduceTransparency,
-                                    onGroupSelected: onGroupSelected,
-                                    onTabSelected: onTabSelected,
-                                    onCloseTab: onCloseTab,
-                                    onGroupRenamed: onGroupRenamed,
-                                    onTabRenamed: onTabRenamed,
-                                    onCollapseToggled: onCollapseToggled,
-                                    onCloseAllTabsInGroup: onCloseAllTabsInGroup,
-                                    onMoveTab: onMoveTab
-                                )
-                            }
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(groups) { group in
+                            GroupSectionView(
+                                group: group,
+                                isActiveGroup: group.id == activeGroupID,
+                                activeTabID: activeTabID,
+                                reduceTransparency: reduceTransparency,
+                                onGroupSelected: onGroupSelected,
+                                onTabSelected: onTabSelected,
+                                onCloseTab: onCloseTab,
+                                onGroupRenamed: onGroupRenamed,
+                                onTabRenamed: onTabRenamed,
+                                onCollapseToggled: onCollapseToggled,
+                                onCloseAllTabsInGroup: onCloseAllTabsInGroup,
+                                onMoveTab: onMoveTab
+                            )
                         }
                     }
                     .padding(.horizontal, 8)
@@ -421,12 +419,12 @@ private struct GroupHeaderBackgroundModifier: ViewModifier {
                         )
                 )
                 .glassEffect(
-                    .clear.tint(groupColor.color.opacity(0.12)).interactive(),
+                    .clear.tint(groupColor.color.opacity(0.12)),
                     in: .rect(cornerRadius: 12)
                 )
                 .overlay {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(Color.white.opacity(0.22), lineWidth: 1)
+                        .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
                         .allowsHitTesting(false)
                 }
         } else {
