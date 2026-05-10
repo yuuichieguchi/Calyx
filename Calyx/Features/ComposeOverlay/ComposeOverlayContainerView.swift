@@ -43,7 +43,7 @@ struct ComposeResizeHandle: View {
 
     var body: some View {
         Color.clear
-            .frame(height: 16)
+            .frame(height: 12)
             .contentShape(Rectangle())
             .onHover { hovering in
                 guard !isDragging else { return }

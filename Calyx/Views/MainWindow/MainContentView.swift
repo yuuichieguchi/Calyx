@@ -205,6 +205,14 @@ struct MainContentView: View {
                                             onDismiss: onDismissComposeOverlay
                                         )
                                         .frame(height: windowSession.composeOverlayHeight)
+                                        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                                                .allowsHitTesting(false)
+                                        }
+                                        .padding(.horizontal, 12)
+                                        .padding(.bottom, 12)
                                     }
                                     .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
                                 }
