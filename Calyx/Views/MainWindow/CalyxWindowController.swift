@@ -519,7 +519,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func deactivateCurrentTab() {
-        dismissComposeOverlay()
         guard let tab = activeTab else { return }
         if case .terminal = tab.content {
             focusedController?.setFocus(false)
@@ -716,7 +715,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
         guard windowSession.activeGroupID != groupID else { return }
 
-        dismissComposeOverlay()
         deactivateCurrentTab()
         windowSession.activeGroupID = groupID
         activateCurrentTab()

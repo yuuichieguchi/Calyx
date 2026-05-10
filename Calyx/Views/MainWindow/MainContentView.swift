@@ -200,6 +200,7 @@ struct MainContentView: View {
                                         )
 
                                         ComposeOverlayContainerView(
+                                            text: $windowSession.composeOverlayText,
                                             onSend: onComposeOverlaySend,
                                             onDismiss: onDismissComposeOverlay
                                         )

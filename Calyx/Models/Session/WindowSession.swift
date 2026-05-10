@@ -20,6 +20,7 @@ class WindowSession: Identifiable {
     var showCommandPalette: Bool = false
     var showComposeOverlay: Bool = false
     var composeOverlayHeight: CGFloat = 120
+    var composeOverlayText: String = ""
     var sidebarMode: SidebarMode = .tabs
     var gitChangesState: GitChangesState = .notLoaded
     var gitEntries: [GitFileEntry] = []

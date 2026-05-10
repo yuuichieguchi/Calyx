@@ -7,19 +7,30 @@ import SwiftUI
 import AppKit
 
 struct ComposeOverlayContainerView: NSViewRepresentable {
+    @Binding var text: String
     var onSend: ((String) -> Bool)?
     var onDismiss: (() -> Void)?
 
     func makeNSView(context: Context) -> ComposeOverlayView {
         let view = ComposeOverlayView()
+        view.text = text
         view.onSend = onSend
         view.onDismiss = onDismiss
+        view.onTextChanged = { newText in
+            if newText != text { text = newText }
+        }
         return view
     }
 
     func updateNSView(_ nsView: ComposeOverlayView, context: Context) {
+        if nsView.textView.string != text {
+            nsView.text = text
+        }
         nsView.onSend = onSend
         nsView.onDismiss = onDismiss
+        nsView.onTextChanged = { newText in
+            if newText != text { text = newText }
+        }
     }
 }
 

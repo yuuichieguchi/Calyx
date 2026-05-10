@@ -39,6 +39,17 @@ class ComposeOverlayView: NSView {
 
     var onSend: ((String) -> Bool)?
     var onDismiss: (() -> Void)?
+    var onTextChanged: ((String) -> Void)?
+
+    var text: String {
+        get { textView.string }
+        set {
+            if textView.string != newValue {
+                textView.string = newValue
+                updatePlaceholder()
+            }
+        }
+    }
 
     // MARK: - Initializers
 
@@ -89,14 +100,9 @@ class ComposeOverlayView: NSView {
         textView.delegate = self
         (textView as? ComposeTextView)?.onMarkedTextChanged = { [weak self] in
             self?.updatePlaceholder()
+            guard let self else { return }
+            self.onTextChanged?(self.textView.string)
         }
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(textViewDidChangeNotification(_:)),
-            name: NSText.didChangeNotification,
-            object: textView
-        )
-
         // Scroll view
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
@@ -162,12 +168,14 @@ class ComposeOverlayView: NSView {
         if sent {
             textView.string = ""
             updatePlaceholder()
+            onTextChanged?("")
         }
     }
 
     override func insertNewlineIgnoringFieldEditor(_ sender: Any?) {
         textView.insertNewlineIgnoringFieldEditor(sender)
         updatePlaceholder()
+        onTextChanged?(textView.string)
     }
 
     override func cancelOperation(_ sender: Any?) {
@@ -175,10 +183,6 @@ class ComposeOverlayView: NSView {
     }
 
     // MARK: - Placeholder
-
-    @objc private func textViewDidChangeNotification(_ notification: Notification) {
-        updatePlaceholder()
-    }
 
     private func updatePlaceholder() {
         placeholderLabel.isHidden = !textView.string.isEmpty || textView.hasMarkedText()
@@ -191,6 +195,7 @@ extension ComposeOverlayView: NSTextViewDelegate {
 
     func textDidChange(_ notification: Notification) {
         updatePlaceholder()
+        onTextChanged?(textView.string)
     }
 
     func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
