@@ -36,6 +36,7 @@ class ComposeOverlayView: NSView {
     private let scrollView = NSScrollView()
     private(set) var textView: NSTextView = ComposeTextView()
     private let placeholderLabel = NSTextField(labelWithString: "Type here...")
+    private var scrollerStyleObserver: NSObjectProtocol?
 
     var onSend: ((String) -> Bool)?
     var onDismiss: (() -> Void)?
@@ -106,6 +107,8 @@ class ComposeOverlayView: NSView {
         // Scroll view
         scrollView.documentView = textView
         scrollView.hasVerticalScroller = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.contentView.drawsBackground = false
         scrollView.translatesAutoresizingMaskIntoConstraints = false
@@ -134,6 +137,24 @@ class ComposeOverlayView: NSView {
         setAccessibilityIdentifier(AccessibilityID.Compose.container)
         textView.setAccessibilityIdentifier(AccessibilityID.Compose.textView)
         placeholderLabel.setAccessibilityIdentifier(AccessibilityID.Compose.placeholder)
+
+        scrollerStyleObserver = NotificationCenter.default.addObserver(
+            forName: NSScroller.preferredScrollerStyleDidChangeNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.scrollView.scrollerStyle = .overlay
+            }
+        }
+    }
+
+    deinit {
+        MainActor.assumeIsolated {
+            if let scrollerStyleObserver {
+                NotificationCenter.default.removeObserver(scrollerStyleObserver)
+            }
+        }
     }
 
     func focusTextView() {
