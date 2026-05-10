@@ -216,8 +216,7 @@ private struct GroupSectionView: View {
                 .contentShape(Rectangle())
                 .modifier(GroupHeaderBackgroundModifier(
                     isActiveGroup: isActiveGroup,
-                    reduceTransparency: reduceTransparency,
-                    groupColor: group.color
+                    reduceTransparency: reduceTransparency
                 ))
             } else {
                 TabClickContainer(
@@ -279,8 +278,7 @@ private struct GroupSectionView: View {
                     .padding(.horizontal, 14)
                     .modifier(GroupHeaderBackgroundModifier(
                         isActiveGroup: isActiveGroup,
-                        reduceTransparency: reduceTransparency,
-                        groupColor: group.color
+                        reduceTransparency: reduceTransparency
                     ))
                 }
                 .accessibilityElement(children: .contain)
@@ -392,47 +390,29 @@ private struct GroupSectionView: View {
 private struct GroupHeaderBackgroundModifier: ViewModifier {
     let isActiveGroup: Bool
     let reduceTransparency: Bool
-    let groupColor: TabGroupColor
+    @Environment(\.controlActiveState) private var controlActiveState
 
     func body(content: Content) -> some View {
         if reduceTransparency {
-            content
-                .background(
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(
-                            groupColor.color.opacity(isActiveGroup ? 0.18 : 0.08)
-                        )
-                )
+            content.background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.gray.opacity(isActiveGroup ? 0.18 : 0.05))
+            )
         } else if isActiveGroup {
             content
                 .background(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    groupColor.color.opacity(0.16),
-                                    Color.gray.opacity(0.10),
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                )
-                .glassEffect(
-                    .clear.tint(groupColor.color.opacity(0.12)),
-                    in: .rect(cornerRadius: 12)
+                        .fill(Color.white.opacity(0.08))
                 )
                 .overlay {
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.22), lineWidth: 1)
+                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
                         .allowsHitTesting(false)
                 }
+                .opacity(controlActiveState == .key ? 1.0 : 0.5)
         } else {
             content
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(groupColor.color.opacity(0.08))
-                )
+                .opacity(controlActiveState == .key ? 1.0 : 0.5)
         }
     }
 }
