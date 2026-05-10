@@ -4,6 +4,7 @@
 // SwiftUI sidebar showing tab groups and their tabs.
 
 import SwiftUI
+import AppKit
 
 struct SidebarContentView: View {
     let groups: [TabGroup]
@@ -253,8 +254,9 @@ private struct GroupSectionView: View {
             if isEditing {
                 HStack(spacing: 6) {
                     Circle()
-                        .fill(Color(nsColor: group.color.nsColor))
-                        .frame(width: 8, height: 8)
+                        .fill(subduedDotColor(group.color.nsColor))
+                        .frame(width: 6, height: 6)
+                        .opacity(isActiveGroup ? 1.0 : 0.5)
                     InlineTextField(
                         initialText: group.name,
                         accessibilityID: AccessibilityID.Sidebar.groupNameTextField(group.id),
@@ -293,8 +295,9 @@ private struct GroupSectionView: View {
                         // handled by surrounding TabClickContainer)
                         HStack(spacing: 6) {
                             Circle()
-                                .fill(Color(nsColor: group.color.nsColor))
-                                .frame(width: 8, height: 8)
+                                .fill(subduedDotColor(group.color.nsColor))
+                                .frame(width: 6, height: 6)
+                                .opacity(isActiveGroup ? 1.0 : 0.5)
                             Text(group.name)
                                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                                 .tracking(0.4)
@@ -424,6 +427,13 @@ private struct GroupSectionView: View {
         .onChange(of: group.tabs.map(\.id)) { _, _ in
             reorderState.reset()
         }
+    }
+
+    private func subduedDotColor(_ nsColor: NSColor) -> Color {
+        let converted = nsColor.usingColorSpace(.sRGB) ?? nsColor
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        converted.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        return Color(hue: Double(h), saturation: Double(s * 0.7), brightness: Double(b * 0.9), opacity: Double(a))
     }
 
     // MARK: - Insertion Indicator

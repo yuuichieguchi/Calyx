@@ -82,7 +82,7 @@ struct TabChromeModifier: ViewModifier {
                 content
                     .background(
                         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                            .fill(Color.black.opacity(0.2))
+                            .fill(Color.white.opacity(0.10))
                     )
                     .opacity(controlActiveState == .key ? 1.0 : 0.5)
             } else {
