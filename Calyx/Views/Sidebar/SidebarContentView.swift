@@ -31,17 +31,81 @@ struct SidebarContentView: View {
     var onMoveTab: ((UUID, Int, Int) -> Void)?
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.controlActiveState) private var controlActiveState
+    @Namespace private var togglePillNS
+
+    @ViewBuilder
+    private var togglePill: some View {
+        if reduceTransparency {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.gray.opacity(0.18))
+        } else {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.08))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                }
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("Mode", selection: $sidebarMode) {
-                Text("Tabs").tag(SidebarMode.tabs)
-                Text("Changes").tag(SidebarMode.changes)
+            HStack(spacing: 4) {
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        sidebarMode = .tabs
+                    }
+                } label: {
+                    Text("Tabs")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background {
+                            if sidebarMode == .tabs {
+                                Color.clear
+                                    .overlay { togglePill }
+                                    .matchedGeometryEffect(id: "togglePill", in: togglePillNS)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Tabs")
+                .accessibilityAddTraits(sidebarMode == .tabs ? [.isSelected] : [])
+
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        sidebarMode = .changes
+                    }
+                } label: {
+                    Text("Changes")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background {
+                            if sidebarMode == .changes {
+                                Color.clear
+                                    .overlay { togglePill }
+                                    .matchedGeometryEffect(id: "togglePill", in: togglePillNS)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Changes")
+                .accessibilityAddTraits(sidebarMode == .changes ? [.isSelected] : [])
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
             .padding(.horizontal, 12)
             .padding(.top, 8)
+            .opacity(controlActiveState == .key ? 1.0 : 0.5)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Sidebar mode")
+            .accessibilityValue(sidebarMode == .tabs ? "Tabs" : "Changes")
             .accessibilityIdentifier(AccessibilityID.Git.modeToggle)
 
             if sidebarMode == .tabs {
