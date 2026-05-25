@@ -123,11 +123,14 @@ private struct SplitDividerGlassStrip: View {
     }
 
     var body: some View {
-        Color.clear
-            .glassEffect(
-                .clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))),
-                in: .rect
-            )
+        let tint: NSColor
+        if let configColor = ghosttyProvider.splitDividerColor {
+            tint = configColor
+        } else {
+            tint = GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)
+        }
+        return Color.clear
+            .glassEffect(.clear.tint(Color(nsColor: tint)), in: .rect)
             .opacity(0.5)
             .allowsHitTesting(false)
     }

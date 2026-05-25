@@ -13,6 +13,7 @@ final class GhosttyThemeProvider {
 
     private(set) var ghosttyBackground: NSColor = ThemeColorPreset.ghostty.color
     private(set) var ghosttyForeground: NSColor = .white
+    private(set) var splitDividerColor: NSColor? = nil
     nonisolated(unsafe) private var observer: Any?
 
     private init() {
@@ -34,6 +35,7 @@ final class GhosttyThemeProvider {
         guard let raw = GhosttyAppController.shared.configManager.getColor("background") else {
             ghosttyBackground = ThemeColorPreset.ghostty.color
             ghosttyForeground = .white
+            splitDividerColor = nil
             return
         }
         ghosttyBackground = NSColor(
@@ -52,6 +54,17 @@ final class GhosttyThemeProvider {
             )
         } else {
             ghosttyForeground = .white
+        }
+
+        if let div = GhosttyAppController.shared.configManager.getColor("split-divider-color") {
+            splitDividerColor = NSColor(
+                red: CGFloat(div.r) / 255.0,
+                green: CGFloat(div.g) / 255.0,
+                blue: CGFloat(div.b) / 255.0,
+                alpha: 1.0
+            )
+        } else {
+            splitDividerColor = nil
         }
     }
 }
