@@ -193,14 +193,17 @@ class SearchBarView: NSView, NSTextFieldDelegate {
     // MARK: - Button Actions
 
     @objc private func previousMatch() {
-        if sender?.performAction("navigate_search:previous") != true {
-            logger.warning("navigate_search:previous failed")
+        // ghostty's navigate_search:next moves toward the top of the buffer,
+        // which is what users expect from chevron.up / Find Previous.
+        if sender?.performAction("navigate_search:next") != true {
+            logger.warning("navigate_search:next failed")
         }
     }
 
     @objc private func nextMatch() {
-        if sender?.performAction("navigate_search:next") != true {
-            logger.warning("navigate_search:next failed")
+        // chevron.down / Find Next → toward the bottom of the buffer.
+        if sender?.performAction("navigate_search:previous") != true {
+            logger.warning("navigate_search:previous failed")
         }
     }
 
@@ -248,9 +251,9 @@ class SearchBarView: NSView, NSTextFieldDelegate {
             return true
         }
         if commandSelector == #selector(insertNewline(_:)) {
-            // Return → next match
-            if sender?.performAction("navigate_search:next") != true {
-                logger.warning("navigate_search:next failed")
+            // Return → next match (toward bottom of buffer)
+            if sender?.performAction("navigate_search:previous") != true {
+                logger.warning("navigate_search:previous failed")
             }
             return true
         }
@@ -263,18 +266,18 @@ class SearchBarView: NSView, NSTextFieldDelegate {
         guard event.type == .keyDown else { return false }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
 
-        // Cmd+G → next match
+        // Cmd+G → next match (toward bottom of buffer)
         if flags == .command, event.charactersIgnoringModifiers == "g" {
-            if sender?.performAction("navigate_search:next") != true {
-                logger.warning("navigate_search:next failed")
+            if sender?.performAction("navigate_search:previous") != true {
+                logger.warning("navigate_search:previous failed")
             }
             return true
         }
 
-        // Cmd+Shift+G → previous match
+        // Cmd+Shift+G → previous match (toward top of buffer)
         if flags == [.command, .shift], event.charactersIgnoringModifiers == "G" {
-            if sender?.performAction("navigate_search:previous") != true {
-                logger.warning("navigate_search:previous failed")
+            if sender?.performAction("navigate_search:next") != true {
+                logger.warning("navigate_search:next failed")
             }
             return true
         }

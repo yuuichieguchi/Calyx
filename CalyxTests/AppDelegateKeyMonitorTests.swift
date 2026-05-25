@@ -23,7 +23,7 @@
 //  - Negative cases (no match -> nil):
 //      * Plain "]" (no modifiers)
 //      * Cmd+] (missing shift)
-//      * Ctrl+Shift+] (wrong modifier set; owned by ShortcutManager)
+//      * Ctrl+Shift+] (wrong modifier set; handled by Window > Group menu)
 //
 
 import XCTest
@@ -369,7 +369,7 @@ final class AppDelegateKeyMonitorTests: XCTestCase {
         )
     }
 
-    /// Ctrl+Shift+] is owned by `ShortcutManager` (group navigation).
+    /// Ctrl+Shift+] is owned by the Window > Group menu (group navigation).
     /// The AppDelegate key monitor must not claim it.
     func test_matchKeyEvent_ctrlShiftRightBracket_returnsNil() {
         guard let event = makeKeyEvent(
@@ -386,7 +386,7 @@ final class AppDelegateKeyMonitorTests: XCTestCase {
 
         XCTAssertNil(
             result,
-            "Ctrl+Shift+] is handled by ShortcutManager (group navigation); the key monitor must not claim it"
+            "Ctrl+Shift+] is handled by the Window > Group menu (group navigation); the key monitor must not claim it"
         )
     }
 

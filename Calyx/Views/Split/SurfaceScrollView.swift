@@ -127,6 +127,23 @@ class SurfaceScrollView: NSView {
     private var searchTotalObserver: NSObjectProtocol?
     private var searchSelectedObserver: NSObjectProtocol?
 
+    /// True while the in-terminal search bar is presented. Used by
+    /// `SurfaceView.validateMenuItem` to gate Find Next / Find Previous.
+    var isSearchBarPresented: Bool { searchBar != nil }
+
+    /// Walks up the responder/view hierarchy from `view` (inclusive) and
+    /// returns the enclosing `SurfaceScrollView`, or `nil` if none is found.
+    /// Used by validateMenuItem implementations that need to consult the
+    /// search-bar presentation state without duplicating the walk.
+    static func enclosing(_ view: NSView?) -> SurfaceScrollView? {
+        var ancestor: NSView? = view
+        while let v = ancestor {
+            if let scroll = v as? SurfaceScrollView { return scroll }
+            ancestor = v.superview
+        }
+        return nil
+    }
+
     // MARK: - Cell Height
 
     private func applyCellHeight(pixelHeight: CGFloat) {

@@ -323,6 +323,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         fileMenu.addItem(withTitle: "New Tab", action: #selector(CalyxWindowController.newTab(_:)), keyEquivalent: "t")
         fileMenu.addItem(withTitle: "New Browser Tab", action: #selector(CalyxWindowController.newBrowserTab(_:)), keyEquivalent: "")
         fileMenu.addItem(.separator())
+
+        // Split actions live directly under File to match Ghostty's menu structure.
+        let splitRightItem = NSMenuItem(
+            title: "Split Right",
+            action: #selector(SurfaceView.splitRight(_:)),
+            keyEquivalent: "d")
+        splitRightItem.keyEquivalentModifierMask = [.command]
+        fileMenu.addItem(splitRightItem)
+
+        let splitLeftItem = NSMenuItem(
+            title: "Split Left",
+            action: #selector(SurfaceView.splitLeft(_:)),
+            keyEquivalent: "")
+        fileMenu.addItem(splitLeftItem)
+
+        let splitDownItem = NSMenuItem(
+            title: "Split Down",
+            action: #selector(SurfaceView.splitDown(_:)),
+            keyEquivalent: "d")
+        splitDownItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(splitDownItem)
+
+        let splitUpItem = NSMenuItem(
+            title: "Split Up",
+            action: #selector(SurfaceView.splitUp(_:)),
+            keyEquivalent: "")
+        fileMenu.addItem(splitUpItem)
+
+        fileMenu.addItem(.separator())
         fileMenu.addItem(withTitle: "Close Tab", action: #selector(CalyxWindowController.closeTab(_:)), keyEquivalent: "w")
 
         // Edit menu
@@ -337,6 +366,46 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+
+        editMenu.addItem(.separator())
+
+        // Parent "Find" submenu item has no action of its own — clicking it
+        // only expands the submenu (which exposes Find…, Find Next, Find
+        // Previous). Earlier revisions wired #selector(performFindAction:) on
+        // the parent as a workaround for XCUI predicate-based firstMatch
+        // landing on the submenu parent before its child; that workaround was
+        // unsafe (AppKit could fire the parent action alongside submenu
+        // expansion) and has been replaced with a tightened predicate in the
+        // UI tests that selects "Find…" directly.
+        let findMenuItem = NSMenuItem(
+            title: "Find",
+            action: nil,
+            keyEquivalent: "")
+        let findMenu = NSMenu(title: "Find")
+        findMenuItem.submenu = findMenu
+
+        let findStartItem = NSMenuItem(
+            title: "Find…",
+            action: #selector(SurfaceView.performFindAction(_:)),
+            keyEquivalent: "f")
+        findStartItem.keyEquivalentModifierMask = [.command]
+        findMenu.addItem(findStartItem)
+
+        let findNextItem = NSMenuItem(
+            title: "Find Next",
+            action: #selector(SurfaceView.findNext(_:)),
+            keyEquivalent: "g")
+        findNextItem.keyEquivalentModifierMask = [.command]
+        findMenu.addItem(findNextItem)
+
+        let findPreviousItem = NSMenuItem(
+            title: "Find Previous",
+            action: #selector(SurfaceView.findPrevious(_:)),
+            keyEquivalent: "g")
+        findPreviousItem.keyEquivalentModifierMask = [.command, .shift]
+        findMenu.addItem(findPreviousItem)
+
+        editMenu.addItem(findMenuItem)
 
         editMenu.addItem(.separator())
         let composeItem = NSMenuItem(
@@ -361,14 +430,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         toggleSidebarItem.keyEquivalentModifierMask = [.command, .option]
         viewMenu.addItem(toggleSidebarItem)
 
-        let fullScreenItem = NSMenuItem(
-            title: "Toggle Full Screen",
-            action: #selector(NSWindow.toggleFullScreen(_:)),
-            keyEquivalent: "f"
-        )
-        fullScreenItem.keyEquivalentModifierMask = [.command, .control]
-        viewMenu.addItem(fullScreenItem)
-
         viewMenu.addItem(.separator())
 
         let paletteItem = NSMenuItem(
@@ -379,6 +440,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         paletteItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(paletteItem)
 
+        viewMenu.addItem(.separator())
+
+        viewMenu.addItem(
+            withTitle: "Quick Terminal",
+            action: #selector(handleToggleQuickTerminal),
+            keyEquivalent: ""
+        )
+
         // Window menu
         let windowMenuItem = NSMenuItem()
         mainMenu.addItem(windowMenuItem)
@@ -388,6 +457,55 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+
+        // Use a custom selector instead of NSWindow.toggleFullScreen(_:) so
+        // AppKit doesn't rewrite the menu title to "Enter/Exit Full Screen".
+        // Matches Ghostty's `toggleGhosttyFullScreen:` approach.
+        let fullScreenItem = NSMenuItem(
+            title: "Toggle Full Screen",
+            action: #selector(CalyxWindowController.toggleFullScreen(_:)),
+            keyEquivalent: "f"
+        )
+        fullScreenItem.keyEquivalentModifierMask = [.command, .control]
+        windowMenu.addItem(fullScreenItem)
+
+        windowMenu.addItem(.separator())
+
+        let focusSplitMenuItem = NSMenuItem(title: "Focus Split", action: nil, keyEquivalent: "")
+        let focusSplitMenu = NSMenu(title: "Focus Split")
+        focusSplitMenuItem.submenu = focusSplitMenu
+
+        let focusUpItem = NSMenuItem(
+            title: "Focus Split Up",
+            action: #selector(SurfaceView.focusSplitUp(_:)),
+            keyEquivalent: String(Unicode.Scalar(NSUpArrowFunctionKey)!))
+        focusUpItem.keyEquivalentModifierMask = [.command, .option]
+        focusSplitMenu.addItem(focusUpItem)
+
+        let focusDownItem = NSMenuItem(
+            title: "Focus Split Down",
+            action: #selector(SurfaceView.focusSplitDown(_:)),
+            keyEquivalent: String(Unicode.Scalar(NSDownArrowFunctionKey)!))
+        focusDownItem.keyEquivalentModifierMask = [.command, .option]
+        focusSplitMenu.addItem(focusDownItem)
+
+        let focusLeftItem = NSMenuItem(
+            title: "Focus Split Left",
+            action: #selector(SurfaceView.focusSplitLeft(_:)),
+            keyEquivalent: String(Unicode.Scalar(NSLeftArrowFunctionKey)!))
+        focusLeftItem.keyEquivalentModifierMask = [.command, .option]
+        focusSplitMenu.addItem(focusLeftItem)
+
+        let focusRightItem = NSMenuItem(
+            title: "Focus Split Right",
+            action: #selector(SurfaceView.focusSplitRight(_:)),
+            keyEquivalent: String(Unicode.Scalar(NSRightArrowFunctionKey)!))
+        focusRightItem.keyEquivalentModifierMask = [.command, .option]
+        focusSplitMenu.addItem(focusRightItem)
+
+        windowMenu.addItem(focusSplitMenuItem)
+
         windowMenu.addItem(.separator())
 
         // Tab navigation via menu
@@ -405,18 +523,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         windowMenu.addItem(.separator())
 
-        // Cmd+1-9 tab selection
+        // Cmd+1-9 tab selection — collapsed into a submenu so the Window menu
+        // doesn't carry 9 sibling rows.
+        let selectTabMenuItem = NSMenuItem(title: "Select Tab", action: nil, keyEquivalent: "")
+        let selectTabMenu = NSMenu(title: "Select Tab")
+        selectTabMenuItem.submenu = selectTabMenu
         for i in 1...9 {
-            let item = NSMenuItem(title: "Select Tab \(i)", action: #selector(selectTabByNumber(_:)), keyEquivalent: "\(i)")
+            let item = NSMenuItem(title: "Tab \(i)", action: #selector(selectTabByNumber(_:)), keyEquivalent: "\(i)")
             item.target = self
             item.tag = i - 1
-            windowMenu.addItem(item)
+            selectTabMenu.addItem(item)
         }
+        windowMenu.addItem(selectTabMenuItem)
+
+        windowMenu.addItem(.separator())
+
+        let groupMenuItem = NSMenuItem(title: "Group", action: nil, keyEquivalent: "")
+        let groupMenu = NSMenu(title: "Group")
+        groupMenuItem.submenu = groupMenu
+
+        let newGroupItem = NSMenuItem(
+            title: "New Group",
+            action: #selector(CalyxWindowController.newGroup(_:)),
+            keyEquivalent: "n")
+        newGroupItem.keyEquivalentModifierMask = [.control, .shift]
+        groupMenu.addItem(newGroupItem)
+
+        let closeGroupItem = NSMenuItem(
+            title: "Close Group",
+            action: #selector(CalyxWindowController.closeGroup(_:)),
+            keyEquivalent: "w")
+        closeGroupItem.keyEquivalentModifierMask = [.control, .shift]
+        groupMenu.addItem(closeGroupItem)
+
+        groupMenu.addItem(.separator())
+
+        let nextGroupItem = NSMenuItem(
+            title: "Next Group",
+            action: #selector(CalyxWindowController.nextGroup(_:)),
+            keyEquivalent: "]")
+        nextGroupItem.keyEquivalentModifierMask = [.control, .shift]
+        groupMenu.addItem(nextGroupItem)
+
+        let prevGroupItem = NSMenuItem(
+            title: "Previous Group",
+            action: #selector(CalyxWindowController.previousGroup(_:)),
+            keyEquivalent: "[")
+        prevGroupItem.keyEquivalentModifierMask = [.control, .shift]
+        groupMenu.addItem(prevGroupItem)
+
+        windowMenu.addItem(groupMenuItem)
 
         windowMenu.addItem(.separator())
         windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
-        windowMenu.addItem(.separator())
-        windowMenu.addItem(withTitle: "Toggle Quick Terminal", action: #selector(handleToggleQuickTerminal), keyEquivalent: "")
 
         NSApp.mainMenu = mainMenu
     }
@@ -756,9 +915,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // `charactersIgnoringModifiers` APPLIES Shift (per Apple docs: "as if
         // no modifier key had been pressed, except for Shift"). So a real
         // `Cmd+Shift+]` keystroke reports `"}"`, not `"]"`. KeyCode matching
-        // is also the project's convention for bracket shortcuts — see
-        // `CalyxWindowController.setupShortcutManager()` which matches the
-        // sibling `Ctrl+Shift+]` / `Ctrl+Shift+[` on the same physical keys.
+        // is also the project's convention for bracket shortcuts — the
+        // sibling `Ctrl+Shift+]` / `Ctrl+Shift+[` group-navigation
+        // shortcuts are bound on the Window > Group menu items
+        // (see `AppDelegate.setupMainMenu`) using the same physical keys.
         // kVK_ANSI_RightBracket = 30 (from HIToolbox/Events.h).
         if mods == [.command, .shift], event.keyCode == 30 {
             return .nextTab
@@ -988,6 +1148,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         UserDefaults.standard.set(input.global, forKey: "SecureInput")
     }
 
+    @objc private func selectTabByNumber(_ sender: NSMenuItem) {
+        guard let wc = windowControllers.first(where: { $0.window?.isKeyWindow == true }) else { return }
+        wc.selectTab(at: sender.tag)
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(toggleSecureInput(_:)) {
             menuItem.state = SecureInput.shared.global ? .on : .off
@@ -998,10 +1163,5 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleToggleQuickTerminal() {
         toggleQuickTerminal()
-    }
-
-    @objc private func selectTabByNumber(_ sender: NSMenuItem) {
-        guard let wc = windowControllers.first(where: { $0.window?.isKeyWindow == true }) else { return }
-        wc.selectTab(at: sender.tag)
     }
 }

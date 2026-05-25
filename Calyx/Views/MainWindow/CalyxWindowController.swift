@@ -118,7 +118,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         window.delegate = self
         window.center()
-        setupShortcutManager()
         setupCommandRegistry()
         setupUI()
         if !restoring { setupTerminalSurface() }
@@ -135,34 +134,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     // MARK: - Setup
-
-    private func setupShortcutManager() {
-        guard let calyxWindow = window as? CalyxWindow else { return }
-        let manager = ShortcutManager()
-
-        // Ctrl+Shift+] → next group (keyCode 30 = ])
-        manager.register(modifiers: [.control, .shift], keyCode: 30) { [weak self] in
-            self?.switchToNextGroup()
-        }
-        // Ctrl+Shift+[ → previous group (keyCode 33 = [)
-        manager.register(modifiers: [.control, .shift], keyCode: 33) { [weak self] in
-            self?.switchToPreviousGroup()
-        }
-        // Ctrl+Shift+N → new group (keyCode 45 = N)
-        manager.register(modifiers: [.control, .shift], keyCode: 45) { [weak self] in
-            self?.createNewGroup()
-        }
-        // Ctrl+Shift+W → close group (keyCode 13 = W)
-        manager.register(modifiers: [.control, .shift], keyCode: 13) { [weak self] in
-            self?.closeActiveGroup()
-        }
-        // Cmd+Shift+E → compose overlay (keyCode 14 = E)
-        manager.register(modifiers: [.command, .shift], keyCode: 14) { [weak self] in
-            self?.toggleComposeOverlay()
-        }
-
-        calyxWindow.shortcutManager = manager
-    }
 
     private func setupCommandRegistry() {
         commandRegistry.register(Command(id: "tab.new", title: "New Tab", shortcut: "Cmd+T", category: "Tabs") { [weak self] in
@@ -1401,11 +1372,75 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         switchToTab(id: target.id)
     }
 
-    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(jumpToMostRecentUnreadTab) {
             return windowSession.groups.flatMap(\.tabs).contains { $0.unreadNotifications > 0 }
         }
+        // When the in-terminal search bar is presented, focus moves to its
+        // text field and SurfaceView is no longer in the responder chain, so
+        // we expose findNext:/findPrevious: here as a fallback target. The
+        // validation gates them to "search bar visible" to mirror the
+        // SurfaceView-side check.
+        if menuItem.action == #selector(findNext(_:)) || menuItem.action == #selector(findPrevious(_:)) {
+            return focusedSurfaceHasVisibleSearchBar
+        }
+        // Next/Previous Tab — only enabled when the active group has more
+        // than one tab to switch between.
+        if menuItem.action == #selector(selectNextTab(_:))
+            || menuItem.action == #selector(selectPreviousTab(_:)) {
+            return (windowSession.activeGroup?.tabs.count ?? 0) > 1
+        }
+        // Next/Previous Group — only enabled when more than one group exists.
+        if menuItem.action == #selector(nextGroup(_:))
+            || menuItem.action == #selector(previousGroup(_:)) {
+            return windowSession.groups.count > 1
+        }
+        // Focus Split (4 directions) — only enabled when the active tab has
+        // been split (i.e., its SplitTree root is a .split node).
+        if menuItem.action == #selector(SurfaceView.focusSplitLeft(_:))
+            || menuItem.action == #selector(SurfaceView.focusSplitRight(_:))
+            || menuItem.action == #selector(SurfaceView.focusSplitUp(_:))
+            || menuItem.action == #selector(SurfaceView.focusSplitDown(_:)) {
+            return activeTab?.splitTree.isSplit ?? false
+        }
         return true
+    }
+
+    private var focusedSurfaceHasVisibleSearchBar: Bool {
+        guard let surfaceView = focusedController?.surfaceView else { return false }
+        return SurfaceScrollView.enclosing(surfaceView.superview)?.isSearchBarPresented ?? false
+    }
+
+    // MARK: - Menu Actions (Group)
+
+    @objc func newGroup(_ sender: Any?) { createNewGroup() }
+    @objc func closeGroup(_ sender: Any?) { closeActiveGroup() }
+    @objc func nextGroup(_ sender: Any?) { switchToNextGroup() }
+    @objc func previousGroup(_ sender: Any?) { switchToPreviousGroup() }
+
+    // MARK: - Menu Actions (Full Screen)
+
+    // Wrapping NSWindow.toggleFullScreen via a custom selector keeps the
+    // menu title fixed at "Toggle Full Screen" (AppKit only rewrites the
+    // title to Enter/Exit when the direct NSWindow selector is used).
+    @objc func toggleFullScreen(_ sender: Any?) {
+        window?.toggleFullScreen(sender)
+    }
+
+    // MARK: - Menu Actions (Find)
+
+    @objc func performFindAction(_ sender: Any?) {
+        focusedController?.performAction("start_search")
+    }
+
+    @objc func findNext(_ sender: Any?) {
+        // ghostty's `navigate_search:previous` moves toward the bottom of the
+        // buffer, which is the conventional Find Next direction.
+        focusedController?.performAction("navigate_search:previous")
+    }
+
+    @objc func findPrevious(_ sender: Any?) {
+        focusedController?.performAction("navigate_search:next")
     }
 
     @objc func newTab(_ sender: Any?) {

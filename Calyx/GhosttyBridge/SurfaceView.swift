@@ -1193,5 +1193,86 @@ extension SurfaceView {
     @IBAction func performFindAction(_ sender: Any?) {
         surfaceController?.performAction("start_search")
     }
+
+    @IBAction func focusSplitLeft(_ sender: Any) {
+        NotificationCenter.default.post(
+            name: .ghosttyGotoSplit,
+            object: self,
+            userInfo: ["direction": GHOSTTY_GOTO_SPLIT_LEFT])
+    }
+
+    @IBAction func focusSplitRight(_ sender: Any) {
+        NotificationCenter.default.post(
+            name: .ghosttyGotoSplit,
+            object: self,
+            userInfo: ["direction": GHOSTTY_GOTO_SPLIT_RIGHT])
+    }
+
+    @IBAction func focusSplitUp(_ sender: Any) {
+        NotificationCenter.default.post(
+            name: .ghosttyGotoSplit,
+            object: self,
+            userInfo: ["direction": GHOSTTY_GOTO_SPLIT_UP])
+    }
+
+    @IBAction func focusSplitDown(_ sender: Any) {
+        NotificationCenter.default.post(
+            name: .ghosttyGotoSplit,
+            object: self,
+            userInfo: ["direction": GHOSTTY_GOTO_SPLIT_DOWN])
+    }
+
+    @IBAction func findNext(_ sender: Any) {
+        // ghostty's `navigate_search:previous` moves toward the bottom of the
+        // buffer, which is the conventional Find Next direction.
+        surfaceController?.performAction("navigate_search:previous")
+    }
+
+    @IBAction func findPrevious(_ sender: Any) {
+        surfaceController?.performAction("navigate_search:next")
+    }
+
+    // Find Next/Previous only make sense while the in-terminal search bar is
+    // visible, so we gate them through validateMenuItem. SurfaceView is in
+    // the responder chain when the terminal is focused; once focus moves to
+    // the search field, CalyxWindowController provides the same gating in
+    // its own validateMenuItem.
+    //
+    // splitRight/Left/Up/Down and focusSplit* are intentionally NOT gated
+    // here. AppKit auto-disables menu items whose target action has no
+    // responder (e.g. browser tabs, where SurfaceView leaves the chain),
+    // which is exactly the desired behavior. See
+    // MenuShortcutsUITests.test_splitRight_isDisabled_inBrowserTab.
+    @objc func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        let action = menuItem.action
+        if action == #selector(findNext(_:)) || action == #selector(findPrevious(_:)) {
+            return isSearchBarVisible
+        }
+        // Focus Split (4 directions) — only meaningful when the active tab
+        // has been split. SurfaceView is in the responder chain whenever a
+        // terminal surface is focused, so AppKit asks us first. Without this
+        // gate the menu item would always appear enabled (we'd fall through
+        // to `return true`) and CalyxWindowController's matching gate would
+        // never be consulted.
+        if action == #selector(focusSplitLeft(_:))
+            || action == #selector(focusSplitRight(_:))
+            || action == #selector(focusSplitUp(_:))
+            || action == #selector(focusSplitDown(_:)) {
+            return isActiveTabSplit
+        }
+        return true
+    }
+
+    private var isSearchBarVisible: Bool {
+        SurfaceScrollView.enclosing(superview)?.isSearchBarPresented ?? false
+    }
+
+    private var isActiveTabSplit: Bool {
+        guard let controller = window?.windowController as? CalyxWindowController else {
+            return false
+        }
+        return controller.windowSession.activeGroup?.activeTab?.splitTree.isSplit ?? false
+    }
+
 }
 

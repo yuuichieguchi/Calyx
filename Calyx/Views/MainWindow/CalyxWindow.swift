@@ -3,8 +3,6 @@ import AppKit
 @MainActor
 class CalyxWindow: NSWindow {
 
-    var shortcutManager: ShortcutManager?
-
     nonisolated(unsafe) private var doubleClickZoomMonitor: Any?
 
     override init(
@@ -80,16 +78,4 @@ class CalyxWindow: NSWindow {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
-
-    override func sendEvent(_ event: NSEvent) {
-        if event.type == .keyDown,
-           let manager = shortcutManager,
-           manager.shouldIntercept(event: event, firstResponder: firstResponder) {
-            if manager.handleEvent(event) {
-                return
-            }
-        }
-
-        super.sendEvent(event)
-    }
 }

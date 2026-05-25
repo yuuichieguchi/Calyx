@@ -27,6 +27,10 @@ class SplitDividerView: NSView {
         super.init(frame: .zero)
         wantsLayer = true
         addSubview(glassHost)
+        // Expose as splitter to AppKit accessibility so UI tests (and screen
+        // readers) can identify split divider geometry.
+        setAccessibilityRole(.splitter)
+        setAccessibilityElement(true)
     }
 
     @available(*, unavailable)
