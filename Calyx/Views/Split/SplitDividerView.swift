@@ -10,11 +10,21 @@ import SwiftUI
 class SplitDividerView: NSView {
 
     let direction: SplitDirection
-    var onRatioChange: ((Double) -> Void)?
+    var onTargetRatioChange: ((Double) -> Void)?
+
+    /// The rect (in our superview's coordinate space) that the SPLIT this
+    /// divider belongs to occupies. For a root-level split this equals the
+    /// container's bounds; for a nested split it's the sub-rect carved out
+    /// for that subtree. Drag math is performed RELATIVE to this rect so
+    /// that nested dividers don't accidentally interpret cursor positions
+    /// in the whole-container coordinate space (Bug C).
+    ///
+    /// Defaults to `.zero` — callers that don't set it fall back to
+    /// `superview.bounds` to preserve the original semantics for top-level
+    /// splits and to keep existing fixtures working.
+    var containingRect: CGRect = .zero
 
     private var isDragging = false
-    private var dragStartPoint: CGPoint = .zero
-    private var dragStartRatio: Double = 0
 
     private let visibleThickness: CGFloat = 1
     private let hitAreaThickness: CGFloat = 7
@@ -71,37 +81,64 @@ class SplitDividerView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         isDragging = true
-        dragStartPoint = convert(event.locationInWindow, from: nil)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard isDragging else { return }
-        guard let superview else { return }
+        guard isDragging, let superview else { return }
 
-        let currentPoint = convert(event.locationInWindow, from: nil)
-        let parentSize = superview.bounds.size
-
-        let delta: CGFloat
-        let totalSize: CGFloat
-
-        switch direction {
-        case .horizontal:
-            delta = currentPoint.x - dragStartPoint.x
-            totalSize = parentSize.width
-        case .vertical:
-            delta = currentPoint.y - dragStartPoint.y
-            totalSize = parentSize.height
-        }
-
-        guard totalSize > 0 else { return }
-        let ratioDelta = delta / totalSize
-        onRatioChange?(ratioDelta)
-        dragStartPoint = currentPoint
+        // Read the cursor in the superview's coordinate space — that anchor
+        // is immune to our own frame shifting during the layout-pass round-trip.
+        let point = superview.convert(event.locationInWindow, from: nil)
+        guard let ratio = ratio(forSuperviewPoint: point, superview: superview) else { return }
+        onTargetRatioChange?(ratio)
     }
 
     override func mouseUp(with event: NSEvent) {
         isDragging = false
     }
+
+    /// AppKit removes a view from its window when it's detached. If a drag
+    /// was in flight we'd otherwise leak `isDragging == true` and the next
+    /// stray mouseDragged that AppKit routes our way would mutate the tree
+    /// even though the user lifted nothing — defensive cleanup (Bug F).
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow == nil {
+            isDragging = false
+        }
+    }
+
+    /// Compute the absolute target ratio in [0, 1] for a cursor at
+    /// `superviewPoint` (in `superview`'s coordinate space). Uses
+    /// `containingRect` when it has positive width AND height so that
+    /// nested-split dividers interpret the cursor RELATIVE to their own
+    /// sub-rect; otherwise falls back to `superview.bounds`.
+    private func ratio(forSuperviewPoint superviewPoint: NSPoint, superview: NSView) -> Double? {
+        let rect: CGRect
+        if containingRect.width > 0 && containingRect.height > 0 {
+            rect = containingRect
+        } else {
+            rect = superview.bounds
+        }
+        switch direction {
+        case .horizontal:
+            guard rect.width > 0 else { return nil }
+            return Double((superviewPoint.x - rect.minX) / rect.width)
+        case .vertical:
+            guard rect.height > 0 else { return nil }
+            return Double((superviewPoint.y - rect.minY) / rect.height)
+        }
+    }
+
+    #if DEBUG
+    /// Test-only: bypasses the NSEvent path because XCTest cannot reliably
+    /// attach a live NSWindow. Runs the same math as `mouseDragged`.
+    func _testSimulateDrag(toSuperviewPoint point: NSPoint) {
+        guard let superview else { return }
+        guard let ratio = ratio(forSuperviewPoint: point, superview: superview) else { return }
+        onTargetRatioChange?(ratio)
+    }
+    #endif
 }
 
 private struct SplitDividerGlassStrip: View {

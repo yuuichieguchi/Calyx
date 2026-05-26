@@ -307,8 +307,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         // Create the split container (shared across tabs — we swap its tree)
         let container = SplitContainerView(registry: SurfaceRegistry())
-        container.onRatioChange = { [weak self] leafID, delta, direction in
-            self?.handleDividerDrag(leafID: leafID, delta: delta, direction: direction)
+        container.onTargetRatioChange = { [weak self] firstChildID, secondChildID, targetRatio, direction, splitRect in
+            self?.handleDividerDrag(
+                firstChildFirstLeafID: firstChildID,
+                secondChildFirstLeafID: secondChildID,
+                targetRatio: targetRatio,
+                direction: direction,
+                splitRect: splitRect
+            )
         }
         container.onActiveLeafChange = { [weak self] leafID in
             self?.activeTab?.splitTree.focusedLeafID = leafID
@@ -456,8 +462,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             container.updateRegistry(tab.registry)
         } else {
             let container = SplitContainerView(registry: tab.registry)
-            container.onRatioChange = { [weak self] leafID, delta, direction in
-                self?.handleDividerDrag(leafID: leafID, delta: delta, direction: direction)
+            container.onTargetRatioChange = { [weak self] firstChildID, secondChildID, targetRatio, direction, splitRect in
+                self?.handleDividerDrag(
+                    firstChildFirstLeafID: firstChildID,
+                    secondChildFirstLeafID: secondChildID,
+                    targetRatio: targetRatio,
+                    direction: direction,
+                    splitRect: splitRect
+                )
             }
             container.onActiveLeafChange = { [weak self] leafID in
                 self?.activeTab?.splitTree.focusedLeafID = leafID
@@ -1069,16 +1081,33 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: - Split Operations
 
-    private func handleDividerDrag(leafID: UUID, delta: Double, direction: SplitDirection) {
-        guard let tab = activeTab, let contentView = window?.contentView else { return }
-        tab.splitTree = tab.splitTree.resize(
-            node: leafID,
-            by: delta,
+    private func handleDividerDrag(
+        firstChildFirstLeafID: UUID,
+        secondChildFirstLeafID: UUID,
+        targetRatio: Double,
+        direction: SplitDirection,
+        splitRect: CGRect
+    ) {
+        guard let tab = activeTab,
+              let container = splitContainerView,
+              container.bounds.width > 0,
+              container.bounds.height > 0 else { return }
+
+        // Bound the absolute ratio against the LOCAL split rect, not the
+        // outer container — otherwise dragging the inner divider of a
+        // nested split would resize the wrong axis fraction (Bug C).
+        let localSize = splitRect.size
+        guard localSize.width > 0, localSize.height > 0 else { return }
+
+        tab.splitTree = tab.splitTree.setRatio(
+            firstChildFirstLeafID: firstChildFirstLeafID,
+            secondChildFirstLeafID: secondChildFirstLeafID,
             direction: direction,
-            bounds: contentView.bounds.size,
+            to: targetRatio,
+            bounds: localSize,
             minSize: 50
         )
-        splitContainerView?.updateLayout(tree: tab.splitTree)
+        container.updateLayout(tree: tab.splitTree)
     }
 
     private func registerNotificationObservers() {
@@ -1228,7 +1257,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard let tab = activeTab else { return }
         guard let surfaceID = tab.registry.id(for: surfaceView) else { return }
         guard belongsToThisWindow(surfaceView) else { return }
-        guard let contentView = window?.contentView else { return }
+
+        // Refuse to compute a ratio against zero-sized bounds — `resize`
+        // would otherwise divide by zero and pin a NaN/Inf into the tree
+        // (Bug D).
+        guard let container = splitContainerView,
+              container.bounds.width > 0,
+              container.bounds.height > 0 else { return }
 
         guard let resize = notification.userInfo?["resize"] as? ghostty_action_resize_split_s else { return }
 
@@ -1255,10 +1290,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             node: surfaceID,
             by: amount,
             direction: direction,
-            bounds: contentView.bounds.size,
+            bounds: container.bounds.size,
             minSize: 50
         )
-        splitContainerView?.updateLayout(tree: tab.splitTree)
+        container.updateLayout(tree: tab.splitTree)
     }
 
     @objc private func handleEqualizeSplitsNotification(_ notification: Notification) {
