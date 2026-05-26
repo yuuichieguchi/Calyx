@@ -357,6 +357,183 @@ struct SplitTree: Codable, Equatable, Sendable {
         return nil
     }
 
+    // MARK: - Set Ratio
+
+    /// Pin the direction-matching split that owns `leafID` to an absolute
+    /// `targetRatio` in [0, 1]. Used by callers that only have a leaf in hand
+    /// (e.g. tests, future programmatic resize APIs). Clamping happens here
+    /// so callers never have to know about `minSize` or the `SplitData`
+    /// global cap.
+    ///
+    /// NOTE: This walks top-down and stops at the FIRST direction-matching
+    /// ancestor split that contains `leafID`. For nested SAME-direction
+    /// splits — e.g. `V(A, V(B, C))` — this is ambiguous: targeting B will
+    /// pin the OUTER vertical split, not the inner one. The divider-drag
+    /// path must use `setRatio(firstChildFirstLeafID:secondChildFirstLeafID:direction:to:bounds:minSize:)`
+    /// instead, which identifies a split unambiguously by both of its
+    /// children's leftmost leaf IDs.
+    func setRatio(
+        node leafID: UUID,
+        to targetRatio: Double,
+        direction: SplitDirection,
+        bounds: CGSize,
+        minSize: CGFloat
+    ) -> SplitTree {
+        guard let root else { return self }
+
+        guard let newRoot = Self.setRatioInNode(
+            root,
+            targetLeafID: leafID,
+            targetRatio: targetRatio,
+            targetDirection: direction,
+            totalSize: direction == .horizontal ? bounds.width : bounds.height,
+            minSize: minSize
+        ) else {
+            return self
+        }
+
+        return SplitTree(root: newRoot, focusedLeafID: focusedLeafID)
+    }
+
+    /// Pin a SPECIFIC split — identified unambiguously by the leftmost leaf
+    /// IDs of both its children plus its direction — to an absolute
+    /// `targetRatio` in [0, 1]. This is the divider-drag entry point: in a
+    /// binary tree, two distinct splits cannot share BOTH children's
+    /// leftmost leaves AND direction, so this triple uniquely names exactly
+    /// one split, which avoids the Bug B ambiguity that
+    /// `setRatio(node:to:...)` suffers for nested same-direction nests
+    /// like `V(A, V(B, C))`.
+    func setRatio(
+        firstChildFirstLeafID: UUID,
+        secondChildFirstLeafID: UUID,
+        direction: SplitDirection,
+        to targetRatio: Double,
+        bounds: CGSize,
+        minSize: CGFloat
+    ) -> SplitTree {
+        guard let root else { return self }
+
+        guard let newRoot = Self.setRatioForSpecificSplit(
+            root,
+            firstChildFirstLeafID: firstChildFirstLeafID,
+            secondChildFirstLeafID: secondChildFirstLeafID,
+            targetDirection: direction,
+            targetRatio: targetRatio,
+            totalSize: direction == .horizontal ? bounds.width : bounds.height,
+            minSize: minSize
+        ) else {
+            return self
+        }
+
+        return SplitTree(root: newRoot, focusedLeafID: focusedLeafID)
+    }
+
+    private static func setRatioInNode(
+        _ node: SplitNode,
+        targetLeafID: UUID,
+        targetRatio: Double,
+        targetDirection: SplitDirection,
+        totalSize: CGFloat,
+        minSize: CGFloat
+    ) -> SplitNode? {
+        guard case .split(let data) = node else { return nil }
+
+        let firstContains = containsLeaf(data.first, id: targetLeafID)
+        let secondContains = containsLeaf(data.second, id: targetLeafID)
+
+        guard firstContains || secondContains else { return nil }
+
+        if data.direction == targetDirection {
+            let newRatio: Double = firstContains ? targetRatio : 1 - targetRatio
+            let minRatio = totalSize > 0 ? Double(minSize) / Double(totalSize) : 0
+            let geometryClamped = max(minRatio, min(1 - minRatio, newRatio))
+            let clampedRatio = SplitData.clampRatio(geometryClamped)
+
+            return .split(SplitData(direction: data.direction, ratio: clampedRatio, first: data.first, second: data.second))
+        }
+
+        // Direction doesn't match — recurse into the child that contains the target
+        if firstContains {
+            if let newFirst = setRatioInNode(data.first, targetLeafID: targetLeafID, targetRatio: targetRatio, targetDirection: targetDirection, totalSize: totalSize, minSize: minSize) {
+                return .split(SplitData(direction: data.direction, ratio: data.ratio, first: newFirst, second: data.second))
+            }
+        }
+        if secondContains {
+            if let newSecond = setRatioInNode(data.second, targetLeafID: targetLeafID, targetRatio: targetRatio, targetDirection: targetDirection, totalSize: totalSize, minSize: minSize) {
+                return .split(SplitData(direction: data.direction, ratio: data.ratio, first: data.first, second: newSecond))
+            }
+        }
+
+        return nil
+    }
+
+    /// Walk the tree and pin exactly the split whose `(firstLeafID(first),
+    /// firstLeafID(second), direction)` triple matches the request. Returns
+    /// `nil` if no such split exists (e.g. caller passed IDs for a split
+    /// that's already been collapsed away).
+    private static func setRatioForSpecificSplit(
+        _ node: SplitNode,
+        firstChildFirstLeafID: UUID,
+        secondChildFirstLeafID: UUID,
+        targetDirection: SplitDirection,
+        targetRatio: Double,
+        totalSize: CGFloat,
+        minSize: CGFloat
+    ) -> SplitNode? {
+        guard case .split(let data) = node else { return nil }
+
+        if data.direction == targetDirection,
+           firstLeafID(of: data.first) == firstChildFirstLeafID,
+           firstLeafID(of: data.second) == secondChildFirstLeafID {
+            // Exact match — clamp and pin the ratio here.
+            let minRatio = totalSize > 0 ? Double(minSize) / Double(totalSize) : 0
+            let geometryClamped = max(minRatio, min(1 - minRatio, targetRatio))
+            let clampedRatio = SplitData.clampRatio(geometryClamped)
+            return .split(SplitData(
+                direction: data.direction,
+                ratio: clampedRatio,
+                first: data.first,
+                second: data.second
+            ))
+        }
+
+        // Not this split — recurse into either child that might contain it.
+        if let newFirst = setRatioForSpecificSplit(
+            data.first,
+            firstChildFirstLeafID: firstChildFirstLeafID,
+            secondChildFirstLeafID: secondChildFirstLeafID,
+            targetDirection: targetDirection,
+            targetRatio: targetRatio,
+            totalSize: totalSize,
+            minSize: minSize
+        ) {
+            return .split(SplitData(
+                direction: data.direction,
+                ratio: data.ratio,
+                first: newFirst,
+                second: data.second
+            ))
+        }
+        if let newSecond = setRatioForSpecificSplit(
+            data.second,
+            firstChildFirstLeafID: firstChildFirstLeafID,
+            secondChildFirstLeafID: secondChildFirstLeafID,
+            targetDirection: targetDirection,
+            targetRatio: targetRatio,
+            totalSize: totalSize,
+            minSize: minSize
+        ) {
+            return .split(SplitData(
+                direction: data.direction,
+                ratio: data.ratio,
+                first: data.first,
+                second: newSecond
+            ))
+        }
+
+        return nil
+    }
+
     // MARK: - Queries
 
     func allLeafIDs() -> [UUID] {

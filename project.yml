@@ -21,8 +21,10 @@ settings:
       - -framework CoreText
       - -lz
       - -lc++
-    SWIFT_ACTIVE_COMPILATION_CONDITIONS:
-      - DEBUG
+  configs:
+    debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS:
+        - DEBUG
 
 packages:
   Sparkle:
