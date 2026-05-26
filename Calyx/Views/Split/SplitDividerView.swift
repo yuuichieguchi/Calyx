@@ -145,7 +145,7 @@ class SplitDividerView: NSView {
     #endif
 }
 
-private struct SplitDividerGlassStrip: View {
+struct SplitDividerGlassStrip: View {
     @AppStorage("terminalGlassOpacity") private var glassOpacity: Double = 0.7
     @AppStorage("themeColorPreset") private var themePreset: String = "original"
     @AppStorage("themeColorCustomHex") private var customHex: String = "#050D1C"
@@ -159,13 +159,25 @@ private struct SplitDividerGlassStrip: View {
         )
     }
 
-    var body: some View {
-        let tint: NSColor
-        if let configColor = ghosttyProvider.splitDividerColor {
-            tint = configColor
-        } else {
-            tint = GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)
+    static func resolveTint(
+        themePreset: String,
+        configColor: NSColor?,
+        themeColor: NSColor,
+        glassOpacity: Double
+    ) -> NSColor {
+        if themePreset == "ghostty", let configColor {
+            return configColor
         }
+        return GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)
+    }
+
+    var body: some View {
+        let tint = Self.resolveTint(
+            themePreset: themePreset,
+            configColor: ghosttyProvider.splitDividerColor,
+            themeColor: themeColor,
+            glassOpacity: glassOpacity
+        )
         return Color.clear
             .glassEffect(.clear.tint(Color(nsColor: tint)), in: .rect)
             .opacity(0.5)
