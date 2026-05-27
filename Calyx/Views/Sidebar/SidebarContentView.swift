@@ -278,7 +278,7 @@ private struct GroupSectionView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.horizontal, 14)
-                .padding(.vertical, 10)
+                .padding(.vertical, 8)
                 .contentShape(Rectangle())
                 .modifier(GroupHeaderBackgroundModifier(
                     isActiveGroup: isActiveGroup,
@@ -307,7 +307,7 @@ private struct GroupSectionView: View {
                                 .font(.system(size: 10, weight: .bold, design: .rounded))
                                 .foregroundStyle(.secondary)
                         }
-                        .padding(.vertical, 10)
+                        .padding(.vertical, 8)
                         .contentShape(Rectangle())
 
                         // Close all tabs button (shown on hover)
