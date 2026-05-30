@@ -133,6 +133,24 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
         root.addArrangedSubview(divider)
 
+        // --- Scrolling Section ---
+        let scrollingTitle = NSTextField(labelWithString: "Scrolling")
+        scrollingTitle.font = .systemFont(ofSize: 20, weight: .semibold)
+        root.addArrangedSubview(scrollingTitle)
+
+        let smoothScrollSwitch = NSSwitch()
+        smoothScrollSwitch.state = (UserDefaults.standard.object(forKey: "smoothScrollEnabled") as? Bool ?? true) ? .on : .off
+        smoothScrollSwitch.target = self
+        smoothScrollSwitch.action = #selector(smoothScrollDidChange(_:))
+        root.addArrangedSubview(row(label: "Smooth Scrolling", control: smoothScrollSwitch))
+
+        let scrollingDivider = NSBox()
+        scrollingDivider.boxType = .separator
+        scrollingDivider.translatesAutoresizingMaskIntoConstraints = false
+        scrollingDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        root.addArrangedSubview(scrollingDivider)
+
+        // --- Save / Config Actions ---
         let actions = NSStackView()
         actions.orientation = .horizontal
         actions.spacing = 8
@@ -149,23 +167,6 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         actions.addArrangedSubview(NSView())
         root.addArrangedSubview(actions)
-
-        // --- Scrolling Section ---
-        let scrollingDivider = NSBox()
-        scrollingDivider.boxType = .separator
-        scrollingDivider.translatesAutoresizingMaskIntoConstraints = false
-        scrollingDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        root.addArrangedSubview(scrollingDivider)
-
-        let scrollingTitle = NSTextField(labelWithString: "Scrolling")
-        scrollingTitle.font = .systemFont(ofSize: 20, weight: .semibold)
-        root.addArrangedSubview(scrollingTitle)
-
-        let smoothScrollSwitch = NSSwitch()
-        smoothScrollSwitch.state = (UserDefaults.standard.object(forKey: "smoothScrollEnabled") as? Bool ?? true) ? .on : .off
-        smoothScrollSwitch.target = self
-        smoothScrollSwitch.action = #selector(smoothScrollDidChange(_:))
-        root.addArrangedSubview(row(label: "Smooth Scrolling", control: smoothScrollSwitch))
 
         // Divider before config info section
         let configDivider = NSBox()
