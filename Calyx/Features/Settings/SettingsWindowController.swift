@@ -7,18 +7,14 @@ private let logger = Logger(
 )
 
 @MainActor
-class SettingsWindowController: NSWindowController, NSWindowDelegate {
+class SettingsWindowController: NSWindowController {
 
     static let shared = SettingsWindowController()
     private let opacityLabel = NSTextField(labelWithString: "")
     private let opacitySlider = NSSlider(value: 0.7, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
-    private let saveButton = NSButton(title: "Save", target: nil, action: nil)
-    private var lastLoadedOpacity = 0.7
     private let presetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let colorWell = NSColorWell()
     private let hexField = NSTextField()
-    private var lastLoadedPreset: String = "original"
-    private var lastLoadedCustomHex: String = ThemeColorPreset.defaultCustomHex
 
     private init() {
         let window = NSWindow(
@@ -32,7 +28,6 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         window.isReleasedWhenClosed = false
 
         super.init(window: window)
-        window.delegate = self
 
         setupContent()
     }
@@ -150,86 +145,24 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         scrollingDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
         root.addArrangedSubview(scrollingDivider)
 
-        // --- Save / Config Actions ---
+        // --- Config Actions ---
         let actions = NSStackView()
         actions.orientation = .horizontal
         actions.spacing = 8
         actions.alignment = .centerY
 
-        saveButton.target = self
-        saveButton.action = #selector(savePreset(_:))
-        saveButton.bezelStyle = .rounded
-        actions.addArrangedSubview(saveButton)
-
         let openButton = NSButton(title: "Open Config File", target: self, action: #selector(openConfigFile(_:)))
         openButton.bezelStyle = .rounded
         actions.addArrangedSubview(openButton)
 
+        let helpButton = NSButton(title: "", target: self, action: #selector(showConfigHelp(_:)))
+        helpButton.bezelStyle = .helpButton
+        actions.addArrangedSubview(helpButton)
+
         actions.addArrangedSubview(NSView())
         root.addArrangedSubview(actions)
 
-        // Divider before config info section
-        let configDivider = NSBox()
-        configDivider.boxType = .separator
-        configDivider.translatesAutoresizingMaskIntoConstraints = false
-        configDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        root.addArrangedSubview(configDivider)
-
-        // Config info section
-        let configTitle = NSTextField(labelWithString: "Ghostty Config Compatibility")
-        configTitle.font = .systemFont(ofSize: 16, weight: .semibold)
-        root.addArrangedSubview(configTitle)
-
-        let configSubtitle = NSTextField(wrappingLabelWithString: "Calyx reads ~/.config/ghostty/config. Most settings are hot-reloaded when you save the file.")
-        configSubtitle.textColor = .secondaryLabelColor
-        configSubtitle.font = .systemFont(ofSize: 12)
-        root.addArrangedSubview(configSubtitle)
-
-        let managedLabel = NSTextField(wrappingLabelWithString: "The following keys are managed by Calyx for the Glass UI effect and will be overridden:")
-        managedLabel.textColor = .secondaryLabelColor
-        managedLabel.font = .systemFont(ofSize: 12)
-        root.addArrangedSubview(managedLabel)
-
-        let managedKeysText = GhosttyConfigManager.managedKeys.map { "  • \($0)" }.joined(separator: "\n")
-        let managedKeysList = NSTextField(wrappingLabelWithString: managedKeysText)
-        managedKeysList.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
-        managedKeysList.textColor = .tertiaryLabelColor
-        root.addArrangedSubview(managedKeysList)
-
         loadPresetIntoUI()
-    }
-
-    /// Checks for unsaved changes before app termination.
-    /// Returns `true` to proceed, `false` to cancel termination.
-    func confirmTermination() -> Bool {
-        guard window?.isVisible == true, hasUnsavedChanges() else { return true }
-
-        let alert = NSAlert()
-        alert.messageText = "Save settings before quitting?"
-        alert.informativeText = "Your settings have unsaved changes."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Don't Save")
-        alert.addButton(withTitle: "Cancel")
-
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            savePresetFromUI()
-            snapshotCurrentAsLoaded()
-            return true
-        case .alertSecondButtonReturn:
-            UserDefaults.standard.set(lastLoadedOpacity, forKey: "terminalGlassOpacity")
-            NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": lastLoadedOpacity])
-            UserDefaults.standard.set(lastLoadedPreset, forKey: "themeColorPreset")
-            UserDefaults.standard.set(lastLoadedCustomHex, forKey: "themeColorCustomHex")
-            loadPresetIntoUI()
-            GhosttyAppController.shared.reloadConfig()
-            return true
-        default:
-            // Do not revert UserDefaults here (unlike windowShouldClose Cancel).
-            // The user wants to keep editing their in-progress changes.
-            return false
-        }
     }
 
     func showSettings() {
@@ -299,9 +232,7 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         updateOpacityLabel()
         let opacity = max(0.0, min(1.0, opacitySlider.doubleValue))
         UserDefaults.standard.set(opacity, forKey: "terminalGlassOpacity")
-        NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": opacity])
         applyOpacityToRunningSurfaces()
-        fieldDidChange(sender)
     }
 
     @objc private func smoothScrollDidChange(_ sender: NSSwitch) {
@@ -326,7 +257,6 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         else {
             UserDefaults.standard.set("custom", forKey: "themeColorPreset")
         }
-        fieldDidChange(sender)
         GhosttyAppController.shared.reloadConfig()
     }
 
@@ -339,7 +269,6 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         UserDefaults.standard.set("custom", forKey: "themeColorPreset")
         // Update popup to show "Custom"
         presetPopup.selectItem(at: presetPopup.numberOfItems - 1)
-        fieldDidChange(sender)
         GhosttyAppController.shared.reloadConfig()
     }
 
@@ -358,22 +287,12 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             // Invalid hex - show red text, do NOT write to UserDefaults
             hexField.textColor = .systemRed
         }
-        fieldDidChange(sender)
-    }
-
-    @objc private func savePreset(_ sender: Any?) {
-        savePresetFromUI()
-        snapshotCurrentAsLoaded()
     }
 
     @objc func reloadConfig() {
         // Ghostty reloads config automatically via file watcher
         // This is a manual trigger if needed
         logger.info("Config reload requested")
-    }
-
-    @objc private func fieldDidChange(_ sender: Any?) {
-        refreshSaveButtonState()
     }
 
     private func row(label: String, control: NSView) -> NSView {
@@ -412,18 +331,6 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
             hexField.stringValue = customHex
         }
         hexField.textColor = .labelColor
-
-        snapshotCurrentAsLoaded()
-        refreshSaveButtonState()
-    }
-
-    private func savePresetFromUI() {
-        // Theme color changes are written to UserDefaults immediately for live preview.
-        // Only glass opacity needs explicit persistence here.
-        let opacity = max(0.0, min(1.0, opacitySlider.doubleValue))
-        UserDefaults.standard.set(opacity, forKey: "terminalGlassOpacity")
-        NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": opacity])
-        applyOpacityToRunningSurfaces()
     }
 
     private func applyOpacityToRunningSurfaces() {
@@ -432,57 +339,61 @@ class SettingsWindowController: NSWindowController, NSWindowDelegate {
         GhosttyAppController.shared.reloadConfig()
     }
 
-    private func snapshotCurrentAsLoaded() {
-        lastLoadedOpacity = opacitySlider.doubleValue
-        lastLoadedPreset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"
-        lastLoadedCustomHex = UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex
-        refreshSaveButtonState()
+    @objc private func showConfigHelp(_ sender: NSButton) {
+        let controller = GhosttyConfigHelpViewController()
+        let popover = NSPopover()
+        popover.contentViewController = controller
+        popover.behavior = .transient
+        popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .maxY)
     }
+}
 
-    private func hasUnsavedChanges() -> Bool {
-        let currentOpacity = opacitySlider.doubleValue
-        let opacityChanged = abs(currentOpacity - lastLoadedOpacity) > 0.0001
-        let currentPreset = UserDefaults.standard.string(forKey: "themeColorPreset") ?? "original"
-        let currentCustomHex = UserDefaults.standard.string(forKey: "themeColorCustomHex") ?? ThemeColorPreset.defaultCustomHex
-        let themeChanged = currentPreset != lastLoadedPreset || currentCustomHex != lastLoadedCustomHex
-        return opacityChanged || themeChanged
-    }
+@MainActor
+private final class GhosttyConfigHelpViewController: NSViewController {
 
-    private func refreshSaveButtonState() {
-        saveButton.isEnabled = hasUnsavedChanges()
-    }
+    override func loadView() {
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 8
+        root.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        root.translatesAutoresizingMaskIntoConstraints = false
 
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        guard hasUnsavedChanges() else { return true }
+        let title = NSTextField(labelWithString: "Ghostty Config Compatibility")
+        title.font = .systemFont(ofSize: 16, weight: .semibold)
+        root.addArrangedSubview(title)
 
-        let alert = NSAlert()
-        alert.messageText = "Save changes before closing?"
-        alert.informativeText = "Your Glass settings have unsaved changes."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Don't Save")
-        alert.addButton(withTitle: "Cancel")
+        let subtitle = NSTextField(wrappingLabelWithString: "Calyx reads ~/.config/ghostty/config. Most settings are hot-reloaded when you save the file.")
+        subtitle.textColor = .secondaryLabelColor
+        subtitle.font = .systemFont(ofSize: 12)
+        subtitle.preferredMaxLayoutWidth = 328
+        subtitle.setContentCompressionResistancePriority(.required, for: .vertical)
+        root.addArrangedSubview(subtitle)
 
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            savePreset(nil)
-            return !hasUnsavedChanges()
-        case .alertSecondButtonReturn:
-            UserDefaults.standard.set(lastLoadedOpacity, forKey: "terminalGlassOpacity")
-            NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": lastLoadedOpacity])
-            UserDefaults.standard.set(lastLoadedPreset, forKey: "themeColorPreset")
-            UserDefaults.standard.set(lastLoadedCustomHex, forKey: "themeColorCustomHex")
-            loadPresetIntoUI()
-            GhosttyAppController.shared.reloadConfig()
-            return true
-        default:
-            UserDefaults.standard.set(lastLoadedOpacity, forKey: "terminalGlassOpacity")
-            NotificationCenter.default.post(name: .glassOpacityDidChange, object: nil, userInfo: ["opacity": lastLoadedOpacity])
-            UserDefaults.standard.set(lastLoadedPreset, forKey: "themeColorPreset")
-            UserDefaults.standard.set(lastLoadedCustomHex, forKey: "themeColorCustomHex")
-            loadPresetIntoUI()
-            GhosttyAppController.shared.reloadConfig()
-            return false
-        }
+        let managedLabel = NSTextField(wrappingLabelWithString: "The following keys are managed by Calyx for the Glass UI effect and will be overridden:")
+        managedLabel.textColor = .secondaryLabelColor
+        managedLabel.font = .systemFont(ofSize: 12)
+        managedLabel.preferredMaxLayoutWidth = 328
+        managedLabel.setContentCompressionResistancePriority(.required, for: .vertical)
+        root.addArrangedSubview(managedLabel)
+
+        let managedKeysText = GhosttyConfigManager.managedKeys.map { "  • \($0)" }.joined(separator: "\n")
+        let managedKeysList = NSTextField(wrappingLabelWithString: managedKeysText)
+        managedKeysList.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        managedKeysList.textColor = .tertiaryLabelColor
+        managedKeysList.preferredMaxLayoutWidth = 328
+        managedKeysList.setContentCompressionResistancePriority(.required, for: .vertical)
+        root.addArrangedSubview(managedKeysList)
+
+        let container = NSView()
+        container.addSubview(root)
+        NSLayoutConstraint.activate([
+            root.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            root.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            root.topAnchor.constraint(equalTo: container.topAnchor),
+            root.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            root.widthAnchor.constraint(equalToConstant: 360),
+        ])
+        self.view = container
     }
 }

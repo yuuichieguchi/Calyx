@@ -243,7 +243,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Returns true if the app should proceed with quit, false if user cancelled.
     func confirmQuitIfNeeded() -> Bool {
-        // 1. Check for running processes
+        // Check for running processes
         if let app = GhosttyAppController.shared.app,
            ghostty_app_needs_confirm_quit(app) {
             let alert = NSAlert()
@@ -256,11 +256,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if alert.runModal() == .alertSecondButtonReturn {
                 return false
             }
-        }
-
-        // 2. Check for unsaved Settings
-        if !SettingsWindowController.shared.confirmTermination() {
-            return false
         }
 
         return true
