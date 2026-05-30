@@ -217,11 +217,6 @@ private struct SidebarBackgroundModifier: ViewModifier {
         } else {
             content
                 .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
-                .overlay(alignment: .trailing) {
-                    Rectangle()
-                        .fill(GlassTheme.specularStroke.opacity(0.30))
-                        .frame(width: 1)
-                }
                 .environment(\.colorScheme, chromeScheme)
                 .foregroundStyle(themePreset == "ghostty"
                     ? AnyShapeStyle(Color(nsColor: ghosttyProvider.ghosttyForeground))
