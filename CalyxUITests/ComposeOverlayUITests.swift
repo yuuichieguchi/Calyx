@@ -19,8 +19,8 @@ final class ComposeOverlayUITests: CalyxUITestCase {
         let textView = composeTextView()
         XCTAssertTrue(waitFor(textView, timeout: 3), "Compose overlay text view should appear after menu action")
 
-        // Dismiss with Escape
-        app.typeKey(.escape, modifierFlags: [])
+        // Dismiss with Cmd+Shift+E
+        app.typeKey("e", modifierFlags: [.command, .shift])
         waitForNonExistence(textView)
     }
 
@@ -37,14 +37,21 @@ final class ComposeOverlayUITests: CalyxUITestCase {
         waitForNonExistence(textView)
     }
 
-    func test_dismissWithEscape() {
+    func test_escapeDoesNotDismissOverlay() {
         menuAction("Edit", item: "Compose Input")
 
         let textView = composeTextView()
         XCTAssertTrue(waitFor(textView, timeout: 3))
 
-        // Dismiss with Escape
+        // Press Escape -- should NOT dismiss the overlay
         app.typeKey(.escape, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 0.5)
+
+        // Overlay should still be visible
+        XCTAssertTrue(textView.exists, "Escape should not dismiss compose overlay")
+
+        // Dismiss with Cmd+Shift+E
+        app.typeKey("e", modifierFlags: [.command, .shift])
         waitForNonExistence(textView, timeout: 3)
     }
 
@@ -69,7 +76,7 @@ final class ComposeOverlayUITests: CalyxUITestCase {
         XCTAssertFalse(placeholder.isHittable, "Placeholder should disappear after typing")
 
         // Dismiss
-        app.typeKey(.escape, modifierFlags: [])
+        app.typeKey("e", modifierFlags: [.command, .shift])
     }
 
     func test_shiftEnterInsertsNewline() {
@@ -92,7 +99,7 @@ final class ComposeOverlayUITests: CalyxUITestCase {
         XCTAssertTrue(value.contains("line1"), "Text should contain first line")
         XCTAssertTrue(value.contains("line2"), "Text should contain second line")
 
-        app.typeKey(.escape, modifierFlags: [])
+        app.typeKey("e", modifierFlags: [.command, .shift])
     }
 
     func test_enterSendsAndClearsText() {
@@ -120,6 +127,6 @@ final class ComposeOverlayUITests: CalyxUITestCase {
             .firstMatch
         XCTAssertTrue(waitFor(placeholder, timeout: 2), "Placeholder should reappear after text is cleared")
 
-        app.typeKey(.escape, modifierFlags: [])
+        app.typeKey("e", modifierFlags: [.command, .shift])
     }
 }

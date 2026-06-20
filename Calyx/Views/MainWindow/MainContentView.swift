@@ -48,6 +48,7 @@ struct MainContentView: View {
     var onDiscardAllReviews: (() -> Void)?
     var onComposeOverlaySend: ((String) -> Bool)?
     var onDismissComposeOverlay: (() -> Void)?
+    var onComposeOverlayEscapePressed: (() -> Void)?
     var totalReviewCommentCount: Int = 0
     var reviewFileCount: Int = 0
 
@@ -202,7 +203,8 @@ struct MainContentView: View {
                                         ComposeOverlayContainerView(
                                             text: $windowSession.composeOverlayText,
                                             onSend: onComposeOverlaySend,
-                                            onDismiss: onDismissComposeOverlay
+                                            onDismiss: onDismissComposeOverlay,
+                                            onEscapePressed: onComposeOverlayEscapePressed
                                         )
                                         .frame(height: windowSession.composeOverlayHeight)
                                         .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))

@@ -40,6 +40,7 @@ class ComposeOverlayView: NSView {
 
     var onSend: ((String) -> Bool)?
     var onDismiss: (() -> Void)?
+    var onEscapePressed: (() -> Void)?
     var onTextChanged: ((String) -> Void)?
 
     var text: String {
@@ -165,12 +166,6 @@ class ComposeOverlayView: NSView {
     // MARK: - Key Handling (overrides on the view itself for when textView doesn't handle)
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        // Escape dismiss
-        if event.keyCode == 53 {
-            onDismiss?()
-            return true
-        }
-        // Cmd+Shift+E toggle (even when textView has focus)
         if event.modifierFlags.contains([.command, .shift]),
            event.charactersIgnoringModifiers?.lowercased() == "e" {
             onDismiss?()
@@ -200,7 +195,7 @@ class ComposeOverlayView: NSView {
     }
 
     override func cancelOperation(_ sender: Any?) {
-        onDismiss?()
+        onEscapePressed?()
     }
 
     // MARK: - Placeholder

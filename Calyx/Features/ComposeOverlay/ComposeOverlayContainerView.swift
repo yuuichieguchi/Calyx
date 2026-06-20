@@ -10,12 +10,14 @@ struct ComposeOverlayContainerView: NSViewRepresentable {
     @Binding var text: String
     var onSend: ((String) -> Bool)?
     var onDismiss: (() -> Void)?
+    var onEscapePressed: (() -> Void)?
 
     func makeNSView(context: Context) -> ComposeOverlayView {
         let view = ComposeOverlayView()
         view.text = text
         view.onSend = onSend
         view.onDismiss = onDismiss
+        view.onEscapePressed = onEscapePressed
         view.onTextChanged = { newText in
             if newText != text { text = newText }
         }
@@ -28,6 +30,7 @@ struct ComposeOverlayContainerView: NSViewRepresentable {
         }
         nsView.onSend = onSend
         nsView.onDismiss = onDismiss
+        nsView.onEscapePressed = onEscapePressed
         nsView.onTextChanged = { newText in
             if newText != text { text = newText }
         }
