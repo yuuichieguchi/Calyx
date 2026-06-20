@@ -8,7 +8,7 @@
 //  Coverage:
 //  - ComposeOverlayView: Enter sends text via onSend
 //  - ComposeOverlayView: Shift+Enter inserts newline without sending
-//  - ComposeOverlayView: Escape triggers onDismiss
+//  - ComposeOverlayView: Escape forwards via onEscapePressed, does NOT dismiss
 //  - ComposeOverlayView: Empty text is not sent
 //  - GhosttyAppController: trustedPasteContent defaults nil
 //  - GhosttyAppController: trustedPasteContent round-trip
@@ -75,12 +75,16 @@ final class ComposeOverlayViewTests: XCTestCase {
                        "onSend must NOT be called for Shift+Enter")
     }
 
-    // ==================== 3. Escape Triggers onDismiss ====================
+    // ==================== 3. Escape Forwards to Terminal, Does NOT Dismiss ====================
 
-    func test_should_invoke_onDismiss_when_escape_pressed() {
+    func test_escape_should_forward_not_dismiss() {
         // Arrange
         let sut = makeSUT()
+        var escapeCalled = false
         var dismissCalled = false
+        sut.onEscapePressed = {
+            escapeCalled = true
+        }
         sut.onDismiss = {
             dismissCalled = true
         }
@@ -89,8 +93,10 @@ final class ComposeOverlayViewTests: XCTestCase {
         sut.cancelOperation(nil)
 
         // Assert
-        XCTAssertTrue(dismissCalled,
-                      "onDismiss should fire when Escape (cancelOperation) is invoked")
+        XCTAssertTrue(escapeCalled,
+                      "onEscapePressed should fire when Escape (cancelOperation) is invoked")
+        XCTAssertFalse(dismissCalled,
+                       "onDismiss must NOT fire on Escape -- only Cmd+Shift+E should dismiss")
     }
 
     // ==================== 3.5. Enter Clears Text After Send ====================

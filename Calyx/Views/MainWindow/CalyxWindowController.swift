@@ -404,6 +404,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             },
             onComposeOverlaySend: { [weak self] text in self?.sendComposeText(text) ?? false },
             onDismissComposeOverlay: { [weak self] in self?.dismissComposeOverlay() },
+            onComposeOverlayEscapePressed: { [weak self] in self?.forwardEscapeToTerminal() },
             totalReviewCommentCount: totalReviewCommentCount,
             reviewFileCount: reviewFileCount
         )
@@ -940,6 +941,26 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         if case .terminal = activeTab?.content {
             restoreFocus()
         }
+    }
+
+    private func forwardEscapeToTerminal() {
+        guard let tab = activeTab, case .terminal = tab.content else { return }
+        let targetID = composeOverlayTargetSurfaceID ?? tab.splitTree.focusedLeafID
+        guard let targetID,
+              let controller = tab.registry.controller(for: targetID) else { return }
+
+        var escEvent = ghostty_input_key_s()
+        escEvent.action = GHOSTTY_ACTION_PRESS
+        escEvent.keycode = 0x35
+        escEvent.mods = GHOSTTY_MODS_NONE
+        escEvent.consumed_mods = GHOSTTY_MODS_NONE
+        escEvent.text = nil
+        escEvent.unshifted_codepoint = 0
+        escEvent.composing = false
+        controller.sendKey(escEvent)
+
+        escEvent.action = GHOSTTY_ACTION_RELEASE
+        controller.sendKey(escEvent)
     }
 
     @discardableResult
