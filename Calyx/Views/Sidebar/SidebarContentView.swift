@@ -593,7 +593,7 @@ private struct TabRowItemView: View {
             .contentShape(Rectangle())
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .frame(height: 29)
+            .frame(height: 31)
             .modifier(TabChromeModifier(
                 isActive: isActive,
                 cornerRadius: 12,
