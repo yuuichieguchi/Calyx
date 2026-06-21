@@ -142,23 +142,32 @@ final class MCPLSPBridge {
     /// the diff is materialised entirely from data ingested earlier via
     /// `textDocument/publishDiagnostics` notifications. The store is owned
     /// by the bridge (and not by `LSPSession`) so it can outlive individual
-    /// sessions and aggregate across language servers.
-    let diagnosticsStore = DiagnosticsStore()
+    /// sessions and aggregate across language servers. Callers that wire
+    /// production sessions should hand the same instance to
+    /// `LSPService.init(diagnosticsStore:)` so server publishes feed back
+    /// into the store the diff reads from; tests that don't care about
+    /// publish wiring can drop the argument and rely on the default
+    /// internal store.
+    let diagnosticsStore: DiagnosticsStore
 
     // MARK: Init
 
     /// Designated initializer. The `installer` parameter is optional so
     /// callers that don't need the install/orchestration cluster (e.g.
     /// the legacy `CalyxMCPServer` wiring) can keep their existing call
-    /// sites untouched.
+    /// sites untouched. `diagnosticsStore` is optional so existing tests
+    /// that constructed the bridge without one continue to work; when
+    /// `nil` the bridge creates a fresh internal store.
     init(
         service: LSPService,
         workspaceResolver: WorkspaceResolver,
-        installer: LSPInstaller? = nil
+        installer: LSPInstaller? = nil,
+        diagnosticsStore: DiagnosticsStore? = nil
     ) {
         self.service = service
         self.workspaceResolver = workspaceResolver
         self.installer = installer
+        self.diagnosticsStore = diagnosticsStore ?? DiagnosticsStore()
     }
 
     // MARK: - Tool catalogue

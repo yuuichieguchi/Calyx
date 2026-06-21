@@ -148,6 +148,14 @@ final class LSPService {
     /// returned by `availableSnapshots()`. When `nil`, persistence is
     /// disabled end-to-end and `availableSnapshots()` returns `[]`.
     private let persistence: LSPSessionPersistence?
+    /// Optional diagnostics aggregator shared across every session built
+    /// by this service. When non-nil, each session installs a
+    /// `textDocument/publishDiagnostics` notification handler that
+    /// ingests publishes into the store keyed on the session's own
+    /// `workspaceRoot`. The store is owned externally (typically by the
+    /// `MCPLSPBridge`) so reads via `lsp_diagnostics_diff` see a
+    /// workspace-wide view that outlives any individual session.
+    private let diagnosticsStore: DiagnosticsStore?
 
     private var sessions: [SessionKey: SessionEntry] = [:]
     /// In-flight builds keyed by `SessionKey` so concurrent
@@ -165,7 +173,8 @@ final class LSPService {
         sessionFactory: any LSPSessionFactory,
         config: LSPServiceConfig = LSPServiceConfig(),
         fileSyncManager: FileSyncManager? = nil,
-        persistence: LSPSessionPersistence? = nil
+        persistence: LSPSessionPersistence? = nil,
+        diagnosticsStore: DiagnosticsStore? = nil
     ) {
         self.registry = registry
         self.installer = installer
@@ -173,6 +182,7 @@ final class LSPService {
         self.config = config
         self.fileSyncManager = fileSyncManager
         self.persistence = persistence
+        self.diagnosticsStore = diagnosticsStore
     }
 
     // MARK: Public API
@@ -343,7 +353,8 @@ final class LSPService {
             workspaceRoot: key.workspaceRoot,
             languageId: key.languageId,
             client: client,
-            persistence: persistence
+            persistence: persistence,
+            diagnosticsStore: diagnosticsStore
         )
 
         do {

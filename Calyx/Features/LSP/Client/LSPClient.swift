@@ -83,6 +83,14 @@ actor LSPClient {
 
     /// Idempotent shutdown. Cancels the receive loop, closes the
     /// transport, and fails any in-flight `sendRequest`.
+    ///
+    /// Drops every registered request/notification handler before
+    /// returning. The handlers installed by `LSPSession` capture the
+    /// session strongly (so the underlying receive task stays alive for
+    /// the lifetime of the server-initiated traffic stream); clearing
+    /// the handler dictionaries on close breaks that retain cycle so
+    /// `LSPSession ↔ LSPClient ↔ handler closure ↔ LSPSession` can
+    /// deinit once the application releases its references.
     func close() async {
         switch state {
         case .closed:
@@ -96,6 +104,13 @@ actor LSPClient {
 
         await transport.close()
         failAllPending(.transportClosed)
+        // Break the retain cycle with `LSPSession`: the seven handlers
+        // installed during the initialize handshake capture the session
+        // strongly, which would otherwise keep the session, this client,
+        // and the closure dictionary alive forever once the application
+        // drops its top-level reference.
+        requestHandlers.removeAll()
+        notificationHandlers.removeAll()
     }
 
     // MARK: - Client → Server

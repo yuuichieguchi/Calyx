@@ -126,9 +126,27 @@ actor LSPSession {
     /// `didOpen` / `didClose` and removes the entry on `shutdown()`, so
     /// callers can rebuild the open-file set across application launches.
     private let persistence: LSPSessionPersistence?
+    /// Optional diagnostics aggregator. When non-nil the session installs
+    /// a `textDocument/publishDiagnostics` notification handler during
+    /// `start()` that ingests every publish into this store keyed on the
+    /// session's `workspaceRoot`. Multiple sessions can share the same
+    /// store, which is how `MCPLSPBridge` exposes a workspace-wide diff
+    /// view via `lsp_diagnostics_diff`.
+    private let diagnosticsStore: DiagnosticsStore?
 
     private var sessionState: SessionState = .notStarted
     private var openDocs: Set<DocumentUri> = []
+
+    /// Tail of the persist/remove pipeline. Each `schedulePersistSnapshot`
+    /// / `scheduleRemoveSnapshot` call appends a Task that first awaits
+    /// the prior task's value, then dispatches its own `persist` /
+    /// `remove` against the persistence actor. This serialises the
+    /// persist pipeline deterministically — without the chain, the
+    /// unstructured Tasks could reach the persistence actor in an order
+    /// that does not match their spawn order, so a `didOpen → didClose`
+    /// sequence could land as `remove → persist` and the session's open
+    /// set would diverge from the on-disk snapshot.
+    private var pendingPersistTask: Task<Void, Never>?
 
     /// Buffered server-originated message log (showMessage / logMessage /
     /// showMessageRequest / showDocument). FIFO, capped at
@@ -151,7 +169,8 @@ actor LSPSession {
         client: LSPClient,
         clientCapabilities: ClientCapabilities = ClientCapabilities.calyxDefault(),
         clientInfo: ClientInfo = ClientInfo(name: "Calyx", version: "0.26.1"),
-        persistence: LSPSessionPersistence? = nil
+        persistence: LSPSessionPersistence? = nil,
+        diagnosticsStore: DiagnosticsStore? = nil
     ) {
         self.workspaceRoot = workspaceRoot
         self.languageId = languageId
@@ -161,6 +180,7 @@ actor LSPSession {
         self.capabilities = CapabilityRegistry()
         self.progress = ProgressBroker()
         self.persistence = persistence
+        self.diagnosticsStore = diagnosticsStore
     }
 
     // MARK: - Introspection
@@ -251,12 +271,27 @@ actor LSPSession {
             )
 
             await capabilities.setStaticCapabilities(result.capabilities)
-            sessionState = .running(serverInfo: result.serverInfo)
 
+            // Emit `initialized` BEFORE flipping the session to `.running`.
+            // The LSP spec forbids the client from sending any other
+            // request/notification between `initialize` and `initialized`
+            // (only telemetry/log/showMessage are server-initiated and
+            // exempt). If we set `.running` first, concurrent callers
+            // that race through `ensureRunning()` while this method is
+            // still suspended on `sendNotification` could enqueue
+            // `textDocument/didOpen` etc. ahead of `initialized` on the
+            // wire — strict servers reject the session for protocol
+            // violation. By holding the state at `.initializing` until
+            // the notification has been handed to the transport, every
+            // user-facing API stays gated behind the handshake.
+            //
+            // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#initialized
             try await client.sendNotification(
                 method: "initialized",
                 params: InitializedParams()
             )
+
+            sessionState = .running(serverInfo: result.serverInfo)
         } catch let err as LSPClientError {
             sessionState = .failed(reason: String(describing: err))
             throw LSPSessionError.clientError(err)
@@ -270,24 +305,49 @@ actor LSPSession {
 
     /// Send `shutdown` then the `exit` notification, and close the
     /// underlying transport. Transitions the session to `.shutdown`.
+    ///
+    /// The wire-level `shutdown` / `exit` calls are best-effort: when the
+    /// server has already exited (process died, transport half-closed,
+    /// stdin pipe broken) either call can throw a `transportClosed` or
+    /// `serverError`. We deliberately swallow those failures because the
+    /// caller's only sensible reaction is to proceed with the local
+    /// teardown anyway — leaking the `LSPClient`'s receive task and the
+    /// underlying `Process` / `Pipe` (the original behaviour, which
+    /// re-threw mid-teardown and skipped `client.close()` /
+    /// `scheduleRemoveSnapshot()`) is strictly worse than dropping the
+    /// wire error.
+    ///
+    /// `throws` is retained on the signature so existing call sites that
+    /// write `try await session.shutdown()` continue to compile; the
+    /// method itself never throws today.
     func shutdown() async throws {
         sessionState = .shuttingDown
-        do {
-            _ = try await client.sendRequest(
-                method: "shutdown",
-                resultType: AnyCodable.self
-            )
-            try await client.sendNotification(method: "exit")
-            await client.close()
-            sessionState = .shutdown
-        } catch let err as LSPClientError {
-            sessionState = .failed(reason: String(describing: err))
-            throw LSPSessionError.clientError(err)
-        } catch {
-            sessionState = .failed(reason: String(describing: error))
-            throw error
-        }
+        // Best-effort wire teardown: the server may have already exited
+        // or half-closed the transport. We still need to release our
+        // side, so swallow any error here and continue.
+        _ = try? await client.sendRequest(
+            method: "shutdown",
+            resultType: AnyCodable.self
+        )
+        try? await client.sendNotification(method: "exit")
+
+        // Mandatory local teardown — runs regardless of any wire-level
+        // failure above. `client.close()` cancels the receive task,
+        // closes the transport, fails any leftover pending requests and
+        // (since Bug B) drops the handler dictionary that captures
+        // `self` strongly.
+        await client.close()
+        sessionState = .shutdown
         scheduleRemoveSnapshot()
+
+        // Drain the persist/remove pipeline before returning so the
+        // caller (and the surrounding `LSPService`) sees the on-disk
+        // snapshot consistent with the session's final state. Without
+        // this drain, `LSPService.shutdownSession` would return while a
+        // straggler `persist(snapshot-with-open-files)` is still in
+        // flight — a subsequent launch would then `availableSnapshots()`
+        // a session that is already shut down.
+        await pendingPersistTask?.value
     }
 
     // MARK: - textDocument lifecycle
@@ -452,28 +512,39 @@ actor LSPSession {
         )
     }
 
-    /// Fire-and-forget persist of the current snapshot. No-op when the
-    /// session was constructed without a persistence store. The snapshot is
-    /// captured synchronously while the actor is held, then handed to a
-    /// detached Task so the persist I/O does not block the calling
-    /// notification path.
+    /// Persist the current snapshot via the `pendingPersistTask` chain.
+    /// No-op when the session was constructed without a persistence store.
+    ///
+    /// Each scheduled Task captures the previous tail of the chain and
+    /// awaits its completion before invoking `persistence.persist`. This
+    /// is the entire ordering guarantee: unstructured `Task { ... }`
+    /// blocks have no spawn-order arrival guarantee against the
+    /// downstream actor, so a naive fire-and-forget pipeline could land
+    /// `didOpen` after `didClose`, leaving the disk snapshot
+    /// inconsistent with the session's open set. The chain serialises
+    /// the pipeline deterministically without blocking the actor that
+    /// scheduled the work.
     private func schedulePersistSnapshot() {
         guard let persistence else { return }
         let snap = currentSnapshot()
-        Task {
+        let prior = pendingPersistTask
+        pendingPersistTask = Task {
+            await prior?.value
             try? await persistence.persist(snap)
         }
     }
 
-    /// Fire-and-forget removal of this session's persisted entry. No-op
-    /// when the session was constructed without a persistence store.
-    /// Captures `workspaceRoot` / `languageId` into Sendable locals so the
-    /// background Task does not need to reach back into the actor.
+    /// Remove this session's persisted entry via the `pendingPersistTask`
+    /// chain. No-op when the session was constructed without a persistence
+    /// store. Captures `workspaceRoot` / `languageId` into Sendable locals
+    /// so the background Task does not need to reach back into the actor.
     private func scheduleRemoveSnapshot() {
         guard let persistence else { return }
         let ws = workspaceRoot
         let lang = languageId
-        Task {
+        let prior = pendingPersistTask
+        pendingPersistTask = Task {
+            await prior?.value
             try? await persistence.remove(workspaceRoot: ws, languageId: lang)
         }
     }
@@ -529,6 +600,56 @@ actor LSPSession {
             let createParams = try JSONDecoder().decode(WorkDoneProgressCreateParams.self, from: data)
             await broker.registerToken(createParams.token)
             return nil
+        }
+
+        // $/progress — notification. Forward begin / report / end payloads
+        // into the broker. Notifications whose `value` is not a
+        // WorkDoneProgress variant (custom server progress) are dropped
+        // silently; the broker only models the standard WorkDone shape.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#progress
+        await client.setNotificationHandler(method: "$/progress") { params in
+            guard let params = params else { return }
+            do {
+                let data = try JSONEncoder().encode(params)
+                let typed = try JSONDecoder().decode(ProgressNotificationParams.self, from: data)
+                await broker.handleProgress(token: typed.token, value: typed.value)
+            } catch {
+                // Custom server progress (non-WorkDoneProgress `value`)
+                // or malformed payload — drop. The user-facing contract
+                // for `ProgressBroker.handleProgress` only covers
+                // WorkDoneProgress; inventing state from unknown shapes
+                // would surface noise via `inFlight()` / `snapshot()`.
+            }
+        }
+
+        // textDocument/publishDiagnostics — notification. Forward into
+        // the (optional) shared `DiagnosticsStore` keyed on this
+        // session's `workspaceRoot`. The notification handler closure
+        // captures the store and root by value (rather than `self`) so
+        // it does not contribute to the LSPSession ↔ LSPClient retain
+        // cycle that the handlers below intentionally form.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_publishDiagnostics
+        if let diagnosticsStore = self.diagnosticsStore {
+            let workspaceRoot = self.workspaceRoot
+            await client.setNotificationHandler(method: "textDocument/publishDiagnostics") { params in
+                guard let params = params else { return }
+                do {
+                    let data = try JSONEncoder().encode(params)
+                    let typed = try JSONDecoder().decode(
+                        PublishDiagnosticsParams.self,
+                        from: data
+                    )
+                    await diagnosticsStore.ingest(
+                        workspaceRoot: workspaceRoot,
+                        params: typed
+                    )
+                } catch {
+                    // Malformed publishDiagnostics payload — drop. The
+                    // store keeps the previous state for this URI rather
+                    // than reverting to "no diagnostics", which would
+                    // misrepresent the server's view of the document.
+                }
+            }
         }
 
         // The handlers below capture `self` strongly so the session — and
@@ -719,6 +840,21 @@ actor LSPSession {
 /// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_workDoneProgress_create
 private struct WorkDoneProgressCreateParams: Sendable, Codable, Equatable {
     let token: ProgressToken
+}
+
+// MARK: - ProgressNotificationParams
+
+/// LSP 3.18 `$/progress` notification params: a `(token, value)` tuple
+/// where `value` is one of the WorkDoneProgress variants. Declared inline
+/// because `LSPSession` is the only consumer — `ProgressBroker` already
+/// decodes the discriminated `value` separately. Non-WorkDoneProgress
+/// values (custom server progress) fail to decode here and are dropped by
+/// the notification handler.
+///
+/// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#progress
+private struct ProgressNotificationParams: Sendable, Codable, Equatable {
+    let token: ProgressToken
+    let value: WorkDoneProgress
 }
 
 // MARK: - ClientCapabilities.calyxDefault

@@ -66,16 +66,30 @@ final class CalyxMCPServer {
         // `shutdown()`, so a subsequent launch can replay the open-file
         // set via `LSPService.availableSnapshots()`.
         let persistence = LSPSessionPersistence()
+        // Single `DiagnosticsStore` shared between `LSPService` (which
+        // hands it to every freshly built `LSPSession` so server
+        // `textDocument/publishDiagnostics` notifications are ingested)
+        // and `MCPLSPBridge` (which reads from the same store when
+        // serving the `lsp_diagnostics_diff` tool). Without the shared
+        // reference the store the bridge reads from would never be
+        // populated and the diff would always come back empty.
+        let diagnosticsStore = DiagnosticsStore()
         let service = LSPService(
             registry: registry,
             installer: installer,
             sessionFactory: factory,
             config: LSPServiceConfig(),
             fileSyncManager: fileSyncManager,
-            persistence: persistence
+            persistence: persistence,
+            diagnosticsStore: diagnosticsStore
         )
         let resolver = WorkspaceResolver(registry: registry)
-        self.lspBridge = MCPLSPBridge(service: service, workspaceResolver: resolver, installer: installer)
+        self.lspBridge = MCPLSPBridge(
+            service: service,
+            workspaceResolver: resolver,
+            installer: installer,
+            diagnosticsStore: diagnosticsStore
+        )
     }
 
     /// For testing only — inject a pre-built `MCPLSPBridge` (typically
