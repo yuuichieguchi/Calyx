@@ -62,6 +62,45 @@ enum LSPSessionError: Error, Equatable {
     case clientError(LSPClientError)
 }
 
+// MARK: - ServerLogEntry
+
+/// A single entry in the session-local server message log. Captures the
+/// payload of `window/showMessage`, `window/logMessage`,
+/// `window/showMessageRequest` and `window/showDocument` traffic so callers
+/// (CLI, MCP bridge, UI) can review what the server has reported.
+///
+/// `type` follows the LSP `MessageType` enum: `1=Error 2=Warning 3=Info
+/// 4=Log`. `showDocument` does not carry a `MessageType`, so the session
+/// records it as `0` and stores the requested URI in `message`.
+struct ServerLogEntry: Sendable, Equatable {
+    enum Source: String, Sendable, Codable {
+        case showMessage
+        case showMessageRequest
+        case showDocument
+        case logMessage
+    }
+    let source: Source
+    let type: Int
+    let message: String
+}
+
+// MARK: - PendingApplyEdit
+
+/// A `workspace/applyEdit` request that the server has issued and the
+/// session has buffered for downstream review. The session always responds
+/// to the wire request with `{ "applied": false }` so the AI / UI can opt
+/// in to applying the edit out-of-band; the buffered entries live here
+/// until `consumePendingApplyEdit(id:)` drains them.
+struct PendingApplyEdit: Sendable {
+    /// Monotonically increasing, session-local identifier. Distinct from
+    /// the JSON-RPC request id (which is owned by `LSPClient`).
+    let id: Int
+    /// Optional human-readable label supplied by the server.
+    let label: String?
+    /// Raw `WorkspaceEdit` payload.
+    let edit: AnyCodable
+}
+
 // MARK: - LSPSession
 
 /// Actor owning the full LSP 3.18 lifecycle for one workspace + languageId.
@@ -85,6 +124,19 @@ actor LSPSession {
 
     private var sessionState: SessionState = .notStarted
     private var openDocs: Set<DocumentUri> = []
+
+    /// Buffered server-originated message log (showMessage / logMessage /
+    /// showMessageRequest / showDocument). FIFO, capped at
+    /// `serverMessagesCap`.
+    private var serverMessages: [ServerLogEntry] = []
+    private let serverMessagesCap = 100
+
+    /// `workspace/applyEdit` requests the server has issued, in arrival
+    /// order. Drained by callers via `consumePendingApplyEdit(id:)`.
+    private var pendingApplyEditQueue: [PendingApplyEdit] = []
+
+    /// Monotonic id source for `PendingApplyEdit.id`. Session-local.
+    private var nextApplyEditId: Int = 1
 
     // MARK: - Init
 
@@ -124,6 +176,29 @@ actor LSPSession {
     /// Progress broker tracking work-done progress reservations and updates.
     func progressBroker() -> ProgressBroker {
         return progress
+    }
+
+    /// Snapshot of the buffered server message log (FIFO, capped at the
+    /// session-configured maximum). Oldest-first.
+    func recentServerMessages() -> [ServerLogEntry] {
+        return serverMessages
+    }
+
+    /// Snapshot of the pending `workspace/applyEdit` queue.
+    func pendingApplyEdits() -> [PendingApplyEdit] {
+        return pendingApplyEditQueue
+    }
+
+    /// Drop every buffered server message. Used by callers (CLI / MCP /
+    /// UI) that have rendered the log and want a fresh window.
+    func clearServerMessages() {
+        serverMessages.removeAll()
+    }
+
+    /// Remove the pending `workspace/applyEdit` entry whose session-local
+    /// id matches `id`. No-op if no such entry exists.
+    func consumePendingApplyEdit(id: Int) {
+        pendingApplyEditQueue.removeAll { $0.id == id }
     }
 
     // MARK: - Lifecycle: start
@@ -401,6 +476,183 @@ actor LSPSession {
             await broker.registerToken(createParams.token)
             return nil
         }
+
+        // The handlers below capture `self` strongly so the session — and
+        // by transitive ownership the underlying `LSPClient` and its
+        // receive task — stay alive for as long as the server can deliver
+        // traffic. The intentional retain cycle `LSPSession ↔ LSPClient ↔
+        // handler closure ↔ LSPSession` is broken when the application
+        // calls `shutdown()`, which closes the transport so the receive
+        // task drains and exits and then transitions the session to
+        // `.shutdown`. The existing handlers above use sub-actor captures
+        // (`registry`, `broker`) and so do not contribute to the cycle.
+
+        // window/showMessage — notification. Buffer into the server log.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_showMessage
+        await client.setNotificationHandler(method: "window/showMessage") { [self] params in
+            guard let params = params else { return }
+            let parsed = await self.decodeMessageParams(params)
+            await self.appendServerMessage(
+                ServerLogEntry(source: .showMessage, type: parsed.type, message: parsed.message)
+            )
+        }
+
+        // window/logMessage — notification. Buffer into the server log.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_logMessage
+        await client.setNotificationHandler(method: "window/logMessage") { [self] params in
+            guard let params = params else { return }
+            let parsed = await self.decodeMessageParams(params)
+            await self.appendServerMessage(
+                ServerLogEntry(source: .logMessage, type: parsed.type, message: parsed.message)
+            )
+        }
+
+        // window/showMessageRequest — request. Buffer into the server log
+        // and reply with `null` (no user selection at the session level).
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_showMessageRequest
+        await client.setRequestHandler(method: "window/showMessageRequest") { [self] params in
+            guard let params = params else { return nil }
+            let parsed = await self.decodeMessageParams(params)
+            await self.appendServerMessage(
+                ServerLogEntry(source: .showMessageRequest, type: parsed.type, message: parsed.message)
+            )
+            return nil
+        }
+
+        // window/showDocument — request. Buffer the URI into the server log
+        // and acknowledge with `{ "success": true }`. The session does not
+        // actually open the document; downstream layers decide.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_showDocument
+        await client.setRequestHandler(method: "window/showDocument") { [self] params in
+            let uri = await self.extractURIFromParams(params)
+            await self.appendServerMessage(
+                ServerLogEntry(source: .showDocument, type: 0, message: uri)
+            )
+            return AnyCodable(["success": AnyCodable(true)] as [String: AnyCodable])
+        }
+
+        // workspace/configuration — request. Reply with a JSON array of
+        // `null`s, one per requested item. Higher layers may later supply
+        // real configuration values.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_configuration
+        await client.setRequestHandler(method: "workspace/configuration") { [self] params in
+            let count = await self.configurationItemCount(params)
+            let nulls: [AnyCodable] = (0..<count).map { _ in AnyCodable(NSNull()) }
+            return AnyCodable(nulls)
+        }
+
+        // workspace/applyEdit — request. The session does not apply edits
+        // directly; it buffers them onto `pendingApplyEditQueue` and
+        // responds `{ "applied": false }`. The AI / UI consumes the queue
+        // and applies edits out-of-band.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_applyEdit
+        await client.setRequestHandler(method: "workspace/applyEdit") { [self] params in
+            let response = AnyCodable(["applied": AnyCodable(false)] as [String: AnyCodable])
+            guard let params = params else { return response }
+            let label = await self.extractLabel(from: params)
+            let edit = await self.extractEdit(from: params) ?? AnyCodable([String: AnyCodable]())
+            _ = await self.enqueueApplyEdit(label: label, edit: edit)
+            return response
+        }
+
+        // workspace/workspaceFolders — request. Report the single folder
+        // this session was constructed against.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_workspaceFolders
+        await client.setRequestHandler(method: "workspace/workspaceFolders") { [self] _ in
+            let root = self.workspaceRoot
+            let folder: [String: AnyCodable] = [
+                "uri": AnyCodable(root.absoluteString),
+                "name": AnyCodable(root.lastPathComponent)
+            ]
+            return AnyCodable([AnyCodable(folder)])
+        }
+    }
+
+    // MARK: - Server message log helpers
+
+    /// Append `entry` to the buffered server message log, evicting the
+    /// oldest entries when the cap is exceeded.
+    private func appendServerMessage(_ entry: ServerLogEntry) {
+        serverMessages.append(entry)
+        if serverMessages.count > serverMessagesCap {
+            serverMessages.removeFirst(serverMessages.count - serverMessagesCap)
+        }
+    }
+
+    /// Append a new `PendingApplyEdit` to the queue and return its
+    /// session-local id.
+    @discardableResult
+    private func enqueueApplyEdit(label: String?, edit: AnyCodable) -> Int {
+        let id = nextApplyEditId
+        nextApplyEditId += 1
+        pendingApplyEditQueue.append(PendingApplyEdit(id: id, label: label, edit: edit))
+        return id
+    }
+
+    /// Pull `(type, message)` out of an LSP `ShowMessageParams` /
+    /// `LogMessageParams` / `ShowMessageRequestParams` payload. Falls back
+    /// to `(4, "")` (Log severity, empty message) when the payload can't
+    /// be parsed at all — see the test plan, which pins this behaviour.
+    private func decodeMessageParams(_ params: AnyCodable) -> (type: Int, message: String) {
+        guard let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (4, "")
+        }
+        let type: Int
+        if let i = json["type"] as? Int {
+            type = i
+        } else if let d = json["type"] as? Double {
+            type = Int(d)
+        } else {
+            type = 4
+        }
+        let message = (json["message"] as? String) ?? ""
+        return (type, message)
+    }
+
+    /// Extract `uri` from a `ShowDocumentParams` payload. Returns the empty
+    /// string when the URI is missing or the payload is malformed.
+    private func extractURIFromParams(_ params: AnyCodable?) -> String {
+        guard let params,
+              let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ""
+        }
+        return (json["uri"] as? String) ?? ""
+    }
+
+    /// Count the `items` array in a `workspace/configuration` payload.
+    /// Returns 0 when `items` is missing.
+    private func configurationItemCount(_ params: AnyCodable?) -> Int {
+        guard let params,
+              let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["items"] as? [Any] else {
+            return 0
+        }
+        return items.count
+    }
+
+    /// Extract the optional `label` field from an `ApplyWorkspaceEditParams`
+    /// payload.
+    private func extractLabel(from params: AnyCodable) -> String? {
+        guard let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json["label"] as? String
+    }
+
+    /// Extract the `edit` field (a `WorkspaceEdit`) from an
+    /// `ApplyWorkspaceEditParams` payload, preserving its structure as
+    /// `AnyCodable` so downstream callers can re-encode it verbatim.
+    private func extractEdit(from params: AnyCodable) -> AnyCodable? {
+        guard let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let edit = json["edit"] else {
+            return nil
+        }
+        return AnyCodable(edit)
     }
 }
 
