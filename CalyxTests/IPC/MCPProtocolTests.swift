@@ -103,12 +103,14 @@ final class MCPProtocolTests: XCTestCase {
                      "nil instructions must remain nil after roundtrip")
     }
 
-    // ==================== 2. Tools List — All 7 Tools ====================
+    // ==================== 2. Tools List — IPC + LSP Tool Surface ====================
 
     func test_toolsListResponse_containsAllTools() throws {
-        // Arrange
+        // Arrange — `tools/list` advertises the combined IPC + LSP surface
+        // (7 IPC + 10 LSP = 17 tools). Each IPC name must be present and the
+        // LSP catalogue must be surfaced alongside.
         let id = JSONRPCId.int(2)
-        let expectedToolNames: Set<String> = [
+        let expectedIPCTools: Set<String> = [
             "register_peer", "list_peers", "send_message",
             "broadcast", "receive_messages", "ack_messages", "get_peer_status",
         ]
@@ -127,10 +129,12 @@ final class MCPProtocolTests: XCTestCase {
         let toolsResult = try jsonDecoder.decode(MCPToolsListResult.self, from: resultData)
 
         let actualNames = Set(toolsResult.tools.map(\.name))
-        XCTAssertEqual(actualNames, expectedToolNames,
-                       "Tools list must contain exactly the 7 expected tools")
-        XCTAssertEqual(toolsResult.tools.count, 7,
-                       "Tools list must contain exactly 7 tools")
+        XCTAssertTrue(expectedIPCTools.isSubset(of: actualNames),
+                      "Tools list must contain every IPC tool; got: \(actualNames)")
+        XCTAssertTrue(actualNames.contains("lsp_hover"),
+                      "Tools list must surface the LSP tool catalogue alongside IPC tools")
+        XCTAssertEqual(toolsResult.tools.count, 17,
+                       "Tools list must contain 7 IPC + 10 LSP = 17 tools")
     }
 
     // ==================== 3. register_peer Schema ====================

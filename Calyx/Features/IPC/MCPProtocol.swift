@@ -167,6 +167,25 @@ struct MCPRouter: Sendable {
         ]
     }
 
+    /// LSP tool catalogue. Delegates to `MCPLSPBridge.tools` so the bridge
+    /// remains the single source of truth for the `lsp_*` surface.
+    static var lspTools: [MCPTool] {
+        MCPLSPBridge.tools
+    }
+
+    /// Combined IPC + LSP tool catalogue. Used by `tools/list` to advertise
+    /// every tool the server can dispatch.
+    static var allTools: [MCPTool] {
+        tools + lspTools
+    }
+
+    /// Classifier — does `name` belong to the LSP tool surface?
+    /// Identifies tools by the `lsp_` prefix; the bridge owns the full
+    /// dispatch table.
+    static func isLSPTool(name: String) -> Bool {
+        name.hasPrefix("lsp_")
+    }
+
     /// Static, trusted instructions text. Never inject user-controlled content.
     static let instructions = """
     You are connected to Calyx IPC, enabling communication with other Claude Code instances in other terminal panes.
@@ -178,6 +197,8 @@ struct MCPRouter: Sendable {
     Use list_peers to discover other connected instances. Use broadcast for announcements relevant to all peers.
 
     Browser automation tools (browser_*) are available when browser scripting is enabled via the Command Palette. Use browser_snapshot to inspect pages and browser_click/browser_fill to interact with elements. Element refs (@e1, @e2) from snapshots can be used as selectors.
+
+    LSP language tools (lsp_*) are available when the LSP bridge is started. Use lsp_hover to inspect type information and documentation at a position in a file. Use lsp_definition / lsp_declaration / lsp_type_definition / lsp_implementation for navigation. Use lsp_references for finding usages. Use lsp_completion for autocomplete and lsp_workspace_symbol for cross-file symbol search. All LSP tools require workspace_root, language_id, and (most of them) file/line/column arguments.
     """
 
     /// Build the response for `initialize`.
@@ -206,7 +227,7 @@ struct MCPRouter: Sendable {
 
     /// Build the response for `tools/list`.
     static func buildToolsListResponse(id: JSONRPCId) -> JSONRPCResponse {
-        let toolsList = MCPToolsListResult(tools: tools)
+        let toolsList = MCPToolsListResult(tools: allTools)
 
         return JSONRPCResponse(
             jsonrpc: "2.0",

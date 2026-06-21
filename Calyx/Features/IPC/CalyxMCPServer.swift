@@ -23,6 +23,10 @@ final class CalyxMCPServer {
     private(set) var appPeerID: UUID?
     private var peerRegistrationTask: Task<Void, Never>?
 
+    /// Bridge that exposes LSP requests as MCP tools. `nil` until
+    /// `startLSP()` (or `_testInjectLSPBridge(_:)`) wires one in.
+    private(set) var lspBridge: MCPLSPBridge?
+
     // MARK: - Private
 
     private var listener: NWListener?
@@ -40,6 +44,33 @@ final class CalyxMCPServer {
     /// For testing only — sets the token without starting the listener.
     func _testSetToken(_ token: String) {
         self.token = token
+    }
+
+    // MARK: - LSP Bridge Lifecycle
+
+    /// Spin up the LSP tool bridge with the production stdio transport and
+    /// system command runner. Idempotent — re-entry replaces the existing
+    /// bridge with a fresh one.
+    func startLSP() async {
+        let registry = LSPServerRegistry.builtIn()
+        let runner = SystemCommandRunner()
+        let installer = LSPInstaller(registry: registry, runner: runner)
+        let factory = StdioBackedLSPSessionFactory()
+        let service = LSPService(
+            registry: registry,
+            installer: installer,
+            sessionFactory: factory,
+            config: LSPServiceConfig()
+        )
+        let resolver = WorkspaceResolver(registry: registry)
+        self.lspBridge = MCPLSPBridge(service: service, workspaceResolver: resolver)
+    }
+
+    /// For testing only — inject a pre-built `MCPLSPBridge` (typically
+    /// wired against a fake `LSPSessionFactory`) so tool dispatch can be
+    /// exercised without spawning a real language server.
+    func _testInjectLSPBridge(_ bridge: MCPLSPBridge) {
+        self.lspBridge = bridge
     }
 
     // MARK: - Lifecycle
@@ -235,6 +266,15 @@ final class CalyxMCPServer {
             return toolError(id: id, text: "Missing tool name")
         }
 
+        // LSP route — `lsp_*` tools are dispatched through `MCPLSPBridge`.
+        if MCPRouter.isLSPTool(name: toolName) {
+            return await handleLSPToolCall(
+                id: id,
+                toolName: toolName,
+                params: params
+            )
+        }
+
         let arguments = extractDict(params, "arguments")
 
         switch toolName {
@@ -390,6 +430,58 @@ final class CalyxMCPServer {
         return toolSuccess(id: id, text: json)
     }
 
+    // MARK: - LSP Tool Dispatch
+
+    /// Route an `lsp_*` tool call to the configured `MCPLSPBridge`.
+    /// Returns a structured error when the bridge has not been started,
+    /// the tool name is unknown, or an argument fails validation. The
+    /// bridge itself catches LSP server errors and shapes them into the
+    /// returned `MCPContent.text`, so this method only has to translate
+    /// bridge-side validation failures into MCP error envelopes.
+    private func handleLSPToolCall(
+        id: JSONRPCId,
+        toolName: String,
+        params: [String: AnyCodable]
+    ) async -> (statusCode: Int, body: Data?) {
+        guard let bridge = lspBridge else {
+            return toolError(
+                id: id,
+                text: "LSP bridge is not started. Call startLSP() first."
+            )
+        }
+
+        let arguments = extractAnyCodableDict(params, "arguments") ?? [:]
+
+        do {
+            let content = try await bridge.handleToolCall(
+                name: toolName,
+                arguments: arguments
+            )
+            let resp = MCPRouter.buildToolCallResponse(
+                id: id,
+                content: [content],
+                isError: false
+            )
+            return (200, encode(resp))
+        } catch let error as MCPLSPBridgeError {
+            let text: String
+            switch error {
+            case .unknownTool(let name):
+                text = "Unknown LSP tool: \(name)"
+            case .missingArgument(let key):
+                text = "Missing argument: \(key)"
+            case .invalidArgument(let name, let reason):
+                text = "Invalid argument \(name): \(reason)"
+            }
+            return toolError(id: id, text: text)
+        } catch {
+            return toolError(
+                id: id,
+                text: "LSP tool error: \(error.localizedDescription)"
+            )
+        }
+    }
+
     // MARK: - Response Helpers
 
     private func unauthorizedResponse() -> (statusCode: Int, body: Data?) {
@@ -457,6 +549,23 @@ final class CalyxMCPServer {
             return nil
         }
         return obj
+    }
+
+    /// Extract a `[String: AnyCodable]` map from an `AnyCodable` value at
+    /// the given key. Used to forward `tools/call.arguments` to the LSP
+    /// bridge, which is keyed on `AnyCodable`.
+    private func extractAnyCodableDict(
+        _ dict: [String: AnyCodable],
+        _ key: String
+    ) -> [String: AnyCodable]? {
+        guard let value = dict[key] else { return nil }
+        guard let data = try? JSONEncoder().encode(value),
+              let decoded = try? JSONDecoder().decode(
+                [String: AnyCodable].self,
+                from: data
+              )
+        else { return nil }
+        return decoded
     }
 
     /// Extract the client name from an initialize request's clientInfo.
