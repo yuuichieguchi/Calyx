@@ -422,8 +422,8 @@ final class MCPLSPBridgeEditWorkspaceToolsTests: XCTestCase {
 
         XCTAssertEqual(
             names.count,
-            67,
-            "tools count must be 43 existing + 11 edit+workspace + 13 file-ops/AI = 67; got \(names.count) names=\(names)"
+            70,
+            "tools count must be 43 existing + 11 edit+workspace + 13 file-ops/AI + 3 notebook = 70; got \(names.count) names=\(names)"
         )
     }
 

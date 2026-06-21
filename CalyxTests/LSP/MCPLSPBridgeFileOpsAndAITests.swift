@@ -447,8 +447,8 @@ final class MCPLSPBridgeFileOpsAndAITests: XCTestCase {
 
         XCTAssertEqual(
             names.count,
-            67,
-            "tools count must be 54 existing + 13 file-ops/AI = 67; got \(names.count) names=\(names)"
+            70,
+            "tools count must be 54 existing + 13 file-ops/AI + 3 notebook = 70; got \(names.count) names=\(names)"
         )
     }
 

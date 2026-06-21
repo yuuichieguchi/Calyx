@@ -133,8 +133,8 @@ final class MCPProtocolTests: XCTestCase {
                       "Tools list must contain every IPC tool; got: \(actualNames)")
         XCTAssertTrue(actualNames.contains("lsp_hover"),
                       "Tools list must surface the LSP tool catalogue alongside IPC tools")
-        XCTAssertEqual(toolsResult.tools.count, 74,
-                       "Tools list must contain 7 IPC + 67 LSP = 74 tools")
+        XCTAssertEqual(toolsResult.tools.count, 77,
+                       "Tools list must contain 7 IPC + 70 LSP = 77 tools")
     }
 
     // ==================== 3. register_peer Schema ====================

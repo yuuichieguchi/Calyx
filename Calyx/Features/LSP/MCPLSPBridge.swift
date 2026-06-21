@@ -503,6 +503,21 @@ final class MCPLSPBridge {
                 description: CapabilitiesTool.description,
                 inputSchema: CapabilitiesTool.inputSchema
             ),
+            MCPTool(
+                name: NotebookDidOpenTool.name,
+                description: NotebookDidOpenTool.description,
+                inputSchema: NotebookDidOpenTool.inputSchema
+            ),
+            MCPTool(
+                name: NotebookDidChangeTool.name,
+                description: NotebookDidChangeTool.description,
+                inputSchema: NotebookDidChangeTool.inputSchema
+            ),
+            MCPTool(
+                name: NotebookDidCloseTool.name,
+                description: NotebookDidCloseTool.description,
+                inputSchema: NotebookDidCloseTool.inputSchema
+            ),
         ]
     }
 
@@ -645,6 +660,12 @@ final class MCPLSPBridge {
             return try await DiagnosticsDiffTool.handle(arguments: arguments, bridge: self)
         case CapabilitiesTool.name:
             return try await CapabilitiesTool.handle(arguments: arguments, bridge: self)
+        case NotebookDidOpenTool.name:
+            return try await NotebookDidOpenTool.handle(arguments: arguments, bridge: self)
+        case NotebookDidChangeTool.name:
+            return try await NotebookDidChangeTool.handle(arguments: arguments, bridge: self)
+        case NotebookDidCloseTool.name:
+            return try await NotebookDidCloseTool.handle(arguments: arguments, bridge: self)
         default:
             throw MCPLSPBridgeError.unknownTool(name)
         }
@@ -4052,6 +4073,125 @@ enum CapabilitiesTool: MCPLSPTool {
             dynamic: dynamicList
         )
         return try MCPLSPBridge.makeJSONContent(snapshot)
+    }
+}
+
+// MARK: - Notebook tools (shared helpers)
+
+/// Build the JSON-Schema for a notebook synchronisation MCP tool. The
+/// three notebook tools (`lsp_notebook_did_open` /
+/// `lsp_notebook_did_change` / `lsp_notebook_did_close`) all share the
+/// same outer argument shape: `workspace_root` + `language_id` + a single
+/// `notebook` payload that the bridge decodes into the typed LSP params
+/// struct.
+private func notebookSchema() -> [String: AnyCodable] {
+    let props: [String: AnyCodable] = [
+        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'python')"),
+        "notebook": AnyCodable([
+            "type": AnyCodable("object"),
+            "description": AnyCodable(
+                "LSP notebook-document params payload. Shape matches"
+                + " DidOpenNotebookDocumentParams / DidChangeNotebookDocumentParams /"
+                + " DidCloseNotebookDocumentParams depending on the tool."
+            ),
+        ] as [String: AnyCodable]),
+    ]
+    let required = ["workspace_root", "language_id", "notebook"]
+    return [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable(props),
+        "required": AnyCodable(required.map { AnyCodable($0) }),
+    ]
+}
+
+/// Shared body for the three `notebookDocument/did*` notification tools.
+/// Resolves the session, decodes the `notebook` argument into the typed
+/// params struct, ships an LSP notification (no response), and surfaces a
+/// tiny success payload for the MCP caller.
+///
+/// Argument-coercion errors propagate as `MCPLSPBridgeError` (so the MCP
+/// caller sees the structured missing/invalid-argument variant), while
+/// LSP transport errors are folded into the returned content via
+/// `makeErrorContent` to match the rest of the bridge.
+private func handleNotebookNotification<Params: Codable & Sendable>(
+    method: String,
+    paramsType: Params.Type,
+    arguments: [String: AnyCodable],
+    bridge: MCPLSPBridge
+) async throws -> MCPContent {
+    let session: LSPSession
+    do {
+        session = try await bridge.resolveSession(arguments: arguments)
+    } catch let err as MCPLSPBridgeError {
+        throw err
+    } catch {
+        return MCPLSPBridge.makeErrorContent(error)
+    }
+    guard let notebookAny = arguments["notebook"] else {
+        throw MCPLSPBridgeError.missingArgument("notebook")
+    }
+    let params = try MCPLSPBridge.decodeFromAnyCodable(
+        notebookAny,
+        as: paramsType,
+        argumentName: "notebook"
+    )
+    do {
+        try await session.sendGenericNotification(method: method, params: params)
+    } catch {
+        return MCPLSPBridge.makeErrorContent(error)
+    }
+    return MCPContent(type: "text", text: #"{"success":true}"#)
+}
+
+// MARK: - NotebookDidOpenTool
+
+enum NotebookDidOpenTool: MCPLSPTool {
+    static let name = "lsp_notebook_did_open"
+    static let description = "Notify the server that a notebook document has been opened (notebookDocument/didOpen). Sent as an LSP notification — no response."
+    static let inputSchema: [String: AnyCodable] = notebookSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleNotebookNotification(
+            method: "notebookDocument/didOpen",
+            paramsType: DidOpenNotebookDocumentParams.self,
+            arguments: arguments,
+            bridge: bridge
+        )
+    }
+}
+
+// MARK: - NotebookDidChangeTool
+
+enum NotebookDidChangeTool: MCPLSPTool {
+    static let name = "lsp_notebook_did_change"
+    static let description = "Notify the server that a notebook document has changed (notebookDocument/didChange). Sent as an LSP notification — no response."
+    static let inputSchema: [String: AnyCodable] = notebookSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleNotebookNotification(
+            method: "notebookDocument/didChange",
+            paramsType: DidChangeNotebookDocumentParams.self,
+            arguments: arguments,
+            bridge: bridge
+        )
+    }
+}
+
+// MARK: - NotebookDidCloseTool
+
+enum NotebookDidCloseTool: MCPLSPTool {
+    static let name = "lsp_notebook_did_close"
+    static let description = "Notify the server that a notebook document has been closed (notebookDocument/didClose). Sent as an LSP notification — no response."
+    static let inputSchema: [String: AnyCodable] = notebookSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleNotebookNotification(
+            method: "notebookDocument/didClose",
+            paramsType: DidCloseNotebookDocumentParams.self,
+            arguments: arguments,
+            bridge: bridge
+        )
     }
 }
 

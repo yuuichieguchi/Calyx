@@ -338,11 +338,11 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
 
     // ==================== MCPRouter Catalogue Tests ====================
 
-    // 1. allTools combines IPC (7) + LSP (67) = 74.
+    // 1. allTools combines IPC (7) + LSP (70) = 77.
     func test_mcpRouter_allTools_includesIPCAndLSPTools() {
         let all = MCPRouter.allTools
-        XCTAssertEqual(all.count, 74,
-                       "allTools must enumerate 7 IPC + 67 LSP = 74 tools")
+        XCTAssertEqual(all.count, 77,
+                       "allTools must enumerate 7 IPC + 70 LSP = 77 tools")
         let names = Set(all.map { $0.name })
         XCTAssertTrue(names.contains("register_peer"),
                       "allTools must include the IPC tool 'register_peer'")
@@ -354,11 +354,11 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
                       "allTools must include the LSP tool 'lsp_completion'")
     }
 
-    // 2. lspTools is the 67-tool LSP catalogue.
+    // 2. lspTools is the 70-tool LSP catalogue.
     func test_mcpRouter_lspTools_count_is10() {
         let lsp = MCPRouter.lspTools
-        XCTAssertEqual(lsp.count, 67,
-                       "MCPRouter.lspTools must expose exactly 67 LSP tools")
+        XCTAssertEqual(lsp.count, 70,
+                       "MCPRouter.lspTools must expose exactly 70 LSP tools")
         let names = Set(lsp.map { $0.name })
         let expected: Set<String> = [
             "lsp_hover",
@@ -428,9 +428,12 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
             "lsp_cross_workspace_definition",
             "lsp_diagnostics_diff",
             "lsp_capabilities",
+            "lsp_notebook_did_open",
+            "lsp_notebook_did_change",
+            "lsp_notebook_did_close",
         ]
         XCTAssertEqual(names, expected,
-                       "MCPRouter.lspTools must enumerate the 67 expected LSP tool names")
+                       "MCPRouter.lspTools must enumerate the 70 expected LSP tool names")
     }
 
     // 3. isLSPTool prefix classifier.
@@ -462,8 +465,8 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
                       "tools/list must surface 'lsp_workspace_symbol'")
         XCTAssertTrue(names.contains("register_peer"),
                       "tools/list must still surface the IPC tools alongside LSP tools")
-        XCTAssertEqual(tools.count, 74,
-                       "tools/list must enumerate all 74 (7 IPC + 67 LSP) tools")
+        XCTAssertEqual(tools.count, 77,
+                       "tools/list must enumerate all 77 (7 IPC + 70 LSP) tools")
     }
 
     // 5. instructions text mentions LSP tooling so MCP clients can discover it.

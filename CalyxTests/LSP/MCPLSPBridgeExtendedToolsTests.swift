@@ -390,6 +390,9 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
             "lsp_cross_workspace_definition",
             "lsp_diagnostics_diff",
             "lsp_capabilities",
+            "lsp_notebook_did_open",
+            "lsp_notebook_did_change",
+            "lsp_notebook_did_close",
         ]
 
         for name in coreExpected {
@@ -407,7 +410,7 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
         XCTAssertEqual(
             names.count,
             coreExpected.count + extendedExpected.count,
-            "tools count must be 10 core + 57 extended = 67; got \(names.count) names=\(names)"
+            "tools count must be 10 core + 60 extended = 70; got \(names.count) names=\(names)"
         )
     }
 
