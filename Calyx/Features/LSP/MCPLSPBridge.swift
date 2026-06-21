@@ -54,6 +54,17 @@
 //      lsp_document_link_resolve     -> documentLink/resolve
 //      lsp_document_color            -> textDocument/documentColor
 //      lsp_color_presentation        -> textDocument/colorPresentation
+//      lsp_completion_resolve        -> completionItem/resolve
+//      lsp_code_action_resolve       -> codeAction/resolve
+//      lsp_formatting                -> textDocument/formatting
+//      lsp_range_formatting          -> textDocument/rangeFormatting
+//      lsp_on_type_formatting        -> textDocument/onTypeFormatting
+//      lsp_workspace_symbol_resolve  -> workspaceSymbol/resolve
+//      lsp_workspace_diagnostic_pull -> workspace/diagnostic
+//      lsp_workspace_execute_command -> workspace/executeCommand
+//      lsp_workspace_apply_edit      -> Calyx-internal (no LSP request)
+//      lsp_workspace_configuration_get -> bridge-internal store read
+//      lsp_workspace_configuration_set -> bridge-internal store write
 //
 //  Response shaping rule: every tool serialises its LSP result as JSON and
 //  hands the JSON string back as the `text` of a single `MCPContent` block.
@@ -118,6 +129,13 @@ final class MCPLSPBridge {
     /// `"installer not configured"` error payload instead of throwing so
     /// MCP callers still receive a JSON content block.
     let installer: LSPInstaller?
+
+    /// Bridge-internal configuration store backing
+    /// `lsp_workspace_configuration_get` / `_set`. Keyed by a composite
+    /// `"<workspace_root>\0<language_id>\0<section>"` string so each
+    /// `(workspace, language, section)` triple owns an independent slot.
+    /// Values are forwarded verbatim — the store does not interpret them.
+    private var configurationStore: [String: AnyCodable] = [:]
 
     // MARK: Init
 
@@ -357,6 +375,61 @@ final class MCPLSPBridge {
                 description: ColorPresentationTool.description,
                 inputSchema: ColorPresentationTool.inputSchema
             ),
+            MCPTool(
+                name: CompletionResolveTool.name,
+                description: CompletionResolveTool.description,
+                inputSchema: CompletionResolveTool.inputSchema
+            ),
+            MCPTool(
+                name: CodeActionResolveTool.name,
+                description: CodeActionResolveTool.description,
+                inputSchema: CodeActionResolveTool.inputSchema
+            ),
+            MCPTool(
+                name: FormattingTool.name,
+                description: FormattingTool.description,
+                inputSchema: FormattingTool.inputSchema
+            ),
+            MCPTool(
+                name: RangeFormattingTool.name,
+                description: RangeFormattingTool.description,
+                inputSchema: RangeFormattingTool.inputSchema
+            ),
+            MCPTool(
+                name: OnTypeFormattingTool.name,
+                description: OnTypeFormattingTool.description,
+                inputSchema: OnTypeFormattingTool.inputSchema
+            ),
+            MCPTool(
+                name: WorkspaceSymbolResolveTool.name,
+                description: WorkspaceSymbolResolveTool.description,
+                inputSchema: WorkspaceSymbolResolveTool.inputSchema
+            ),
+            MCPTool(
+                name: WorkspaceDiagnosticPullTool.name,
+                description: WorkspaceDiagnosticPullTool.description,
+                inputSchema: WorkspaceDiagnosticPullTool.inputSchema
+            ),
+            MCPTool(
+                name: WorkspaceExecuteCommandTool.name,
+                description: WorkspaceExecuteCommandTool.description,
+                inputSchema: WorkspaceExecuteCommandTool.inputSchema
+            ),
+            MCPTool(
+                name: WorkspaceApplyEditTool.name,
+                description: WorkspaceApplyEditTool.description,
+                inputSchema: WorkspaceApplyEditTool.inputSchema
+            ),
+            MCPTool(
+                name: WorkspaceConfigurationGetTool.name,
+                description: WorkspaceConfigurationGetTool.description,
+                inputSchema: WorkspaceConfigurationGetTool.inputSchema
+            ),
+            MCPTool(
+                name: WorkspaceConfigurationSetTool.name,
+                description: WorkspaceConfigurationSetTool.description,
+                inputSchema: WorkspaceConfigurationSetTool.inputSchema
+            ),
         ]
     }
 
@@ -451,6 +524,28 @@ final class MCPLSPBridge {
             return try await DocumentColorTool.handle(arguments: arguments, bridge: self)
         case ColorPresentationTool.name:
             return try await ColorPresentationTool.handle(arguments: arguments, bridge: self)
+        case CompletionResolveTool.name:
+            return try await CompletionResolveTool.handle(arguments: arguments, bridge: self)
+        case CodeActionResolveTool.name:
+            return try await CodeActionResolveTool.handle(arguments: arguments, bridge: self)
+        case FormattingTool.name:
+            return try await FormattingTool.handle(arguments: arguments, bridge: self)
+        case RangeFormattingTool.name:
+            return try await RangeFormattingTool.handle(arguments: arguments, bridge: self)
+        case OnTypeFormattingTool.name:
+            return try await OnTypeFormattingTool.handle(arguments: arguments, bridge: self)
+        case WorkspaceSymbolResolveTool.name:
+            return try await WorkspaceSymbolResolveTool.handle(arguments: arguments, bridge: self)
+        case WorkspaceDiagnosticPullTool.name:
+            return try await WorkspaceDiagnosticPullTool.handle(arguments: arguments, bridge: self)
+        case WorkspaceExecuteCommandTool.name:
+            return try await WorkspaceExecuteCommandTool.handle(arguments: arguments, bridge: self)
+        case WorkspaceApplyEditTool.name:
+            return try await WorkspaceApplyEditTool.handle(arguments: arguments, bridge: self)
+        case WorkspaceConfigurationGetTool.name:
+            return try await WorkspaceConfigurationGetTool.handle(arguments: arguments, bridge: self)
+        case WorkspaceConfigurationSetTool.name:
+            return try await WorkspaceConfigurationSetTool.handle(arguments: arguments, bridge: self)
         default:
             throw MCPLSPBridgeError.unknownTool(name)
         }
@@ -508,6 +603,32 @@ final class MCPLSPBridge {
             end: Position(line: endLine, character: endCol)
         )
         return (uri, range)
+    }
+
+    // MARK: - Bridge-internal configuration store
+
+    /// Compose the composite key used by the configuration store. The
+    /// separator is `U+0000` (NUL) so any user-supplied string can be used
+    /// for `workspace_root` / `language_id` / `section` without ambiguity —
+    /// NUL cannot appear in any of the three components.
+    nonisolated static func workspaceConfigurationKey(
+        workspaceRoot: String,
+        languageId: String,
+        section: String
+    ) -> String {
+        "\(workspaceRoot)\u{0000}\(languageId)\u{0000}\(section)"
+    }
+
+    /// Read a stored configuration value, or `nil` if the triple has never
+    /// been written to.
+    func workspaceConfiguration(key: String) -> AnyCodable? {
+        configurationStore[key]
+    }
+
+    /// Write a configuration value, overwriting any prior value for the
+    /// same triple.
+    func setWorkspaceConfiguration(key: String, value: AnyCodable) {
+        configurationStore[key] = value
     }
 
     // MARK: - Argument coercion (nonisolated)
@@ -794,6 +915,69 @@ private func rangeRequestSchema(
         "properties": AnyCodable(props),
         "required": AnyCodable(required.map { AnyCodable($0) }),
     ]
+}
+
+/// Build the JSON-Schema for a formatting MCP tool (`lsp_formatting`,
+/// `lsp_range_formatting`, `lsp_on_type_formatting`). The three tools share
+/// `workspace_root`, `language_id`, `file`, `options`; range / position-and-ch
+/// variants are gated on the two flags so each tool keeps a stable schema
+/// without sprouting bespoke shapes.
+private func formattingSchema(
+    includeRange: Bool,
+    includePositionAndCh: Bool
+) -> [String: AnyCodable] {
+    var props: [String: AnyCodable] = [
+        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "file": prop("string", "Absolute path or file:// URI of the target file"),
+        "options": AnyCodable([
+            "type": AnyCodable("object"),
+            "description": AnyCodable(
+                "FormattingOptions object: { tabSize: int, insertSpaces: bool,"
+                + " trimTrailingWhitespace?: bool, insertFinalNewline?: bool,"
+                + " trimFinalNewlines?: bool }"
+            ),
+        ] as [String: AnyCodable]),
+    ]
+    var required = ["workspace_root", "language_id", "file", "options"]
+    if includeRange {
+        props["start_line"] = prop("integer", "0-based start line of the target range")
+        props["start_column"] = prop("integer", "0-based start column of the target range")
+        props["end_line"] = prop("integer", "0-based end line of the target range")
+        props["end_column"] = prop("integer", "0-based end column of the target range")
+        required.append(contentsOf: ["start_line", "start_column", "end_line", "end_column"])
+    }
+    if includePositionAndCh {
+        props["line"] = prop("integer", "0-based line number where the character was typed")
+        props["column"] = prop("integer", "0-based UTF-16 column where the character was typed")
+        props["ch"] = prop(
+            "string",
+            "The character that triggered on-type formatting (e.g. '}' or ';')"
+        )
+        required.append(contentsOf: ["line", "column", "ch"])
+    }
+    return [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable(props),
+        "required": AnyCodable(required.map { AnyCodable($0) }),
+    ]
+}
+
+/// Decode the `options` argument shared by the three formatting tools into
+/// a typed `FormattingOptions`. Throws `MCPLSPBridgeError.missingArgument`
+/// when absent and surfaces decode errors as
+/// `MCPLSPBridgeError.invalidArgument`.
+private func extractFormattingOptions(
+    arguments: [String: AnyCodable]
+) throws -> FormattingOptions {
+    guard let optionsAny = arguments["options"] else {
+        throw MCPLSPBridgeError.missingArgument("options")
+    }
+    return try MCPLSPBridge.decodeFromAnyCodable(
+        optionsAny,
+        as: FormattingOptions.self,
+        argumentName: "options"
+    )
 }
 
 // MARK: - HoverTool
@@ -2539,6 +2723,540 @@ enum ColorPresentationTool: MCPLSPTool {
         } catch {
             return MCPLSPBridge.makeErrorContent(error)
         }
+    }
+}
+
+// MARK: - CompletionResolveTool
+
+enum CompletionResolveTool: MCPLSPTool {
+    static let name = "lsp_completion_resolve"
+    static let description = "Resolve additional details (documentation, detail, additionalTextEdits) for a CompletionItem returned by lsp_completion (completionItem/resolve)."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemKey: "completion_item",
+        itemDescription: "CompletionItem returned by lsp_completion. Forwarded verbatim to completionItem/resolve."
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let itemAny = arguments["completion_item"] else {
+            throw MCPLSPBridgeError.missingArgument("completion_item")
+        }
+        let item = try MCPLSPBridge.decodeFromAnyCodable(
+            itemAny,
+            as: CompletionItem.self,
+            argumentName: "completion_item"
+        )
+        do {
+            let result: CompletionItem = try await session.sendRequest(
+                method: "completionItem/resolve",
+                params: item,
+                resultType: CompletionItem.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - CodeActionResolveTool
+
+enum CodeActionResolveTool: MCPLSPTool {
+    static let name = "lsp_code_action_resolve"
+    static let description = "Resolve the edit / command of a CodeAction returned by lsp_code_action (codeAction/resolve)."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemKey: "code_action",
+        itemDescription: "CodeAction returned by lsp_code_action. Forwarded verbatim to codeAction/resolve."
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let actionAny = arguments["code_action"] else {
+            throw MCPLSPBridgeError.missingArgument("code_action")
+        }
+        let action = try MCPLSPBridge.decodeFromAnyCodable(
+            actionAny,
+            as: CodeAction.self,
+            argumentName: "code_action"
+        )
+        do {
+            let result: CodeAction = try await session.sendRequest(
+                method: "codeAction/resolve",
+                params: action,
+                resultType: CodeAction.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - FormattingTool
+
+enum FormattingTool: MCPLSPTool {
+    static let name = "lsp_formatting"
+    static let description = "Format a whole document (textDocument/formatting)."
+    static let inputSchema: [String: AnyCodable] = formattingSchema(
+        includeRange: false,
+        includePositionAndCh: false
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let uri = try bridge.extractDocumentUri(arguments: arguments)
+        let options = try extractFormattingOptions(arguments: arguments)
+        let params = DocumentFormattingParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            options: options
+        )
+        do {
+            let result: [TextEdit]? = try await session.sendRequest(
+                method: "textDocument/formatting",
+                params: params,
+                resultType: [TextEdit]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - RangeFormattingTool
+
+enum RangeFormattingTool: MCPLSPTool {
+    static let name = "lsp_range_formatting"
+    static let description = "Format a range in a document (textDocument/rangeFormatting)."
+    static let inputSchema: [String: AnyCodable] = formattingSchema(
+        includeRange: true,
+        includePositionAndCh: false
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, range) = try bridge.extractRange(arguments: arguments)
+        let options = try extractFormattingOptions(arguments: arguments)
+        let params = DocumentRangeFormattingParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            range: range,
+            options: options
+        )
+        do {
+            let result: [TextEdit]? = try await session.sendRequest(
+                method: "textDocument/rangeFormatting",
+                params: params,
+                resultType: [TextEdit]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - OnTypeFormattingTool
+
+enum OnTypeFormattingTool: MCPLSPTool {
+    static let name = "lsp_on_type_formatting"
+    static let description = "Format around the character typed at a position (textDocument/onTypeFormatting)."
+    static let inputSchema: [String: AnyCodable] = formattingSchema(
+        includeRange: false,
+        includePositionAndCh: true
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        let ch = try MCPLSPBridge.requireString(arguments: arguments, key: "ch")
+        let options = try extractFormattingOptions(arguments: arguments)
+        let params = DocumentOnTypeFormattingParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position,
+            ch: ch,
+            options: options
+        )
+        do {
+            let result: [TextEdit]? = try await session.sendRequest(
+                method: "textDocument/onTypeFormatting",
+                params: params,
+                resultType: [TextEdit]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - WorkspaceSymbolResolveTool
+
+enum WorkspaceSymbolResolveTool: MCPLSPTool {
+    static let name = "lsp_workspace_symbol_resolve"
+    static let description = "Resolve the full location of a WorkspaceSymbol returned by lsp_workspace_symbol (workspaceSymbol/resolve)."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemKey: "workspace_symbol",
+        itemDescription: "WorkspaceSymbol returned by lsp_workspace_symbol. Forwarded verbatim to workspaceSymbol/resolve."
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let symbolAny = arguments["workspace_symbol"] else {
+            throw MCPLSPBridgeError.missingArgument("workspace_symbol")
+        }
+        let symbol = try MCPLSPBridge.decodeFromAnyCodable(
+            symbolAny,
+            as: WorkspaceSymbol.self,
+            argumentName: "workspace_symbol"
+        )
+        do {
+            let result: WorkspaceSymbol = try await session.sendRequest(
+                method: "workspaceSymbol/resolve",
+                params: symbol,
+                resultType: WorkspaceSymbol.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - WorkspaceDiagnosticPullTool
+
+enum WorkspaceDiagnosticPullTool: MCPLSPTool {
+    static let name = "lsp_workspace_diagnostic_pull"
+    static let description = "Pull workspace-wide diagnostics (workspace/diagnostic)."
+    static let inputSchema: [String: AnyCodable] = {
+        let previousResultIdItemSchema: [String: AnyCodable] = [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "uri": prop("string", "Document URI the prior result id belongs to"),
+                "value": prop("string", "Previous resultId from the server"),
+            ] as [String: AnyCodable]),
+            "required": AnyCodable([AnyCodable("uri"), AnyCodable("value")]),
+        ]
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "identifier": prop(
+                "string",
+                "Optional server-side identifier from registration"
+            ),
+            "previous_result_ids": AnyCodable([
+                "type": AnyCodable("array"),
+                "description": AnyCodable(
+                    "Previously-known {uri, value} result ids. Optional; defaults to an empty list."
+                ),
+                "items": AnyCodable(previousResultIdItemSchema),
+            ] as [String: AnyCodable]),
+        ]
+        let required = ["workspace_root", "language_id"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let identifier = try MCPLSPBridge.optionalString(
+            arguments: arguments,
+            key: "identifier"
+        )
+        let previousResultIds: [PreviousResultId]
+        if let rawAny = arguments["previous_result_ids"] {
+            previousResultIds = try MCPLSPBridge.decodeFromAnyCodable(
+                rawAny,
+                as: [PreviousResultId].self,
+                argumentName: "previous_result_ids"
+            )
+        } else {
+            previousResultIds = []
+        }
+        let params = WorkspaceDiagnosticParams(
+            identifier: identifier,
+            previousResultIds: previousResultIds
+        )
+        do {
+            let result: WorkspaceDiagnosticReport? = try await session.sendRequest(
+                method: "workspace/diagnostic",
+                params: params,
+                resultType: WorkspaceDiagnosticReport?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - WorkspaceExecuteCommandTool
+
+enum WorkspaceExecuteCommandTool: MCPLSPTool {
+    static let name = "lsp_workspace_execute_command"
+    static let description = "Execute a server-side command (workspace/executeCommand)."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "command": prop("string", "Identifier of the command handler on the server"),
+            "arguments": AnyCodable([
+                "type": AnyCodable("array"),
+                "description": AnyCodable(
+                    "Optional arguments forwarded verbatim to the server-side command handler."
+                ),
+            ] as [String: AnyCodable]),
+        ]
+        let required = ["workspace_root", "language_id", "command"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let command = try MCPLSPBridge.requireString(arguments: arguments, key: "command")
+        let commandArguments: [AnyCodable]?
+        if let rawAny = arguments["arguments"] {
+            commandArguments = try MCPLSPBridge.decodeFromAnyCodable(
+                rawAny,
+                as: [AnyCodable].self,
+                argumentName: "arguments"
+            )
+        } else {
+            commandArguments = nil
+        }
+        let params = ExecuteCommandParams(
+            command: command,
+            arguments: commandArguments
+        )
+        do {
+            let result: AnyCodable? = try await session.sendRequest(
+                method: "workspace/executeCommand",
+                params: params,
+                resultType: AnyCodable?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - WorkspaceApplyEditTool
+
+enum WorkspaceApplyEditTool: MCPLSPTool {
+    static let name = "lsp_workspace_apply_edit"
+    static let description = "Apply a WorkspaceEdit locally. Bridge-internal — no LSP request is sent. With commit:false, returns a dry-run failure; with commit:true, the minimal stub reports applied:true (the FS write is owned by a follow-up batch)."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "edit": AnyCodable([
+                "type": AnyCodable("object"),
+                "description": AnyCodable(
+                    "WorkspaceEdit to apply (LSP WorkspaceEdit shape: changes / documentChanges / changeAnnotations)."
+                ),
+            ] as [String: AnyCodable]),
+            "commit": prop(
+                "boolean",
+                "If true, commit the edit. If false, perform a dry-run that reports applied:false / failureReason:'dry-run'."
+            ),
+            "label": prop(
+                "string",
+                "Optional human-readable label for the edit (used by clients for undo UI)."
+            ),
+        ]
+        let required = ["workspace_root", "language_id", "edit", "commit"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        // Intentionally NOT resolving an LSPSession: this tool is
+        // bridge-internal and must never reach the language server.
+        guard let editAny = arguments["edit"] else {
+            throw MCPLSPBridgeError.missingArgument("edit")
+        }
+        // Validate by decoding. The decoded value is discarded for now —
+        // the follow-up batch wires it into the workspace mutation surface.
+        let _: WorkspaceEdit = try MCPLSPBridge.decodeFromAnyCodable(
+            editAny,
+            as: WorkspaceEdit.self,
+            argumentName: "edit"
+        )
+        let commit = try MCPLSPBridge.optionalBool(
+            arguments: arguments,
+            key: "commit"
+        ) ?? false
+        let result: ApplyWorkspaceEditResult
+        if commit {
+            result = ApplyWorkspaceEditResult(applied: true)
+        } else {
+            result = ApplyWorkspaceEditResult(applied: false, failureReason: "dry-run")
+        }
+        return try MCPLSPBridge.makeJSONContent(result)
+    }
+}
+
+// MARK: - WorkspaceConfigurationGetTool
+
+enum WorkspaceConfigurationGetTool: MCPLSPTool {
+    static let name = "lsp_workspace_configuration_get"
+    static let description = "Read a bridge-side workspace configuration value previously written with lsp_workspace_configuration_set. No LSP request is sent."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "section": prop("string", "Configuration section identifier (e.g. 'editor.tabSize')"),
+        ]
+        let required = ["workspace_root", "language_id", "section"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let workspaceRoot = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "workspace_root"
+        )
+        let languageId = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "language_id"
+        )
+        let section = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "section"
+        )
+        let key = MCPLSPBridge.workspaceConfigurationKey(
+            workspaceRoot: workspaceRoot,
+            languageId: languageId,
+            section: section
+        )
+        if let value = bridge.workspaceConfiguration(key: key) {
+            return try MCPLSPBridge.makeJSONContent(value)
+        }
+        // Unknown section: return the bare JSON null literal. The
+        // contract permits `null` / `{}` / `{"value":null}`; we ship the
+        // narrowest form because it makes "section unset" unambiguous on
+        // the wire.
+        return MCPContent(type: "text", text: "null")
+    }
+}
+
+// MARK: - WorkspaceConfigurationSetTool
+
+enum WorkspaceConfigurationSetTool: MCPLSPTool {
+    static let name = "lsp_workspace_configuration_set"
+    static let description = "Write a bridge-side workspace configuration value visible to lsp_workspace_configuration_get. No LSP request is sent."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "section": prop("string", "Configuration section identifier (e.g. 'editor.tabSize')"),
+            "value": AnyCodable([
+                "description": AnyCodable(
+                    "Value to store. Any JSON-shaped value is accepted and round-tripped verbatim."
+                ),
+            ] as [String: AnyCodable]),
+        ]
+        let required = ["workspace_root", "language_id", "section", "value"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let workspaceRoot = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "workspace_root"
+        )
+        let languageId = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "language_id"
+        )
+        let section = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "section"
+        )
+        guard let value = arguments["value"] else {
+            throw MCPLSPBridgeError.missingArgument("value")
+        }
+        let key = MCPLSPBridge.workspaceConfigurationKey(
+            workspaceRoot: workspaceRoot,
+            languageId: languageId,
+            section: section
+        )
+        bridge.setWorkspaceConfiguration(key: key, value: value)
+        return MCPContent(type: "text", text: #"{"success":true}"#)
     }
 }
 

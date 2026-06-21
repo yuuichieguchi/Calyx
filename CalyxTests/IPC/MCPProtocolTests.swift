@@ -107,7 +107,7 @@ final class MCPProtocolTests: XCTestCase {
 
     func test_toolsListResponse_containsAllTools() throws {
         // Arrange — `tools/list` advertises the combined IPC + LSP surface
-        // (7 IPC + 43 LSP = 50 tools). Each IPC name must be present and the
+        // (7 IPC + 54 LSP = 61 tools). Each IPC name must be present and the
         // LSP catalogue must be surfaced alongside.
         let id = JSONRPCId.int(2)
         let expectedIPCTools: Set<String> = [
@@ -133,8 +133,8 @@ final class MCPProtocolTests: XCTestCase {
                       "Tools list must contain every IPC tool; got: \(actualNames)")
         XCTAssertTrue(actualNames.contains("lsp_hover"),
                       "Tools list must surface the LSP tool catalogue alongside IPC tools")
-        XCTAssertEqual(toolsResult.tools.count, 50,
-                       "Tools list must contain 7 IPC + 43 LSP = 50 tools")
+        XCTAssertEqual(toolsResult.tools.count, 61,
+                       "Tools list must contain 7 IPC + 54 LSP = 61 tools")
     }
 
     // ==================== 3. register_peer Schema ====================
