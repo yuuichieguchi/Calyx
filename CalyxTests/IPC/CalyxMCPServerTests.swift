@@ -220,7 +220,7 @@ final class CalyxMCPServerTests: XCTestCase {
                        "instructions must not be empty")
     }
 
-    // 5. "tools/list" → result with the IPC + LSP tool surface (7 + 10 = 17)
+    // 5. "tools/list" → result with the IPC + LSP tool surface (7 + 21 = 28)
     func test_handleJSONRPC_toolsList_returnsAllTools() async throws {
         // Arrange
         let data = makeRequest(method: "tools/list")
@@ -234,8 +234,8 @@ final class CalyxMCPServerTests: XCTestCase {
 
         let tools = try XCTUnwrap(result["tools"] as? [[String: Any]],
                                   "tools/list result must contain 'tools' array")
-        XCTAssertEqual(tools.count, 17,
-                       "tools/list must return 7 IPC + 10 LSP = 17 tools")
+        XCTAssertEqual(tools.count, 28,
+                       "tools/list must return 7 IPC + 21 LSP = 28 tools")
 
         let toolNames = Set(tools.compactMap { $0["name"] as? String })
         let expectedIPCNames: Set<String> = [

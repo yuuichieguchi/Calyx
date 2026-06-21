@@ -7,19 +7,31 @@
 //  each MCP `tools/call` through an `LSPSession` (vended by `LSPService`)
 //  to the underlying language server.
 //
-//  Tools shipped here cover the navigation, symbol-discovery and
-//  completion families:
+//  Tools shipped here cover navigation, symbol-discovery, completion,
+//  refactoring/diagnostics, and Calyx-side orchestration (install +
+//  session lifecycle):
 //
-//      lsp_hover            -> textDocument/hover
-//      lsp_definition       -> textDocument/definition
-//      lsp_declaration      -> textDocument/declaration
-//      lsp_type_definition  -> textDocument/typeDefinition
-//      lsp_implementation   -> textDocument/implementation
-//      lsp_references       -> textDocument/references
-//      lsp_document_highlight -> textDocument/documentHighlight
-//      lsp_document_symbol  -> textDocument/documentSymbol
-//      lsp_workspace_symbol -> workspace/symbol
-//      lsp_completion       -> textDocument/completion
+//      lsp_hover               -> textDocument/hover
+//      lsp_definition          -> textDocument/definition
+//      lsp_declaration         -> textDocument/declaration
+//      lsp_type_definition     -> textDocument/typeDefinition
+//      lsp_implementation      -> textDocument/implementation
+//      lsp_references          -> textDocument/references
+//      lsp_document_highlight  -> textDocument/documentHighlight
+//      lsp_document_symbol     -> textDocument/documentSymbol
+//      lsp_workspace_symbol    -> workspace/symbol
+//      lsp_completion          -> textDocument/completion
+//      lsp_signature_help      -> textDocument/signatureHelp
+//      lsp_prepare_rename      -> textDocument/prepareRename
+//      lsp_rename              -> textDocument/rename
+//      lsp_code_action         -> textDocument/codeAction
+//      lsp_diagnostics         -> textDocument/diagnostic (pull mode)
+//      lsp_check_installation  -> LSPInstaller.checkInstallation(...)
+//      lsp_install             -> LSPInstaller.install(...)
+//      lsp_install_status      -> LSPInstaller.currentStatus(...)
+//      lsp_session_status      -> LSPService.currentSessions()
+//      lsp_session_warmup      -> LSPService.session(for:languageId:)
+//      lsp_session_shutdown    -> LSPService.shutdownSession(...)
 //
 //  Response shaping rule: every tool serialises its LSP result as JSON and
 //  hands the JSON string back as the `text` of a single `MCPContent` block.
@@ -74,14 +86,31 @@ final class MCPLSPBridge {
 
     // MARK: Stored properties
 
-    private let service: LSPService
+    /// `internal` (default) so the tool enums in this file can reach the
+    /// service for warmup / status / shutdown without a public accessor.
+    let service: LSPService
     private let workspaceResolver: WorkspaceResolver
+    /// Optional installer used by the install / check tools. Existing
+    /// integrations (`CalyxMCPServer`) construct the bridge without an
+    /// installer; when absent the install tools return a structured
+    /// `"installer not configured"` error payload instead of throwing so
+    /// MCP callers still receive a JSON content block.
+    let installer: LSPInstaller?
 
     // MARK: Init
 
-    init(service: LSPService, workspaceResolver: WorkspaceResolver) {
+    /// Designated initializer. The `installer` parameter is optional so
+    /// callers that don't need the install/orchestration cluster (e.g.
+    /// the legacy `CalyxMCPServer` wiring) can keep their existing call
+    /// sites untouched.
+    init(
+        service: LSPService,
+        workspaceResolver: WorkspaceResolver,
+        installer: LSPInstaller? = nil
+    ) {
         self.service = service
         self.workspaceResolver = workspaceResolver
+        self.installer = installer
     }
 
     // MARK: - Tool catalogue
@@ -141,6 +170,61 @@ final class MCPLSPBridge {
                 description: CompletionTool.description,
                 inputSchema: CompletionTool.inputSchema
             ),
+            MCPTool(
+                name: SignatureHelpTool.name,
+                description: SignatureHelpTool.description,
+                inputSchema: SignatureHelpTool.inputSchema
+            ),
+            MCPTool(
+                name: PrepareRenameTool.name,
+                description: PrepareRenameTool.description,
+                inputSchema: PrepareRenameTool.inputSchema
+            ),
+            MCPTool(
+                name: RenameTool.name,
+                description: RenameTool.description,
+                inputSchema: RenameTool.inputSchema
+            ),
+            MCPTool(
+                name: CodeActionTool.name,
+                description: CodeActionTool.description,
+                inputSchema: CodeActionTool.inputSchema
+            ),
+            MCPTool(
+                name: DiagnosticsTool.name,
+                description: DiagnosticsTool.description,
+                inputSchema: DiagnosticsTool.inputSchema
+            ),
+            MCPTool(
+                name: CheckInstallationTool.name,
+                description: CheckInstallationTool.description,
+                inputSchema: CheckInstallationTool.inputSchema
+            ),
+            MCPTool(
+                name: InstallTool.name,
+                description: InstallTool.description,
+                inputSchema: InstallTool.inputSchema
+            ),
+            MCPTool(
+                name: InstallStatusTool.name,
+                description: InstallStatusTool.description,
+                inputSchema: InstallStatusTool.inputSchema
+            ),
+            MCPTool(
+                name: SessionStatusTool.name,
+                description: SessionStatusTool.description,
+                inputSchema: SessionStatusTool.inputSchema
+            ),
+            MCPTool(
+                name: SessionWarmupTool.name,
+                description: SessionWarmupTool.description,
+                inputSchema: SessionWarmupTool.inputSchema
+            ),
+            MCPTool(
+                name: SessionShutdownTool.name,
+                description: SessionShutdownTool.description,
+                inputSchema: SessionShutdownTool.inputSchema
+            ),
         ]
     }
 
@@ -169,6 +253,28 @@ final class MCPLSPBridge {
             return try await WorkspaceSymbolTool.handle(arguments: arguments, bridge: self)
         case CompletionTool.name:
             return try await CompletionTool.handle(arguments: arguments, bridge: self)
+        case SignatureHelpTool.name:
+            return try await SignatureHelpTool.handle(arguments: arguments, bridge: self)
+        case PrepareRenameTool.name:
+            return try await PrepareRenameTool.handle(arguments: arguments, bridge: self)
+        case RenameTool.name:
+            return try await RenameTool.handle(arguments: arguments, bridge: self)
+        case CodeActionTool.name:
+            return try await CodeActionTool.handle(arguments: arguments, bridge: self)
+        case DiagnosticsTool.name:
+            return try await DiagnosticsTool.handle(arguments: arguments, bridge: self)
+        case CheckInstallationTool.name:
+            return try await CheckInstallationTool.handle(arguments: arguments, bridge: self)
+        case InstallTool.name:
+            return try await InstallTool.handle(arguments: arguments, bridge: self)
+        case InstallStatusTool.name:
+            return try await InstallStatusTool.handle(arguments: arguments, bridge: self)
+        case SessionStatusTool.name:
+            return try await SessionStatusTool.handle(arguments: arguments, bridge: self)
+        case SessionWarmupTool.name:
+            return try await SessionWarmupTool.handle(arguments: arguments, bridge: self)
+        case SessionShutdownTool.name:
+            return try await SessionShutdownTool.handle(arguments: arguments, bridge: self)
         default:
             throw MCPLSPBridgeError.unknownTool(name)
         }
@@ -398,6 +504,37 @@ private func prop(_ type: String, _ description: String) -> AnyCodable {
         "type": AnyCodable(type),
         "description": AnyCodable(description),
     ] as [String: AnyCodable])
+}
+
+/// Build the JSON-Schema for a range-based MCP tool (`lsp_code_action`).
+/// Shape mirrors `positionRequestSchema` but with `(start_line,
+/// start_column, end_line, end_column)` in place of `(line, column)`.
+private func rangeRequestSchema(
+    extraProperties: [String: AnyCodable] = [:],
+    extraRequired: [String] = []
+) -> [String: AnyCodable] {
+    var props: [String: AnyCodable] = [
+        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "file": prop("string", "Absolute path or file:// URI of the target file"),
+        "start_line": prop("integer", "0-based start line of the target range"),
+        "start_column": prop("integer", "0-based start column of the target range"),
+        "end_line": prop("integer", "0-based end line of the target range"),
+        "end_column": prop("integer", "0-based end column of the target range"),
+    ]
+    for (key, value) in extraProperties {
+        props[key] = value
+    }
+    var required = [
+        "workspace_root", "language_id", "file",
+        "start_line", "start_column", "end_line", "end_column",
+    ]
+    required.append(contentsOf: extraRequired)
+    return [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable(props),
+        "required": AnyCodable(required.map { AnyCodable($0) }),
+    ]
 }
 
 // MARK: - HoverTool
@@ -799,6 +936,553 @@ enum CompletionTool: MCPLSPTool {
             return try MCPLSPBridge.makeJSONContent(result)
         } catch {
             return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - SignatureHelpTool
+
+enum SignatureHelpTool: MCPLSPTool {
+    static let name = "lsp_signature_help"
+    static let description = "Get signature help (parameter info) at a position."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        let params = SignatureHelpParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position
+        )
+        do {
+            let result: SignatureHelp? = try await session.sendRequest(
+                method: "textDocument/signatureHelp",
+                params: params,
+                resultType: SignatureHelp?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - PrepareRenameTool
+
+enum PrepareRenameTool: MCPLSPTool {
+    static let name = "lsp_prepare_rename"
+    static let description = "Check whether the symbol at a position can be renamed."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        let params = PrepareRenameParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position
+        )
+        do {
+            let result: PrepareRenameResult? = try await session.sendRequest(
+                method: "textDocument/prepareRename",
+                params: params,
+                resultType: PrepareRenameResult?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - RenameTool
+
+enum RenameTool: MCPLSPTool {
+    static let name = "lsp_rename"
+    static let description = "Rename the symbol at a position across the workspace."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema(
+        extraProperties: [
+            "new_name": prop("string", "New name to apply to the symbol"),
+        ],
+        extraRequired: ["new_name"]
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        let newName = try MCPLSPBridge.requireString(arguments: arguments, key: "new_name")
+        let params = RenameParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position,
+            newName: newName
+        )
+        do {
+            let result: WorkspaceEdit? = try await session.sendRequest(
+                method: "textDocument/rename",
+                params: params,
+                resultType: WorkspaceEdit?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - CodeActionTool
+
+enum CodeActionTool: MCPLSPTool {
+    static let name = "lsp_code_action"
+    static let description = "Request code actions (quick fixes, refactors) for a range in a file."
+    static let inputSchema: [String: AnyCodable] = rangeRequestSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let file = try MCPLSPBridge.requireString(arguments: arguments, key: "file")
+        let startLine = try MCPLSPBridge.requireInt(arguments: arguments, key: "start_line")
+        let startCol = try MCPLSPBridge.requireInt(arguments: arguments, key: "start_column")
+        let endLine = try MCPLSPBridge.requireInt(arguments: arguments, key: "end_line")
+        let endCol = try MCPLSPBridge.requireInt(arguments: arguments, key: "end_column")
+        let uri = MCPLSPBridge.documentUri(fromPathOrUri: file)
+        let range = LSPRange(
+            start: Position(line: startLine, character: startCol),
+            end: Position(line: endLine, character: endCol)
+        )
+        let context = CodeActionContext(diagnostics: [])
+        let params = CodeActionParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            range: range,
+            context: context
+        )
+        do {
+            let result: [CodeActionItem]? = try await session.sendRequest(
+                method: "textDocument/codeAction",
+                params: params,
+                resultType: [CodeActionItem]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - DiagnosticsTool
+
+enum DiagnosticsTool: MCPLSPTool {
+    static let name = "lsp_diagnostics"
+    static let description = "Pull the current diagnostics for a file (textDocument/diagnostic)."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "file": prop("string", "Absolute path or file:// URI of the target file"),
+            "identifier": prop("string", "Optional server-side identifier from registration"),
+            "previous_result_id": prop("string", "Optional result id from a prior diagnostic response"),
+        ]
+        let required = ["workspace_root", "language_id", "file"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let uri = try bridge.extractDocumentUri(arguments: arguments)
+        let identifier = try MCPLSPBridge.optionalString(arguments: arguments, key: "identifier")
+        let previousResultId = try MCPLSPBridge.optionalString(
+            arguments: arguments,
+            key: "previous_result_id"
+        )
+        let params = DocumentDiagnosticParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            identifier: identifier,
+            previousResultId: previousResultId
+        )
+        do {
+            let result: DocumentDiagnosticReport? = try await session.sendRequest(
+                method: "textDocument/diagnostic",
+                params: params,
+                resultType: DocumentDiagnosticReport?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - CheckInstallationTool
+
+enum CheckInstallationTool: MCPLSPTool {
+    static let name = "lsp_check_installation"
+    static let description = "Report installation status of LSP servers (optionally for one languageId)."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "language_id": prop(
+                "string",
+                "Optional. If present, check only this languageId; otherwise check every registry entry."
+            ),
+        ]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable([AnyCodable]()),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        guard let installer = bridge.installer else {
+            return MCPContent(
+                type: "text",
+                text: #"{"error":"installer not configured"}"#
+            )
+        }
+        if let lang = try MCPLSPBridge.optionalString(arguments: arguments, key: "language_id") {
+            let check = await installer.checkInstallation(forLanguageId: lang)
+            return try MCPLSPBridge.makeJSONContent(InstallationCheckDTO(from: check))
+        }
+        let all = await installer.checkAllInstallations()
+        let dtos: [String: InstallationCheckDTO] = all.mapValues(InstallationCheckDTO.init(from:))
+        return try MCPLSPBridge.makeJSONContent(dtos)
+    }
+}
+
+// MARK: - InstallTool
+
+enum InstallTool: MCPLSPTool {
+    static let name = "lsp_install"
+    static let description = "Auto-install the LSP server for a languageId."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "language_id": prop("string", "Target languageId to install (e.g. 'typescript')"),
+            "approve_prerequisites": prop(
+                "boolean",
+                "If true, the installer is also allowed to install missing prerequisites (e.g. npm)."
+            ),
+        ]
+        let required = ["language_id"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let languageId = try MCPLSPBridge.requireString(arguments: arguments, key: "language_id")
+        let approve = try MCPLSPBridge.optionalBool(
+            arguments: arguments,
+            key: "approve_prerequisites"
+        ) ?? false
+        guard let installer = bridge.installer else {
+            return MCPContent(
+                type: "text",
+                text: #"{"error":"installer not configured"}"#
+            )
+        }
+        let status = await installer.install(
+            languageId: languageId,
+            approvePrerequisites: approve,
+            confirmationMode: .silent
+        )
+        return try MCPLSPBridge.makeJSONContent(InstallStatusDTO(from: status))
+    }
+}
+
+// MARK: - InstallStatusTool
+
+enum InstallStatusTool: MCPLSPTool {
+    static let name = "lsp_install_status"
+    static let description = "Return the current install status for a languageId."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "language_id": prop("string", "Target languageId to query"),
+        ]
+        let required = ["language_id"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let languageId = try MCPLSPBridge.requireString(arguments: arguments, key: "language_id")
+        guard let installer = bridge.installer else {
+            return MCPContent(
+                type: "text",
+                text: #"{"error":"installer not configured"}"#
+            )
+        }
+        let status = await installer.currentStatus(forLanguageId: languageId)
+        return try MCPLSPBridge.makeJSONContent(InstallStatusDTO(from: status))
+    }
+}
+
+// MARK: - SessionStatusTool
+
+enum SessionStatusTool: MCPLSPTool {
+    static let name = "lsp_session_status"
+    static let description = "List every currently open LSP session."
+    static let inputSchema: [String: AnyCodable] = [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable([String: AnyCodable]()),
+        "required": AnyCodable([AnyCodable]()),
+    ]
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let sessions = await bridge.service.currentSessions()
+        let dtos = sessions.map(SessionInfoDTO.init(from:))
+        return try MCPLSPBridge.makeJSONContent(dtos)
+    }
+}
+
+// MARK: - SessionWarmupTool
+
+enum SessionWarmupTool: MCPLSPTool {
+    static let name = "lsp_session_warmup"
+    static let description = "Pre-start an LSP session for a workspace + languageId pair."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        ]
+        let required = ["workspace_root", "language_id"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        // `resolveSession` already enforces the required arguments and
+        // returns a started session (building it on cache miss). Re-using
+        // it here keeps the warmup idempotency contract aligned with the
+        // dispatcher path the LSP request tools take.
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let state = await session.state()
+        let dto = SessionInfoDTO(
+            workspaceRoot: session.workspaceRoot.absoluteString,
+            languageId: session.languageId,
+            state: SessionStateDTO(from: state),
+            createdAtUptimeMillis: 0
+        )
+        return try MCPLSPBridge.makeJSONContent(dto)
+    }
+}
+
+// MARK: - SessionShutdownTool
+
+enum SessionShutdownTool: MCPLSPTool {
+    static let name = "lsp_session_shutdown"
+    static let description = "Shut down a specific LSP session and forget it from the cache."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        ]
+        let required = ["workspace_root", "language_id"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let workspaceString = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "workspace_root"
+        )
+        let languageId = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "language_id"
+        )
+        let workspaceURL = MCPLSPBridge.fileURL(fromPathOrUri: workspaceString)
+        await bridge.service.shutdownSession(
+            workspaceRoot: workspaceURL,
+            languageId: languageId
+        )
+        return MCPContent(type: "text", text: #"{"shutdown":true}"#)
+    }
+}
+
+// MARK: - Install / session DTOs
+//
+// `LSPInstaller` / `LSPService` ship value types that are deliberately not
+// `Codable` (they include `URL?` maps and non-Codable associated values).
+// These DTOs mirror only the fields the MCP surface needs to render, and
+// add explicit Codable conformance with stable JSON shapes.
+
+/// JSON shape returned by `lsp_check_installation`.
+private struct InstallationCheckDTO: Codable, Sendable, Equatable {
+    let languageId: String
+    let isInstalled: Bool
+    let detectedPath: String?
+    let detectedVersion: String?
+    let prerequisiteStatuses: [String: String?]
+
+    init(from check: InstallationCheck) {
+        self.languageId = check.languageId
+        self.isInstalled = check.isInstalled
+        self.detectedPath = check.detectedPath?.absoluteString
+        self.detectedVersion = check.detectedVersion
+        var prereqs: [String: String?] = [:]
+        for (key, value) in check.prerequisiteStatuses {
+            prereqs[key] = value?.absoluteString
+        }
+        self.prerequisiteStatuses = prereqs
+    }
+}
+
+/// JSON shape returned by `lsp_install` and `lsp_install_status`.
+///
+/// Encoded form examples:
+///   - `{"state":"notStarted"}`
+///   - `{"state":"inProgress","step":"…"}`
+///   - `{"state":"completed"}`
+///   - `{"state":"failed","reason":"…"}`
+private struct InstallStatusDTO: Codable, Sendable, Equatable {
+    let state: String
+    let step: String?
+    let reason: String?
+
+    init(from status: LSPInstallStatus) {
+        switch status {
+        case .notStarted:
+            self.state = "notStarted"
+            self.step = nil
+            self.reason = nil
+        case .inProgress(let step):
+            self.state = "inProgress"
+            self.step = step
+            self.reason = nil
+        case .completed:
+            self.state = "completed"
+            self.step = nil
+            self.reason = nil
+        case .failed(let reason):
+            self.state = "failed"
+            self.step = nil
+            self.reason = reason
+        }
+    }
+}
+
+/// JSON shape returned by `lsp_session_status` / `lsp_session_warmup`.
+///
+/// `state` is rendered as a discriminated nested DTO so the consumer can
+/// match on the lifecycle phase without parsing free text.
+private struct SessionInfoDTO: Codable, Sendable, Equatable {
+    let workspaceRoot: String
+    let languageId: String
+    let state: SessionStateDTO
+    let createdAtUptimeMillis: Int64
+
+    init(
+        workspaceRoot: String,
+        languageId: String,
+        state: SessionStateDTO,
+        createdAtUptimeMillis: Int64
+    ) {
+        self.workspaceRoot = workspaceRoot
+        self.languageId = languageId
+        self.state = state
+        self.createdAtUptimeMillis = createdAtUptimeMillis
+    }
+
+    init(from info: LSPSessionInfo) {
+        self.workspaceRoot = info.workspaceRoot.absoluteString
+        self.languageId = info.languageId
+        self.state = SessionStateDTO(from: info.state)
+        self.createdAtUptimeMillis = info.createdAtUptimeMillis
+    }
+}
+
+/// Discriminated JSON shape for a `SessionState`.
+private struct SessionStateDTO: Codable, Sendable, Equatable {
+    let phase: String
+    let serverName: String?
+    let serverVersion: String?
+    let reason: String?
+
+    init(from state: SessionState) {
+        switch state {
+        case .notStarted:
+            self.phase = "notStarted"
+            self.serverName = nil
+            self.serverVersion = nil
+            self.reason = nil
+        case .initializing:
+            self.phase = "initializing"
+            self.serverName = nil
+            self.serverVersion = nil
+            self.reason = nil
+        case .running(let serverInfo):
+            self.phase = "running"
+            self.serverName = serverInfo?.name
+            self.serverVersion = serverInfo?.version
+            self.reason = nil
+        case .shuttingDown:
+            self.phase = "shuttingDown"
+            self.serverName = nil
+            self.serverVersion = nil
+            self.reason = nil
+        case .shutdown:
+            self.phase = "shutdown"
+            self.serverName = nil
+            self.serverVersion = nil
+            self.reason = nil
+        case .failed(let reason):
+            self.phase = "failed"
+            self.serverName = nil
+            self.serverVersion = nil
+            self.reason = reason
         }
     }
 }
