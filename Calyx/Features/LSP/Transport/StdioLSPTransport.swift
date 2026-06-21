@@ -119,8 +119,19 @@ actor StdioLSPTransport: LSPTransport {
         if let h = handle { return h }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
+        // `URL(fileURLWithPath:)` resolves relative paths against the
+        // current working directory, so a bare binary name like
+        // `"rust-analyzer"` would be interpreted as `<cwd>/rust-analyzer`
+        // and fail to launch. Route bare names through `/usr/bin/env` so
+        // the user's `PATH` is consulted; pass absolute paths straight
+        // through.
+        if executable.hasPrefix("/") {
+            process.executableURL = URL(fileURLWithPath: executable)
+            process.arguments = arguments
+        } else {
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            process.arguments = [executable] + arguments
+        }
         if let environment {
             process.environment = environment
         }
@@ -149,8 +160,13 @@ actor StdioLSPTransport: LSPTransport {
             if chunk.isEmpty { return }
             cont.yield(chunk)
         }
-        // stderr is discarded (production hook point: forward to a logger).
-        stderrPipe.fileHandleForReading.readabilityHandler = { _ in }
+        // Forward stderr to the host process's stderr so language-server
+        // startup failures and diagnostics are observable in logs.
+        stderrPipe.fileHandleForReading.readabilityHandler = { fh in
+            let chunk = fh.availableData
+            if chunk.isEmpty { return }
+            FileHandle.standardError.write(chunk)
+        }
 
         // Terminate -> finish incoming stream.
         process.terminationHandler = { _ in
