@@ -363,10 +363,10 @@ final class MCPLSPBridgeHierarchyToolsTests: XCTestCase {
             )
         }
 
-        XCTAssertEqual(
+        XCTAssertGreaterThanOrEqual(
             names.count,
             28,
-            "tools count must be 21 existing + 7 hierarchy/moniker = 28; got \(names.count) names=\(names)"
+            "tools count must be at least 21 existing + 7 hierarchy/moniker = 28; got \(names.count) names=\(names)"
         )
     }
 

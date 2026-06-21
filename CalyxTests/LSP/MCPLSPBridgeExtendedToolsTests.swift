@@ -319,7 +319,7 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
     func test_tools_listContainsAllExtendedTools() {
         let names = MCPLSPBridge.tools.map { $0.name }
 
-        // Both the 10 core tools and the 18 extended tools must be advertised.
+        // The 10 core tools and the 25 extended tools must be advertised.
         let coreExpected = [
             "lsp_hover",
             "lsp_definition",
@@ -351,6 +351,13 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
             "lsp_type_hierarchy_supertypes",
             "lsp_type_hierarchy_subtypes",
             "lsp_moniker",
+            "lsp_code_lens",
+            "lsp_code_lens_resolve",
+            "lsp_inlay_hint",
+            "lsp_inlay_hint_resolve",
+            "lsp_inline_value",
+            "lsp_folding_range",
+            "lsp_selection_range",
         ]
 
         for name in coreExpected {
@@ -368,7 +375,7 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
         XCTAssertEqual(
             names.count,
             coreExpected.count + extendedExpected.count,
-            "tools count must be 10 core + 18 extended = 28; got \(names.count) names=\(names)"
+            "tools count must be 10 core + 25 extended = 35; got \(names.count) names=\(names)"
         )
     }
 

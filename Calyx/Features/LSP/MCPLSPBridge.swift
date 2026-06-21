@@ -39,6 +39,13 @@
 //      lsp_type_hierarchy_supertypes -> typeHierarchy/supertypes
 //      lsp_type_hierarchy_subtypes   -> typeHierarchy/subtypes
 //      lsp_moniker                   -> textDocument/moniker
+//      lsp_code_lens                 -> textDocument/codeLens
+//      lsp_code_lens_resolve         -> codeLens/resolve
+//      lsp_inlay_hint                -> textDocument/inlayHint
+//      lsp_inlay_hint_resolve        -> inlayHint/resolve
+//      lsp_inline_value              -> textDocument/inlineValue
+//      lsp_folding_range             -> textDocument/foldingRange
+//      lsp_selection_range           -> textDocument/selectionRange
 //
 //  Response shaping rule: every tool serialises its LSP result as JSON and
 //  hands the JSON string back as the `text` of a single `MCPContent` block.
@@ -267,6 +274,41 @@ final class MCPLSPBridge {
                 description: MonikerTool.description,
                 inputSchema: MonikerTool.inputSchema
             ),
+            MCPTool(
+                name: CodeLensTool.name,
+                description: CodeLensTool.description,
+                inputSchema: CodeLensTool.inputSchema
+            ),
+            MCPTool(
+                name: CodeLensResolveTool.name,
+                description: CodeLensResolveTool.description,
+                inputSchema: CodeLensResolveTool.inputSchema
+            ),
+            MCPTool(
+                name: InlayHintTool.name,
+                description: InlayHintTool.description,
+                inputSchema: InlayHintTool.inputSchema
+            ),
+            MCPTool(
+                name: InlayHintResolveTool.name,
+                description: InlayHintResolveTool.description,
+                inputSchema: InlayHintResolveTool.inputSchema
+            ),
+            MCPTool(
+                name: InlineValueTool.name,
+                description: InlineValueTool.description,
+                inputSchema: InlineValueTool.inputSchema
+            ),
+            MCPTool(
+                name: FoldingRangeTool.name,
+                description: FoldingRangeTool.description,
+                inputSchema: FoldingRangeTool.inputSchema
+            ),
+            MCPTool(
+                name: SelectionRangeTool.name,
+                description: SelectionRangeTool.description,
+                inputSchema: SelectionRangeTool.inputSchema
+            ),
         ]
     }
 
@@ -331,6 +373,20 @@ final class MCPLSPBridge {
             return try await TypeHierarchySubtypesTool.handle(arguments: arguments, bridge: self)
         case MonikerTool.name:
             return try await MonikerTool.handle(arguments: arguments, bridge: self)
+        case CodeLensTool.name:
+            return try await CodeLensTool.handle(arguments: arguments, bridge: self)
+        case CodeLensResolveTool.name:
+            return try await CodeLensResolveTool.handle(arguments: arguments, bridge: self)
+        case InlayHintTool.name:
+            return try await InlayHintTool.handle(arguments: arguments, bridge: self)
+        case InlayHintResolveTool.name:
+            return try await InlayHintResolveTool.handle(arguments: arguments, bridge: self)
+        case InlineValueTool.name:
+            return try await InlineValueTool.handle(arguments: arguments, bridge: self)
+        case FoldingRangeTool.name:
+            return try await FoldingRangeTool.handle(arguments: arguments, bridge: self)
+        case SelectionRangeTool.name:
+            return try await SelectionRangeTool.handle(arguments: arguments, bridge: self)
         default:
             throw MCPLSPBridgeError.unknownTool(name)
         }
@@ -371,6 +427,23 @@ final class MCPLSPBridge {
     func extractDocumentUri(arguments: [String: AnyCodable]) throws -> DocumentUri {
         let file = try MCPLSPBridge.requireString(arguments: arguments, key: "file")
         return MCPLSPBridge.documentUri(fromPathOrUri: file)
+    }
+
+    /// Pull `file`, `start_line`, `start_column`, `end_line`, `end_column`
+    /// from `arguments` and build the `(uri, range)` pair shared by every
+    /// range-based LSP request (`lsp_code_action`, `lsp_inlay_hint`,
+    /// `lsp_inline_value`).
+    func extractRange(arguments: [String: AnyCodable]) throws -> (uri: DocumentUri, range: LSPRange) {
+        let uri = try extractDocumentUri(arguments: arguments)
+        let startLine = try MCPLSPBridge.requireInt(arguments: arguments, key: "start_line")
+        let startCol = try MCPLSPBridge.requireInt(arguments: arguments, key: "start_column")
+        let endLine = try MCPLSPBridge.requireInt(arguments: arguments, key: "end_line")
+        let endCol = try MCPLSPBridge.requireInt(arguments: arguments, key: "end_column")
+        let range = LSPRange(
+            start: Position(line: startLine, character: startCol),
+            end: Position(line: endLine, character: endCol)
+        )
+        return (uri, range)
     }
 
     // MARK: - Argument coercion (nonisolated)
@@ -584,19 +657,43 @@ private func prop(_ type: String, _ description: String) -> AnyCodable {
 }
 
 /// Build the JSON-Schema for an item-based MCP tool (the call/type
-/// hierarchy `incoming` / `outgoing` / `supertypes` / `subtypes` tools).
-/// The `item` payload is the verbatim `CallHierarchyItem` /
-/// `TypeHierarchyItem` returned by the matching `prepare*` call.
-private func itemBasedSchema(itemDescription: String) -> [String: AnyCodable] {
+/// hierarchy `incoming` / `outgoing` / `supertypes` / `subtypes` tools,
+/// and the `code_lens` / `inlay_hint` resolve tools).
+/// The item payload is the verbatim domain object (e.g.
+/// `CallHierarchyItem`, `TypeHierarchyItem`, `CodeLens`, `InlayHint`)
+/// returned by the matching producer call. `itemKey` selects the
+/// argument-dict key under which the value is expected; defaults to
+/// `"item"` so existing hierarchy tools keep their wire format.
+private func itemBasedSchema(
+    itemKey: String = "item",
+    itemDescription: String
+) -> [String: AnyCodable] {
     let props: [String: AnyCodable] = [
         "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
         "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-        "item": AnyCodable([
+        itemKey: AnyCodable([
             "type": AnyCodable("object"),
             "description": AnyCodable(itemDescription),
         ] as [String: AnyCodable]),
     ]
-    let required = ["workspace_root", "language_id", "item"]
+    let required = ["workspace_root", "language_id", itemKey]
+    return [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable(props),
+        "required": AnyCodable(required.map { AnyCodable($0) }),
+    ]
+}
+
+/// Build the JSON-Schema for a file-only MCP tool (`lsp_code_lens`,
+/// `lsp_folding_range`). Mirrors `DocumentSymbolTool` / `DiagnosticsTool`'s
+/// inline schema but factored into a shared helper.
+private func fileOnlySchema() -> [String: AnyCodable] {
+    let props: [String: AnyCodable] = [
+        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "file": prop("string", "Absolute path or file:// URI of the target file"),
+    ]
+    let required = ["workspace_root", "language_id", "file"]
     return [
         "type": AnyCodable("object"),
         "properties": AnyCodable(props),
@@ -1163,16 +1260,7 @@ enum CodeActionTool: MCPLSPTool {
         } catch {
             return MCPLSPBridge.makeErrorContent(error)
         }
-        let file = try MCPLSPBridge.requireString(arguments: arguments, key: "file")
-        let startLine = try MCPLSPBridge.requireInt(arguments: arguments, key: "start_line")
-        let startCol = try MCPLSPBridge.requireInt(arguments: arguments, key: "start_column")
-        let endLine = try MCPLSPBridge.requireInt(arguments: arguments, key: "end_line")
-        let endCol = try MCPLSPBridge.requireInt(arguments: arguments, key: "end_column")
-        let uri = MCPLSPBridge.documentUri(fromPathOrUri: file)
-        let range = LSPRange(
-            start: Position(line: startLine, character: startCol),
-            end: Position(line: endLine, character: endCol)
-        )
+        let (uri, range) = try bridge.extractRange(arguments: arguments)
         let context = CodeActionContext(diagnostics: [])
         let params = CodeActionParams(
             textDocument: TextDocumentIdentifier(uri: uri),
@@ -1704,6 +1792,370 @@ enum MonikerTool: MCPLSPTool {
                 method: "textDocument/moniker",
                 params: params,
                 resultType: [Moniker]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - CodeLensTool
+
+enum CodeLensTool: MCPLSPTool {
+    static let name = "lsp_code_lens"
+    static let description = "Get code lens entries (e.g. references, run/debug actions) for a document."
+    static let inputSchema: [String: AnyCodable] = fileOnlySchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let uri = try bridge.extractDocumentUri(arguments: arguments)
+        let params = CodeLensParams(textDocument: TextDocumentIdentifier(uri: uri))
+        do {
+            let result: [CodeLens]? = try await session.sendRequest(
+                method: "textDocument/codeLens",
+                params: params,
+                resultType: [CodeLens]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - CodeLensResolveTool
+
+enum CodeLensResolveTool: MCPLSPTool {
+    static let name = "lsp_code_lens_resolve"
+    static let description = "Resolve the command / data of a code lens entry returned by lsp_code_lens."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemKey: "code_lens",
+        itemDescription: "CodeLens object returned by lsp_code_lens. Forwarded verbatim to codeLens/resolve."
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let codeLensAny = arguments["code_lens"] else {
+            throw MCPLSPBridgeError.missingArgument("code_lens")
+        }
+        let codeLens = try MCPLSPBridge.decodeFromAnyCodable(
+            codeLensAny,
+            as: CodeLens.self,
+            argumentName: "code_lens"
+        )
+        do {
+            let result: CodeLens? = try await session.sendRequest(
+                method: "codeLens/resolve",
+                params: codeLens,
+                resultType: CodeLens?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - InlayHintTool
+
+enum InlayHintTool: MCPLSPTool {
+    static let name = "lsp_inlay_hint"
+    static let description = "Get inlay hints (inferred type / parameter labels) for a range in a document."
+    static let inputSchema: [String: AnyCodable] = rangeRequestSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, range) = try bridge.extractRange(arguments: arguments)
+        let params = InlayHintParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            range: range
+        )
+        do {
+            let result: [InlayHint]? = try await session.sendRequest(
+                method: "textDocument/inlayHint",
+                params: params,
+                resultType: [InlayHint]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - InlayHintResolveTool
+
+enum InlayHintResolveTool: MCPLSPTool {
+    static let name = "lsp_inlay_hint_resolve"
+    static let description = "Resolve the tooltip / text edits / label parts of an InlayHint returned by lsp_inlay_hint."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemKey: "inlay_hint",
+        itemDescription: "InlayHint object returned by lsp_inlay_hint. Forwarded verbatim to inlayHint/resolve."
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let hintAny = arguments["inlay_hint"] else {
+            throw MCPLSPBridgeError.missingArgument("inlay_hint")
+        }
+        let hint = try MCPLSPBridge.decodeFromAnyCodable(
+            hintAny,
+            as: InlayHint.self,
+            argumentName: "inlay_hint"
+        )
+        do {
+            let result: InlayHint? = try await session.sendRequest(
+                method: "inlayHint/resolve",
+                params: hint,
+                resultType: InlayHint?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - InlineValueTool
+
+enum InlineValueTool: MCPLSPTool {
+    static let name = "lsp_inline_value"
+    static let description = "Get inline value hints for a range while a debugger is stopped at a frame."
+    static let inputSchema: [String: AnyCodable] = rangeRequestSchema(
+        extraProperties: [
+            "frame_id": prop(
+                "integer",
+                "DAP stack frame id where execution has stopped. Defaults to 0."
+            ),
+            "stopped_start_line": prop(
+                "integer",
+                "0-based start line of the stopped-location range. Defaults to start_line."
+            ),
+            "stopped_start_column": prop(
+                "integer",
+                "0-based start column of the stopped-location range. Defaults to start_column."
+            ),
+            "stopped_end_line": prop(
+                "integer",
+                "0-based end line of the stopped-location range. Defaults to end_line."
+            ),
+            "stopped_end_column": prop(
+                "integer",
+                "0-based end column of the stopped-location range. Defaults to end_column."
+            ),
+        ]
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, range) = try bridge.extractRange(arguments: arguments)
+        let frameId = try MCPLSPBridge.optionalInt(
+            arguments: arguments,
+            key: "frame_id"
+        ) ?? 0
+        // Spec requires a `stoppedLocation` range. When the caller omits the
+        // `stopped_*` fields the bridge mirrors the requested target range —
+        // a sensible default for non-debug uses where the caller does not
+        // distinguish between "range under inspection" and "frame location".
+        let stoppedStartLine = try MCPLSPBridge.optionalInt(
+            arguments: arguments,
+            key: "stopped_start_line"
+        )
+        let stoppedStartCol = try MCPLSPBridge.optionalInt(
+            arguments: arguments,
+            key: "stopped_start_column"
+        )
+        let stoppedEndLine = try MCPLSPBridge.optionalInt(
+            arguments: arguments,
+            key: "stopped_end_line"
+        )
+        let stoppedEndCol = try MCPLSPBridge.optionalInt(
+            arguments: arguments,
+            key: "stopped_end_column"
+        )
+        let stoppedLocation: LSPRange
+        if let sl = stoppedStartLine,
+           let sc = stoppedStartCol,
+           let el = stoppedEndLine,
+           let ec = stoppedEndCol {
+            stoppedLocation = LSPRange(
+                start: Position(line: sl, character: sc),
+                end: Position(line: el, character: ec)
+            )
+        } else {
+            stoppedLocation = range
+        }
+        let context = InlineValueContext(
+            frameId: frameId,
+            stoppedLocation: stoppedLocation
+        )
+        let params = InlineValueParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            range: range,
+            context: context
+        )
+        do {
+            let result: [InlineValue]? = try await session.sendRequest(
+                method: "textDocument/inlineValue",
+                params: params,
+                resultType: [InlineValue]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - FoldingRangeTool
+
+enum FoldingRangeTool: MCPLSPTool {
+    static let name = "lsp_folding_range"
+    static let description = "Get folding ranges (regions, imports, comments) for a document."
+    static let inputSchema: [String: AnyCodable] = fileOnlySchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let uri = try bridge.extractDocumentUri(arguments: arguments)
+        let params = FoldingRangeParams(textDocument: TextDocumentIdentifier(uri: uri))
+        do {
+            let result: [FoldingRange]? = try await session.sendRequest(
+                method: "textDocument/foldingRange",
+                params: params,
+                resultType: [FoldingRange]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - SelectionRangeTool
+
+enum SelectionRangeTool: MCPLSPTool {
+    static let name = "lsp_selection_range"
+    static let description = "Get selection ranges for an array of positions in a document."
+    static let inputSchema: [String: AnyCodable] = {
+        // `positions` is an array of `{ line, column }` objects. We document
+        // the item schema inline so callers can see the expected shape via
+        // `tools/list`.
+        let positionItemSchema: [String: AnyCodable] = [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "line": prop("integer", "0-based line number"),
+                "column": prop("integer", "0-based UTF-16 column / character offset"),
+            ] as [String: AnyCodable]),
+            "required": AnyCodable([AnyCodable("line"), AnyCodable("column")]),
+        ]
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "file": prop("string", "Absolute path or file:// URI of the target file"),
+            "positions": AnyCodable([
+                "type": AnyCodable("array"),
+                "description": AnyCodable("Positions at which to compute selection ranges"),
+                "items": AnyCodable(positionItemSchema),
+            ] as [String: AnyCodable]),
+        ]
+        let required = ["workspace_root", "language_id", "file", "positions"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    /// MCP-facing position payload: matches the rest of the bridge's
+    /// `{ line, column }` convention. Translated into an LSP `Position`
+    /// (`character` key) before sending.
+    private struct PositionInput: Decodable, Sendable {
+        let line: Int
+        let column: Int
+    }
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let uri = try bridge.extractDocumentUri(arguments: arguments)
+        guard let positionsAny = arguments["positions"] else {
+            throw MCPLSPBridgeError.missingArgument("positions")
+        }
+        // `AnyCodable.storage` is private. Round-trip through JSON to recover
+        // the typed `[PositionInput]` array. Mirrors `decodeFromAnyCodable`
+        // but is tailored to surface a clearer error message for the
+        // positions-array case.
+        let inputs: [PositionInput]
+        do {
+            let data = try JSONEncoder().encode(positionsAny)
+            inputs = try JSONDecoder().decode([PositionInput].self, from: data)
+        } catch {
+            throw MCPLSPBridgeError.invalidArgument(
+                name: "positions",
+                reason: "expected an array of {line, column} objects: \(error)"
+            )
+        }
+        let positions = inputs.map {
+            Position(line: $0.line, character: $0.column)
+        }
+        let params = SelectionRangeParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            positions: positions
+        )
+        do {
+            let result: [SelectionRange]? = try await session.sendRequest(
+                method: "textDocument/selectionRange",
+                params: params,
+                resultType: [SelectionRange]?.self
             )
             return try MCPLSPBridge.makeJSONContent(result)
         } catch {
