@@ -142,6 +142,12 @@ final class LSPService {
     /// `shutdownAll`) routes a matching `unwatch` / `stopAll` through
     /// the manager so the FSEvents stream is released.
     private let fileSyncManager: FileSyncManager?
+    /// Optional session persistence store. When non-nil, every session
+    /// built via `buildSession` is constructed with the same store, so
+    /// post-build `didOpen` / `didClose` activity surfaces in the store
+    /// returned by `availableSnapshots()`. When `nil`, persistence is
+    /// disabled end-to-end and `availableSnapshots()` returns `[]`.
+    private let persistence: LSPSessionPersistence?
 
     private var sessions: [SessionKey: SessionEntry] = [:]
     /// In-flight builds keyed by `SessionKey` so concurrent
@@ -158,13 +164,15 @@ final class LSPService {
         installer: LSPInstaller? = nil,
         sessionFactory: any LSPSessionFactory,
         config: LSPServiceConfig = LSPServiceConfig(),
-        fileSyncManager: FileSyncManager? = nil
+        fileSyncManager: FileSyncManager? = nil,
+        persistence: LSPSessionPersistence? = nil
     ) {
         self.registry = registry
         self.installer = installer
         self.sessionFactory = sessionFactory
         self.config = config
         self.fileSyncManager = fileSyncManager
+        self.persistence = persistence
     }
 
     // MARK: Public API
@@ -217,6 +225,15 @@ final class LSPService {
             ))
         }
         return out
+    }
+
+    /// Snapshots persisted to the configured `LSPSessionPersistence`
+    /// store, suitable for restoring open documents on a fresh launch.
+    /// Returns `[]` when this service was constructed without a
+    /// persistence store, so callers can opt out of restoration without
+    /// branching on the configuration.
+    func availableSnapshots() async -> [LSPSessionPersistence.SessionSnapshot] {
+        await persistence?.load() ?? []
     }
 
     /// Direct snapshot of every cached `LSPSession` value. Distinct from
@@ -325,7 +342,8 @@ final class LSPService {
         let session = LSPSession(
             workspaceRoot: key.workspaceRoot,
             languageId: key.languageId,
-            client: client
+            client: client,
+            persistence: persistence
         )
 
         do {

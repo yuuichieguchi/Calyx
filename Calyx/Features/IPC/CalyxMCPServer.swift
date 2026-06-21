@@ -60,12 +60,19 @@ final class CalyxMCPServer {
         // on-disk edits outside Calyx's own writers feed back into LSP
         // synchronisation notifications.
         let fileSyncManager = FileSyncManager()
+        // Default persistence store under
+        // `~/Library/Application Support/Calyx/lsp/sessions.json`. Snapshots
+        // are written on every `didOpen` / `didClose` and removed on
+        // `shutdown()`, so a subsequent launch can replay the open-file
+        // set via `LSPService.availableSnapshots()`.
+        let persistence = LSPSessionPersistence()
         let service = LSPService(
             registry: registry,
             installer: installer,
             sessionFactory: factory,
             config: LSPServiceConfig(),
-            fileSyncManager: fileSyncManager
+            fileSyncManager: fileSyncManager,
+            persistence: persistence
         )
         let resolver = WorkspaceResolver(registry: registry)
         self.lspBridge = MCPLSPBridge(service: service, workspaceResolver: resolver, installer: installer)

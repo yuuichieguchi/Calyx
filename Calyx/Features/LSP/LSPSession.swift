@@ -121,6 +121,11 @@ actor LSPSession {
     private let clientInfo: ClientInfo
     private let capabilities: CapabilityRegistry
     private let progress: ProgressBroker
+    /// Optional persistence store. When non-nil the session writes a fresh
+    /// snapshot (workspace + language + currently-open URIs) on every
+    /// `didOpen` / `didClose` and removes the entry on `shutdown()`, so
+    /// callers can rebuild the open-file set across application launches.
+    private let persistence: LSPSessionPersistence?
 
     private var sessionState: SessionState = .notStarted
     private var openDocs: Set<DocumentUri> = []
@@ -145,7 +150,8 @@ actor LSPSession {
         languageId: String,
         client: LSPClient,
         clientCapabilities: ClientCapabilities = ClientCapabilities.calyxDefault(),
-        clientInfo: ClientInfo = ClientInfo(name: "Calyx", version: "0.26.1")
+        clientInfo: ClientInfo = ClientInfo(name: "Calyx", version: "0.26.1"),
+        persistence: LSPSessionPersistence? = nil
     ) {
         self.workspaceRoot = workspaceRoot
         self.languageId = languageId
@@ -154,6 +160,7 @@ actor LSPSession {
         self.clientInfo = clientInfo
         self.capabilities = CapabilityRegistry()
         self.progress = ProgressBroker()
+        self.persistence = persistence
     }
 
     // MARK: - Introspection
@@ -280,6 +287,7 @@ actor LSPSession {
             sessionState = .failed(reason: String(describing: error))
             throw error
         }
+        scheduleRemoveSnapshot()
     }
 
     // MARK: - textDocument lifecycle
@@ -316,6 +324,7 @@ actor LSPSession {
             openDocs.remove(uri)
             throw error
         }
+        schedulePersistSnapshot()
     }
 
     /// Notify the server that an open document has changed. Throws
@@ -357,6 +366,7 @@ actor LSPSession {
             openDocs.insert(uri)
             throw error
         }
+        schedulePersistSnapshot()
     }
 
     /// Notify the server that an open document has been saved. `text` is
@@ -422,6 +432,50 @@ actor LSPSession {
     ) async throws {
         try ensureRunning()
         try await sendNotification(method: method, params: params)
+    }
+
+    // MARK: - Persistence helpers
+
+    /// Build a `SessionSnapshot` describing this session's current
+    /// (workspaceRoot, languageId, openFiles) tuple. `initializationOptions`
+    /// is reserved for a future extension that surfaces user-supplied
+    /// init options; the session emits `nil` today. `savedAtUptimeMillis`
+    /// is sampled from `ProcessInfo.processInfo.systemUptime` so callers
+    /// can perform staleness checks across launches.
+    private func currentSnapshot() -> LSPSessionPersistence.SessionSnapshot {
+        LSPSessionPersistence.SessionSnapshot(
+            workspaceRoot: workspaceRoot,
+            languageId: languageId,
+            openFiles: Array(openDocs),
+            initializationOptions: nil,
+            savedAtUptimeMillis: Int64(ProcessInfo.processInfo.systemUptime * 1000)
+        )
+    }
+
+    /// Fire-and-forget persist of the current snapshot. No-op when the
+    /// session was constructed without a persistence store. The snapshot is
+    /// captured synchronously while the actor is held, then handed to a
+    /// detached Task so the persist I/O does not block the calling
+    /// notification path.
+    private func schedulePersistSnapshot() {
+        guard let persistence else { return }
+        let snap = currentSnapshot()
+        Task {
+            try? await persistence.persist(snap)
+        }
+    }
+
+    /// Fire-and-forget removal of this session's persisted entry. No-op
+    /// when the session was constructed without a persistence store.
+    /// Captures `workspaceRoot` / `languageId` into Sendable locals so the
+    /// background Task does not need to reach back into the actor.
+    private func scheduleRemoveSnapshot() {
+        guard let persistence else { return }
+        let ws = workspaceRoot
+        let lang = languageId
+        Task {
+            try? await persistence.remove(workspaceRoot: ws, languageId: lang)
+        }
     }
 
     // MARK: - Private helpers
