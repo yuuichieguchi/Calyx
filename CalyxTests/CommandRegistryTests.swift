@@ -33,8 +33,8 @@ final class CommandRegistryTests: XCTestCase {
         title: String = "Test Command",
         shortcut: String? = nil,
         category: String = "General"
-    ) -> Command {
-        Command(id: id, title: title, shortcut: shortcut, category: category) {}
+    ) -> PaletteCommand {
+        PaletteCommand(id: id, title: title, shortcut: shortcut, category: category) {}
     }
 
     // ==================== 1. Register → allCommands Contains It ====================

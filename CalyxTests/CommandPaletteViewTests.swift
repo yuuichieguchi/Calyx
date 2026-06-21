@@ -20,7 +20,7 @@ final class CommandPaletteViewTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeRegistry(commands: [Command] = []) -> CommandRegistry {
+    private func makeRegistry(commands: [PaletteCommand] = []) -> CommandRegistry {
         let registry = CommandRegistry()
         for command in commands {
             registry.register(command)
@@ -32,8 +32,8 @@ final class CommandPaletteViewTests: XCTestCase {
         id: String = "test.cmd",
         title: String = "Test Command",
         handler: @escaping @MainActor @Sendable () -> Void = {}
-    ) -> Command {
-        Command(id: id, title: title, handler: handler)
+    ) -> PaletteCommand {
+        PaletteCommand(id: id, title: title, handler: handler)
     }
 
     // ==================== 1. executeSelected with Empty Registry → No Crash ====================

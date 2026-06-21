@@ -19,7 +19,7 @@ class CommandPaletteView: NSView, NSTableViewDelegate, NSTableViewDataSource, NS
     private let resultsScrollView = NSScrollView()
     private let resultsTableView = NSTableView()
 
-    private var filteredCommands: [Command] = []
+    private var filteredCommands: [PaletteCommand] = []
     private var selectedIndex = 0
 
     var onDismiss: (() -> Void)?

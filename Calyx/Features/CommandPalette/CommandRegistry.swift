@@ -8,15 +8,15 @@ import Foundation
 @MainActor
 class CommandRegistry {
 
-    private var commands: [Command] = []
+    private var commands: [PaletteCommand] = []
     private var frequencyMap: [String: Int] = [:]
 
-    func register(_ command: Command) {
+    func register(_ command: PaletteCommand) {
         commands.append(command)
     }
 
-    func search(query: String) -> [Command] {
-        let scored = commands.compactMap { cmd -> (Command, Int)? in
+    func search(query: String) -> [PaletteCommand] {
+        let scored = commands.compactMap { cmd -> (PaletteCommand, Int)? in
             guard cmd.isAvailable() else { return nil }
             let matchScore = FuzzyMatcher.score(query: query, candidate: cmd.title)
             guard matchScore > 0 else { return nil }
@@ -33,5 +33,5 @@ class CommandRegistry {
         frequencyMap[commandID, default: 0] += 1
     }
 
-    var allCommands: [Command] { commands }
+    var allCommands: [PaletteCommand] { commands }
 }

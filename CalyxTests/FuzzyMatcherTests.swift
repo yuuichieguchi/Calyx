@@ -68,8 +68,8 @@ final class FuzzyMatcherTests: XCTestCase {
     func test_frequency_boost_affects_ranking() {
         let registry = CommandRegistry()
 
-        let cmd1 = Command(id: "cmd1", title: "New Tab") {}
-        let cmd2 = Command(id: "cmd2", title: "New Window") {}
+        let cmd1 = PaletteCommand(id: "cmd1", title: "New Tab") {}
+        let cmd2 = PaletteCommand(id: "cmd2", title: "New Window") {}
 
         registry.register(cmd1)
         registry.register(cmd2)
