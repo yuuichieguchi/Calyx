@@ -299,6 +299,56 @@ actor LSPSession {
         try await sendNotification(method: "textDocument/didSave", params: params)
     }
 
+    // MARK: - Generic request / notification surface
+
+    /// Send a typed LSP request through the embedded `LSPClient`. Used by
+    /// higher layers (e.g. `MCPLSPBridge`) that map their own request
+    /// vocabulary onto the LSP wire protocol. Transport-level failures
+    /// from the client are surfaced as `LSPSessionError.clientError`.
+    func sendRequest<Params: Encodable & Sendable, Result: Decodable & Sendable>(
+        method: String,
+        params: Params,
+        resultType: Result.Type
+    ) async throws -> Result {
+        try ensureRunning()
+        do {
+            return try await client.sendRequest(
+                method: method,
+                params: params,
+                resultType: resultType
+            )
+        } catch let err as LSPClientError {
+            throw LSPSessionError.clientError(err)
+        }
+    }
+
+    /// Send a parameterless LSP request through the embedded `LSPClient`.
+    func sendRequest<Result: Decodable & Sendable>(
+        method: String,
+        resultType: Result.Type
+    ) async throws -> Result {
+        try ensureRunning()
+        do {
+            return try await client.sendRequest(
+                method: method,
+                resultType: resultType
+            )
+        } catch let err as LSPClientError {
+            throw LSPSessionError.clientError(err)
+        }
+    }
+
+    /// Public counterpart to the private `sendNotification(method:params:)`
+    /// helper, exposed for callers that need to ship one-off notifications
+    /// after the session has reached `.running`.
+    func sendGenericNotification<Params: Encodable & Sendable>(
+        method: String,
+        params: Params
+    ) async throws {
+        try ensureRunning()
+        try await sendNotification(method: method, params: params)
+    }
+
     // MARK: - Private helpers
 
     private func ensureRunning() throws {

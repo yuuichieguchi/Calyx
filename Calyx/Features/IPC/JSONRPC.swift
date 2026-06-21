@@ -59,8 +59,27 @@ struct AnyCodable: @unchecked Sendable, Codable, Equatable {
             self.storage = a.storage
         case let s as String:
             self.storage = .string(s)
+        case let n as NSNumber:
+            // JSON numbers and booleans both arrive as `NSNumber` after a
+            // `JSONSerialization.jsonObject(...)` parse. The plain `as? Bool`
+            // / `as? Int` cast is *not* sufficient to discriminate them:
+            // every numeric `NSNumber` whose value is `0` or `1` will also
+            // satisfy `as? Bool`, so an integer 1 (e.g. an LSP `line: 1`)
+            // would be misclassified as `true` and re-encoded as a JSON
+            // boolean. Use `CFGetTypeID` to identify the boolean variant
+            // (`__NSCFBoolean`) explicitly before falling back to Int /
+            // Double.
+            if CFGetTypeID(n) == CFBooleanGetTypeID() {
+                self.storage = .bool(n.boolValue)
+            } else if CFNumberIsFloatType(n) {
+                self.storage = .double(n.doubleValue)
+            } else {
+                self.storage = .int(n.intValue)
+            }
         case let b as Bool:
-            // Bool must be checked before Int/Double because NSNumber(bool) bridges to both.
+            // Pure Swift `Bool` (not bridged through NSNumber). Kept after
+            // the `NSNumber` branch so JSON-derived numerics never hit
+            // this arm.
             self.storage = .bool(b)
         case let i as Int:
             self.storage = .int(i)
