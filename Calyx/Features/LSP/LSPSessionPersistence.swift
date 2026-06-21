@@ -14,6 +14,14 @@
 //  is treated as "no sessions" (the application then falls back to a
 //  fresh-install code path). Mutating operations propagate I/O errors.
 //
+//  Mutating operations (`persist`, `remove`) do NOT share that best-effort
+//  read path: when the on-disk file exists but is undecodable, they rotate
+//  the unreadable file to `<storageURL>.bak` and start a fresh entry list,
+//  rather than silently overwriting every surviving entry with the single
+//  caller-supplied snapshot. This protects against the data-loss scenario
+//  where a transient corruption / schema-skew on read would otherwise erase
+//  N-1 healthy entries on the next persist.
+//
 //  All state lives in an `actor` so concurrent `persist` / `remove` / `clear`
 //  / `load` from multiple LSP sessions cannot interleave file reads and
 //  writes. The on-disk write itself is atomic (`Data.write(options: .atomic)`)
@@ -86,8 +94,16 @@ actor LSPSessionPersistence {
     /// Persist (or overwrite) the entry for
     /// `(snapshot.workspaceRoot, snapshot.languageId)`. Creates any missing
     /// parent directories. Propagates encoding / I/O errors.
+    ///
+    /// If the on-disk file exists but cannot be decoded (corruption / schema
+    /// skew), the unreadable file is rotated to `<storageURL>.bak` and the
+    /// new entry list starts empty rather than overwriting the original file
+    /// in place: this preserves the user's data for forensic recovery and
+    /// avoids the silent N-1-entry data-loss bug where the best-effort
+    /// read-as-empty fallback would otherwise erase every surviving entry
+    /// on the very next write.
     func persist(_ snapshot: SessionSnapshot) throws {
-        var entries = readFromDisk()
+        var entries = try readForMutation()
         entries.removeAll {
             $0.workspaceRoot == snapshot.workspaceRoot
                 && $0.languageId == snapshot.languageId
@@ -99,8 +115,14 @@ actor LSPSessionPersistence {
     /// Remove the entry identified by `(workspaceRoot, languageId)`. A
     /// no-op (no throw, no file write) when no such entry exists, so that
     /// the on-disk file is not touched unnecessarily.
+    ///
+    /// Shares the same corruption-handling semantics as `persist(_:)`: if
+    /// the on-disk file exists but cannot be decoded, the unreadable file
+    /// is rotated to `<storageURL>.bak` and the working entry list starts
+    /// empty (which, combined with the unchanged-count guard, leaves no
+    /// new file on disk).
     func remove(workspaceRoot: URL, languageId: String) throws {
-        var entries = readFromDisk()
+        var entries = try readForMutation()
         let before = entries.count
         entries.removeAll {
             $0.workspaceRoot == workspaceRoot && $0.languageId == languageId
@@ -129,6 +151,12 @@ actor LSPSessionPersistence {
 
     // MARK: - Internals
 
+    /// Best-effort read used by `load()`. Returns `[]` for any failure
+    /// (missing file, unreadable bytes, malformed JSON). NEVER throws.
+    /// MUST NOT be used as the source-of-truth for mutating operations —
+    /// callers that are about to overwrite the file must use
+    /// `readForMutation()` instead, which distinguishes "no file" from
+    /// "file exists but undecodable" to avoid clobbering live data.
     private func readFromDisk() -> [SessionSnapshot] {
         guard FileManager.default.fileExists(atPath: storageURL.path) else {
             return []
@@ -141,6 +169,42 @@ actor LSPSessionPersistence {
         } catch {
             // Malformed JSON / partial write / version skew: fall back to a
             // fresh-install state. The contract of `load()` is best-effort.
+            return []
+        }
+    }
+
+    /// Read for the read-modify-write path. Semantics:
+    ///   - File does not exist → return `[]` (first-ever write).
+    ///   - File exists and decodes → return the decoded entries.
+    ///   - File exists but is unreadable / undecodable → rotate the bad
+    ///     file to `<storageURL>.bak` (overwriting any previous `.bak`)
+    ///     and return `[]`. The rotation is best-effort: a rotation
+    ///     failure does NOT throw, because surfacing it would leave the
+    ///     caller with an unrecoverable persist (the bad file would block
+    ///     every subsequent write). The recovered data lives in `.bak`
+    ///     for the user to inspect; the next successful `writeToDisk`
+    ///     restores `storageURL` to a healthy state.
+    ///
+    /// Unlike `readFromDisk()`, this method does NOT silently treat a
+    /// corrupted file as "empty entries we should keep as the canonical
+    /// state": doing so would let the next mutating call overwrite every
+    /// surviving entry with the single caller-supplied snapshot.
+    private func readForMutation() throws -> [SessionSnapshot] {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: storageURL.path) else {
+            return []
+        }
+        do {
+            let data = try Data(contentsOf: storageURL)
+            return try JSONDecoder().decode([SessionSnapshot].self, from: data)
+        } catch {
+            // Rotate the unreadable file aside so we don't lose the bytes,
+            // then start a fresh entry list. Rotation failures are
+            // intentionally swallowed: if they propagated, the persist
+            // path would be permanently wedged on a broken file.
+            let bak = storageURL.appendingPathExtension("bak")
+            try? fm.removeItem(at: bak)
+            try? fm.moveItem(at: storageURL, to: bak)
             return []
         }
     }

@@ -380,6 +380,108 @@ final class LSPSessionPersistenceTests: XCTestCase {
     }
 
     // ====================================================================
+    // MARK: - 10b. persist on corrupted file rotates to .bak (no data clobber)
+    // ====================================================================
+
+    /// Contract: when `persist(_:)` runs against a storage file that exists
+    /// on disk but cannot be decoded (truncated JSON, schema skew, etc.),
+    /// the actor MUST move the unreadable file aside to `<storageURL>.bak`
+    /// before writing the new entry list. This pins the data-loss fix:
+    ///
+    /// Previously, `persist` used `load()`'s best-effort read which returned
+    /// `[]` for any decode failure; the subsequent atomic write would then
+    /// overwrite an N-entry file with a single new snapshot, silently
+    /// destroying every healthy entry that happened to share the file. The
+    /// expected behaviour now is:
+    ///
+    ///   - The original (corrupt) bytes survive at `<storageURL>.bak`, so
+    ///     the user / operator can forensic-recover whatever they need.
+    ///   - The new write proceeds against a fresh entry list (`[snapshot]`),
+    ///     so `persist(_:)` does not get permanently wedged on the broken
+    ///     file.
+    func test_persist_withCorruptedJSON_rotatesToBakAndWritesFreshEntry() async throws {
+        let storage = try makeStorageURL()
+        let corruptBody = Data("this is not json {{{".utf8)
+        try corruptBody.write(to: storage, options: .atomic)
+
+        let bak = storage.appendingPathExtension("bak")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: bak.path),
+            "precondition: .bak must not exist before persist()"
+        )
+
+        let persistence = LSPSessionPersistence(storageURL: storage)
+        let ws = workspaceURL("rescue")
+        let snapshot = snap(
+            workspace: ws,
+            languageId: "swift",
+            openFiles: ["file:///tmp/ws-rescue/Recover.swift"],
+            savedAt: 4242
+        )
+
+        try await persistence.persist(snapshot)
+
+        // (a) The new snapshot is the only entry visible via load() — the
+        //     fresh-start path correctly produced a 1-element file rather
+        //     than blowing up or producing an empty array.
+        let loaded = await persistence.load()
+        XCTAssertEqual(loaded, [snapshot],
+                       "persist() against a corrupt file must yield a single-entry list containing only the new snapshot")
+
+        // (b) The corrupted bytes survive at `<storageURL>.bak`, byte-for-byte.
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: bak.path),
+            "persist() against a corrupt file must rotate the unreadable file to <storageURL>.bak"
+        )
+        let bakBytes = try Data(contentsOf: bak)
+        XCTAssertEqual(
+            bakBytes, corruptBody,
+            ".bak must contain the original corrupt bytes verbatim (forensic recovery)"
+        )
+    }
+
+    // ====================================================================
+    // MARK: - 10c. persist after rotation overwrites any stale .bak
+    // ====================================================================
+
+    /// Contract: a previous rotation may have already produced a `.bak`
+    /// file. A second corruption + persist cycle must replace the stale
+    /// `.bak` with the freshly rotated bytes rather than refusing to
+    /// rotate (which would leave the current bad file on disk and
+    /// re-trigger the data-loss bug on the next write).
+    func test_persist_corruptedFileTwice_replacesStaleBak() async throws {
+        let storage = try makeStorageURL()
+        let bak = storage.appendingPathExtension("bak")
+
+        // Round 1: pre-existing stale .bak from a previous rotation.
+        try Data("old-bak-bytes".utf8).write(to: bak, options: .atomic)
+        // Current storage file is corrupt.
+        let corruptV2 = Data("corrupt-v2 }}}".utf8)
+        try corruptV2.write(to: storage, options: .atomic)
+
+        let persistence = LSPSessionPersistence(storageURL: storage)
+        let ws = workspaceURL("rescue2")
+        let snapshot = snap(
+            workspace: ws,
+            languageId: "swift",
+            openFiles: ["file:///tmp/ws-rescue2/A.swift"],
+            savedAt: 7777
+        )
+        try await persistence.persist(snapshot)
+
+        let bakBytes = try Data(contentsOf: bak)
+        XCTAssertEqual(
+            bakBytes, corruptV2,
+            ".bak must be replaced with the just-rotated corrupt bytes, not retain the stale ones"
+        )
+        let loaded = await persistence.load()
+        XCTAssertEqual(
+            loaded, [snapshot],
+            "fresh persist after rotation must still produce a one-entry file"
+        )
+    }
+
+    // ====================================================================
     // MARK: - 11. Bonus: round-trip preserves initializationOptions (AnyCodable)
     // ====================================================================
 

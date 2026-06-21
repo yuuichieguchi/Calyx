@@ -3800,8 +3800,9 @@ enum BatchTool: MCPLSPTool {
             "requests": AnyCodable([
                 "type": AnyCodable("array"),
                 "description": AnyCodable(
-                    "Ordered list of inner tool invocations to dispatch"
+                    "Ordered list of inner tool invocations to dispatch. Nested 'lsp_batch' entries are rejected per-entry. Capped at 64 entries per batch."
                 ),
+                "maxItems": AnyCodable(64),
                 "items": AnyCodable(requestItemSchema),
             ] as [String: AnyCodable]),
         ]
@@ -3854,6 +3855,12 @@ enum BatchTool: MCPLSPTool {
         }
     }
 
+    /// Maximum number of inner requests one `lsp_batch` invocation may carry.
+    /// Bounded so a single MCP round-trip cannot pin the bridge actor with an
+    /// unbounded fan-out; combined with the nested-batch reject below this
+    /// also caps total dispatches at a constant `O(maxRequestsPerBatch)`.
+    static let maxRequestsPerBatch: Int = 64
+
     static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
         guard let requestsAny = arguments["requests"] else {
             throw MCPLSPBridgeError.missingArgument("requests")
@@ -3863,9 +3870,29 @@ enum BatchTool: MCPLSPTool {
             as: [BatchRequest].self,
             argumentName: "requests"
         )
+        guard requests.count <= maxRequestsPerBatch else {
+            throw MCPLSPBridgeError.invalidArgument(
+                name: "requests",
+                reason: "max \(maxRequestsPerBatch) requests per batch (got \(requests.count))"
+            )
+        }
         var entries: [BatchResponseEntry] = []
         entries.reserveCapacity(requests.count)
         for request in requests {
+            // Reject nested `lsp_batch` entries: allowing them turns a single
+            // outer dispatch into an exponential fan-out (e.g. 100x100x100 =>
+            // 1M inner dispatches), pins the @MainActor-isolated bridge, and
+            // is a trivial DoS vector. Surface the rejection as a per-entry
+            // error so peer entries still execute normally.
+            if request.tool == BatchTool.name {
+                entries.append(
+                    BatchResponseEntry(
+                        tool: request.tool,
+                        error: "nested lsp_batch is not allowed"
+                    )
+                )
+                continue
+            }
             do {
                 let inner = try await bridge.handleToolCall(
                     name: request.tool,

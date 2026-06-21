@@ -736,6 +736,100 @@ final class MCPLSPBridgeFileOpsAndAITests: XCTestCase {
         )
     }
 
+    // MARK: - 8b. lsp_batch rejects nested lsp_batch entries
+
+    /// A `lsp_batch` whose inner entry targets `lsp_batch` itself must NOT
+    /// recurse. Permitting recursion turns one outer call into an
+    /// exponential fan-out (e.g. 100x100x100 = 1M dispatches) which pins the
+    /// `@MainActor`-isolated bridge and is a trivial DoS vector. The bridge
+    /// must surface the rejection as a per-entry `error` so peer entries
+    /// still execute normally; the outer call MUST NOT throw.
+    func test_lspBatch_nestedBatch_rejectedWithError() async throws {
+        let (bridge, _) = await makeBridge()
+
+        let innerParams: [String: AnyCodable] = [
+            "requests": AnyCodable([AnyCodable]()),
+        ]
+        let requests = AnyCodable([
+            AnyCodable([
+                "tool": AnyCodable("lsp_batch"),
+                "params": AnyCodable(innerParams),
+            ] as [String: AnyCodable]),
+        ])
+        let args: [String: AnyCodable] = ["requests": requests]
+
+        let content = try await bridge.handleToolCall(
+            name: "lsp_batch",
+            arguments: args
+        )
+        XCTAssertEqual(content.type, "text")
+
+        guard let data = content.text.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
+        else {
+            XCTFail("lsp_batch text must be a JSON array; got: \(content.text)")
+            return
+        }
+        XCTAssertEqual(arr.count, 1, "expected exactly one entry; got: \(arr)")
+        guard let entry = arr.first else { return }
+        XCTAssertEqual(
+            entry["tool"] as? String, "lsp_batch",
+            "entry must echo the inner tool name; got: \(entry)"
+        )
+        XCTAssertNil(
+            entry["result"],
+            "rejected nested batch entry must not carry a result; got: \(entry)"
+        )
+        let errorText = (entry["error"] as? String) ?? ""
+        XCTAssertTrue(
+            errorText.contains("nested") || errorText.contains("lsp_batch"),
+            "rejected entry must explain the nested-batch rejection; got error=\(errorText)"
+        )
+    }
+
+    // MARK: - 8c. lsp_batch caps requests.count to prevent DoS
+
+    /// `requests.count` MUST be bounded so a single MCP round-trip cannot pin
+    /// the bridge actor with an unbounded fan-out. The cap is encoded as
+    /// `BatchTool.maxRequestsPerBatch` (64 in this build); exceeding it
+    /// throws `MCPLSPBridgeError.invalidArgument(name: "requests", ...)`
+    /// rather than per-entry failing so the client gets a single clear
+    /// signal instead of N tiny errors.
+    func test_lspBatch_tooManyRequests_throws() async throws {
+        let (bridge, _) = await makeBridge()
+
+        let manyRequests = AnyCodable(
+            (0..<65).map { _ in
+                AnyCodable([
+                    "tool": AnyCodable("lsp_check_installation"),
+                    "params": AnyCodable([String: AnyCodable]()),
+                ] as [String: AnyCodable])
+            }
+        )
+        let args: [String: AnyCodable] = ["requests": manyRequests]
+
+        do {
+            _ = try await bridge.handleToolCall(
+                name: "lsp_batch",
+                arguments: args
+            )
+            XCTFail("lsp_batch must reject a batch whose requests.count exceeds the per-batch cap")
+        } catch let err as MCPLSPBridgeError {
+            if case .invalidArgument(let name, let reason) = err {
+                XCTAssertEqual(
+                    name, "requests",
+                    "invalidArgument must point at the 'requests' field; got: \(err)"
+                )
+                XCTAssertTrue(
+                    reason.contains("65") || reason.contains("64") || reason.contains("max"),
+                    "reason must mention the cap or observed count; got: \(reason)"
+                )
+            } else {
+                XCTFail("expected MCPLSPBridgeError.invalidArgument, got: \(err)")
+            }
+        }
+    }
+
     // MARK: - 9. lsp_hover_bundle returns hover + definition + surrounding_code
 
     func test_lspHoverBundle_returnsHoverAndDefinition() async throws {

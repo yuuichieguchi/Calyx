@@ -131,6 +131,20 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
     }
 }
 
+// MARK: - LSPServerRegistryError
+
+/// Errors thrown while loading the user override file.
+///
+/// - `symlinkRedirect`: the override path is a symlink. Following it
+///   would allow another process with write access to the link's
+///   destination to redirect Calyx into spawning an attacker-controlled
+///   `executable`. Mirrors the symlink rejection policy already used by
+///   the Claude / Codex / OpenCode / Hermes config managers via
+///   `ConfigFileUtils.isSymlink(at:)`.
+enum LSPServerRegistryError: Error, Sendable, Equatable {
+    case symlinkRedirect(URL)
+}
+
 // MARK: - LSPServerRegistry
 
 /// Immutable in-memory table of every language server Calyx knows
@@ -176,6 +190,12 @@ struct LSPServerRegistry: Sendable, Equatable, Codable {
     /// Behavior:
     /// - `overridePath == nil`             → built-in only.
     /// - file does not exist               → built-in only (no throw).
+    /// - file is a symlink                 → throws
+    ///   `LSPServerRegistryError.symlinkRedirect`. We refuse to follow
+    ///   symlinks because the override's `executable` field is spawned
+    ///   directly; a symlink redirect would let any process with write
+    ///   access to the link's destination control which LSP binary
+    ///   Calyx launches.
     /// - file exists and parses as JSON    → merge applied:
     ///     • override entries whose `languageId` matches a built-in
     ///       replace the built-in in place (order preserved).
@@ -186,6 +206,13 @@ struct LSPServerRegistry: Sendable, Equatable, Codable {
         guard let overridePath else { return builtIn }
         guard FileManager.default.fileExists(atPath: overridePath.path) else {
             return builtIn
+        }
+        // Reject symlink redirects to prevent the override from being
+        // pointed at an arbitrary writable file controlled by another
+        // process. Mirrors the policy used by every other config
+        // manager that consumes paths under ~/.config/calyx.
+        if ConfigFileUtils.isSymlink(at: overridePath.path) {
+            throw LSPServerRegistryError.symlinkRedirect(overridePath)
         }
         let data = try Data(contentsOf: overridePath)
         let override = try JSONDecoder().decode(LSPServerRegistry.self, from: data)

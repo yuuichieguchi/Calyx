@@ -603,4 +603,40 @@ final class LSPServerRegistryTests: XCTestCase {
             "Malformed override JSON must throw."
         )
     }
+
+    // ====================================================================
+    // MARK: - loaded(overridePath:) — symlink redirect rejection
+    // ====================================================================
+
+    /// The override file's `executable` field is spawned directly by the
+    /// LSP proxy. If `loaded(overridePath:)` followed symlinks, any
+    /// process with write access to the link's destination could redirect
+    /// Calyx into launching an attacker-controlled binary. All other
+    /// config managers (Claude / Codex / OpenCode / Hermes) reject
+    /// symlinks via `ConfigFileUtils.isSymlink(at:)`; the LSP registry
+    /// must do the same.
+    func test_loaded_symlinkOverride_throws() throws {
+        let tempDir = try makeTempDir()
+        let target = tempDir.appendingPathComponent("real-override.json")
+        let link = tempDir.appendingPathComponent("symlink-override.json")
+        try writeJSON(#"{"entries":[]}"#, to: target)
+        try FileManager.default.createSymbolicLink(
+            at: link, withDestinationURL: target
+        )
+
+        XCTAssertThrowsError(
+            try LSPServerRegistry.loaded(overridePath: link),
+            "Symlinked override path must be rejected."
+        ) { error in
+            guard case LSPServerRegistryError.symlinkRedirect(let url) = error
+            else {
+                XCTFail(
+                    "Expected LSPServerRegistryError.symlinkRedirect, " +
+                    "got \(error)"
+                )
+                return
+            }
+            XCTAssertEqual(url, link)
+        }
+    }
 }
