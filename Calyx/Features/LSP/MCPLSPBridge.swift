@@ -137,6 +137,14 @@ final class MCPLSPBridge {
     /// Values are forwarded verbatim — the store does not interpret them.
     private var configurationStore: [String: AnyCodable] = [:]
 
+    /// Bridge-side diagnostics snapshot store backing the
+    /// `lsp_diagnostics_diff` AI tool. Reads do not hit the LSP server —
+    /// the diff is materialised entirely from data ingested earlier via
+    /// `textDocument/publishDiagnostics` notifications. The store is owned
+    /// by the bridge (and not by `LSPSession`) so it can outlive individual
+    /// sessions and aggregate across language servers.
+    let diagnosticsStore = DiagnosticsStore()
+
     // MARK: Init
 
     /// Designated initializer. The `installer` parameter is optional so
@@ -430,6 +438,71 @@ final class MCPLSPBridge {
                 description: WorkspaceConfigurationSetTool.description,
                 inputSchema: WorkspaceConfigurationSetTool.inputSchema
             ),
+            MCPTool(
+                name: WillCreateFilesTool.name,
+                description: WillCreateFilesTool.description,
+                inputSchema: WillCreateFilesTool.inputSchema
+            ),
+            MCPTool(
+                name: DidCreateFilesTool.name,
+                description: DidCreateFilesTool.description,
+                inputSchema: DidCreateFilesTool.inputSchema
+            ),
+            MCPTool(
+                name: WillRenameFilesTool.name,
+                description: WillRenameFilesTool.description,
+                inputSchema: WillRenameFilesTool.inputSchema
+            ),
+            MCPTool(
+                name: DidRenameFilesTool.name,
+                description: DidRenameFilesTool.description,
+                inputSchema: DidRenameFilesTool.inputSchema
+            ),
+            MCPTool(
+                name: WillDeleteFilesTool.name,
+                description: WillDeleteFilesTool.description,
+                inputSchema: WillDeleteFilesTool.inputSchema
+            ),
+            MCPTool(
+                name: DidDeleteFilesTool.name,
+                description: DidDeleteFilesTool.description,
+                inputSchema: DidDeleteFilesTool.inputSchema
+            ),
+            MCPTool(
+                name: BatchTool.name,
+                description: BatchTool.description,
+                inputSchema: BatchTool.inputSchema
+            ),
+            MCPTool(
+                name: HoverBundleTool.name,
+                description: HoverBundleTool.description,
+                inputSchema: HoverBundleTool.inputSchema
+            ),
+            MCPTool(
+                name: SymbolWalkTool.name,
+                description: SymbolWalkTool.description,
+                inputSchema: SymbolWalkTool.inputSchema
+            ),
+            MCPTool(
+                name: GlobalWorkspaceSymbolTool.name,
+                description: GlobalWorkspaceSymbolTool.description,
+                inputSchema: GlobalWorkspaceSymbolTool.inputSchema
+            ),
+            MCPTool(
+                name: CrossWorkspaceDefinitionTool.name,
+                description: CrossWorkspaceDefinitionTool.description,
+                inputSchema: CrossWorkspaceDefinitionTool.inputSchema
+            ),
+            MCPTool(
+                name: DiagnosticsDiffTool.name,
+                description: DiagnosticsDiffTool.description,
+                inputSchema: DiagnosticsDiffTool.inputSchema
+            ),
+            MCPTool(
+                name: CapabilitiesTool.name,
+                description: CapabilitiesTool.description,
+                inputSchema: CapabilitiesTool.inputSchema
+            ),
         ]
     }
 
@@ -546,6 +619,32 @@ final class MCPLSPBridge {
             return try await WorkspaceConfigurationGetTool.handle(arguments: arguments, bridge: self)
         case WorkspaceConfigurationSetTool.name:
             return try await WorkspaceConfigurationSetTool.handle(arguments: arguments, bridge: self)
+        case WillCreateFilesTool.name:
+            return try await WillCreateFilesTool.handle(arguments: arguments, bridge: self)
+        case DidCreateFilesTool.name:
+            return try await DidCreateFilesTool.handle(arguments: arguments, bridge: self)
+        case WillRenameFilesTool.name:
+            return try await WillRenameFilesTool.handle(arguments: arguments, bridge: self)
+        case DidRenameFilesTool.name:
+            return try await DidRenameFilesTool.handle(arguments: arguments, bridge: self)
+        case WillDeleteFilesTool.name:
+            return try await WillDeleteFilesTool.handle(arguments: arguments, bridge: self)
+        case DidDeleteFilesTool.name:
+            return try await DidDeleteFilesTool.handle(arguments: arguments, bridge: self)
+        case BatchTool.name:
+            return try await BatchTool.handle(arguments: arguments, bridge: self)
+        case HoverBundleTool.name:
+            return try await HoverBundleTool.handle(arguments: arguments, bridge: self)
+        case SymbolWalkTool.name:
+            return try await SymbolWalkTool.handle(arguments: arguments, bridge: self)
+        case GlobalWorkspaceSymbolTool.name:
+            return try await GlobalWorkspaceSymbolTool.handle(arguments: arguments, bridge: self)
+        case CrossWorkspaceDefinitionTool.name:
+            return try await CrossWorkspaceDefinitionTool.handle(arguments: arguments, bridge: self)
+        case DiagnosticsDiffTool.name:
+            return try await DiagnosticsDiffTool.handle(arguments: arguments, bridge: self)
+        case CapabilitiesTool.name:
+            return try await CapabilitiesTool.handle(arguments: arguments, bridge: self)
         default:
             throw MCPLSPBridgeError.unknownTool(name)
         }
@@ -956,6 +1055,42 @@ private func formattingSchema(
         )
         required.append(contentsOf: ["line", "column", "ch"])
     }
+    return [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable(props),
+        "required": AnyCodable(required.map { AnyCodable($0) }),
+    ]
+}
+
+/// Build the JSON-Schema for a `workspace/*Files` MCP tool. `itemKeys`
+/// lists the required string keys that each `files[i]` object must
+/// expose:
+///   - `["uri"]`           for create / delete (and their will-/did-
+///                          counterparts)
+///   - `["oldUri", "newUri"]` for rename
+private func filesArraySchema(itemKeys: [String]) -> [String: AnyCodable] {
+    var itemProps: [String: AnyCodable] = [:]
+    for key in itemKeys {
+        itemProps[key] = prop("string", "file:// URI for this file or folder")
+    }
+    let itemSchema: [String: AnyCodable] = [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable(itemProps),
+        "required": AnyCodable(itemKeys.map { AnyCodable($0) }),
+    ]
+    let props: [String: AnyCodable] = [
+        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "files": AnyCodable([
+            "type": AnyCodable("array"),
+            "description": AnyCodable(
+                "Array of file descriptors. Each entry carries the keys: "
+                + itemKeys.joined(separator: ", ")
+            ),
+            "items": AnyCodable(itemSchema),
+        ] as [String: AnyCodable]),
+    ]
+    let required = ["workspace_root", "language_id", "files"]
     return [
         "type": AnyCodable("object"),
         "properties": AnyCodable(props),
@@ -3257,6 +3392,666 @@ enum WorkspaceConfigurationSetTool: MCPLSPTool {
         )
         bridge.setWorkspaceConfiguration(key: key, value: value)
         return MCPContent(type: "text", text: #"{"success":true}"#)
+    }
+}
+
+// MARK: - File operations cluster
+
+/// Shared body for the three `workspace/will{Create,Rename,Delete}Files`
+/// request tools. Decodes the `files` argument into the typed `Params`
+/// (CreateFilesParams / RenameFilesParams / DeleteFilesParams), dispatches
+/// the request, and JSON-encodes the resulting `WorkspaceEdit?`.
+private func handleWillFilesRequest<Params: Encodable & Sendable>(
+    method: String,
+    paramsBuilder: @Sendable ([FileDescriptor]) throws -> Params,
+    arguments: [String: AnyCodable],
+    bridge: MCPLSPBridge
+) async throws -> MCPContent {
+    let session: LSPSession
+    do {
+        session = try await bridge.resolveSession(arguments: arguments)
+    } catch let err as MCPLSPBridgeError {
+        throw err
+    } catch {
+        return MCPLSPBridge.makeErrorContent(error)
+    }
+    guard let filesAny = arguments["files"] else {
+        throw MCPLSPBridgeError.missingArgument("files")
+    }
+    let files = try MCPLSPBridge.decodeFromAnyCodable(
+        filesAny,
+        as: [FileDescriptor].self,
+        argumentName: "files"
+    )
+    let params = try paramsBuilder(files)
+    do {
+        let result: WorkspaceEdit? = try await session.sendRequest(
+            method: method,
+            params: params,
+            resultType: WorkspaceEdit?.self
+        )
+        return try MCPLSPBridge.makeJSONContent(result)
+    } catch {
+        return MCPLSPBridge.makeErrorContent(error)
+    }
+}
+
+/// Permissive decoder for one `files[i]` entry. Carries both the
+/// create/delete `uri` key and the rename `oldUri` / `newUri` pair so a
+/// single Codable type can handle all three file-operations clusters.
+/// Missing keys decode to `nil`; the per-tool builder closure throws if
+/// a required key is absent for that cluster.
+private struct FileDescriptor: Sendable, Codable, Equatable {
+    let uri: String?
+    let oldUri: String?
+    let newUri: String?
+}
+
+private func toFileCreates(_ files: [FileDescriptor]) throws -> [FileCreate] {
+    try files.map { entry in
+        guard let uri = entry.uri else {
+            throw MCPLSPBridgeError.invalidArgument(
+                name: "files",
+                reason: "every entry must carry a 'uri' string"
+            )
+        }
+        return FileCreate(uri: uri)
+    }
+}
+
+private func toFileDeletes(_ files: [FileDescriptor]) throws -> [FileDelete] {
+    try files.map { entry in
+        guard let uri = entry.uri else {
+            throw MCPLSPBridgeError.invalidArgument(
+                name: "files",
+                reason: "every entry must carry a 'uri' string"
+            )
+        }
+        return FileDelete(uri: uri)
+    }
+}
+
+private func toFileRenames(_ files: [FileDescriptor]) throws -> [FileRename] {
+    try files.map { entry in
+        guard let oldUri = entry.oldUri, let newUri = entry.newUri else {
+            throw MCPLSPBridgeError.invalidArgument(
+                name: "files",
+                reason: "every entry must carry an 'oldUri' and 'newUri' pair"
+            )
+        }
+        return FileRename(oldUri: oldUri, newUri: newUri)
+    }
+}
+
+/// Shared body for the three `workspace/did{Create,Rename,Delete}Files`
+/// notification tools. Resolves the session, decodes the `files` array,
+/// ships an LSP notification (no response), and surfaces a tiny success
+/// payload for the MCP caller.
+private func handleDidFilesNotification<Params: Encodable & Sendable>(
+    method: String,
+    paramsBuilder: @Sendable ([FileDescriptor]) throws -> Params,
+    arguments: [String: AnyCodable],
+    bridge: MCPLSPBridge
+) async throws -> MCPContent {
+    let session: LSPSession
+    do {
+        session = try await bridge.resolveSession(arguments: arguments)
+    } catch let err as MCPLSPBridgeError {
+        throw err
+    } catch {
+        return MCPLSPBridge.makeErrorContent(error)
+    }
+    guard let filesAny = arguments["files"] else {
+        throw MCPLSPBridgeError.missingArgument("files")
+    }
+    let files = try MCPLSPBridge.decodeFromAnyCodable(
+        filesAny,
+        as: [FileDescriptor].self,
+        argumentName: "files"
+    )
+    let params = try paramsBuilder(files)
+    do {
+        try await session.sendGenericNotification(method: method, params: params)
+    } catch {
+        return MCPLSPBridge.makeErrorContent(error)
+    }
+    return MCPContent(type: "text", text: #"{"sent":true}"#)
+}
+
+// MARK: - WillCreateFilesTool
+
+enum WillCreateFilesTool: MCPLSPTool {
+    static let name = "lsp_will_create_files"
+    static let description = "Notify the server of an impending file/folder creation (workspace/willCreateFiles). Returns an optional WorkspaceEdit the server wants applied before the create happens."
+    static let inputSchema: [String: AnyCodable] = filesArraySchema(itemKeys: ["uri"])
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleWillFilesRequest(
+            method: "workspace/willCreateFiles",
+            paramsBuilder: { files in
+                CreateFilesParams(files: try toFileCreates(files))
+            },
+            arguments: arguments,
+            bridge: bridge
+        )
+    }
+}
+
+// MARK: - DidCreateFilesTool
+
+enum DidCreateFilesTool: MCPLSPTool {
+    static let name = "lsp_did_create_files"
+    static let description = "Notify the server that files/folders have been created (workspace/didCreateFiles). Sent as an LSP notification — no response."
+    static let inputSchema: [String: AnyCodable] = filesArraySchema(itemKeys: ["uri"])
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleDidFilesNotification(
+            method: "workspace/didCreateFiles",
+            paramsBuilder: { files in
+                CreateFilesParams(files: try toFileCreates(files))
+            },
+            arguments: arguments,
+            bridge: bridge
+        )
+    }
+}
+
+// MARK: - WillRenameFilesTool
+
+enum WillRenameFilesTool: MCPLSPTool {
+    static let name = "lsp_will_rename_files"
+    static let description = "Notify the server of an impending file/folder rename (workspace/willRenameFiles). Returns an optional WorkspaceEdit the server wants applied before the rename happens."
+    static let inputSchema: [String: AnyCodable] = filesArraySchema(itemKeys: ["oldUri", "newUri"])
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleWillFilesRequest(
+            method: "workspace/willRenameFiles",
+            paramsBuilder: { files in
+                RenameFilesParams(files: try toFileRenames(files))
+            },
+            arguments: arguments,
+            bridge: bridge
+        )
+    }
+}
+
+// MARK: - DidRenameFilesTool
+
+enum DidRenameFilesTool: MCPLSPTool {
+    static let name = "lsp_did_rename_files"
+    static let description = "Notify the server that files/folders have been renamed (workspace/didRenameFiles). Sent as an LSP notification — no response."
+    static let inputSchema: [String: AnyCodable] = filesArraySchema(itemKeys: ["oldUri", "newUri"])
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleDidFilesNotification(
+            method: "workspace/didRenameFiles",
+            paramsBuilder: { files in
+                RenameFilesParams(files: try toFileRenames(files))
+            },
+            arguments: arguments,
+            bridge: bridge
+        )
+    }
+}
+
+// MARK: - WillDeleteFilesTool
+
+enum WillDeleteFilesTool: MCPLSPTool {
+    static let name = "lsp_will_delete_files"
+    static let description = "Notify the server of an impending file/folder deletion (workspace/willDeleteFiles). Returns an optional WorkspaceEdit the server wants applied before the delete happens."
+    static let inputSchema: [String: AnyCodable] = filesArraySchema(itemKeys: ["uri"])
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleWillFilesRequest(
+            method: "workspace/willDeleteFiles",
+            paramsBuilder: { files in
+                DeleteFilesParams(files: try toFileDeletes(files))
+            },
+            arguments: arguments,
+            bridge: bridge
+        )
+    }
+}
+
+// MARK: - DidDeleteFilesTool
+
+enum DidDeleteFilesTool: MCPLSPTool {
+    static let name = "lsp_did_delete_files"
+    static let description = "Notify the server that files/folders have been deleted (workspace/didDeleteFiles). Sent as an LSP notification — no response."
+    static let inputSchema: [String: AnyCodable] = filesArraySchema(itemKeys: ["uri"])
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await handleDidFilesNotification(
+            method: "workspace/didDeleteFiles",
+            paramsBuilder: { files in
+                DeleteFilesParams(files: try toFileDeletes(files))
+            },
+            arguments: arguments,
+            bridge: bridge
+        )
+    }
+}
+
+// MARK: - BatchTool
+
+enum BatchTool: MCPLSPTool {
+    static let name = "lsp_batch"
+    static let description = "Dispatch multiple MCP-LSP tools in a single MCP round-trip. Each entry specifies the inner tool name and its argument object; results are returned as an ordered array of {tool, result|error} entries."
+    static let inputSchema: [String: AnyCodable] = {
+        let requestItemSchema: [String: AnyCodable] = [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable([
+                "tool": prop("string", "Name of the bridge tool to dispatch (e.g. 'lsp_hover')"),
+                "params": AnyCodable([
+                    "type": AnyCodable("object"),
+                    "description": AnyCodable(
+                        "Argument payload forwarded verbatim to the inner tool"
+                    ),
+                ] as [String: AnyCodable]),
+            ] as [String: AnyCodable]),
+            "required": AnyCodable([AnyCodable("tool"), AnyCodable("params")]),
+        ]
+        let props: [String: AnyCodable] = [
+            "requests": AnyCodable([
+                "type": AnyCodable("array"),
+                "description": AnyCodable(
+                    "Ordered list of inner tool invocations to dispatch"
+                ),
+                "items": AnyCodable(requestItemSchema),
+            ] as [String: AnyCodable]),
+        ]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable([AnyCodable("requests")]),
+        ]
+    }()
+
+    /// JSON-decodable shape for one batch entry.
+    private struct BatchRequest: Sendable, Codable {
+        let tool: String
+        let params: [String: AnyCodable]
+    }
+
+    /// One entry in the encoded response array. Either `result` (the inner
+    /// tool's text payload, parsed back to its raw JSON shape so the
+    /// outer JSON stays structured) or `error` is populated.
+    private struct BatchResponseEntry: Encodable {
+        let tool: String
+        let result: AnyCodable?
+        let error: String?
+
+        init(tool: String, result: AnyCodable) {
+            self.tool = tool
+            self.result = result
+            self.error = nil
+        }
+
+        init(tool: String, error: String) {
+            self.tool = tool
+            self.result = nil
+            self.error = error
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case tool, result, error
+        }
+
+        func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(tool, forKey: .tool)
+            if let result {
+                try container.encode(result, forKey: .result)
+            }
+            if let error {
+                try container.encode(error, forKey: .error)
+            }
+        }
+    }
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        guard let requestsAny = arguments["requests"] else {
+            throw MCPLSPBridgeError.missingArgument("requests")
+        }
+        let requests = try MCPLSPBridge.decodeFromAnyCodable(
+            requestsAny,
+            as: [BatchRequest].self,
+            argumentName: "requests"
+        )
+        var entries: [BatchResponseEntry] = []
+        entries.reserveCapacity(requests.count)
+        for request in requests {
+            do {
+                let inner = try await bridge.handleToolCall(
+                    name: request.tool,
+                    arguments: request.params
+                )
+                let parsed = parseInnerText(inner.text)
+                entries.append(BatchResponseEntry(tool: request.tool, result: parsed))
+            } catch {
+                entries.append(
+                    BatchResponseEntry(tool: request.tool, error: "\(error)")
+                )
+            }
+        }
+        return try MCPLSPBridge.makeJSONContent(entries)
+    }
+
+    /// Parse one inner tool's text payload back into structured JSON so it
+    /// nests as a real array/object inside the outer batch response, not
+    /// as an escaped string. Falls back to the raw text when the payload
+    /// is not valid JSON (e.g. an `"LSP error: ..."` envelope).
+    private static func parseInnerText(_ text: String) -> AnyCodable {
+        guard let data = text.data(using: .utf8) else {
+            return AnyCodable(text)
+        }
+        if let parsed = try? JSONDecoder().decode(AnyCodable.self, from: data) {
+            return parsed
+        }
+        return AnyCodable(text)
+    }
+}
+
+// MARK: - HoverBundleTool
+
+enum HoverBundleTool: MCPLSPTool {
+    static let name = "lsp_hover_bundle"
+    static let description = "AI-friendly bundle of hover + definition + surrounding source for a position. Fans out textDocument/hover and textDocument/definition in parallel and surfaces them under one JSON envelope."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema()
+
+    /// JSON envelope returned by the bundle. `surrounding_code` is kept as
+    /// an empty string in this build; later iterations populate it with a
+    /// few lines of context around `(line, column)`.
+    private struct Bundle: Encodable {
+        let hover: Hover?
+        let definition: DefinitionResult?
+        let surroundingCode: String
+
+        enum CodingKeys: String, CodingKey {
+            case hover
+            case definition
+            case surroundingCode = "surrounding_code"
+        }
+    }
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        let hoverParams = HoverParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position
+        )
+        let defParams = DefinitionParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position
+        )
+        async let hoverTask: Hover? = {
+            do {
+                return try await session.sendRequest(
+                    method: "textDocument/hover",
+                    params: hoverParams,
+                    resultType: Hover?.self
+                )
+            } catch {
+                return nil
+            }
+        }()
+        async let definitionTask: DefinitionResult? = {
+            do {
+                return try await session.sendRequest(
+                    method: "textDocument/definition",
+                    params: defParams,
+                    resultType: DefinitionResult?.self
+                )
+            } catch {
+                return nil
+            }
+        }()
+        let hover = await hoverTask
+        let definition = await definitionTask
+        let bundle = Bundle(
+            hover: hover,
+            definition: definition,
+            surroundingCode: ""
+        )
+        return try MCPLSPBridge.makeJSONContent(bundle)
+    }
+}
+
+// MARK: - SymbolWalkTool
+
+enum SymbolWalkTool: MCPLSPTool {
+    static let name = "lsp_symbol_walk"
+    static let description = "Walk a hierarchy starting from a seed CallHierarchyItem / TypeHierarchyItem. Only direction='call_incoming' with depth=1 is supported in this build; other directions throw invalidArgument."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "item": AnyCodable([
+                "type": AnyCodable("object"),
+                "description": AnyCodable(
+                    "Seed CallHierarchyItem (for direction='call_incoming') or TypeHierarchyItem. Forwarded verbatim to the underlying LSP request."
+                ),
+            ] as [String: AnyCodable]),
+            "direction": prop(
+                "string",
+                "Walk direction: 'call_incoming' | 'call_outgoing' | 'type_supertypes' | 'type_subtypes'. Only 'call_incoming' is supported in this build."
+            ),
+            "depth": prop(
+                "integer",
+                "Max recursion depth (default 3; this stub honours depth=1 only for 'call_incoming')"
+            ),
+        ]
+        let required = ["workspace_root", "language_id", "item"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let direction = try MCPLSPBridge.optionalString(
+            arguments: arguments,
+            key: "direction"
+        ) ?? "call_incoming"
+        guard direction == "call_incoming" else {
+            throw MCPLSPBridgeError.invalidArgument(
+                name: "direction",
+                reason: "only 'call_incoming' is supported in this build (got '\(direction)')"
+            )
+        }
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let itemAny = arguments["item"] else {
+            throw MCPLSPBridgeError.missingArgument("item")
+        }
+        let item = try MCPLSPBridge.decodeFromAnyCodable(
+            itemAny,
+            as: CallHierarchyItem.self,
+            argumentName: "item"
+        )
+        let params = CallHierarchyIncomingCallsParams(item: item)
+        do {
+            let result: [CallHierarchyIncomingCall]? = try await session.sendRequest(
+                method: "callHierarchy/incomingCalls",
+                params: params,
+                resultType: [CallHierarchyIncomingCall]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - GlobalWorkspaceSymbolTool
+
+enum GlobalWorkspaceSymbolTool: MCPLSPTool {
+    static let name = "lsp_global_workspace_symbol"
+    static let description = "Search for symbols across every cached LSP session (any workspace, any languageId). Fans `workspace/symbol` out across `LSPService.allSessions()` and concatenates the results."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "query": prop("string", "Substring to match against symbol names"),
+        ]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable([AnyCodable("query")]),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let query = try MCPLSPBridge.requireString(arguments: arguments, key: "query")
+        let sessions = bridge.service.allSessions()
+        var aggregated: [AnyCodable] = []
+        for session in sessions {
+            let params = WorkspaceSymbolParams(query: query)
+            do {
+                let result: WorkspaceSymbolResult? = try await session.sendRequest(
+                    method: "workspace/symbol",
+                    params: params,
+                    resultType: WorkspaceSymbolResult?.self
+                )
+                guard let result else { continue }
+                let data = try JSONEncoder().encode(result)
+                if let parsed = try? JSONDecoder().decode(AnyCodable.self, from: data) {
+                    aggregated.append(parsed)
+                }
+            } catch {
+                // Per-session failures must not abort the whole walk —
+                // surface what we can and let the caller correlate gaps
+                // via `lsp_session_status`.
+                continue
+            }
+        }
+        return try MCPLSPBridge.makeJSONContent(aggregated)
+    }
+}
+
+// MARK: - CrossWorkspaceDefinitionTool
+
+enum CrossWorkspaceDefinitionTool: MCPLSPTool {
+    static let name = "lsp_cross_workspace_definition"
+    static let description = "Resolve a definition across workspaces. In this build the tool is a thin wrapper over textDocument/definition against the requested workspace; later iterations will hop through monikers to chase symbols into sibling workspaces."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        try await DefinitionTool.handle(arguments: arguments, bridge: bridge)
+    }
+}
+
+// MARK: - DiagnosticsDiffTool
+
+enum DiagnosticsDiffTool: MCPLSPTool {
+    static let name = "lsp_diagnostics_diff"
+    static let description = "Return the diagnostics that changed in a workspace since a previous snapshot id. Reads from the bridge-owned DiagnosticsStore — no LSP request is sent."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop(
+                "string",
+                "LSP languageId — accepted for parity with other tools but not used by the diff (the store keys on workspace only)."
+            ),
+            "since_snapshot_id": prop(
+                "integer",
+                "Snapshot id previously issued by the store; the diff returns URIs whose diagnostics changed strictly after this id."
+            ),
+        ]
+        let required = ["workspace_root", "since_snapshot_id"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let workspaceString = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "workspace_root"
+        )
+        let since = try MCPLSPBridge.requireInt(
+            arguments: arguments,
+            key: "since_snapshot_id"
+        )
+        let workspaceURL = MCPLSPBridge.fileURL(fromPathOrUri: workspaceString)
+        do {
+            let diff = try await bridge.diagnosticsStore.diff(
+                workspaceRoot: workspaceURL,
+                since: since
+            )
+            return try MCPLSPBridge.makeJSONContent(diff)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - CapabilitiesTool
+
+enum CapabilitiesTool: MCPLSPTool {
+    static let name = "lsp_capabilities"
+    static let description = "Return the server's static + dynamic capability snapshot for a workspace+language. Reads the session-resident CapabilityRegistry — no LSP request is sent."
+    static let inputSchema: [String: AnyCodable] = {
+        let props: [String: AnyCodable] = [
+            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        ]
+        let required = ["workspace_root", "language_id"]
+        return [
+            "type": AnyCodable("object"),
+            "properties": AnyCodable(props),
+            "required": AnyCodable(required.map { AnyCodable($0) }),
+        ]
+    }()
+
+    /// JSON envelope for the capability snapshot.
+    /// `dynamic` is rendered as an array (rather than a `{id: Registration}`
+    /// map) so the MCP caller can iterate registrations in registration
+    /// order without depending on JSON-object key stability.
+    private struct CapabilitySnapshot: Encodable {
+        let staticCapabilities: ServerCapabilities?
+        let dynamic: [Registration]
+
+        enum CodingKeys: String, CodingKey {
+            case staticCapabilities = "static"
+            case dynamic
+        }
+    }
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let registry = await session.capabilityRegistry()
+        let staticCaps = await registry.currentStaticCapabilities()
+        let dynamic = await registry.currentRegistrations()
+        // Sort by registration id for a deterministic wire shape.
+        let dynamicList = dynamic.values.sorted { $0.id < $1.id }
+        let snapshot = CapabilitySnapshot(
+            staticCapabilities: staticCaps,
+            dynamic: dynamicList
+        )
+        return try MCPLSPBridge.makeJSONContent(snapshot)
     }
 }
 

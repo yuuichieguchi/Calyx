@@ -210,6 +210,16 @@ final class LSPService {
         return out
     }
 
+    /// Direct snapshot of every cached `LSPSession` value. Distinct from
+    /// `currentSessions()` (which returns metadata DTOs); this accessor
+    /// hands back the live session references so MCP bridge tools that
+    /// fan out across every workspace (`lsp_global_workspace_symbol`) can
+    /// dispatch requests without going through the keyed `session(for:)`
+    /// path. Does not bump LRU timestamps and does not touch the cache.
+    func allSessions() -> [LSPSession] {
+        sessions.values.map { $0.session }
+    }
+
     /// Shut down and forget the session for `(workspaceRoot, languageId)`.
     /// A subsequent `session(for:)` call will rebuild from scratch.
     func shutdownSession(workspaceRoot: URL, languageId: String) async {

@@ -377,6 +377,19 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
             "lsp_workspace_apply_edit",
             "lsp_workspace_configuration_get",
             "lsp_workspace_configuration_set",
+            "lsp_will_create_files",
+            "lsp_did_create_files",
+            "lsp_will_rename_files",
+            "lsp_did_rename_files",
+            "lsp_will_delete_files",
+            "lsp_did_delete_files",
+            "lsp_batch",
+            "lsp_hover_bundle",
+            "lsp_symbol_walk",
+            "lsp_global_workspace_symbol",
+            "lsp_cross_workspace_definition",
+            "lsp_diagnostics_diff",
+            "lsp_capabilities",
         ]
 
         for name in coreExpected {
@@ -394,7 +407,7 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
         XCTAssertEqual(
             names.count,
             coreExpected.count + extendedExpected.count,
-            "tools count must be 10 core + 44 extended = 54; got \(names.count) names=\(names)"
+            "tools count must be 10 core + 57 extended = 67; got \(names.count) names=\(names)"
         )
     }
 

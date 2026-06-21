@@ -40,7 +40,7 @@ import Foundation
 typealias SnapshotId = Int
 
 /// Result of `DiagnosticsStore.diff(workspaceRoot:, since:)`.
-struct DiagnosticsDiff: Sendable, Equatable {
+struct DiagnosticsDiff: Sendable, Equatable, Codable {
     /// The snapshot id the caller passed in as `since`.
     let snapshotId: SnapshotId
     /// A freshly-issued snapshot id representing "now". Callers should pass
