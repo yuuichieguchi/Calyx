@@ -234,6 +234,28 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
     private let fileA = "file:///tmp/calyx-mcp-lsp-bridge-ext-A/main.ts"
     private let fileB = "file:///tmp/calyx-mcp-lsp-bridge-ext-B/main.ts"
 
+    // MARK: - Lifecycle
+
+    // `InstallTool.handle` now consults `LSPSettings` to decide the
+    // installer's `ConfirmationMode`. The product defaults (auto-install on,
+    // confirmation prompt on) would route the install through a rejecting
+    // prompt handler — there is no UI bridge in this test process — and the
+    // install would fail with "user declined: ...". For these unit tests we
+    // pin the settings to "auto-install on, no confirmation" so the
+    // installer runs straight through and the assertions on `.completed`
+    // remain meaningful. `tearDown` restores the documented defaults so we
+    // do not leak this state into sibling test classes.
+    override func setUp() {
+        super.setUp()
+        LSPSettings.autoInstallEnabled = true
+        LSPSettings.requireInstallConfirmation = false
+    }
+
+    override func tearDown() {
+        LSPSettings.resetToDefaults()
+        super.tearDown()
+    }
+
     // MARK: - Helpers
 
     /// Build an `LSPInstaller` whose runner reports the

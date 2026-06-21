@@ -1807,10 +1807,15 @@ enum InstallTool: MCPLSPTool {
                 text: #"{"error":"installer not configured"}"#
             )
         }
+        // The MCP tool layer has no UI to surface a prompt to the user, so
+        // when `LSPSettings` resolves to `.prompt(...)` the handler we hand
+        // it refuses the step (defensive default). A future UI bridge can
+        // route the prompt through the app and substitute a real handler.
+        let mode = LSPSettings.confirmationMode { @Sendable _ in false }
         let status = await installer.install(
             languageId: languageId,
             approvePrerequisites: approve,
-            confirmationMode: .silent
+            confirmationMode: mode
         )
         return try MCPLSPBridge.makeJSONContent(InstallStatusDTO(from: status))
     }
