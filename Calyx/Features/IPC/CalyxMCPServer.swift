@@ -63,7 +63,7 @@ final class CalyxMCPServer {
             config: LSPServiceConfig()
         )
         let resolver = WorkspaceResolver(registry: registry)
-        self.lspBridge = MCPLSPBridge(service: service, workspaceResolver: resolver)
+        self.lspBridge = MCPLSPBridge(service: service, workspaceResolver: resolver, installer: installer)
     }
 
     /// For testing only — inject a pre-built `MCPLSPBridge` (typically
@@ -106,6 +106,9 @@ final class CalyxMCPServer {
                 self.peerRegistrationTask = Task {
                     let peer = await self.store.registerPeer(name: "calyx-app", role: "review-ui")
                     self.appPeerID = peer.id
+                }
+                Task { @MainActor in
+                    await self.startLSP()
                 }
                 return
             } catch {

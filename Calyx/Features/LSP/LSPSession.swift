@@ -92,7 +92,7 @@ actor LSPSession {
         workspaceRoot: URL,
         languageId: String,
         client: LSPClient,
-        clientCapabilities: ClientCapabilities = ClientCapabilities(),
+        clientCapabilities: ClientCapabilities = ClientCapabilities.calyxDefault(),
         clientInfo: ClientInfo = ClientInfo(name: "Calyx", version: "0.26.1")
     ) {
         self.workspaceRoot = workspaceRoot
@@ -413,4 +413,204 @@ actor LSPSession {
 /// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_workDoneProgress_create
 private struct WorkDoneProgressCreateParams: Sendable, Codable, Equatable {
     let token: ProgressToken
+}
+
+// MARK: - ClientCapabilities.calyxDefault
+
+extension ClientCapabilities {
+    /// Calyx default: declares support for the full surface that
+    /// `MCPLSPBridge` exposes. Used as the default value for
+    /// `LSPSession.init(clientCapabilities:)` so production sessions always
+    /// negotiate the complete capability set rather than the empty
+    /// `ClientCapabilities()` placeholder.
+    ///
+    /// Mirrors the LSP 3.18 "maximal client" capability JSON. Sub-trees are
+    /// modelled as `AnyCodable` literals because `ClientCapabilities` keeps
+    /// each field as `AnyCodable?` pending fine-grained Codable modelling.
+    static func calyxDefault() -> ClientCapabilities {
+        let workspace: AnyCodable = AnyCodable([
+            "applyEdit": AnyCodable(true),
+            "workspaceEdit": AnyCodable([
+                "documentChanges": AnyCodable(true),
+                "resourceOperations": AnyCodable([AnyCodable("create"), AnyCodable("rename"), AnyCodable("delete")]),
+                "failureHandling": AnyCodable("textOnlyTransactional"),
+                "normalizesLineEndings": AnyCodable(true),
+                "changeAnnotationSupport": AnyCodable(["groupsOnLabel": AnyCodable(true)]),
+            ] as [String: AnyCodable]),
+            "didChangeConfiguration": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "didChangeWatchedFiles": AnyCodable(["dynamicRegistration": AnyCodable(true), "relativePatternSupport": AnyCodable(true)]),
+            "symbol": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "symbolKind": AnyCodable([
+                    "valueSet": AnyCodable((1...26).map { AnyCodable($0) }),
+                ]),
+                "tagSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1)])]),
+                "resolveSupport": AnyCodable(["properties": AnyCodable([AnyCodable("location.range")])]),
+            ] as [String: AnyCodable]),
+            "executeCommand": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "workspaceFolders": AnyCodable(true),
+            "configuration": AnyCodable(true),
+            "semanticTokens": AnyCodable(["refreshSupport": AnyCodable(true)]),
+            "codeLens": AnyCodable(["refreshSupport": AnyCodable(true)]),
+            "fileOperations": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "didCreate": AnyCodable(true),
+                "willCreate": AnyCodable(true),
+                "didRename": AnyCodable(true),
+                "willRename": AnyCodable(true),
+                "didDelete": AnyCodable(true),
+                "willDelete": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "inlineValue": AnyCodable(["refreshSupport": AnyCodable(true)]),
+            "inlayHint": AnyCodable(["refreshSupport": AnyCodable(true)]),
+            "diagnostics": AnyCodable(["refreshSupport": AnyCodable(true)]),
+        ] as [String: AnyCodable])
+
+        let textDocument: AnyCodable = AnyCodable([
+            "synchronization": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "willSave": AnyCodable(true),
+                "willSaveWaitUntil": AnyCodable(true),
+                "didSave": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "completion": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "completionItem": AnyCodable([
+                    "snippetSupport": AnyCodable(true),
+                    "commitCharactersSupport": AnyCodable(true),
+                    "documentationFormat": AnyCodable([AnyCodable("markdown"), AnyCodable("plaintext")]),
+                    "deprecatedSupport": AnyCodable(true),
+                    "preselectSupport": AnyCodable(true),
+                    "tagSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1)])]),
+                    "insertReplaceSupport": AnyCodable(true),
+                    "resolveSupport": AnyCodable(["properties": AnyCodable([AnyCodable("documentation"), AnyCodable("detail"), AnyCodable("additionalTextEdits")])]),
+                    "insertTextModeSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1), AnyCodable(2)])]),
+                    "labelDetailsSupport": AnyCodable(true),
+                ] as [String: AnyCodable]),
+                "completionItemKind": AnyCodable(["valueSet": AnyCodable((1...25).map { AnyCodable($0) })]),
+                "contextSupport": AnyCodable(true),
+                "insertTextMode": AnyCodable(2),
+                "completionList": AnyCodable(["itemDefaults": AnyCodable([AnyCodable("commitCharacters"), AnyCodable("editRange"), AnyCodable("insertTextFormat"), AnyCodable("insertTextMode"), AnyCodable("data")])]),
+            ] as [String: AnyCodable]),
+            "hover": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "contentFormat": AnyCodable([AnyCodable("markdown"), AnyCodable("plaintext")]),
+            ] as [String: AnyCodable]),
+            "signatureHelp": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "signatureInformation": AnyCodable([
+                    "documentationFormat": AnyCodable([AnyCodable("markdown"), AnyCodable("plaintext")]),
+                    "parameterInformation": AnyCodable(["labelOffsetSupport": AnyCodable(true)]),
+                    "activeParameterSupport": AnyCodable(true),
+                ] as [String: AnyCodable]),
+                "contextSupport": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "declaration": AnyCodable(["dynamicRegistration": AnyCodable(true), "linkSupport": AnyCodable(true)]),
+            "definition": AnyCodable(["dynamicRegistration": AnyCodable(true), "linkSupport": AnyCodable(true)]),
+            "typeDefinition": AnyCodable(["dynamicRegistration": AnyCodable(true), "linkSupport": AnyCodable(true)]),
+            "implementation": AnyCodable(["dynamicRegistration": AnyCodable(true), "linkSupport": AnyCodable(true)]),
+            "references": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "documentHighlight": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "documentSymbol": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "symbolKind": AnyCodable(["valueSet": AnyCodable((1...26).map { AnyCodable($0) })]),
+                "hierarchicalDocumentSymbolSupport": AnyCodable(true),
+                "tagSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1)])]),
+                "labelSupport": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "codeAction": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "codeActionLiteralSupport": AnyCodable([
+                    "codeActionKind": AnyCodable([
+                        "valueSet": AnyCodable([AnyCodable(""), AnyCodable("quickfix"), AnyCodable("refactor"), AnyCodable("refactor.extract"), AnyCodable("refactor.inline"), AnyCodable("refactor.rewrite"), AnyCodable("source"), AnyCodable("source.organizeImports"), AnyCodable("source.fixAll")]),
+                    ] as [String: AnyCodable]),
+                ] as [String: AnyCodable]),
+                "isPreferredSupport": AnyCodable(true),
+                "disabledSupport": AnyCodable(true),
+                "dataSupport": AnyCodable(true),
+                "resolveSupport": AnyCodable(["properties": AnyCodable([AnyCodable("edit")])]),
+                "honorsChangeAnnotations": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "codeLens": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "documentLink": AnyCodable(["dynamicRegistration": AnyCodable(true), "tooltipSupport": AnyCodable(true)]),
+            "colorProvider": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "formatting": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "rangeFormatting": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "onTypeFormatting": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "rename": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "prepareSupport": AnyCodable(true),
+                "prepareSupportDefaultBehavior": AnyCodable(1),
+                "honorsChangeAnnotations": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "publishDiagnostics": AnyCodable([
+                "relatedInformation": AnyCodable(true),
+                "tagSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1), AnyCodable(2)])]),
+                "versionSupport": AnyCodable(true),
+                "codeDescriptionSupport": AnyCodable(true),
+                "dataSupport": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "foldingRange": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "rangeLimit": AnyCodable(5000),
+                "lineFoldingOnly": AnyCodable(false),
+                "foldingRangeKind": AnyCodable(["valueSet": AnyCodable([AnyCodable("comment"), AnyCodable("imports"), AnyCodable("region")])]),
+                "foldingRange": AnyCodable(["collapsedText": AnyCodable(true)]),
+            ] as [String: AnyCodable]),
+            "selectionRange": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "linkedEditingRange": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "callHierarchy": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "semanticTokens": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "requests": AnyCodable([
+                    "range": AnyCodable(true),
+                    "full": AnyCodable(["delta": AnyCodable(true)]),
+                ] as [String: AnyCodable]),
+                "tokenTypes": AnyCodable([
+                    AnyCodable("namespace"), AnyCodable("type"), AnyCodable("class"), AnyCodable("enum"), AnyCodable("interface"), AnyCodable("struct"), AnyCodable("typeParameter"), AnyCodable("parameter"), AnyCodable("variable"), AnyCodable("property"), AnyCodable("enumMember"), AnyCodable("event"), AnyCodable("function"), AnyCodable("method"), AnyCodable("macro"), AnyCodable("keyword"), AnyCodable("modifier"), AnyCodable("comment"), AnyCodable("string"), AnyCodable("number"), AnyCodable("regexp"), AnyCodable("operator"), AnyCodable("decorator"),
+                ]),
+                "tokenModifiers": AnyCodable([
+                    AnyCodable("declaration"), AnyCodable("definition"), AnyCodable("readonly"), AnyCodable("static"), AnyCodable("deprecated"), AnyCodable("abstract"), AnyCodable("async"), AnyCodable("modification"), AnyCodable("documentation"), AnyCodable("defaultLibrary"),
+                ]),
+                "formats": AnyCodable([AnyCodable("relative")]),
+                "overlappingTokenSupport": AnyCodable(false),
+                "multilineTokenSupport": AnyCodable(false),
+                "serverCancelSupport": AnyCodable(true),
+                "augmentsSyntaxTokens": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "moniker": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "typeHierarchy": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "inlineValue": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "inlayHint": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "resolveSupport": AnyCodable(["properties": AnyCodable([AnyCodable("tooltip"), AnyCodable("textEdits"), AnyCodable("label.tooltip"), AnyCodable("label.location"), AnyCodable("label.command")])]),
+            ] as [String: AnyCodable]),
+            "diagnostic": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "relatedDocumentSupport": AnyCodable(true),
+            ] as [String: AnyCodable]),
+        ] as [String: AnyCodable])
+
+        let window: AnyCodable = AnyCodable([
+            "workDoneProgress": AnyCodable(true),
+            "showMessage": AnyCodable(["messageActionItem": AnyCodable(["additionalPropertiesSupport": AnyCodable(true)])]),
+            "showDocument": AnyCodable(["support": AnyCodable(true)]),
+        ] as [String: AnyCodable])
+
+        let general: AnyCodable = AnyCodable([
+            "staleRequestSupport": AnyCodable(["cancel": AnyCodable(true), "retryOnContentModified": AnyCodable([] as [AnyCodable])]),
+            "regularExpressions": AnyCodable(["engine": AnyCodable("ECMAScript"), "version": AnyCodable("ES2020")]),
+            "markdown": AnyCodable(["parser": AnyCodable("marked"), "version": AnyCodable("1.1.0")]),
+            "positionEncodings": AnyCodable([AnyCodable("utf-16")]),
+        ] as [String: AnyCodable])
+
+        return ClientCapabilities(
+            workspace: workspace,
+            textDocument: textDocument,
+            notebookDocument: nil,
+            window: window,
+            general: general,
+            experimental: nil
+        )
+    }
 }
