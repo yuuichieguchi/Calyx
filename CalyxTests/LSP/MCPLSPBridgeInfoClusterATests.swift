@@ -381,10 +381,10 @@ final class MCPLSPBridgeInfoClusterATests: XCTestCase {
             )
         }
 
-        XCTAssertEqual(
+        XCTAssertGreaterThanOrEqual(
             names.count,
             35,
-            "tools count must be 28 existing + 7 information-cluster-A = 35; got \(names.count) names=\(names)"
+            "tools count must be at least 28 existing + 7 information-cluster-A = 35; got \(names.count) names=\(names)"
         )
     }
 

@@ -358,6 +358,14 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
             "lsp_inline_value",
             "lsp_folding_range",
             "lsp_selection_range",
+            "lsp_semantic_tokens_full",
+            "lsp_semantic_tokens_range",
+            "lsp_semantic_tokens_delta",
+            "lsp_linked_editing_range",
+            "lsp_document_link",
+            "lsp_document_link_resolve",
+            "lsp_document_color",
+            "lsp_color_presentation",
         ]
 
         for name in coreExpected {
@@ -375,7 +383,7 @@ final class MCPLSPBridgeExtendedToolsTests: XCTestCase {
         XCTAssertEqual(
             names.count,
             coreExpected.count + extendedExpected.count,
-            "tools count must be 10 core + 25 extended = 35; got \(names.count) names=\(names)"
+            "tools count must be 10 core + 33 extended = 43; got \(names.count) names=\(names)"
         )
     }
 
