@@ -32,6 +32,13 @@
 //      lsp_session_status      -> LSPService.currentSessions()
 //      lsp_session_warmup      -> LSPService.session(for:languageId:)
 //      lsp_session_shutdown    -> LSPService.shutdownSession(...)
+//      lsp_call_hierarchy_prepare    -> textDocument/prepareCallHierarchy
+//      lsp_call_hierarchy_incoming   -> callHierarchy/incomingCalls
+//      lsp_call_hierarchy_outgoing   -> callHierarchy/outgoingCalls
+//      lsp_type_hierarchy_prepare    -> textDocument/prepareTypeHierarchy
+//      lsp_type_hierarchy_supertypes -> typeHierarchy/supertypes
+//      lsp_type_hierarchy_subtypes   -> typeHierarchy/subtypes
+//      lsp_moniker                   -> textDocument/moniker
 //
 //  Response shaping rule: every tool serialises its LSP result as JSON and
 //  hands the JSON string back as the `text` of a single `MCPContent` block.
@@ -225,6 +232,41 @@ final class MCPLSPBridge {
                 description: SessionShutdownTool.description,
                 inputSchema: SessionShutdownTool.inputSchema
             ),
+            MCPTool(
+                name: CallHierarchyPrepareTool.name,
+                description: CallHierarchyPrepareTool.description,
+                inputSchema: CallHierarchyPrepareTool.inputSchema
+            ),
+            MCPTool(
+                name: CallHierarchyIncomingTool.name,
+                description: CallHierarchyIncomingTool.description,
+                inputSchema: CallHierarchyIncomingTool.inputSchema
+            ),
+            MCPTool(
+                name: CallHierarchyOutgoingTool.name,
+                description: CallHierarchyOutgoingTool.description,
+                inputSchema: CallHierarchyOutgoingTool.inputSchema
+            ),
+            MCPTool(
+                name: TypeHierarchyPrepareTool.name,
+                description: TypeHierarchyPrepareTool.description,
+                inputSchema: TypeHierarchyPrepareTool.inputSchema
+            ),
+            MCPTool(
+                name: TypeHierarchySupertypesTool.name,
+                description: TypeHierarchySupertypesTool.description,
+                inputSchema: TypeHierarchySupertypesTool.inputSchema
+            ),
+            MCPTool(
+                name: TypeHierarchySubtypesTool.name,
+                description: TypeHierarchySubtypesTool.description,
+                inputSchema: TypeHierarchySubtypesTool.inputSchema
+            ),
+            MCPTool(
+                name: MonikerTool.name,
+                description: MonikerTool.description,
+                inputSchema: MonikerTool.inputSchema
+            ),
         ]
     }
 
@@ -275,6 +317,20 @@ final class MCPLSPBridge {
             return try await SessionWarmupTool.handle(arguments: arguments, bridge: self)
         case SessionShutdownTool.name:
             return try await SessionShutdownTool.handle(arguments: arguments, bridge: self)
+        case CallHierarchyPrepareTool.name:
+            return try await CallHierarchyPrepareTool.handle(arguments: arguments, bridge: self)
+        case CallHierarchyIncomingTool.name:
+            return try await CallHierarchyIncomingTool.handle(arguments: arguments, bridge: self)
+        case CallHierarchyOutgoingTool.name:
+            return try await CallHierarchyOutgoingTool.handle(arguments: arguments, bridge: self)
+        case TypeHierarchyPrepareTool.name:
+            return try await TypeHierarchyPrepareTool.handle(arguments: arguments, bridge: self)
+        case TypeHierarchySupertypesTool.name:
+            return try await TypeHierarchySupertypesTool.handle(arguments: arguments, bridge: self)
+        case TypeHierarchySubtypesTool.name:
+            return try await TypeHierarchySubtypesTool.handle(arguments: arguments, bridge: self)
+        case MonikerTool.name:
+            return try await MonikerTool.handle(arguments: arguments, bridge: self)
         default:
             throw MCPLSPBridgeError.unknownTool(name)
         }
@@ -369,6 +425,27 @@ final class MCPLSPBridge {
             throw MCPLSPBridgeError.invalidArgument(name: key, reason: "expected string")
         }
         return value
+    }
+
+    /// Decode an `AnyCodable` payload (typically a nested JSON object such
+    /// as a `CallHierarchyItem` / `TypeHierarchyItem`) into a typed
+    /// `Decodable` value by round-tripping through JSON. Used by the
+    /// item-based hierarchy tools to turn the raw `item` argument into the
+    /// strongly-typed parameter expected by the LSP request.
+    nonisolated static func decodeFromAnyCodable<T: Decodable>(
+        _ value: AnyCodable,
+        as type: T.Type,
+        argumentName: String
+    ) throws -> T {
+        do {
+            let data = try JSONEncoder().encode(value)
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            throw MCPLSPBridgeError.invalidArgument(
+                name: argumentName,
+                reason: "failed to decode as \(T.self): \(error)"
+            )
+        }
     }
 
     /// `AnyCodable.storage` is private; recover the underlying primitive
@@ -504,6 +581,27 @@ private func prop(_ type: String, _ description: String) -> AnyCodable {
         "type": AnyCodable(type),
         "description": AnyCodable(description),
     ] as [String: AnyCodable])
+}
+
+/// Build the JSON-Schema for an item-based MCP tool (the call/type
+/// hierarchy `incoming` / `outgoing` / `supertypes` / `subtypes` tools).
+/// The `item` payload is the verbatim `CallHierarchyItem` /
+/// `TypeHierarchyItem` returned by the matching `prepare*` call.
+private func itemBasedSchema(itemDescription: String) -> [String: AnyCodable] {
+    let props: [String: AnyCodable] = [
+        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "item": AnyCodable([
+            "type": AnyCodable("object"),
+            "description": AnyCodable(itemDescription),
+        ] as [String: AnyCodable]),
+    ]
+    let required = ["workspace_root", "language_id", "item"]
+    return [
+        "type": AnyCodable("object"),
+        "properties": AnyCodable(props),
+        "required": AnyCodable(required.map { AnyCodable($0) }),
+    ]
 }
 
 /// Build the JSON-Schema for a range-based MCP tool (`lsp_code_action`).
@@ -1349,6 +1447,268 @@ enum SessionShutdownTool: MCPLSPTool {
             languageId: languageId
         )
         return MCPContent(type: "text", text: #"{"shutdown":true}"#)
+    }
+}
+
+// MARK: - CallHierarchyPrepareTool
+
+enum CallHierarchyPrepareTool: MCPLSPTool {
+    static let name = "lsp_call_hierarchy_prepare"
+    static let description = "Prepare a call hierarchy at a position. Returns CallHierarchyItem entries to use with incoming/outgoing calls."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        let params = CallHierarchyPrepareParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position
+        )
+        do {
+            let result: [CallHierarchyItem]? = try await session.sendRequest(
+                method: "textDocument/prepareCallHierarchy",
+                params: params,
+                resultType: [CallHierarchyItem]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - CallHierarchyIncomingTool
+
+enum CallHierarchyIncomingTool: MCPLSPTool {
+    static let name = "lsp_call_hierarchy_incoming"
+    static let description = "Get incoming calls for a CallHierarchyItem returned by lsp_call_hierarchy_prepare."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemDescription: "CallHierarchyItem returned by lsp_call_hierarchy_prepare"
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let itemAny = arguments["item"] else {
+            throw MCPLSPBridgeError.missingArgument("item")
+        }
+        let item = try MCPLSPBridge.decodeFromAnyCodable(
+            itemAny,
+            as: CallHierarchyItem.self,
+            argumentName: "item"
+        )
+        let params = CallHierarchyIncomingCallsParams(item: item)
+        do {
+            let result: [CallHierarchyIncomingCall]? = try await session.sendRequest(
+                method: "callHierarchy/incomingCalls",
+                params: params,
+                resultType: [CallHierarchyIncomingCall]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - CallHierarchyOutgoingTool
+
+enum CallHierarchyOutgoingTool: MCPLSPTool {
+    static let name = "lsp_call_hierarchy_outgoing"
+    static let description = "Get outgoing calls for a CallHierarchyItem returned by lsp_call_hierarchy_prepare."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemDescription: "CallHierarchyItem returned by lsp_call_hierarchy_prepare"
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let itemAny = arguments["item"] else {
+            throw MCPLSPBridgeError.missingArgument("item")
+        }
+        let item = try MCPLSPBridge.decodeFromAnyCodable(
+            itemAny,
+            as: CallHierarchyItem.self,
+            argumentName: "item"
+        )
+        let params = CallHierarchyOutgoingCallsParams(item: item)
+        do {
+            let result: [CallHierarchyOutgoingCall]? = try await session.sendRequest(
+                method: "callHierarchy/outgoingCalls",
+                params: params,
+                resultType: [CallHierarchyOutgoingCall]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - TypeHierarchyPrepareTool
+
+enum TypeHierarchyPrepareTool: MCPLSPTool {
+    static let name = "lsp_type_hierarchy_prepare"
+    static let description = "Prepare a type hierarchy at a position. Returns TypeHierarchyItem entries to use with supertypes/subtypes."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        let params = TypeHierarchyPrepareParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position
+        )
+        do {
+            let result: [TypeHierarchyItem]? = try await session.sendRequest(
+                method: "textDocument/prepareTypeHierarchy",
+                params: params,
+                resultType: [TypeHierarchyItem]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - TypeHierarchySupertypesTool
+
+enum TypeHierarchySupertypesTool: MCPLSPTool {
+    static let name = "lsp_type_hierarchy_supertypes"
+    static let description = "Get supertypes for a TypeHierarchyItem returned by lsp_type_hierarchy_prepare."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemDescription: "TypeHierarchyItem returned by lsp_type_hierarchy_prepare"
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let itemAny = arguments["item"] else {
+            throw MCPLSPBridgeError.missingArgument("item")
+        }
+        let item = try MCPLSPBridge.decodeFromAnyCodable(
+            itemAny,
+            as: TypeHierarchyItem.self,
+            argumentName: "item"
+        )
+        let params = TypeHierarchySupertypesParams(item: item)
+        do {
+            let result: [TypeHierarchyItem]? = try await session.sendRequest(
+                method: "typeHierarchy/supertypes",
+                params: params,
+                resultType: [TypeHierarchyItem]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - TypeHierarchySubtypesTool
+
+enum TypeHierarchySubtypesTool: MCPLSPTool {
+    static let name = "lsp_type_hierarchy_subtypes"
+    static let description = "Get subtypes for a TypeHierarchyItem returned by lsp_type_hierarchy_prepare."
+    static let inputSchema: [String: AnyCodable] = itemBasedSchema(
+        itemDescription: "TypeHierarchyItem returned by lsp_type_hierarchy_prepare"
+    )
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        guard let itemAny = arguments["item"] else {
+            throw MCPLSPBridgeError.missingArgument("item")
+        }
+        let item = try MCPLSPBridge.decodeFromAnyCodable(
+            itemAny,
+            as: TypeHierarchyItem.self,
+            argumentName: "item"
+        )
+        let params = TypeHierarchySubtypesParams(item: item)
+        do {
+            let result: [TypeHierarchyItem]? = try await session.sendRequest(
+                method: "typeHierarchy/subtypes",
+                params: params,
+                resultType: [TypeHierarchyItem]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+    }
+}
+
+// MARK: - MonikerTool
+
+enum MonikerTool: MCPLSPTool {
+    static let name = "lsp_moniker"
+    static let description = "Get monikers (cross-project symbol identifiers) at a position."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema()
+
+    static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        let params = MonikerParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position
+        )
+        do {
+            let result: [Moniker]? = try await session.sendRequest(
+                method: "textDocument/moniker",
+                params: params,
+                resultType: [Moniker]?.self
+            )
+            return try MCPLSPBridge.makeJSONContent(result)
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
     }
 }
 
