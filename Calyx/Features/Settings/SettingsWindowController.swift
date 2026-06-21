@@ -145,6 +145,36 @@ class SettingsWindowController: NSWindowController {
         scrollingDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
         root.addArrangedSubview(scrollingDivider)
 
+        // --- LSP Section ---
+        let lspTitle = NSTextField(labelWithString: "LSP Proxy")
+        lspTitle.font = .systemFont(ofSize: 20, weight: .semibold)
+        root.addArrangedSubview(lspTitle)
+
+        let lspSubtitle = NSTextField(labelWithString: "Calyx hosts language servers and exposes them to AI agents over MCP. When a server is missing, Calyx can install it automatically.")
+        lspSubtitle.textColor = .secondaryLabelColor
+        lspSubtitle.font = .systemFont(ofSize: 13)
+        lspSubtitle.maximumNumberOfLines = 0
+        lspSubtitle.preferredMaxLayoutWidth = 460
+        root.addArrangedSubview(lspSubtitle)
+
+        let autoInstallSwitch = NSSwitch()
+        autoInstallSwitch.state = LSPSettings.autoInstallEnabled ? .on : .off
+        autoInstallSwitch.target = self
+        autoInstallSwitch.action = #selector(lspAutoInstallDidChange(_:))
+        root.addArrangedSubview(row(label: "Auto-install language servers", control: autoInstallSwitch))
+
+        let requireConfirmSwitch = NSSwitch()
+        requireConfirmSwitch.state = LSPSettings.requireInstallConfirmation ? .on : .off
+        requireConfirmSwitch.target = self
+        requireConfirmSwitch.action = #selector(lspRequireConfirmationDidChange(_:))
+        root.addArrangedSubview(row(label: "Confirm before each install step", control: requireConfirmSwitch))
+
+        let lspDivider = NSBox()
+        lspDivider.boxType = .separator
+        lspDivider.translatesAutoresizingMaskIntoConstraints = false
+        lspDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        root.addArrangedSubview(lspDivider)
+
         // --- Config Actions ---
         let actions = NSStackView()
         actions.orientation = .horizontal
@@ -241,6 +271,14 @@ class SettingsWindowController: NSWindowController {
         if !enabled {
             NotificationCenter.default.post(name: .smoothScrollSettingChanged, object: nil)
         }
+    }
+
+    @objc private func lspAutoInstallDidChange(_ sender: NSSwitch) {
+        LSPSettings.autoInstallEnabled = (sender.state == .on)
+    }
+
+    @objc private func lspRequireConfirmationDidChange(_ sender: NSSwitch) {
+        LSPSettings.requireInstallConfirmation = (sender.state == .on)
     }
 
     @objc private func presetDidChange(_ sender: Any?) {
