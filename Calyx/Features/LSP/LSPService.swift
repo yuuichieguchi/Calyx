@@ -1,0 +1,374 @@
+//
+//  LSPService.swift
+//  Calyx
+//
+//  Main-actor facade the Calyx MCP layer uses to obtain a started,
+//  ready-to-use `LSPSession` for a given (workspace root, languageId)
+//  pair.
+//
+//  Responsibilities:
+//    - Registry lookup: validates the `languageId` against the bundled
+//      `LSPServerRegistry`.
+//    - Auto-install bridge: when the server binary is not on PATH the
+//      service consults `LSPInstaller` (respecting `config.autoInstall`
+//      and `config.installConfirmation`).
+//    - Session cache: warm `(workspaceRoot, languageId)` pairs reuse the
+//      same `LSPSession`. Concurrent `session(for:)` calls dedup onto a
+//      single in-flight build.
+//    - LRU + idle eviction: capped by `config.maxConcurrentSessions`
+//      with a background timer that retires sessions idle for longer
+//      than `config.idleTimeoutSeconds`.
+//
+//  All five surface types co-habit this file by design — they form one
+//  tight orchestration layer and are easier to read together.
+//
+
+import Foundation
+
+// MARK: - LSPServiceConfig
+
+/// Tuning knobs for `LSPService`. `installConfirmation` may carry a
+/// closure (`.prompt`), so the config is intentionally not `Equatable`.
+struct LSPServiceConfig: Sendable {
+    /// Sessions untouched for this many seconds are shut down by the
+    /// background idle timer.
+    let idleTimeoutSeconds: Int
+    /// Hard cap on cached sessions; exceeding the cap evicts the
+    /// least-recently-used entry.
+    let maxConcurrentSessions: Int
+    /// When `true`, `session(for:)` will attempt an install via
+    /// `LSPInstaller` if the executable is missing on PATH.
+    let autoInstall: Bool
+    /// Forwarded verbatim to `LSPInstaller.install(...)` when an
+    /// install is required.
+    let installConfirmation: ConfirmationMode
+
+    init(
+        idleTimeoutSeconds: Int = 1800,
+        maxConcurrentSessions: Int = 16,
+        autoInstall: Bool = true,
+        installConfirmation: ConfirmationMode = .silent
+    ) {
+        self.idleTimeoutSeconds = idleTimeoutSeconds
+        self.maxConcurrentSessions = maxConcurrentSessions
+        self.autoInstall = autoInstall
+        self.installConfirmation = installConfirmation
+    }
+}
+
+// MARK: - LSPServiceError
+
+/// Failures surfaced from `LSPService.session(for:languageId:)`.
+enum LSPServiceError: Error, Equatable {
+    /// `languageId` is not present in the configured `LSPServerRegistry`.
+    case languageNotInRegistry(languageId: String)
+    /// The language server executable is not on PATH and either
+    /// `autoInstall` was disabled or the install attempt did not
+    /// complete successfully.
+    case languageServerNotAvailable(languageId: String, reason: String)
+    /// The supplied workspace root is not usable as an LSP root URI
+    /// (reserved for future validation; not raised by current code).
+    case workspaceRootInvalid(URL)
+    /// `LSPSession.start()` failed — the embedded `LSPClient` could not
+    /// complete the `initialize` handshake.
+    case sessionStartFailed(reason: String)
+}
+
+// MARK: - LSPSessionFactory
+
+/// Indirection used by `LSPService` to construct an `LSPClient`.
+/// Production code wires a real `Process`-backed stdio transport; tests
+/// inject an in-memory transport so no external process is spawned.
+protocol LSPSessionFactory: Sendable {
+    func makeClient(
+        executable: String,
+        arguments: [String],
+        environment: [String: String]?,
+        workingDirectory: URL?
+    ) async throws -> LSPClient
+}
+
+// MARK: - LSPSessionInfo
+
+/// Snapshot of one cached session, returned by `currentSessions()`.
+struct LSPSessionInfo: Sendable, Equatable {
+    let workspaceRoot: URL
+    let languageId: String
+    let state: SessionState
+    /// `ProcessInfo.processInfo.systemUptime` (in milliseconds) at the
+    /// moment the session was inserted into the cache.
+    let createdAtUptimeMillis: Int64
+}
+
+// MARK: - LSPService
+
+/// Main-actor orchestrator owning the (workspace, language) → session
+/// cache, install bridging, LRU policy and idle eviction.
+@MainActor
+final class LSPService {
+
+    // MARK: Composite cache key
+
+    private struct SessionKey: Hashable, Sendable {
+        let workspaceRoot: URL
+        let languageId: String
+    }
+
+    /// One cached session plus its LRU + uptime bookkeeping. Reference
+    /// type so we can mutate `lastAccessed` in place without copying the
+    /// dictionary value.
+    private final class SessionEntry {
+        let session: LSPSession
+        var lastAccessed: Date
+        let createdAtUptimeMillis: Int64
+
+        init(session: LSPSession, lastAccessed: Date, createdAtUptimeMillis: Int64) {
+            self.session = session
+            self.lastAccessed = lastAccessed
+            self.createdAtUptimeMillis = createdAtUptimeMillis
+        }
+    }
+
+    // MARK: Stored properties
+
+    private let registry: LSPServerRegistry
+    private let installer: LSPInstaller?
+    private let sessionFactory: any LSPSessionFactory
+    private let config: LSPServiceConfig
+
+    private var sessions: [SessionKey: SessionEntry] = [:]
+    /// In-flight builds keyed by `SessionKey` so concurrent
+    /// `session(for:)` calls dedup onto one build.
+    private var inProgressSessions: [SessionKey: Task<LSPSession, Error>] = [:]
+    /// Background loop that retires idle sessions. Lazily started on
+    /// first cache insertion.
+    private var idleTimerTask: Task<Void, Never>?
+
+    // MARK: Init
+
+    init(
+        registry: LSPServerRegistry = .builtIn(),
+        installer: LSPInstaller? = nil,
+        sessionFactory: any LSPSessionFactory,
+        config: LSPServiceConfig = LSPServiceConfig()
+    ) {
+        self.registry = registry
+        self.installer = installer
+        self.sessionFactory = sessionFactory
+        self.config = config
+    }
+
+    // MARK: Public API
+
+    /// Returns a `running` `LSPSession` for `(workspaceRoot, languageId)`.
+    /// Reuses a cached instance when one is already open, dedups parallel
+    /// build attempts, and triggers auto-install when configured.
+    func session(for workspaceRoot: URL, languageId: String) async throws -> LSPSession {
+        let key = SessionKey(workspaceRoot: workspaceRoot, languageId: languageId)
+
+        // 1. Warm cache hit — refresh LRU timestamp and return.
+        if let entry = sessions[key] {
+            entry.lastAccessed = Date()
+            return entry.session
+        }
+
+        // 2. Build already in flight for this key — share it.
+        if let inflight = inProgressSessions[key] {
+            return try await inflight.value
+        }
+
+        // 3. Kick off a new build and remember the Task so concurrent
+        //    callers can join.
+        let task = Task<LSPSession, Error> { [self] in
+            try await self.buildSession(for: key)
+        }
+        inProgressSessions[key] = task
+
+        do {
+            let session = try await task.value
+            inProgressSessions[key] = nil
+            return session
+        } catch {
+            inProgressSessions[key] = nil
+            throw error
+        }
+    }
+
+    /// Snapshot of every open session.
+    func currentSessions() async -> [LSPSessionInfo] {
+        var out: [LSPSessionInfo] = []
+        out.reserveCapacity(sessions.count)
+        for (key, entry) in sessions {
+            let state = await entry.session.state()
+            out.append(LSPSessionInfo(
+                workspaceRoot: key.workspaceRoot,
+                languageId: key.languageId,
+                state: state,
+                createdAtUptimeMillis: entry.createdAtUptimeMillis
+            ))
+        }
+        return out
+    }
+
+    /// Shut down and forget the session for `(workspaceRoot, languageId)`.
+    /// A subsequent `session(for:)` call will rebuild from scratch.
+    func shutdownSession(workspaceRoot: URL, languageId: String) async {
+        let key = SessionKey(workspaceRoot: workspaceRoot, languageId: languageId)
+        guard let entry = sessions.removeValue(forKey: key) else { return }
+        try? await entry.session.shutdown()
+    }
+
+    /// Shut down every cached session and stop the idle timer.
+    func shutdownAll() async {
+        // Snapshot the actor references (Sendable) — `SessionEntry` is a
+        // MainActor-accessible reference type, so we must not capture it
+        // inside a concurrent child task.
+        let liveSessions: [LSPSession] = sessions.values.map { $0.session }
+        sessions.removeAll()
+        idleTimerTask?.cancel()
+        idleTimerTask = nil
+
+        await withTaskGroup(of: Void.self) { group in
+            for session in liveSessions {
+                group.addTask {
+                    try? await session.shutdown()
+                }
+            }
+        }
+    }
+
+    // MARK: - Private: build pipeline
+
+    private func buildSession(for key: SessionKey) async throws -> LSPSession {
+        // Registry lookup ----------------------------------------------------
+        guard let entry = registry.entry(forLanguageId: key.languageId) else {
+            throw LSPServiceError.languageNotInRegistry(languageId: key.languageId)
+        }
+
+        // Availability + (optional) install ---------------------------------
+        if let installer {
+            let check = await installer.checkInstallation(forLanguageId: key.languageId)
+            if !check.isInstalled {
+                if !config.autoInstall {
+                    throw LSPServiceError.languageServerNotAvailable(
+                        languageId: key.languageId,
+                        reason: "executable '\(entry.executable)' not on PATH and autoInstall is disabled"
+                    )
+                }
+                let status = await installer.install(
+                    languageId: key.languageId,
+                    approvePrerequisites: true,
+                    confirmationMode: config.installConfirmation
+                )
+                guard case .completed = status else {
+                    let reason: String
+                    if case .failed(let r) = status {
+                        reason = r
+                    } else {
+                        reason = "install did not complete (status: \(status))"
+                    }
+                    throw LSPServiceError.languageServerNotAvailable(
+                        languageId: key.languageId,
+                        reason: reason
+                    )
+                }
+            }
+        }
+
+        // Client + session ---------------------------------------------------
+        let client: LSPClient
+        do {
+            client = try await sessionFactory.makeClient(
+                executable: entry.executable,
+                arguments: entry.arguments,
+                environment: nil,
+                workingDirectory: key.workspaceRoot
+            )
+        } catch {
+            throw LSPServiceError.sessionStartFailed(reason: String(describing: error))
+        }
+
+        let session = LSPSession(
+            workspaceRoot: key.workspaceRoot,
+            languageId: key.languageId,
+            client: client
+        )
+
+        do {
+            try await session.start()
+        } catch {
+            throw LSPServiceError.sessionStartFailed(reason: String(describing: error))
+        }
+
+        // LRU enforcement ---------------------------------------------------
+        if sessions.count >= config.maxConcurrentSessions {
+            await evictOldestEntry()
+        }
+
+        let cacheEntry = SessionEntry(
+            session: session,
+            lastAccessed: Date(),
+            createdAtUptimeMillis: Self.currentUptimeMillis()
+        )
+        sessions[key] = cacheEntry
+
+        ensureIdleTimerRunning()
+        return session
+    }
+
+    // MARK: - Private: LRU + idle eviction
+
+    /// Removes the entry with the smallest `lastAccessed` timestamp and
+    /// shuts it down. Caller has already confirmed the cache is at
+    /// capacity.
+    private func evictOldestEntry() async {
+        guard let oldest = sessions.min(by: { $0.value.lastAccessed < $1.value.lastAccessed }) else {
+            return
+        }
+        sessions.removeValue(forKey: oldest.key)
+        try? await oldest.value.session.shutdown()
+    }
+
+    /// Starts the background idle-eviction loop if it's not running.
+    /// Polls at half the idle window (capped at 100ms minimum) so the
+    /// real-world latency between "idle" and "actually shut down" stays
+    /// within one polling tick.
+    private func ensureIdleTimerRunning() {
+        if idleTimerTask != nil { return }
+
+        let halfWindowNanos = UInt64(max(config.idleTimeoutSeconds, 1)) * 500_000_000
+        let minimumNanos: UInt64 = 100_000_000 // 100ms
+        let intervalNanos = max(halfWindowNanos, minimumNanos)
+
+        idleTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: intervalNanos)
+                if Task.isCancelled { return }
+                await self?.evictIdleSessions()
+            }
+        }
+    }
+
+    /// Drops any session whose `lastAccessed` is older than
+    /// `idleTimeoutSeconds`.
+    private func evictIdleSessions() async {
+        let cutoff = Date().addingTimeInterval(-Double(config.idleTimeoutSeconds))
+        let staleKeys = sessions.compactMap { (key, entry) -> SessionKey? in
+            entry.lastAccessed < cutoff ? key : nil
+        }
+        for key in staleKeys {
+            await shutdownSession(
+                workspaceRoot: key.workspaceRoot,
+                languageId: key.languageId
+            )
+        }
+    }
+
+    // MARK: - Private: uptime
+
+    /// Process uptime in milliseconds, monotonic across the lifetime of
+    /// the host process — does not jump when the wall clock changes.
+    private static func currentUptimeMillis() -> Int64 {
+        Int64(ProcessInfo.processInfo.systemUptime * 1000)
+    }
+}
