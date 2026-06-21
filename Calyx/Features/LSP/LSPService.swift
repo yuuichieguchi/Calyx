@@ -135,6 +135,13 @@ final class LSPService {
     private let installer: LSPInstaller?
     private let sessionFactory: any LSPSessionFactory
     private let config: LSPServiceConfig
+    /// Optional file-system synchroniser. When non-nil every freshly
+    /// built session registers its `workspaceRoot` with the manager so
+    /// LSP `textDocument` / `workspace` notifications fire in response
+    /// to on-disk changes. Tearing a session down (`shutdownSession`,
+    /// `shutdownAll`) routes a matching `unwatch` / `stopAll` through
+    /// the manager so the FSEvents stream is released.
+    private let fileSyncManager: FileSyncManager?
 
     private var sessions: [SessionKey: SessionEntry] = [:]
     /// In-flight builds keyed by `SessionKey` so concurrent
@@ -150,12 +157,14 @@ final class LSPService {
         registry: LSPServerRegistry = .builtIn(),
         installer: LSPInstaller? = nil,
         sessionFactory: any LSPSessionFactory,
-        config: LSPServiceConfig = LSPServiceConfig()
+        config: LSPServiceConfig = LSPServiceConfig(),
+        fileSyncManager: FileSyncManager? = nil
     ) {
         self.registry = registry
         self.installer = installer
         self.sessionFactory = sessionFactory
         self.config = config
+        self.fileSyncManager = fileSyncManager
     }
 
     // MARK: Public API
@@ -225,6 +234,11 @@ final class LSPService {
     func shutdownSession(workspaceRoot: URL, languageId: String) async {
         let key = SessionKey(workspaceRoot: workspaceRoot, languageId: languageId)
         guard let entry = sessions.removeValue(forKey: key) else { return }
+        if let fileSyncManager {
+            Task {
+                await fileSyncManager.unwatch(workspaceRoot: workspaceRoot)
+            }
+        }
         try? await entry.session.shutdown()
     }
 
@@ -237,6 +251,16 @@ final class LSPService {
         sessions.removeAll()
         idleTimerTask?.cancel()
         idleTimerTask = nil
+
+        // Tear down every registered watch in one shot. `stopAll`
+        // clears the manager's internal `watchedRoots_` map and stops
+        // the underlying event source, so we don't need to snapshot
+        // individual workspace keys.
+        if let fileSyncManager {
+            Task {
+                await fileSyncManager.stopAll()
+            }
+        }
 
         await withTaskGroup(of: Void.self) { group in
             for session in liveSessions {
@@ -321,6 +345,23 @@ final class LSPService {
             createdAtUptimeMillis: Self.currentUptimeMillis()
         )
         sessions[key] = cacheEntry
+
+        // FileSyncManager wiring — fire-and-forget so the build pipeline
+        // is not blocked on the FSEvents stream coming up. `buildSession`
+        // is dedup'd by `inProgressSessions[key]`, so this Task is
+        // scheduled exactly once per (workspaceRoot, languageId) build;
+        // warm-cache hits in `session(for:)` short-circuit before this
+        // point and therefore do not re-arm the watch.
+        if let fileSyncManager {
+            let root = key.workspaceRoot
+            let sessionRef = session
+            Task {
+                try? await fileSyncManager.watch(
+                    workspaceRoot: root,
+                    session: sessionRef
+                )
+            }
+        }
 
         ensureIdleTimerRunning()
         return session

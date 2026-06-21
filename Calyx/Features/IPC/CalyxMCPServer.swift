@@ -56,11 +56,16 @@ final class CalyxMCPServer {
         let runner = SystemCommandRunner()
         let installer = LSPInstaller(registry: registry, runner: runner)
         let factory = StdioBackedLSPSessionFactory()
+        // Production wiring uses the FSEvents-backed event source so
+        // on-disk edits outside Calyx's own writers feed back into LSP
+        // synchronisation notifications.
+        let fileSyncManager = FileSyncManager()
         let service = LSPService(
             registry: registry,
             installer: installer,
             sessionFactory: factory,
-            config: LSPServiceConfig()
+            config: LSPServiceConfig(),
+            fileSyncManager: fileSyncManager
         )
         let resolver = WorkspaceResolver(registry: registry)
         self.lspBridge = MCPLSPBridge(service: service, workspaceResolver: resolver, installer: installer)
