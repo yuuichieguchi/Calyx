@@ -725,6 +725,65 @@ final class MCPLSPBridge {
         return (uri, range)
     }
 
+    // MARK: - didOpen orchestration
+
+    /// Ensure that `uri` is registered as an open document on `session`
+    /// before a position/range/file-based LSP request is dispatched.
+    ///
+    /// Most language servers (sourcekit-lsp, gopls, rust-analyzer, the
+    /// TypeScript server, …) refuse to answer `textDocument/*` requests
+    /// for a URI that the client has not previously announced via
+    /// `textDocument/didOpen`; sourcekit-lsp surfaces the failure as the
+    /// `-32001 "No language service for '...' found"` JSON-RPC error.
+    /// MCP tool calls are stateless from the caller's point of view, so
+    /// the bridge has to lazily synthesise the didOpen on first contact.
+    ///
+    /// Behaviour:
+    ///   * No-op when the session already tracks the URI (idempotent).
+    ///   * No-op for non-`file://` URIs (`untitled:`, `jdt://`, …) — the
+    ///     bridge has no on-disk source to read for those.
+    ///   * No-op when the file does not exist or can't be read; the
+    ///     downstream request will surface a more informative error than
+    ///     "we failed before even asking the server."
+    ///   * Best-effort: any error from `session.didOpen` is silently
+    ///     absorbed so a missing didOpen never replaces the actual
+    ///     diagnostic the caller wanted (e.g. a server crash).
+    ///
+    /// `nonisolated static` so the per-tool handlers (which only carry an
+    /// `LSPSession` reference, not the `@MainActor` bridge) can call it
+    /// without an extra actor hop.
+    nonisolated static func ensureFileOpen(
+        session: LSPSession,
+        uri: DocumentUri
+    ) async {
+        // Idempotency guard: skip work when the URI is already tracked.
+        let openDocs = await session.openDocuments()
+        if openDocs.contains(uri) {
+            return
+        }
+
+        // Only file:// URIs map to a readable on-disk source. Anything
+        // else (untitled:, jdt://, vscode-notebook-cell:, …) is left
+        // alone — the caller is responsible for opening those via the
+        // bridge's notebook / explicit didOpen surface.
+        guard let url = URL(string: uri), url.isFileURL else { return }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            return
+        }
+
+        // Use the session's default languageId. `didOpen` is itself
+        // idempotent inside the session (it dedups on `openDocs`), so a
+        // race between two MCP tool calls that both reach this point
+        // before either has finished only sends one notification.
+        try? await session.didOpen(
+            uri: uri,
+            languageId: session.languageId,
+            version: 1,
+            text: text
+        )
+    }
+
     // MARK: - Bridge-internal configuration store
 
     /// Compose the composite key used by the configuration store. The
@@ -1153,6 +1212,7 @@ enum HoverTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = HoverParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1187,6 +1247,7 @@ enum DefinitionTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DefinitionParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1221,6 +1282,7 @@ enum DeclarationTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DeclarationParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1255,6 +1317,7 @@ enum TypeDefinitionTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = TypeDefinitionParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1289,6 +1352,7 @@ enum ImplementationTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = ImplementationParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1330,6 +1394,7 @@ enum ReferencesTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let includeDecl = try MCPLSPBridge.optionalBool(
             arguments: arguments,
             key: "include_declaration"
@@ -1369,6 +1434,7 @@ enum DocumentHighlightTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DocumentHighlightParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1415,6 +1481,7 @@ enum DocumentSymbolTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DocumentSymbolParams(
             textDocument: TextDocumentIdentifier(uri: uri)
         )
@@ -1502,6 +1569,7 @@ enum CompletionTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
 
         var context: CompletionContext?
         if let kindRaw = try MCPLSPBridge.optionalInt(arguments: arguments, key: "trigger_kind") {
@@ -1556,6 +1624,7 @@ enum SignatureHelpTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = SignatureHelpParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1590,6 +1659,7 @@ enum PrepareRenameTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = PrepareRenameParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1629,6 +1699,7 @@ enum RenameTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let newName = try MCPLSPBridge.requireString(arguments: arguments, key: "new_name")
         let params = RenameParams(
             textDocument: TextDocumentIdentifier(uri: uri),
@@ -1665,6 +1736,7 @@ enum CodeActionTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let context = CodeActionContext(diagnostics: [])
         let params = CodeActionParams(
             textDocument: TextDocumentIdentifier(uri: uri),
@@ -1715,6 +1787,7 @@ enum DiagnosticsTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let identifier = try MCPLSPBridge.optionalString(arguments: arguments, key: "identifier")
         let previousResultId = try MCPLSPBridge.optionalString(
             arguments: arguments,
@@ -1873,11 +1946,20 @@ enum SessionStatusTool: MCPLSPTool {
 
 enum SessionWarmupTool: MCPLSPTool {
     static let name = "lsp_session_warmup"
-    static let description = "Pre-start an LSP session for a workspace + languageId pair."
+    static let description = "Pre-start an LSP session for a workspace + languageId pair. Optionally pre-opens an initial set of files so subsequent position/range/file tools can dispatch immediately."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
             "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
             "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "files": AnyCodable([
+                "type": AnyCodable("array"),
+                "description": AnyCodable(
+                    "Optional list of files (absolute paths or file:// URIs) to pre-open via textDocument/didOpen as soon as the session is running. Missing files are silently skipped."
+                ),
+                "items": AnyCodable([
+                    "type": AnyCodable("string"),
+                ] as [String: AnyCodable]),
+            ] as [String: AnyCodable]),
         ]
         let required = ["workspace_root", "language_id"]
         return [
@@ -1900,6 +1982,25 @@ enum SessionWarmupTool: MCPLSPTool {
         } catch {
             return MCPLSPBridge.makeErrorContent(error)
         }
+
+        // Optional `files` payload: an array of strings (paths or file://
+        // URIs). Pre-opens each file via `ensureFileOpen`, which already
+        // handles dedup, missing-on-disk, and non-file URIs gracefully.
+        // Malformed payloads (`files` present but not an array of
+        // strings) are surfaced as `invalidArgument` so callers can fix
+        // the call rather than silently lose warmup work.
+        if let filesAny = arguments["files"] {
+            let paths: [String] = try MCPLSPBridge.decodeFromAnyCodable(
+                filesAny,
+                as: [String].self,
+                argumentName: "files"
+            )
+            for path in paths {
+                let uri = MCPLSPBridge.documentUri(fromPathOrUri: path)
+                await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+            }
+        }
+
         let state = await session.state()
         let dto = SessionInfoDTO(
             workspaceRoot: session.workspaceRoot.absoluteString,
@@ -1964,6 +2065,7 @@ enum CallHierarchyPrepareTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = CallHierarchyPrepareParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -2078,6 +2180,7 @@ enum TypeHierarchyPrepareTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = TypeHierarchyPrepareParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -2192,6 +2295,7 @@ enum MonikerTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = MonikerParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -2226,6 +2330,7 @@ enum CodeLensTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = CodeLensParams(textDocument: TextDocumentIdentifier(uri: uri))
         do {
             let result: [CodeLens]? = try await session.sendRequest(
@@ -2297,6 +2402,7 @@ enum InlayHintTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = InlayHintParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             range: range
@@ -2394,6 +2500,7 @@ enum InlineValueTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let frameId = try MCPLSPBridge.optionalInt(
             arguments: arguments,
             key: "frame_id"
@@ -2469,6 +2576,7 @@ enum FoldingRangeTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = FoldingRangeParams(textDocument: TextDocumentIdentifier(uri: uri))
         do {
             let result: [FoldingRange]? = try await session.sendRequest(
@@ -2536,6 +2644,7 @@ enum SelectionRangeTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         guard let positionsAny = arguments["positions"] else {
             throw MCPLSPBridgeError.missingArgument("positions")
         }
@@ -2590,6 +2699,7 @@ enum SemanticTokensFullTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = SemanticTokensParams(
             textDocument: TextDocumentIdentifier(uri: uri)
         )
@@ -2623,6 +2733,7 @@ enum SemanticTokensRangeTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = SemanticTokensRangeParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             range: range
@@ -2673,6 +2784,7 @@ enum SemanticTokensDeltaTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let previousResultId = try MCPLSPBridge.requireString(
             arguments: arguments,
             key: "previous_result_id"
@@ -2711,6 +2823,7 @@ enum LinkedEditingRangeTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = LinkedEditingRangeParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -2745,6 +2858,7 @@ enum DocumentLinkTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DocumentLinkParams(
             textDocument: TextDocumentIdentifier(uri: uri)
         )
@@ -2818,6 +2932,7 @@ enum DocumentColorTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DocumentColorParams(
             textDocument: TextDocumentIdentifier(uri: uri)
         )
@@ -2861,6 +2976,7 @@ enum ColorPresentationTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         guard let colorAny = arguments["color"] else {
             throw MCPLSPBridgeError.missingArgument("color")
         }
@@ -2987,6 +3103,7 @@ enum FormattingTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let options = try extractFormattingOptions(arguments: arguments)
         let params = DocumentFormattingParams(
             textDocument: TextDocumentIdentifier(uri: uri),
@@ -3025,6 +3142,7 @@ enum RangeFormattingTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let options = try extractFormattingOptions(arguments: arguments)
         let params = DocumentRangeFormattingParams(
             textDocument: TextDocumentIdentifier(uri: uri),
@@ -3064,6 +3182,7 @@ enum OnTypeFormattingTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let ch = try MCPLSPBridge.requireString(arguments: arguments, key: "ch")
         let options = try extractFormattingOptions(arguments: arguments)
         let params = DocumentOnTypeFormattingParams(
@@ -3810,6 +3929,7 @@ enum HoverBundleTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let hoverParams = HoverParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
