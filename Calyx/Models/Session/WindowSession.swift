@@ -69,6 +69,24 @@ class WindowSession: Identifiable {
         }
     }
 
+    /// Computes the next default group name based on existing names.
+    ///
+    /// Extracts names strictly matching the pattern `"Group N"` (literal
+    /// `"Group "` prefix followed by an integer) and returns `"Group (max + 1)"`.
+    /// If no existing name matches, returns `"Group 1"`. Gaps are never filled.
+    ///
+    /// Loose matches such as `"Groupie 1"` (different prefix) or `"Group "`
+    /// (prefix present but no integer suffix) are ignored.
+    static func nextDefaultGroupName(existing: [String]) -> String {
+        let prefix = "Group "
+        let numbers: [Int] = existing.compactMap { name in
+            guard name.hasPrefix(prefix) else { return nil }
+            return Int(String(name.dropFirst(prefix.count)))
+        }
+        let next = (numbers.max() ?? 0) + 1
+        return "Group \(next)"
+    }
+
     @discardableResult
     func removeTab(id tabID: UUID, fromGroup groupID: UUID) -> TabRemoveResult {
         guard let groupIndex = groups.firstIndex(where: { $0.id == groupID }) else {

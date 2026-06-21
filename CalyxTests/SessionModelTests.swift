@@ -803,4 +803,143 @@ final class SessionModelTests: XCTestCase {
         XCTAssertEqual(tab.title, "user@host:~$",
                        "title should reflect the terminal title update")
     }
+
+    // ==================== WindowSession.nextDefaultGroupName ====================
+    //
+    // Spec:
+    // - Extract the maximum N from existing names matching the exact pattern
+    //   "Group N" (literal "Group " prefix + a non-negative integer), and return
+    //   "Group {N+1}". If no such name exists, return "Group 1".
+    // - Holes are NOT filled (use max + 1, not lowest unused).
+    // - Loose matches like "Groupie 1" or "Group " (no integer) must be ignored.
+    //
+    // Bug context: CalyxWindowController.createNewGroup() currently uses
+    // `groups.count + 1`, which collides with an existing higher-numbered group
+    // after a lower-numbered one is deleted (e.g. delete Group 1 leaves
+    // ["Group 2"], next new group would be "Group 2" again).
+
+    func test_should_return_Group_1_when_existing_is_empty() {
+        // Arrange
+        let existing: [String] = []
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 1",
+                       "Empty existing names should yield Group 1")
+    }
+
+    func test_should_return_Group_2_when_existing_is_Group_1() {
+        // Arrange
+        let existing = ["Group 1"]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 2",
+                       "After [Group 1], next default name should be Group 2")
+    }
+
+    func test_should_return_Group_3_when_existing_is_Group_1_and_Group_2() {
+        // Arrange
+        let existing = ["Group 1", "Group 2"]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 3",
+                       "After [Group 1, Group 2], next default name should be Group 3")
+    }
+
+    func test_should_return_Group_3_when_Group_1_was_deleted_leaving_only_Group_2() {
+        // Arrange — Bug reproduction case:
+        // Group 1 was deleted, leaving ["Group 2"]. The buggy implementation
+        // would return "Group 2" (= count + 1 = 2), colliding with the existing
+        // group. The correct behavior is max + 1 = 3.
+        let existing = ["Group 2"]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 3",
+                       "When only Group 2 remains, next default name must be Group 3 (max + 1), not Group 2")
+    }
+
+    func test_should_return_max_plus_1_when_there_is_a_gap_in_existing_numbers() {
+        // Arrange — A hole exists at "Group 2", but we do NOT fill holes;
+        // we always use max + 1.
+        let existing = ["Group 1", "Group 3"]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 4",
+                       "Gap in numbering must not be filled; next default name should be max + 1")
+    }
+
+    func test_should_ignore_renamed_groups_and_consider_only_Group_N_pattern() {
+        // Arrange — Mixed: a manually renamed group and a default-named group.
+        let existing = ["Backend", "Group 2"]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 3",
+                       "Renamed groups must be ignored; next default name should be based on Group 2 + 1")
+    }
+
+    func test_should_return_Group_1_when_no_existing_matches_Group_N_pattern() {
+        // Arrange — All names are renamed, none match "Group N".
+        let existing = ["Backend", "Frontend"]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 1",
+                       "When no existing name matches 'Group N', next default name should be Group 1")
+    }
+
+    func test_should_handle_two_digit_group_numbers() {
+        // Arrange — Verify integer parsing handles multi-digit values, not just single digits.
+        let existing = ["Group 1", "Group 10"]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 11",
+                       "Two-digit group numbers must be parsed correctly; next should be Group 11")
+    }
+
+    func test_should_not_match_Groupie_prefix() {
+        // Arrange — "Groupie 1" must NOT be treated as a "Group N" match,
+        // because the required prefix is exactly "Group " (with trailing space).
+        let existing = ["Groupie 1"]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 1",
+                       "'Groupie 1' must not be treated as 'Group N'; result should be Group 1")
+    }
+
+    func test_should_not_match_Group_with_trailing_space_and_no_integer() {
+        // Arrange — "Group " has the prefix but no integer suffix; it must be rejected.
+        let existing = ["Group "]
+
+        // Act
+        let result = WindowSession.nextDefaultGroupName(existing: existing)
+
+        // Assert
+        XCTAssertEqual(result, "Group 1",
+                       "'Group ' (no integer suffix) must not be treated as 'Group N'; result should be Group 1")
+    }
 }

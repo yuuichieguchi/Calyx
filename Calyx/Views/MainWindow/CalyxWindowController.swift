@@ -727,7 +727,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         let newColor = TabGroupColor.nextColor(excluding: windowSession.groups.map { $0.color })
         let group = TabGroup(
-            name: "Group \(windowSession.groups.count + 1)",
+            name: WindowSession.nextDefaultGroupName(existing: windowSession.groups.map(\.name)),
             color: newColor,
             tabs: [tab],
             activeTabID: tab.id
