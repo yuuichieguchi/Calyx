@@ -140,34 +140,35 @@ final class MCPLSPBridge {
     /// Bridge-side diagnostics snapshot store backing the
     /// `lsp_diagnostics_diff` AI tool. Reads do not hit the LSP server —
     /// the diff is materialised entirely from data ingested earlier via
-    /// `textDocument/publishDiagnostics` notifications. The store is owned
-    /// by the bridge (and not by `LSPSession`) so it can outlive individual
-    /// sessions and aggregate across language servers. Callers that wire
-    /// production sessions should hand the same instance to
-    /// `LSPService.init(diagnosticsStore:)` so server publishes feed back
-    /// into the store the diff reads from; tests that don't care about
-    /// publish wiring can drop the argument and rely on the default
-    /// internal store.
+    /// `textDocument/publishDiagnostics` notifications. The store is
+    /// owned externally and handed in at init: the SAME instance MUST
+    /// also be passed to `LSPService.init(diagnosticsStore:)` so server
+    /// publishes feed back into the same store the bridge reads from.
+    /// Tests that don't care about publish wiring may construct a fresh
+    /// `DiagnosticsStore()` and pass it in explicitly.
     let diagnosticsStore: DiagnosticsStore
 
     // MARK: Init
 
-    /// Designated initializer. The `installer` parameter is optional so
-    /// callers that don't need the install/orchestration cluster (e.g.
-    /// the legacy `CalyxMCPServer` wiring) can keep their existing call
-    /// sites untouched. `diagnosticsStore` is optional so existing tests
-    /// that constructed the bridge without one continue to work; when
-    /// `nil` the bridge creates a fresh internal store.
+    /// Designated initializer. `installer` stays optional for callers
+    /// that don't need the install/orchestration cluster (e.g. the
+    /// legacy `CalyxMCPServer` wiring before installer support
+    /// landed). `diagnosticsStore` is required and has no default —
+    /// accepting a fresh internal store when callers omitted it was a
+    /// footgun: the bridge's diff view would then silently disconnect
+    /// from the `textDocument/publishDiagnostics` traffic the
+    /// surrounding `LSPService` ingests into its own (different)
+    /// store, and `lsp_diagnostics_diff` would always come back empty.
     init(
         service: LSPService,
         workspaceResolver: WorkspaceResolver,
         installer: LSPInstaller? = nil,
-        diagnosticsStore: DiagnosticsStore? = nil
+        diagnosticsStore: DiagnosticsStore
     ) {
         self.service = service
         self.workspaceResolver = workspaceResolver
         self.installer = installer
-        self.diagnosticsStore = diagnosticsStore ?? DiagnosticsStore()
+        self.diagnosticsStore = diagnosticsStore
     }
 
     // MARK: - Tool catalogue

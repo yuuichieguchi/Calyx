@@ -315,7 +315,11 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
             config: LSPServiceConfig()
         )
         let resolver = WorkspaceResolver(registry: .builtIn())
-        let bridge = MCPLSPBridge(service: service, workspaceResolver: resolver)
+        let bridge = MCPLSPBridge(
+            service: service,
+            workspaceResolver: resolver,
+            diagnosticsStore: DiagnosticsStore()
+        )
         return (bridge, driver)
     }
 
@@ -660,6 +664,72 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
         XCTAssertTrue(
             drained,
             "stop() must asynchronously shut down every session previously held by the LSP bridge"
+        )
+    }
+
+    // 14. `start()` immediately followed by `stop()` does not leak the
+    //     LSP bridge installed by the racing `startLSP()` Task.
+    //
+    //     Before the post-drain re-read in `stop()`, the cleanup
+    //     captured `lspBridge` synchronously (which was nil because
+    //     `startLSP()` had not yet populated it) and then the racing
+    //     `startLSP()` installed a brand-new `MCPLSPBridge` *after* the
+    //     sync clear. The cleanup Task awaited the startup but never
+    //     looked at the freshly-installed bridge — every `LSPService`,
+    //     child language-server process, and FSEvents watch leaked.
+    //
+    //     This test drives the race directly by calling
+    //     `startLSP()` and `stop()` back-to-back on `@MainActor`, then
+    //     waits for the post-drain teardown to clear the cache.
+    func test_stop_racingStartLSP_tearsDownBridgeBuiltAfterClear() async throws {
+        // Pre-condition — fresh server, no bridge yet.
+        XCTAssertNil(server.lspBridge,
+                     "precondition: lspBridge must be nil before this test")
+
+        // Act 1 — kick startLSP as an unstructured Task so it races
+        // with the immediately-following stop(). Mirrors what the
+        // real `start()` path does internally: it schedules
+        // `Task { await startLSP() }` and returns.
+        let startTask = Task { @MainActor in
+            await self.server.startLSP()
+        }
+
+        // Give the Task a tiny chance to suspend on the async work
+        // inside `startLSP()` (LSPInstaller actor hops, etc.). The
+        // race we want is `stop()` landing *before* `startLSP()` has
+        // executed `self.lspBridge = MCPLSPBridge(...)`. Without a
+        // sleep here the runtime may or may not have entered the
+        // startup body yet — both windows exercise the race-safety
+        // contract.
+        await Task.yield()
+
+        // Act 2 — stop() while startLSP() is still in flight (or
+        // about to be). The sync clear inside stop() nils any
+        // currently-set bridge; the cleanup Task must re-read
+        // `self.lspBridge` after the startup drains so the
+        // freshly-installed bridge is also torn down.
+        server.stop()
+
+        // Sync invariant: lspBridge cleared.
+        XCTAssertNil(
+            server.lspBridge,
+            "stop() must clear lspBridge synchronously regardless of startLSP() racing"
+        )
+
+        // Wait for the startup task to finish so we are sure
+        // `self.lspBridge` has had a chance to be set by the race.
+        await startTask.value
+
+        // The cleanup Task scheduled inside stop() will eventually
+        // re-read lspBridge, clear it, and shut down every session.
+        // Poll until both invariants hold.
+        let finalCleared = await waitUntil(timeout: 5.0) {
+            let bridge = await MainActor.run { self.server.lspBridge }
+            return bridge == nil
+        }
+        XCTAssertTrue(
+            finalCleared,
+            "post-drain re-read in stop() must clear lspBridge even after startLSP() raced past the sync clear"
         )
     }
 

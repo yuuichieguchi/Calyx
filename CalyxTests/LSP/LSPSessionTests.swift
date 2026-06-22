@@ -307,6 +307,47 @@ final class LSPSessionTests: XCTestCase {
         }
     }
 
+    // MARK: - 5b. initialize failure closes the underlying client
+
+    /// Regression: `installServerRequestHandlers()` registers closures
+    /// that strongly capture `self` to establish the intentional
+    /// `LSPSession ↔ LSPClient ↔ closure ↔ LSPSession` retain cycle.
+    /// On the success path the cycle is broken by `shutdown()`'s
+    /// `client.close()`. On the failure path (initialize errors out
+    /// after the handlers have already been installed), `start()` must
+    /// also call `client.close()` so the cycle does not leak the
+    /// session, the client, and the receive task forever. We observe
+    /// the close via the transport — closed transports reject `send`
+    /// with `LSPClientError.transportClosed`.
+    func test_start_failedInitialize_closesUnderlyingTransport() async throws {
+        let (session, transport) = makeSession()
+
+        let responder = respondToInitialize(on: transport) { id in
+            self.jsonRPCErrorResponse(id: id, code: -32002, message: "init failed")
+        }
+
+        do {
+            try await session.start()
+            XCTFail("start() must throw when initialize errors")
+        } catch {
+            // expected
+        }
+        _ = await responder.value
+
+        // `client.close()` cascades to `transport.close()`, after which
+        // any subsequent `send` must fail with `.transportClosed`.
+        do {
+            try await transport.send(Data("x".utf8))
+            XCTFail(
+                "transport must be closed after initialize failure — LSPSession.start() must call client.close() to break the handler retain cycle"
+            )
+        } catch let err as LSPClientError {
+            XCTAssertEqual(err, .transportClosed)
+        } catch {
+            XCTFail("expected LSPClientError.transportClosed, got \(error)")
+        }
+    }
+
     // MARK: - 6. ServerInfo surfaced in .running
 
     func test_state_running_includesServerInfo() async throws {

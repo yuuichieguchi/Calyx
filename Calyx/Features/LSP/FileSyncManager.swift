@@ -416,13 +416,24 @@ final class FSEventsEventSource: FileSystemEventSource, @unchecked Sendable {
             )
         }
         FSEventStreamSetDispatchQueue(s, queue)
-        _ = FSEventStreamStart(s)
+        // Publish the continuation, consumer task, and stream pointer
+        // BEFORE we call `FSEventStreamStart`. FSEvents delivers its
+        // first callback batch on `queue` once the stream is started,
+        // and that callback path reads `state.continuation` to yield
+        // batches into the AsyncStream funnel. If we publish the state
+        // *after* the start call, a callback that races in between
+        // `FSEventStreamStart(s)` and `state.withLock { ... }` finds
+        // `state.continuation == nil` and silently drops the batch —
+        // every subscriber loses every event up to the first lock
+        // acquisition. Publishing first guarantees the very first
+        // callback observes a live continuation.
         let box = StreamBox(value: s)
         state.withLock { state in
             state.stream = box
             state.continuation = continuation
             state.consumerTask = consumerTask
         }
+        _ = FSEventStreamStart(s)
     }
 
     func stop() async {

@@ -351,6 +351,15 @@ final class LSPServiceTests: XCTestCase {
     // MARK: - 3. Executable missing, autoInstall enabled → install attempted
 
     func test_session_executableMissing_autoInstallEnabled_attemptsInstall() async throws {
+        // The Settings-level "Ask before install" toggle now gates the
+        // installer's confirmation mode unconditionally (the code-level
+        // `LSPServiceConfig.installConfirmation` is no longer consulted
+        // on the auto-install path). Default `requireInstallConfirmation`
+        // is `true`, which would refuse every install step — opt-out
+        // explicitly so this test exercises the success path it was
+        // designed for.
+        LSPSettings.requireInstallConfirmation = false
+
         let runner = MockCommandRunner()
         // First locate: missing. After install completes the service
         // should retry locate and find it. MockCommandRunner returns the
@@ -732,6 +741,128 @@ final class LSPServiceTests: XCTestCase {
             made,
             0,
             "factory must not be invoked when auto-install is disabled in settings"
+        )
+    }
+
+    // MARK: - 14. LSPSettings.requireInstallConfirmation = true refuses install
+
+    /// When auto-install is enabled but the "Ask before install" toggle
+    /// is on (the default), `session(for:)` must route through the
+    /// installer's `.prompt` confirmation mode. Without a UI bridge to
+    /// answer the prompt the bridged handler returns `false`, so the
+    /// installer must surface `.failed(reason: "user declined: ...")`
+    /// and `session(for:)` must throw `.languageServerNotAvailable` —
+    /// rather than silently running the install command as the
+    /// previous code-level `installConfirmation: .silent` wiring did.
+    func test_lspSettings_requireConfirmation_blocksInstall() async throws {
+        LSPSettings.autoInstallEnabled = true
+        LSPSettings.requireInstallConfirmation = true
+
+        let runner = MockCommandRunner()
+        await runner.setLocateResult("typescript-language-server", url: nil)
+        await runner.setLocateResult(
+            "npm",
+            url: URL(fileURLWithPath: "/usr/local/bin/npm")
+        )
+        // Enqueue a success for npm just in case — the assertion below
+        // proves the runner is never actually consulted on this path.
+        await runner.enqueueRunResult(
+            "npm",
+            result: .success(CommandResult(exitCode: 0, stdout: "", stderr: ""))
+        )
+
+        let installer = makeInstaller(runner: runner)
+        let factory = MockLSPSessionFactory()
+        // `installConfirmation: .silent` on the code-level config so the
+        // assertion proves the Settings-level toggle dominates the
+        // config rather than the other way around.
+        let service = LSPService(
+            registry: .builtIn(),
+            installer: installer,
+            sessionFactory: factory,
+            config: LSPServiceConfig(autoInstall: true, installConfirmation: .silent)
+        )
+
+        do {
+            _ = try await service.session(for: workspaceA, languageId: "typescript")
+            XCTFail(
+                "expected throw when LSPSettings.requireInstallConfirmation is true and no UI handler is wired"
+            )
+        } catch let err as LSPServiceError {
+            switch err {
+            case .languageServerNotAvailable(let lang, let reason):
+                XCTAssertEqual(lang, "typescript")
+                XCTAssertTrue(
+                    reason.localizedCaseInsensitiveContains("declined")
+                        || reason.localizedCaseInsensitiveContains("user")
+                        || reason.localizedCaseInsensitiveContains("install"),
+                    "failure reason must reference the declined install; got: \(reason)"
+                )
+            default:
+                XCTFail("expected .languageServerNotAvailable, got \(err)")
+            }
+        }
+
+        // The install command itself must NOT have run — the prompt
+        // handler returns `false` for the first prerequisite step, so
+        // `npm` is never actually executed.
+        let history = await runner.history()
+        XCTAssertFalse(
+            history.contains(where: { $0.executable == "npm" }),
+            "no install command may run when the bridged confirmation handler refuses; history=\(history)"
+        )
+
+        let made = await factory.clientsMadeCount()
+        XCTAssertEqual(
+            made,
+            0,
+            "factory must not be invoked when the install is refused via confirmation"
+        )
+    }
+
+    // MARK: - 15. session(for:) after shutdownAll() throws
+
+    /// `shutdownAll()` is terminal: once it has run, the service must
+    /// not spawn any further `LSPClient` instances. A `session(for:)`
+    /// call that lands after `shutdownAll()` must short-circuit before
+    /// the cache lookup / build pipeline so no factory / installer /
+    /// FSEvents watch is touched on the dead service.
+    func test_session_afterShutdownAll_throws() async throws {
+        let runner = await makeReadyRunner()
+        let installer = makeInstaller(runner: runner)
+        let factory = MockLSPSessionFactory()
+        let service = LSPService(
+            registry: .builtIn(),
+            installer: installer,
+            sessionFactory: factory,
+            config: LSPServiceConfig()
+        )
+
+        // Warm one session so the cache is non-empty when shutdownAll runs.
+        _ = try await service.session(for: workspaceA, languageId: "typescript")
+        let warmCount = await factory.clientsMadeCount()
+        XCTAssertEqual(warmCount, 1, "precondition: warm-up must build exactly one client")
+
+        await service.shutdownAll()
+
+        do {
+            _ = try await service.session(for: workspaceB, languageId: "typescript")
+            XCTFail("session(for:) must throw after shutdownAll()")
+        } catch let err as LSPServiceError {
+            switch err {
+            case .sessionStartFailed:
+                break // expected
+            default:
+                XCTFail("expected .sessionStartFailed, got \(err)")
+            }
+        }
+
+        // The factory must NOT have been invoked for the post-shutdown call.
+        let afterCount = await factory.clientsMadeCount()
+        XCTAssertEqual(
+            afterCount,
+            1,
+            "post-shutdownAll session(for:) must not invoke the factory; count=\(afterCount)"
         )
     }
 }

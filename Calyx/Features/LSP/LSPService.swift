@@ -199,6 +199,18 @@ final class LSPService {
     /// Reuses a cached instance when one is already open, dedups parallel
     /// build attempts, and triggers auto-install when configured.
     func session(for workspaceRoot: URL, languageId: String) async throws -> LSPSession {
+        // Post-shutdown short-circuit. `shutdownAll()` is a terminal
+        // transition — once it has run, the service must not spawn
+        // additional `LSPClient` processes or FSEvents watches. Bail
+        // before the cache lookup so a session(for:) call that lands
+        // after `shutdownAll()` fails fast without touching the
+        // factory or installer.
+        if isShutdown {
+            throw LSPServiceError.sessionStartFailed(
+                reason: "LSPService has been shut down"
+            )
+        }
+
         let key = SessionKey(workspaceRoot: workspaceRoot, languageId: languageId)
 
         // 1. Warm cache hit — refresh LRU timestamp and return.
@@ -362,10 +374,25 @@ final class LSPService {
                         reason: "executable '\(entry.executable)' not on PATH and autoInstall is disabled"
                     )
                 }
+                // Collapse the two UI-facing settings knobs
+                // (`autoInstallEnabled`, `requireInstallConfirmation`)
+                // into the `ConfirmationMode` the installer expects.
+                // The code-level `config.installConfirmation` is
+                // intentionally NOT consulted on this branch — the
+                // Settings UI toggle is the source of truth at install
+                // time. Until a UI bridge wires a real prompt handler
+                // through to this point, the handler argument is a
+                // closure that refuses every step, so a session that
+                // lands here with `requireInstallConfirmation == true`
+                // fails with `user declined: ...` instead of running
+                // an install command behind the user's back.
+                let mode = LSPSettings.confirmationMode(
+                    confirmationHandler: { @Sendable _ in false }
+                )
                 let status = await installer.install(
                     languageId: key.languageId,
                     approvePrerequisites: true,
-                    confirmationMode: config.installConfirmation
+                    confirmationMode: mode
                 )
                 guard case .completed = status else {
                     let reason: String

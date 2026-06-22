@@ -304,7 +304,8 @@ final class MCPLSPBridgeEditWorkspaceToolsTests: XCTestCase {
         let bridge = MCPLSPBridge(
             service: service,
             workspaceResolver: resolver,
-            installer: installer
+            installer: installer,
+            diagnosticsStore: DiagnosticsStore()
         )
         return (bridge, driver)
     }

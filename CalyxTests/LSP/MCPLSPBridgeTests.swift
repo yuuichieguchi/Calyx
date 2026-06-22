@@ -283,7 +283,11 @@ final class MCPLSPBridgeTests: XCTestCase {
             config: LSPServiceConfig()
         )
         let resolver = WorkspaceResolver(registry: .builtIn())
-        let bridge = MCPLSPBridge(service: service, workspaceResolver: resolver)
+        let bridge = MCPLSPBridge(
+            service: service,
+            workspaceResolver: resolver,
+            diagnosticsStore: DiagnosticsStore()
+        )
         return (bridge, driver)
     }
 

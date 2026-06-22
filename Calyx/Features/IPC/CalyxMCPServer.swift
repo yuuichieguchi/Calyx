@@ -192,6 +192,17 @@ final class CalyxMCPServer {
         // — if any — gets cancelled and awaited before we ask its
         // bridge to release every child LSP process and `FSEvents`
         // watch.
+        //
+        // Race-safety: we synchronously clear `lspBridge` here so
+        // callers polling the property right after `stop()` observe a
+        // cleared state. We also capture a snapshot in `pendingBridge`
+        // and, crucially, re-read `self.lspBridge` *inside the Task*
+        // after `pendingStartup` drains — when `stop()` lands before
+        // `startLSP()` has populated `self.lspBridge`, the synchronous
+        // snapshot is `nil` and the racing `startLSP()` will install a
+        // brand-new bridge after our sync clear. Without the post-drain
+        // re-read that freshly-built `LSPService`, every child language
+        // server process, and the FSEvents watches would leak.
         let pendingStartup = lspStartTask
         let pendingBridge = lspBridge
         self.lspStartTask = nil
@@ -199,6 +210,18 @@ final class CalyxMCPServer {
         Task { @MainActor in
             pendingStartup?.cancel()
             _ = await pendingStartup?.value
+            // Re-read after the startup Task has drained. If
+            // `startLSP()` raced our sync clear it will have installed
+            // a new bridge into `self.lspBridge`; clear it again here
+            // and tear it down. `!==` dedup avoids shutting the same
+            // bridge twice when `pendingBridge` and the post-drain
+            // read point at the same instance (the common case when
+            // `startLSP()` had completed before `stop()` ran).
+            let postStartupBridge = self.lspBridge
+            self.lspBridge = nil
+            if let postStartupBridge, postStartupBridge !== pendingBridge {
+                await postStartupBridge.service.shutdownAll()
+            }
             await pendingBridge?.service.shutdownAll()
         }
     }

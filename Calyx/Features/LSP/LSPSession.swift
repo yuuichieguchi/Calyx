@@ -30,6 +30,7 @@
 //
 
 import Foundation
+import os
 
 // MARK: - SessionState
 
@@ -294,9 +295,23 @@ actor LSPSession {
             sessionState = .running(serverInfo: result.serverInfo)
         } catch let err as LSPClientError {
             sessionState = .failed(reason: String(describing: err))
+            // `installServerRequestHandlers()` ran above and registered
+            // closures that strongly capture `self`. If we leave the
+            // client alive (handler dictionary populated) after the
+            // handshake fails, the `LSPSession ↔ LSPClient ↔ closure ↔
+            // LSPSession` retain cycle keeps the actor — and its
+            // receive task — alive forever. `client.close()` is
+            // idempotent and clears the dictionaries; calling it on
+            // every failure path breaks the cycle deterministically.
+            await client.close()
             throw LSPSessionError.clientError(err)
         } catch {
             sessionState = .failed(reason: String(describing: error))
+            // Same rationale as the LSPClientError arm above:
+            // unconditionally tear down the client so the handlers
+            // registered earlier in this method release their `self`
+            // capture and the session can deinit.
+            await client.close()
             throw error
         }
     }
@@ -347,7 +362,44 @@ actor LSPSession {
         // straggler `persist(snapshot-with-open-files)` is still in
         // flight — a subsequent launch would then `availableSnapshots()`
         // a session that is already shut down.
-        await pendingPersistTask?.value
+        //
+        // Bounded wait: cap the drain at 2 seconds so a stuck
+        // persistence actor (disk full, jammed file handle, etc.)
+        // cannot wedge `shutdown()` indefinitely and, by extension,
+        // wedge `LSPService.shutdownAll()` and the app-level IPC
+        // toggle. `Task<_>.value` does not honour cancellation, so a
+        // naive `TaskGroup`-based race-and-cancel would still gate
+        // on the drain — the cancelled child would block the group's
+        // exit. Instead, detach a supervisor: two unstructured Tasks
+        // (the drain observer and a timer) signal a shared
+        // `CheckedContinuation` through an `OSAllocatedUnfairLock`
+        // gate so only the first arrival wakes the caller. The drain
+        // task is left to complete on its own if it overshoots; the
+        // shared persistence actor will quiesce independently and
+        // does not retain `self`.
+        if let task = pendingPersistTask {
+            let signaled = OSAllocatedUnfairLock<Bool>(initialState: false)
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                let signalOnce: @Sendable () -> Void = {
+                    let alreadySignaled = signaled.withLock { (state: inout Bool) -> Bool in
+                        let prev = state
+                        state = true
+                        return prev
+                    }
+                    if !alreadySignaled {
+                        cont.resume()
+                    }
+                }
+                Task {
+                    _ = await task.value
+                    signalOnce()
+                }
+                Task {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    signalOnce()
+                }
+            }
+        }
     }
 
     // MARK: - textDocument lifecycle
