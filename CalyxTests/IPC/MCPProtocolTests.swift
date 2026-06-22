@@ -107,7 +107,7 @@ final class MCPProtocolTests: XCTestCase {
 
     func test_toolsListResponse_containsAllTools() throws {
         // Arrange — `tools/list` advertises the combined IPC + LSP surface
-        // (7 IPC + 54 LSP = 61 tools). Each IPC name must be present and the
+        // (7 IPC + 70 LSP = 77 tools). Each IPC name must be present and the
         // LSP catalogue must be surfaced alongside.
         let id = JSONRPCId.int(2)
         let expectedIPCTools: Set<String> = [

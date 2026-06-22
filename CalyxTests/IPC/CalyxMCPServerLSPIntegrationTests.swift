@@ -761,10 +761,26 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
     //     `_testInjectLSPBridge` / `_testInjectLSPStartTask` hooks
     //     instead of binding a real `NWListener` port.
     func test_stopThenStart_doesNotTearDownNewBridge() async throws {
-        // ---- Phase 1: set up bridge_A + a completed startup_A. ----
+        // ---- Phase 1: build BOTH bridges up front so no `await` sits
+        //               between `stop()` and the `_testInjectLSPBridge(bridgeB)`
+        //               call. With awaits in that window the MainActor
+        //               could yield to teardown_1 before bridge_B is
+        //               injected, which would make the regression test
+        //               pass for the wrong reason (teardown_1 reads nil
+        //               and bails harmlessly). Pre-building keeps the
+        //               race window deterministic. ----
         let (bridgeA, _) = await makeBridge()
-        // Warm a session so the preStartupBridge cleanup has something
-        // observable to drain.
+        let (bridgeB, _) = await makeBridge()
+        // Long-running startTaskB so `self.lspStartTask` is non-nil when
+        // teardown_1's identity guard executes. Cancelled at the end of
+        // the test so tearDown can exit cleanly. Building it pre-stop is
+        // fine; the Task itself only runs once it gets scheduled.
+        let startTaskB = Task<Void, Never> {
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+
+        // Warm a session on bridge_A so the preStartupBridge cleanup has
+        // something observable to drain.
         let warmedA = try await bridgeA.service.session(
             for: workspace,
             languageId: "typescript"
@@ -779,26 +795,16 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
         await startTaskA.value
         server._testInjectLSPStartTask(startTaskA)
 
-        // ---- Phase 2: stop() schedules teardown_1 against bridge_A. ----
+        // ---- Phase 2: stop() schedules teardown_1, then we immediately
+        //               (no `await` in between) simulate start(B) by
+        //               injecting startup_B + bridge_B. The order matches
+        //               a real `start(token:)`: lspStartTask first, then
+        //               the body installs the bridge. ----
         server.stop()
         XCTAssertNil(
             server.lspBridge,
             "sync stop() must clear lspBridge before teardown_1 fires"
         )
-
-        // ---- Phase 3: simulate start(B) by installing a fresh bridge and
-        //               a still-in-flight startup task BEFORE teardown_1
-        //               has had a chance to wake up. The order of
-        //               operations matches what a real `start(token:)`
-        //               does: `lspStartTask` is set first, then its
-        //               `startLSP()` body eventually installs the bridge.
-        let (bridgeB, _) = await makeBridge()
-        let startTaskB = Task<Void, Never> {
-            // Long-running so `self.lspStartTask` is non-nil when
-            // teardown_1's identity guard executes. Cancelled at the
-            // end of the test so tearDown can exit cleanly.
-            try? await Task.sleep(nanoseconds: 5_000_000_000)
-        }
         server._testInjectLSPStartTask(startTaskB)
         server._testInjectLSPBridge(bridgeB)
 
