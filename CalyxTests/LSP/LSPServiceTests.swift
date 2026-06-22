@@ -138,6 +138,98 @@ fileprivate actor MockLSPSessionFactory: LSPSessionFactory {
     }
 }
 
+// MARK: - file-private SilentMockLSPSessionFactory
+
+/// Factory variant that hands out an `LSPClient` whose transport never
+/// receives an `initialize` reply. The surrounding `LSPSession.start()`
+/// parks on its `withCheckedThrowingContinuation` and stays in flight
+/// until something resumes it (typically via this factory's
+/// `releaseAll(...)` helper). Used by the shutdown-cancellation race
+/// test, which needs a deterministic "still building" window for
+/// `shutdownAll()` to land in.
+fileprivate actor SilentMockLSPSessionFactory: LSPSessionFactory {
+
+    private(set) var clientsMade: Int = 0
+    private var transports: [InMemoryLSPTransport] = []
+    /// Pre-arranged delay applied before the sidecar emits the canned
+    /// `initialize` / `shutdown` replies. A non-zero delay lets the test
+    /// schedule `shutdownAll()` *between* the build kicking off and the
+    /// LSP handshake completing.
+    private let initDelayMillis: Int
+    private var sidecars: [Task<Void, Never>] = []
+
+    init(initDelayMillis: Int) {
+        self.initDelayMillis = initDelayMillis
+    }
+
+    func clientsMadeCount() -> Int { clientsMade }
+
+    func makeClient(
+        executable: String,
+        arguments: [String],
+        environment: [String: String]?,
+        workingDirectory: URL?
+    ) async throws -> LSPClient {
+        clientsMade += 1
+        let transport = InMemoryLSPTransport()
+        transports.append(transport)
+        let client = LSPClient(transport: transport)
+        let delay = initDelayMillis
+        let sidecar = Task {
+            try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
+            await Self.driveServerReplies(on: transport)
+        }
+        sidecars.append(sidecar)
+        return client
+    }
+
+    private static func driveServerReplies(on transport: InMemoryLSPTransport) async {
+        var initializeAnswered = false
+        var shutdownAnsweredIds: Set<Int> = []
+        for _ in 0..<2000 {
+            let sent = await transport.sentMessages()
+            for data in sent {
+                guard let dict = parseFramedJSON(data) else { continue }
+                let method = dict["method"] as? String
+                if method == "initialize", !initializeAnswered {
+                    if let id = extractId(dict["id"]) {
+                        let resp = #"{"jsonrpc":"2.0","id":\#(id),"result":{"capabilities":{},"serverInfo":{"name":"mock-lsp"}}}"#
+                        await transport.simulateServerMessage(lspFrame(resp))
+                        initializeAnswered = true
+                    }
+                } else if method == "shutdown",
+                          let id = extractId(dict["id"]),
+                          !shutdownAnsweredIds.contains(id) {
+                    let resp = #"{"jsonrpc":"2.0","id":\#(id),"result":null}"#
+                    await transport.simulateServerMessage(lspFrame(resp))
+                    shutdownAnsweredIds.insert(id)
+                }
+            }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+    }
+
+    private static func lspFrame(_ json: String) -> Data {
+        let body = Data(json.utf8)
+        var out = Data("Content-Length: \(body.count)\r\n\r\n".utf8)
+        out.append(body)
+        return out
+    }
+
+    private static func parseFramedJSON(_ data: Data) -> [String: Any]? {
+        guard let headerEnd = data.range(of: Data("\r\n\r\n".utf8)) else { return nil }
+        let body = data.subdata(in: headerEnd.upperBound..<data.endIndex)
+        return try? JSONSerialization.jsonObject(with: body) as? [String: Any]
+    }
+
+    private static func extractId(_ any: Any?) -> Int? {
+        if let i = any as? Int { return i }
+        if let n = any as? NSNumber { return n.intValue }
+        if let s = any as? String { return Int(s) }
+        return nil
+    }
+}
+
 // MARK: - LSPServiceTests
 
 @MainActor
@@ -148,6 +240,22 @@ final class LSPServiceTests: XCTestCase {
     private let workspaceA = URL(fileURLWithPath: "/tmp/calyx-lsp-service-test-A")
     private let workspaceB = URL(fileURLWithPath: "/tmp/calyx-lsp-service-test-B")
     private let workspaceC = URL(fileURLWithPath: "/tmp/calyx-lsp-service-test-C")
+
+    // MARK: - Lifecycle
+
+    override func setUp() {
+        super.setUp()
+        // `LSPSettings` is backed by `UserDefaults.standard`, which is
+        // process-wide. Reset before every test so a test that flips
+        // the master switch (e.g. the auto-install-off case below)
+        // cannot leak its state into a neighbour test.
+        LSPSettings.resetToDefaults()
+    }
+
+    override func tearDown() {
+        LSPSettings.resetToDefaults()
+        super.tearDown()
+    }
 
     // MARK: - Helpers
 
@@ -503,5 +611,127 @@ final class LSPServiceTests: XCTestCase {
         )
         XCTAssertTrue(roots.contains(workspaceB))
         XCTAssertTrue(roots.contains(workspaceC))
+    }
+
+    // MARK: - 12. shutdownAll cancels in-progress session builds
+
+    /// `shutdownAll()` must cancel any in-flight `buildSession` Task and
+    /// guarantee the freshly-started session is torn down in-place rather
+    /// than slipping into the cache after the teardown is complete.
+    func test_shutdownAll_cancelsInProgressSessions() async throws {
+        let runner = await makeReadyRunner()
+        let installer = makeInstaller(runner: runner)
+        // 300ms delay: long enough that `service.shutdownAll()` lands
+        // while `LSPSession.start()` is parked on the `initialize`
+        // continuation, but short enough that the build resumes and
+        // observes the `isShutdown` flag before the test times out.
+        let factory = SilentMockLSPSessionFactory(initDelayMillis: 300)
+        let service = LSPService(
+            registry: .builtIn(),
+            installer: installer,
+            sessionFactory: factory,
+            config: LSPServiceConfig()
+        )
+
+        // Kick off a build. Use a detached `Task` (not `async let`) so we
+        // can move past the build without implicitly awaiting it — the
+        // build will finish on its own once the sidecar resumes the
+        // hanging `initialize` and the post-`start` `isShutdown` check
+        // throws.
+        let svc = service
+        let buildTask = Task<LSPSession?, Never> { @MainActor in
+            try? await svc.session(for: workspaceA, languageId: "typescript")
+        }
+
+        // Wait for the build to actually invoke the factory so we know
+        // the in-flight Task exists when shutdownAll runs.
+        let kicked = await waitUntil {
+            let made = await factory.clientsMadeCount()
+            return made >= 1
+        }
+        XCTAssertTrue(kicked, "precondition: factory must have built at least one client")
+
+        // Act — tear the service down while the handshake is still
+        // pending on the `initialize` continuation.
+        await service.shutdownAll()
+
+        // The sessions cache must not retain anything from the
+        // cancelled build.
+        let infos = await service.currentSessions()
+        XCTAssertTrue(
+            infos.isEmpty,
+            "shutdownAll must drop every in-flight build before it can land in the cache: \(infos)"
+        )
+
+        // The in-flight build must eventually finish (or fail). Wait for
+        // the sidecar to release the parked `initialize` continuation so
+        // the test doesn't leak the Task across the suite.
+        _ = await buildTask.value
+
+        // After the build resumes the post-`start` `isShutdown` check
+        // fires and the freshly-built session is shut down in-place, so
+        // the cache must still be empty.
+        let after = await service.currentSessions()
+        XCTAssertTrue(
+            after.isEmpty,
+            "post-shutdownAll build resumption must not insert into the cache: \(after)"
+        )
+    }
+
+    // MARK: - 13. LSPSettings.autoInstallEnabled = false short-circuits install
+
+    /// When the Settings UI master switch is off, `session(for:)` must
+    /// raise `.languageServerNotAvailable` for an uninstalled language
+    /// *without* invoking the installer at all — even when the
+    /// code-level `LSPServiceConfig.autoInstall` would otherwise allow
+    /// it. This guards against the previous behaviour where LSPService
+    /// consulted only the boot-time config and ignored the user's
+    /// runtime preference.
+    func test_lspSettings_autoInstallOff_throwsLanguageServerNotAvailable() async throws {
+        LSPSettings.autoInstallEnabled = false
+
+        let runner = MockCommandRunner()
+        await runner.setLocateResult("typescript-language-server", url: nil)
+        await runner.setLocateResult(
+            "npm",
+            url: URL(fileURLWithPath: "/usr/local/bin/npm")
+        )
+
+        let installer = makeInstaller(runner: runner)
+        let factory = MockLSPSessionFactory()
+        // `autoInstall: true` in the code-level config so we can
+        // distinguish "settings-disabled" from "config-disabled". The
+        // master switch must dominate the config.
+        let service = LSPService(
+            registry: .builtIn(),
+            installer: installer,
+            sessionFactory: factory,
+            config: LSPServiceConfig(autoInstall: true, installConfirmation: .silent)
+        )
+
+        do {
+            _ = try await service.session(for: workspaceA, languageId: "typescript")
+            XCTFail("expected throw when LSPSettings.autoInstallEnabled is false")
+        } catch let err as LSPServiceError {
+            switch err {
+            case .languageServerNotAvailable(let lang, _):
+                XCTAssertEqual(lang, "typescript")
+            default:
+                XCTFail("expected .languageServerNotAvailable, got \(err)")
+            }
+        }
+
+        // No install command must have run.
+        let history = await runner.history()
+        XCTAssertFalse(
+            history.contains(where: { $0.executable == "npm" }),
+            "no install command may run when LSPSettings.autoInstallEnabled is false; history=\(history)"
+        )
+        let made = await factory.clientsMadeCount()
+        XCTAssertEqual(
+            made,
+            0,
+            "factory must not be invoked when auto-install is disabled in settings"
+        )
     }
 }

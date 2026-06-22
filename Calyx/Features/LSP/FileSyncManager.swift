@@ -6,9 +6,15 @@
 //  workspace synchronisation notifications on a per-(workspaceRoot,
 //  session) basis.
 //
-//  In production a single `FileSyncManager` instance wraps an
-//  `FSEventsEventSource`; tests inject a `MockFileSystemEventSource`
-//  and drive events explicitly via `MockFileSystemEventSource.emit(_:)`.
+//  In production a single `FileSyncManager` instance provisions one
+//  `FSEventsEventSource` per watched workspace via an injected factory;
+//  tests inject a closure that returns `MockFileSystemEventSource`
+//  instances and drive events explicitly via
+//  `MockFileSystemEventSource.emit(_:)`. The per-workspace source model
+//  guarantees that watching N workspaces produces N independent FSEvents
+//  streams — a single shared source would silently drop every workspace
+//  after the first because `FSEventsEventSource.start(...)` is a no-op
+//  when a stream is already active.
 //
 //  Event translation:
 //    - .created                    -> workspace/didChangeWatchedFiles (Created)
@@ -107,12 +113,22 @@ actor FileSyncManager {
 
     // MARK: - State
 
-    private let eventSource: any FileSystemEventSource
+    /// Factory invoked once per `watch(workspaceRoot:session:)` call to
+    /// build the underlying file-system event source for that workspace.
+    /// Production wiring leaves this at its default which returns a fresh
+    /// `FSEventsEventSource()` per workspace; tests inject a closure that
+    /// returns `MockFileSystemEventSource` instances.
+    private let eventSourceFactory: @Sendable () -> any FileSystemEventSource
 
     /// `workspaceRoot -> LSPSession` map of currently watched workspaces.
     /// Strong reference; callers MUST call `unwatch(workspaceRoot:)` or
     /// `stopAll()` to drop the session before tearing it down.
     private var watchedRoots_: [URL: LSPSession] = [:]
+
+    /// `workspaceRoot -> FileSystemEventSource` map. One source per
+    /// watched workspace so two workspaces never compete for the single
+    /// FSEvents stream a `FSEventsEventSource` can host at a time.
+    private var eventSources: [URL: any FileSystemEventSource] = [:]
 
     /// Suppression counters keyed by path. `suppressNextEvent(at:)`
     /// increments the counter and `handleEvents(_:workspaceRoot:)`
@@ -128,8 +144,11 @@ actor FileSyncManager {
 
     // MARK: - Init
 
-    init(eventSource: any FileSystemEventSource = FSEventsEventSource()) {
-        self.eventSource = eventSource
+    init(
+        eventSourceFactory: @Sendable @escaping () -> any FileSystemEventSource
+            = { FSEventsEventSource() }
+    ) {
+        self.eventSourceFactory = eventSourceFactory
     }
 
     // MARK: - Introspection
@@ -143,35 +162,51 @@ actor FileSyncManager {
 
     /// Register `workspaceRoot` for monitoring. Subsequent file-system
     /// events under `workspaceRoot` are routed to `session`. Watching an
-    /// already-watched root is a no-op.
+    /// already-watched root is a no-op. Each watched workspace owns its
+    /// own `FileSystemEventSource` instance produced by the injected
+    /// factory.
     func watch(workspaceRoot: URL, session: LSPSession) async throws {
         if watchedRoots_[workspaceRoot] != nil {
             return
         }
         watchedRoots_[workspaceRoot] = session
-        try await eventSource.start(at: workspaceRoot) { [weak self] events in
-            guard let self else { return }
-            await self.handleEvents(events, workspaceRoot: workspaceRoot)
+        let source = eventSourceFactory()
+        eventSources[workspaceRoot] = source
+        do {
+            try await source.start(at: workspaceRoot) { [weak self] events in
+                guard let self else { return }
+                await self.handleEvents(events, workspaceRoot: workspaceRoot)
+            }
+        } catch {
+            // Roll back bookkeeping so a retry can succeed; propagate the
+            // failure to the caller (no silent fallback).
+            watchedRoots_[workspaceRoot] = nil
+            eventSources[workspaceRoot] = nil
+            throw error
         }
     }
 
     /// Stop monitoring `workspaceRoot`. Unwatching an unknown root is a
-    /// no-op. When the last watched root is removed the underlying
-    /// `eventSource` is stopped as well.
+    /// no-op. The per-workspace `FileSystemEventSource` is stopped and
+    /// released; other watched roots remain unaffected.
     func unwatch(workspaceRoot: URL) async {
         guard watchedRoots_[workspaceRoot] != nil else { return }
         watchedRoots_[workspaceRoot] = nil
-        if watchedRoots_.isEmpty {
-            await eventSource.stop()
+        if let source = eventSources.removeValue(forKey: workspaceRoot) {
+            await source.stop()
         }
     }
 
     /// Drop every watched root, clear pending suppressions, and stop the
-    /// underlying `eventSource`.
+    /// per-workspace event sources.
     func stopAll() async {
         watchedRoots_.removeAll()
         suppressedEvents.removeAll()
-        await eventSource.stop()
+        let sources = Array(eventSources.values)
+        eventSources.removeAll()
+        for source in sources {
+            await source.stop()
+        }
     }
 
     /// Mask exactly one subsequent event for `path`. Calling this N times
@@ -309,9 +344,19 @@ final class FSEventsEventSource: FileSystemEventSource, @unchecked Sendable {
     /// async-safe replacement for `NSLock` recommended by Swift
     /// Concurrency: its `withLock` body is `@Sendable` and is permitted
     /// inside `async` functions.
+    ///
+    /// `continuation` and `consumerTask` form an AsyncStream funnel: every
+    /// FSEvents callback yields its translated batch through the
+    /// continuation, and a single long-lived consumer Task drains the
+    /// stream FIFO and forwards each batch sequentially to the handler.
+    /// This preserves the FSEvents callback order at the handler boundary
+    /// — spawning a `Task` per callback (the previous implementation) does
+    /// not, because actor enqueue order across independently-created Tasks
+    /// is implementation-defined.
     private struct State: Sendable {
         var stream: StreamBox?
-        var handler: (@Sendable ([FileSystemEvent]) async -> Void)?
+        var continuation: AsyncStream<[FileSystemEvent]>.Continuation?
+        var consumerTask: Task<Void, Never>?
     }
 
     private let queue = DispatchQueue(label: "com.calyx.lsp.fseventseventsource")
@@ -326,6 +371,16 @@ final class FSEventsEventSource: FileSystemEventSource, @unchecked Sendable {
         let alreadyRunning = state.withLock { $0.stream != nil }
         if alreadyRunning {
             return
+        }
+
+        // Provision the AsyncStream funnel before starting FSEvents so the
+        // very first callback batch always finds a live continuation.
+        let (eventStream, continuation) =
+            AsyncStream<[FileSystemEvent]>.makeStream()
+        let consumerTask = Task {
+            for await batch in eventStream {
+                await handler(batch)
+            }
         }
 
         let pathsToWatch = [path.path] as CFArray
@@ -350,6 +405,10 @@ final class FSEventsEventSource: FileSystemEventSource, @unchecked Sendable {
             0.2,
             createFlags
         ) else {
+            // Tear down the consumer we just provisioned before throwing
+            // so the failed start leaves no orphaned task behind.
+            continuation.finish()
+            await consumerTask.value
             throw NSError(
                 domain: "FSEventsEventSource",
                 code: 1,
@@ -361,28 +420,43 @@ final class FSEventsEventSource: FileSystemEventSource, @unchecked Sendable {
         let box = StreamBox(value: s)
         state.withLock { state in
             state.stream = box
-            state.handler = handler
+            state.continuation = continuation
+            state.consumerTask = consumerTask
         }
     }
 
     func stop() async {
-        let toRelease = state.withLock { state -> StreamBox? in
+        let (toRelease, contToFinish, taskToAwait) = state.withLock {
+            state -> (
+                StreamBox?,
+                AsyncStream<[FileSystemEvent]>.Continuation?,
+                Task<Void, Never>?
+            ) in
             let s = state.stream
+            let c = state.continuation
+            let t = state.consumerTask
             state.stream = nil
-            state.handler = nil
-            return s
+            state.continuation = nil
+            state.consumerTask = nil
+            return (s, c, t)
         }
         if let box = toRelease {
             FSEventStreamStop(box.value)
             FSEventStreamInvalidate(box.value)
             FSEventStreamRelease(box.value)
         }
+        // Finish the continuation so the consumer loop drains any pending
+        // batches and exits cleanly; then await the task so a follow-up
+        // start() observes a fully torn-down state.
+        contToFinish?.finish()
+        if let taskToAwait {
+            _ = await taskToAwait.value
+        }
     }
 
     fileprivate func emitFromCallback(_ events: [FileSystemEvent]) {
-        let h = state.withLock { $0.handler }
-        guard let h else { return }
-        Task { await h(events) }
+        let c = state.withLock { $0.continuation }
+        c?.yield(events)
     }
 
     /// C-convention callback dispatched on `queue`. Decodes the FSEvents

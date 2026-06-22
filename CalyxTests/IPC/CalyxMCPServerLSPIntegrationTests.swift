@@ -608,6 +608,61 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
                       "list_peers must surface the freshly registered peer")
     }
 
+    /// Poll `predicate` until it returns true or `timeout` expires.
+    @discardableResult
+    private func waitUntil(
+        timeout: TimeInterval = 3.0,
+        pollInterval: TimeInterval = 0.01,
+        _ predicate: () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await predicate() { return true }
+            try? await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+        }
+        return await predicate()
+    }
+
+    // 13. `stop()` tears down the injected LSP bridge: every cached
+    //     session is shut down, and `server.lspBridge` is cleared so
+    //     no stale reference survives the toggle. Guards against the
+    //     leak where Disable AI Agent IPC left child language-server
+    //     processes and FSEvents streams alive.
+    func test_stop_tearsDownLSPBridge() async throws {
+        // Arrange — inject a bridge wired to a fake driver and warm up a
+        // session so there is something to shut down.
+        let (bridge, _) = await makeBridge()
+        server._testInjectLSPBridge(bridge)
+        let session = try await bridge.service.session(
+            for: workspace,
+            languageId: "typescript"
+        )
+        XCTAssertEqual(session.workspaceRoot, workspace,
+                       "precondition: session must be built for the test workspace")
+        let before = await bridge.service.currentSessions()
+        XCTAssertEqual(before.count, 1,
+                       "precondition: bridge must hold exactly one cached session")
+
+        // Act — synchronous stop schedules an async LSP teardown.
+        server.stop()
+
+        // Assert — the server clears its bridge reference immediately,
+        // and the async teardown eventually drains the bridge's
+        // session cache.
+        XCTAssertNil(
+            server.lspBridge,
+            "stop() must clear server.lspBridge so a subsequent disable cannot reach a stale bridge"
+        )
+        let drained = await waitUntil(timeout: 3.0) {
+            let infos = await bridge.service.currentSessions()
+            return infos.isEmpty
+        }
+        XCTAssertTrue(
+            drained,
+            "stop() must asynchronously shut down every session previously held by the LSP bridge"
+        )
+    }
+
     // 12. Calling an lsp_* tool before startLSP() / _testInjectLSPBridge
     //     surfaces a structured error rather than crashing.
     func test_calyxMCPServer_handleConnection_lspBridgeNotStarted_returnsError() async throws {

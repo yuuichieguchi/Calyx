@@ -164,6 +164,14 @@ final class LSPService {
     /// Background loop that retires idle sessions. Lazily started on
     /// first cache insertion.
     private var idleTimerTask: Task<Void, Never>?
+    /// Set to `true` when `shutdownAll()` runs. `buildSession` consults this
+    /// flag after `session.start()` returns; if shutdown ran while the
+    /// handshake was still pending the freshly-started session is shut down
+    /// in-place instead of being inserted into the cache. The flag is
+    /// terminal — once set, no further `session(for:)` build will succeed,
+    /// matching the documented semantics of `shutdownAll()` ("Shut down
+    /// every cached session and stop the idle timer").
+    private var isShutdown = false
 
     // MARK: Init
 
@@ -260,6 +268,18 @@ final class LSPService {
     /// A subsequent `session(for:)` call will rebuild from scratch.
     func shutdownSession(workspaceRoot: URL, languageId: String) async {
         let key = SessionKey(workspaceRoot: workspaceRoot, languageId: languageId)
+
+        // Cancel any in-flight build for this key. We do NOT await the
+        // cancelled task here: `LSPClient.sendRequest` parks on a
+        // non-cancellation-aware continuation, so a build stuck on
+        // `initialize` would deadlock the caller of `shutdownSession`.
+        // The `Task.isCancelled` check `buildSession` runs after
+        // `session.start()` returns guarantees the freshly-built session
+        // is torn down in-place instead of slipping into the cache.
+        if let pending = inProgressSessions.removeValue(forKey: key) {
+            pending.cancel()
+        }
+
         guard let entry = sessions.removeValue(forKey: key) else { return }
         if let fileSyncManager {
             Task {
@@ -271,6 +291,21 @@ final class LSPService {
 
     /// Shut down every cached session and stop the idle timer.
     func shutdownAll() async {
+        // Mark the service as shut down *before* cancelling pending tasks so
+        // any build that resumes mid-tear-down sees the flag and bails via
+        // the post-`start` check in `buildSession`.
+        isShutdown = true
+
+        // Cancel every in-flight build. Same rationale as
+        // `shutdownSession`: do not await the cancelled tasks — the LSP
+        // client's request continuation isn't cancellation-aware and a
+        // hung `initialize` would deadlock shutdownAll().
+        let pendingBuilds = Array(inProgressSessions.values)
+        inProgressSessions.removeAll()
+        for task in pendingBuilds {
+            task.cancel()
+        }
+
         // Snapshot the actor references (Sendable) — `SessionEntry` is a
         // MainActor-accessible reference type, so we must not capture it
         // inside a concurrent child task.
@@ -310,6 +345,17 @@ final class LSPService {
         if let installer {
             let check = await installer.checkInstallation(forLanguageId: key.languageId)
             if !check.isInstalled {
+                // Honor the user-facing master switch *before* the code-level
+                // `config.autoInstall`. `LSPSettings.autoInstallEnabled` is
+                // the toggle exposed in the Settings UI, so if the user has
+                // disabled auto-install we must not run any install command
+                // even when the code-level `LSPServiceConfig` would allow it.
+                if !LSPSettings.autoInstallEnabled {
+                    throw LSPServiceError.languageServerNotAvailable(
+                        languageId: key.languageId,
+                        reason: "executable '\(entry.executable)' not on PATH and auto-install is disabled in settings"
+                    )
+                }
                 if !config.autoInstall {
                     throw LSPServiceError.languageServerNotAvailable(
                         languageId: key.languageId,
@@ -361,6 +407,22 @@ final class LSPService {
             try await session.start()
         } catch {
             throw LSPServiceError.sessionStartFailed(reason: String(describing: error))
+        }
+
+        // Shutdown race guard ----------------------------------------------
+        // `session.start()` parks on a non-cancellation-aware continuation
+        // inside `LSPClient.sendRequest`, so a `shutdownAll()` /
+        // `shutdownSession(...)` that lands while the handshake is in flight
+        // cannot interrupt the await directly. Once the await resumes we
+        // consult both the per-task cancellation flag (set by
+        // `shutdownSession`) and the service-wide `isShutdown` flag (set by
+        // `shutdownAll`) and tear the freshly-started session down in-place
+        // rather than letting it slip into the cache.
+        if isShutdown || Task.isCancelled {
+            try? await session.shutdown()
+            throw LSPServiceError.sessionStartFailed(
+                reason: "session shutdown cancelled in-flight build"
+            )
         }
 
         // LRU enforcement ---------------------------------------------------

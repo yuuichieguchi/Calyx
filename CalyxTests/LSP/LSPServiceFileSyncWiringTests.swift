@@ -175,7 +175,7 @@ final class LSPServiceFileSyncWiringTests: XCTestCase {
 
     func test_newSession_triggersFileSyncWatch() async throws {
         let factory = MockLSPSessionFactory()
-        let fileSync = FileSyncManager(eventSource: MockFileSystemEventSource())
+        let fileSync = FileSyncManager(eventSourceFactory: { MockFileSystemEventSource() })
         let service = makeService(factory: factory, fileSync: fileSync)
         let ws = workspaceA
         let lang = languageId
@@ -196,7 +196,7 @@ final class LSPServiceFileSyncWiringTests: XCTestCase {
 
     func test_warmCache_skipsWatch() async throws {
         let factory = MockLSPSessionFactory()
-        let fileSync = FileSyncManager(eventSource: MockFileSystemEventSource())
+        let fileSync = FileSyncManager(eventSourceFactory: { MockFileSystemEventSource() })
         let service = makeService(factory: factory, fileSync: fileSync)
         let ws = workspaceA
         let lang = languageId
@@ -229,7 +229,7 @@ final class LSPServiceFileSyncWiringTests: XCTestCase {
 
     func test_concurrentSession_callsWatchOnce() async throws {
         let factory = MockLSPSessionFactory()
-        let fileSync = FileSyncManager(eventSource: MockFileSystemEventSource())
+        let fileSync = FileSyncManager(eventSourceFactory: { MockFileSystemEventSource() })
         let service = makeService(factory: factory, fileSync: fileSync)
 
         // Capture into locals so async-let bodies don't read MainActor self.
@@ -271,7 +271,7 @@ final class LSPServiceFileSyncWiringTests: XCTestCase {
 
     func test_shutdownSession_triggersUnwatch() async throws {
         let factory = MockLSPSessionFactory()
-        let fileSync = FileSyncManager(eventSource: MockFileSystemEventSource())
+        let fileSync = FileSyncManager(eventSourceFactory: { MockFileSystemEventSource() })
         let service = makeService(factory: factory, fileSync: fileSync)
         let ws = workspaceA
         let lang = languageId
@@ -299,7 +299,7 @@ final class LSPServiceFileSyncWiringTests: XCTestCase {
 
     func test_shutdownAll_triggersUnwatchAll() async throws {
         let factory = MockLSPSessionFactory()
-        let fileSync = FileSyncManager(eventSource: MockFileSystemEventSource())
+        let fileSync = FileSyncManager(eventSourceFactory: { MockFileSystemEventSource() })
         let service = makeService(factory: factory, fileSync: fileSync)
         let wsA = workspaceA
         let wsB = workspaceB

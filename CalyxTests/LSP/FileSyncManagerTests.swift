@@ -34,6 +34,30 @@
 import XCTest
 @testable import Calyx
 
+/// Captures every `MockFileSystemEventSource` produced by an
+/// `eventSourceFactory` closure. Lets the per-workspace event-source
+/// regression test reach into the manager's internal sources without
+/// exposing them on the production surface. Synchronised through an
+/// `NSLock` so the factory closure stays `@Sendable`.
+private final class MockEventSourceCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _mocks: [MockFileSystemEventSource] = []
+
+    func makeMock() -> MockFileSystemEventSource {
+        let m = MockFileSystemEventSource()
+        lock.lock()
+        _mocks.append(m)
+        lock.unlock()
+        return m
+    }
+
+    func mocks() -> [MockFileSystemEventSource] {
+        lock.lock()
+        defer { lock.unlock() }
+        return _mocks
+    }
+}
+
 @MainActor
 final class FileSyncManagerTests: XCTestCase {
 
@@ -173,7 +197,7 @@ final class FileSyncManagerTests: XCTestCase {
         let (session, _) = try await makeStartedSession(workspaceRoot: ws)
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
 
         try await manager.watch(workspaceRoot: ws, session: session)
 
@@ -188,7 +212,7 @@ final class FileSyncManagerTests: XCTestCase {
         let (session, _) = try await makeStartedSession(workspaceRoot: ws)
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
 
         try await manager.watch(workspaceRoot: ws, session: session)
         await manager.unwatch(workspaceRoot: ws)
@@ -206,7 +230,7 @@ final class FileSyncManagerTests: XCTestCase {
         let (sessionB, _) = try await makeStartedSession(workspaceRoot: wsB)
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
 
         try await manager.watch(workspaceRoot: wsA, session: sessionA)
         try await manager.watch(workspaceRoot: wsB, session: sessionB)
@@ -237,7 +261,7 @@ final class FileSyncManagerTests: XCTestCase {
         )
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
         try await manager.watch(workspaceRoot: ws, session: session)
 
         // Update the file on disk (so any read inside the manager observes
@@ -272,7 +296,7 @@ final class FileSyncManagerTests: XCTestCase {
         try "old".write(to: fileURL, atomically: true, encoding: .utf8)
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
         try await manager.watch(workspaceRoot: ws, session: session)
 
         await mock.emit([FileSystemEvent(path: fileURL, kind: .modified)])
@@ -308,7 +332,7 @@ final class FileSyncManagerTests: XCTestCase {
         XCTAssertTrue(openBefore.contains(fileURL.absoluteString), "precondition: file is open")
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
         try await manager.watch(workspaceRoot: ws, session: session)
 
         try? FileManager.default.removeItem(at: fileURL)
@@ -336,7 +360,7 @@ final class FileSyncManagerTests: XCTestCase {
         let fileURL = ws.appendingPathComponent("new.swift")
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
         try await manager.watch(workspaceRoot: ws, session: session)
 
         try "fresh".write(to: fileURL, atomically: true, encoding: .utf8)
@@ -368,7 +392,7 @@ final class FileSyncManagerTests: XCTestCase {
         )
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
         try await manager.watch(workspaceRoot: ws, session: session)
 
         // Move the file then emit a `renamed` event for the original path.
@@ -417,7 +441,7 @@ final class FileSyncManagerTests: XCTestCase {
         )
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
         try await manager.watch(workspaceRoot: ws, session: session)
 
         // First modification: should be suppressed by `suppressNextEvent`.
@@ -468,8 +492,8 @@ final class FileSyncManagerTests: XCTestCase {
         // stream owned by a single `FileSyncManager` instance.
         let mockA = MockFileSystemEventSource()
         let mockB = MockFileSystemEventSource()
-        let managerA = FileSyncManager(eventSource: mockA)
-        let managerB = FileSyncManager(eventSource: mockB)
+        let managerA = FileSyncManager(eventSourceFactory: { mockA })
+        let managerB = FileSyncManager(eventSourceFactory: { mockB })
         try await managerA.watch(workspaceRoot: wsA, session: sessionA)
         try await managerB.watch(workspaceRoot: wsB, session: sessionB)
 
@@ -497,7 +521,7 @@ final class FileSyncManagerTests: XCTestCase {
         let (session, _) = try await makeStartedSession(workspaceRoot: ws)
 
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
 
         try await manager.watch(workspaceRoot: ws, session: session)
         // Second watch must not throw and must leave watchedRoots() unchanged.
@@ -514,7 +538,7 @@ final class FileSyncManagerTests: XCTestCase {
     func test_unwatch_unknownWorkspace_isNoOp() async throws {
         let ws = makeWorkspaceRoot("unknown")
         let mock = MockFileSystemEventSource()
-        let manager = FileSyncManager(eventSource: mock)
+        let manager = FileSyncManager(eventSourceFactory: { mock })
 
         // Must not throw / crash.
         await manager.unwatch(workspaceRoot: ws)
@@ -522,5 +546,66 @@ final class FileSyncManagerTests: XCTestCase {
         let roots = await manager.watchedRoots()
         XCTAssertTrue(roots.isEmpty,
                       "unwatch on an unknown workspace must be a no-op and leave watchedRoots() empty: \(roots)")
+    }
+
+    // MARK: - 13. single manager watching two workspaces — second workspace
+    //              still receives its events (per-workspace event source).
+
+    /// Regression test for the "single FileSystemEventSource, multiple
+    /// workspaces" bug: `FSEventsEventSource.start(...)` silently no-ops
+    /// when a stream is already active, so a single shared source would
+    /// drop every event for the second-and-later workspace registered
+    /// against the same manager. The fix is that `FileSyncManager` builds
+    /// one event source per `watch(workspaceRoot:session:)` call via the
+    /// injected factory; this test asserts events emitted on the second
+    /// workspace's source land on the second session's transport without
+    /// bleeding through to the first.
+    func test_watchSecondWorkspace_receivesEvents() async throws {
+        let wsA = makeWorkspaceRoot("perWsA")
+        let wsB = makeWorkspaceRoot("perWsB")
+        let (sessionA, transportA) = try await makeStartedSession(workspaceRoot: wsA)
+        let (sessionB, transportB) = try await makeStartedSession(workspaceRoot: wsB)
+
+        try FileManager.default.createDirectory(at: wsA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: wsB, withIntermediateDirectories: true)
+        let fileB = wsB.appendingPathComponent("only-on-b.swift")
+        try "b".write(to: fileB, atomically: true, encoding: .utf8)
+
+        // A single FileSyncManager. The factory hands out a fresh mock per
+        // watch() call and the capture lets us reach the second mock so we
+        // can drive an event into the wsB pipeline specifically.
+        let capture = MockEventSourceCapture()
+        let manager = FileSyncManager(eventSourceFactory: { capture.makeMock() })
+
+        try await manager.watch(workspaceRoot: wsA, session: sessionA)
+        try await manager.watch(workspaceRoot: wsB, session: sessionB)
+
+        let mocks = capture.mocks()
+        XCTAssertEqual(
+            mocks.count,
+            2,
+            "FileSyncManager must build one event source per watch() call: got \(mocks.count)"
+        )
+
+        // Emit ONLY on the second workspace's mock. Under the old "single
+        // shared eventSource" wiring this would land nowhere because the
+        // second start(...) call was a no-op.
+        await mocks[1].emit([FileSystemEvent(path: fileB, kind: .created)])
+
+        let sawOnB = await waitUntil {
+            let methods = (try? await self.sentMethods(transportB)) ?? []
+            return methods.contains("workspace/didChangeWatchedFiles")
+        }
+        XCTAssertTrue(
+            sawOnB,
+            "an event emitted on the second workspace's source must reach the second session"
+        )
+
+        // Workspace A's transport must not have observed B's event.
+        let methodsA = try await sentMethods(transportA)
+        XCTAssertFalse(
+            methodsA.contains("workspace/didChangeWatchedFiles"),
+            "workspace A must not receive workspace B's events: methodsA=\(methodsA)"
+        )
     }
 }

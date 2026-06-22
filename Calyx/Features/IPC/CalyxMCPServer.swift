@@ -30,6 +30,13 @@ final class CalyxMCPServer {
     // MARK: - Private
 
     private var listener: NWListener?
+    /// Background task running `startLSP()`. Retained so `stop()` can
+    /// cancel it (and await its completion) before tearing down the
+    /// resulting `lspBridge`. Without this, a `start()` → `stop()` pair
+    /// fired before `startLSP()` finishes would leak the freshly-built
+    /// `LSPService` plus its child language-server processes and
+    /// `FSEvents` watches.
+    private var lspStartTask: Task<Void, Never>?
 
     private static let iso8601: ISO8601DateFormatter = {
         let fmt = ISO8601DateFormatter()
@@ -52,6 +59,17 @@ final class CalyxMCPServer {
     /// system command runner. Idempotent — re-entry replaces the existing
     /// bridge with a fresh one.
     func startLSP() async {
+        // Defensive teardown of any prior bridge so re-entry replaces it
+        // cleanly. In the normal `start()` -> `stop()` -> `start()` flow
+        // `stop()` already nils `lspBridge`, but tests that drive
+        // `startLSP()` directly (or `_testInjectLSPBridge` followed by a
+        // real `startLSP()`) can land here with a stale bridge still
+        // attached.
+        if let priorBridge = lspBridge {
+            self.lspBridge = nil
+            await priorBridge.service.shutdownAll()
+        }
+
         let registry = LSPServerRegistry.builtIn()
         let runner = SystemCommandRunner()
         let installer = LSPInstaller(registry: registry, runner: runner)
@@ -133,7 +151,9 @@ final class CalyxMCPServer {
                     let peer = await self.store.registerPeer(name: "calyx-app", role: "review-ui")
                     self.appPeerID = peer.id
                 }
-                Task { @MainActor in
+                // Retain the LSP startup task so `stop()` can cancel + await
+                // it before tearing down the resulting bridge.
+                self.lspStartTask = Task { @MainActor in
                     await self.startLSP()
                 }
                 return
@@ -162,6 +182,25 @@ final class CalyxMCPServer {
         peerRegistrationTask = nil
         port = 0
         Task { await store.cleanup() }
+
+        // LSP bridge teardown. `stop()` is synchronous to match the
+        // existing call sites (`CalyxWindowController.disableIPC`,
+        // `start()`'s reset-on-toggle path) so we schedule the actual
+        // service shutdown on a fire-and-forget Task. The listener is
+        // already cancelled at this point so no new requests can land in
+        // the meantime; what matters is that the in-flight `startLSP()`
+        // — if any — gets cancelled and awaited before we ask its
+        // bridge to release every child LSP process and `FSEvents`
+        // watch.
+        let pendingStartup = lspStartTask
+        let pendingBridge = lspBridge
+        self.lspStartTask = nil
+        self.lspBridge = nil
+        Task { @MainActor in
+            pendingStartup?.cancel()
+            _ = await pendingStartup?.value
+            await pendingBridge?.service.shutdownAll()
+        }
     }
 
     /// Ensures the app peer is registered before proceeding.
