@@ -117,6 +117,14 @@ final class CalyxMCPServer {
         self.lspBridge = bridge
     }
 
+    /// For testing only — install an arbitrary `Task` reference into the
+    /// `lspStartTask` slot so tests can simulate the `start()` → `stop()`
+    /// → `start()` race the teardown identity check guards against without
+    /// having to bind a real `NWListener` port.
+    func _testInjectLSPStartTask(_ task: Task<Void, Never>?) {
+        self.lspStartTask = task
+    }
+
     // MARK: - Lifecycle
 
     func start(token: String, preferredPort: Int = 41830) throws {
@@ -193,36 +201,63 @@ final class CalyxMCPServer {
         // bridge to release every child LSP process and `FSEvents`
         // watch.
         //
-        // Race-safety: we synchronously clear `lspBridge` here so
-        // callers polling the property right after `stop()` observe a
-        // cleared state. We also capture a snapshot in `pendingBridge`
-        // and, crucially, re-read `self.lspBridge` *inside the Task*
-        // after `pendingStartup` drains — when `stop()` lands before
-        // `startLSP()` has populated `self.lspBridge`, the synchronous
-        // snapshot is `nil` and the racing `startLSP()` will install a
-        // brand-new bridge after our sync clear. Without the post-drain
-        // re-read that freshly-built `LSPService`, every child language
-        // server process, and the FSEvents watches would leak.
+        // Race-safety: callers polling `lspBridge` right after `stop()`
+        // observe a cleared state, and a follow-up `start(B)` landing
+        // before the teardown Task wakes must NOT have its
+        // freshly-installed bridge clobbered. We achieve both by:
+        //
+        //   1. Snapshotting `pendingStartup` + `preStartupBridge` and
+        //      synchronously clearing `lspStartTask` / `lspBridge`.
+        //   2. Inside the Task: cancel + await the snapshotted startup
+        //      so any in-flight `startLSP()` finishes before we touch
+        //      its bridge, then unconditionally shut down
+        //      `preStartupBridge` (it belonged to us).
+        //   3. Identity-checking `self.lspStartTask` as the gate: if it
+        //      is still `nil`, no follow-up `start()` has landed and any
+        //      bridge that surfaced in `self.lspBridge` between the sync
+        //      clear and now is also ours (a late `startLSP()` racing
+        //      past the clear). If it is non-`nil`, a follow-up
+        //      `start(B)` has taken over and the bridge in
+        //      `self.lspBridge` belongs to that new startup — we leave
+        //      it untouched. The previous identity-agnostic re-read
+        //      would tear down `start(B)`'s bridge, leaving the server
+        //      in a state where `isRunning == true` yet every `lsp_*`
+        //      tool returned "LSP bridge is not started".
         let pendingStartup = lspStartTask
-        let pendingBridge = lspBridge
+        let preStartupBridge = lspBridge
         self.lspStartTask = nil
         self.lspBridge = nil
         Task { @MainActor in
             pendingStartup?.cancel()
             _ = await pendingStartup?.value
-            // Re-read after the startup Task has drained. If
-            // `startLSP()` raced our sync clear it will have installed
-            // a new bridge into `self.lspBridge`; clear it again here
-            // and tear it down. `!==` dedup avoids shutting the same
-            // bridge twice when `pendingBridge` and the post-drain
-            // read point at the same instance (the common case when
-            // `startLSP()` had completed before `stop()` ran).
-            let postStartupBridge = self.lspBridge
-            self.lspBridge = nil
-            if let postStartupBridge, postStartupBridge !== pendingBridge {
-                await postStartupBridge.service.shutdownAll()
+
+            // Shut down the bridge that this `stop()` owns. Always
+            // safe — `preStartupBridge` was the live bridge at the
+            // moment of the sync clear, and no later code path
+            // reinstates it.
+            await preStartupBridge?.service.shutdownAll()
+
+            // Identity gate. A non-nil `lspStartTask` means a
+            // follow-up `start(B)` already took over since our sync
+            // clear; the bridge currently in `self.lspBridge` (if
+            // any) belongs to that new startup and must be left
+            // alone.
+            guard self.lspStartTask == nil else {
+                return
             }
-            await pendingBridge?.service.shutdownAll()
+
+            // No follow-up start landed. If a late `startLSP()`
+            // installed a bridge after our sync clear, it is ours to
+            // tear down. The `!==` guard short-circuits when
+            // `self.lspBridge` somehow points back at the same
+            // instance as `preStartupBridge` (already shut down
+            // above).
+            let postStartupBridge = self.lspBridge
+            if postStartupBridge !== preStartupBridge,
+               let bridge = postStartupBridge {
+                self.lspBridge = nil
+                await bridge.service.shutdownAll()
+            }
         }
     }
 

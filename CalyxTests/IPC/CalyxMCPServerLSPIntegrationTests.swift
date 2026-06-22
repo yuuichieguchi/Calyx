@@ -733,6 +733,116 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
         )
     }
 
+    // 15. `stop()` followed by an immediate `start(B)` must NOT let the
+    //     first stop's teardown Task tear down `start(B)`'s freshly
+    //     installed bridge.
+    //
+    //     Previously the post-drain re-read inside `stop()` was
+    //     identity-agnostic: after `await pendingStartup?.value` it would
+    //     read whatever was in `self.lspBridge`. With this sequence:
+    //
+    //       1. start(A) — installs startup_A in `lspStartTask` and
+    //          (eventually) bridge_A in `lspBridge`.
+    //       2. stop() — snapshots pendingStartup=startup_A,
+    //          pendingBridge=bridge_A, schedules teardown_1, returns.
+    //       3. start(B) — installs startup_B in `lspStartTask`. Its
+    //          `startLSP()` later installs bridge_B in `lspBridge`.
+    //       4. teardown_1 wakes up, re-reads `self.lspBridge`, sees
+    //          bridge_B, and calls `shutdownAll()` on it. start(B)'s
+    //          bridge dies; `isRunning == true` but every `lsp_*` tool
+    //          returns "LSP bridge is not started".
+    //
+    //     The fix uses `self.lspStartTask` as the identity gate. If a
+    //     follow-up `start(B)` set `lspStartTask` after the sync clear,
+    //     teardown_1 bails out without touching `self.lspBridge`. Only
+    //     the snapshotted `preStartupBridge` (= bridge_A) is shut down.
+    //
+    //     This test reproduces the race directly with the
+    //     `_testInjectLSPBridge` / `_testInjectLSPStartTask` hooks
+    //     instead of binding a real `NWListener` port.
+    func test_stopThenStart_doesNotTearDownNewBridge() async throws {
+        // ---- Phase 1: set up bridge_A + a completed startup_A. ----
+        let (bridgeA, _) = await makeBridge()
+        // Warm a session so the preStartupBridge cleanup has something
+        // observable to drain.
+        let warmedA = try await bridgeA.service.session(
+            for: workspace,
+            languageId: "typescript"
+        )
+        XCTAssertEqual(warmedA.workspaceRoot, workspace,
+                       "precondition: bridge_A must hold a session for the workspace")
+        let bridgeABefore = await bridgeA.service.currentSessions()
+        XCTAssertEqual(bridgeABefore.count, 1,
+                       "precondition: bridge_A must own exactly one cached session")
+        server._testInjectLSPBridge(bridgeA)
+        let startTaskA = Task<Void, Never> {}
+        await startTaskA.value
+        server._testInjectLSPStartTask(startTaskA)
+
+        // ---- Phase 2: stop() schedules teardown_1 against bridge_A. ----
+        server.stop()
+        XCTAssertNil(
+            server.lspBridge,
+            "sync stop() must clear lspBridge before teardown_1 fires"
+        )
+
+        // ---- Phase 3: simulate start(B) by installing a fresh bridge and
+        //               a still-in-flight startup task BEFORE teardown_1
+        //               has had a chance to wake up. The order of
+        //               operations matches what a real `start(token:)`
+        //               does: `lspStartTask` is set first, then its
+        //               `startLSP()` body eventually installs the bridge.
+        let (bridgeB, _) = await makeBridge()
+        let startTaskB = Task<Void, Never> {
+            // Long-running so `self.lspStartTask` is non-nil when
+            // teardown_1's identity guard executes. Cancelled at the
+            // end of the test so tearDown can exit cleanly.
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+        }
+        server._testInjectLSPStartTask(startTaskB)
+        server._testInjectLSPBridge(bridgeB)
+
+        // ---- Phase 4: wait for teardown_1 to actually run its
+        //               preStartupBridge cleanup. Observing bridge_A's
+        //               session cache drain proves teardown_1 has
+        //               progressed past `shutdownAll(preStartupBridge)`
+        //               and is now at (or past) the identity guard.
+        let drained = await waitUntil(timeout: 5.0) {
+            let infos = await bridgeA.service.currentSessions()
+            return infos.isEmpty
+        }
+        XCTAssertTrue(
+            drained,
+            "preStartupBridge cleanup inside teardown_1 must shut down bridge_A's session"
+        )
+
+        // Yield briefly so the synchronous guard + early-return after
+        // the async `shutdownAll` has finished executing on @MainActor.
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        // ---- Phase 5: bridge_B must survive. ----
+        XCTAssertNotNil(
+            server.lspBridge,
+            "teardown_1 from the prior stop() must not clobber the bridge installed by the racing start(B)"
+        )
+        XCTAssertTrue(
+            server.lspBridge === bridgeB,
+            "lspBridge must still be exactly bridge_B; teardown_1 should have bailed at the identity guard"
+        )
+        let bridgeBSessions = await bridgeB.service.currentSessions()
+        XCTAssertTrue(
+            bridgeBSessions.isEmpty,
+            "bridge_B was freshly built so its session cache should still be empty (no spurious shutdown happened either)"
+        )
+
+        // ---- Cleanup: release startTaskB so tearDown's server.stop()
+        //               does not block on a still-sleeping task. The
+        //               cancel propagates through the `try?` inside the
+        //               task body.
+        startTaskB.cancel()
+        server._testInjectLSPStartTask(nil)
+    }
+
     // 12. Calling an lsp_* tool before startLSP() / _testInjectLSPBridge
     //     surfaces a structured error rather than crashing.
     func test_calyxMCPServer_handleConnection_lspBridgeNotStarted_returnsError() async throws {
