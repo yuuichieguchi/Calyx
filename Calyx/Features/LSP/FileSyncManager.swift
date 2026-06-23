@@ -120,20 +120,34 @@ actor FileSyncManager {
     /// returns `MockFileSystemEventSource` instances.
     private let eventSourceFactory: @Sendable () -> any FileSystemEventSource
 
-    /// `workspaceRoot -> LSPSession` map of currently watched workspaces.
-    /// Strong reference; callers MUST call `unwatch(workspaceRoot:)` or
-    /// `stopAll()` to drop the session before tearing it down.
-    private var watchedRoots_: [URL: LSPSession] = [:]
+    /// Tri-state per-workspace slot:
+    /// - `.pending` is installed by the originating `watch(...)` call
+    ///   while the underlying `source.start(...)` is in flight, and is
+    ///   awaited by any concurrent `watch(...)` call landing on the same
+    ///   root so the second caller's session reference is never silently
+    ///   dropped. The associated `Task` returns the constructed source
+    ///   on success so a late caller that wins the actor reentry race can
+    ///   transition the slot to `.active` itself.
+    /// - `.active` carries the live source and the session that should
+    ///   receive routed events. Late-arrival LIFO semantics: when a peer
+    ///   call resumes and finds the slot already `.active`, it rewrites
+    ///   the session reference to its own.
+    private enum Slot {
+        case pending(Task<any FileSystemEventSource, Error>)
+        case active(source: any FileSystemEventSource, session: LSPSession)
+    }
 
-    /// `workspaceRoot -> FileSystemEventSource` map. One source per
-    /// watched workspace so two workspaces never compete for the single
-    /// FSEvents stream a `FSEventsEventSource` can host at a time.
-    private var eventSources: [URL: any FileSystemEventSource] = [:]
+    /// `workspaceRoot -> Slot` map. Replaces the previous two-dictionary
+    /// `watchedRoots_` + `eventSources` shape so the pending/active
+    /// transition is atomic under the actor.
+    private var slots: [URL: Slot] = [:]
 
-    /// Suppression counters keyed by path. `suppressNextEvent(at:)`
-    /// increments the counter and `handleEvents(_:workspaceRoot:)`
-    /// decrements it once per masked event for that path.
-    private var suppressedEvents: [URL: Int] = [:]
+    /// Suppression counters keyed by a canonical path string so the
+    /// `/tmp` vs `/private/tmp` symlink alias on macOS does not silently
+    /// bypass the echo guard. `suppressNextEvent(at:)` increments the
+    /// counter and `handleEvents(_:workspaceRoot:)` decrements it once
+    /// per masked event for that canonical path.
+    private var suppressedEvents: [String: Int] = [:]
 
     /// Monotonic version counter handed to `textDocument/didChange` and
     /// post-rename `textDocument/didOpen` payloads. LSP requires the
@@ -154,69 +168,183 @@ actor FileSyncManager {
     // MARK: - Introspection
 
     /// Snapshot of every workspace root currently registered with `watch`.
+    /// Includes both `.pending` and `.active` slots: callers that race a
+    /// concurrent watch see the root as in-flight before the source has
+    /// finished arming.
     func watchedRoots() -> [URL] {
-        Array(watchedRoots_.keys)
+        Array(slots.keys)
     }
 
     // MARK: - Lifecycle
 
     /// Register `workspaceRoot` for monitoring. Subsequent file-system
-    /// events under `workspaceRoot` are routed to `session`. Watching an
-    /// already-watched root is a no-op. Each watched workspace owns its
-    /// own `FileSystemEventSource` instance produced by the injected
-    /// factory.
+    /// events under `workspaceRoot` are routed to `session`. Each watched
+    /// workspace owns its own `FileSystemEventSource` instance produced
+    /// by the injected factory.
+    ///
+    /// Concurrency contract: if two `watch(...)` calls land on the same
+    /// root before the first finishes arming its source, the second call
+    /// awaits the in-flight start (via a `.pending` slot tagged with the
+    /// originator's Task) and then overrides the slot's session reference
+    /// with its own. LIFO wins — events go to the *latest* caller's
+    /// session — but no caller's session is silently dropped.
     func watch(workspaceRoot: URL, session: LSPSession) async throws {
-        if watchedRoots_[workspaceRoot] != nil {
-            return
-        }
-        watchedRoots_[workspaceRoot] = session
-        let source = eventSourceFactory()
-        eventSources[workspaceRoot] = source
-        do {
-            try await source.start(at: workspaceRoot) { [weak self] events in
-                guard let self else { return }
-                await self.handleEvents(events, workspaceRoot: workspaceRoot)
+        while true {
+            switch slots[workspaceRoot] {
+            case .some(.pending(let task)):
+                // A peer call is still arming the source. Wait for it to
+                // settle, then either piggy-back on the active slot or
+                // promote the slot ourselves with the source returned by
+                // the pending task.
+                let source: any FileSystemEventSource
+                do {
+                    source = try await task.value
+                } catch {
+                    // The originator's start threw. Help clear the slot
+                    // if it still references the failed task so the next
+                    // iteration enters the fresh-install path instead of
+                    // awaiting the same failed task forever.
+                    if case .some(.pending(let stored)) = slots[workspaceRoot],
+                       stored == task {
+                        slots[workspaceRoot] = nil
+                    }
+                    continue
+                }
+                switch slots[workspaceRoot] {
+                case .some(.active(let activeSource, _)):
+                    // The originator (or another late caller) already
+                    // promoted. Overwrite the session reference so events
+                    // route to the most recent caller.
+                    slots[workspaceRoot] = .active(
+                        source: activeSource,
+                        session: session
+                    )
+                    return
+                case .some(.pending(let stored)) where stored == task:
+                    // We reached the actor before the originator's
+                    // post-await transition. Take responsibility for
+                    // promoting using the source returned by the pending
+                    // task.
+                    slots[workspaceRoot] = .active(
+                        source: source,
+                        session: session
+                    )
+                    return
+                default:
+                    // Slot was cleared (unwatch) or replaced with a
+                    // different pending task; loop to re-evaluate.
+                    continue
+                }
+
+            case .some(.active):
+                // Already-watched root: per existing `watch_alreadyWatching_isNoOp`
+                // semantics this is a no-op. Leave the slot unchanged so
+                // the original session continues to receive events.
+                return
+
+            case .none:
+                // Install a pending slot, drive the source's start
+                // through a Task so concurrent callers can observe and
+                // await it, then promote to active.
+                let source = eventSourceFactory()
+                let startTask = Task<any FileSystemEventSource, Error> {
+                    [weak self, source] in
+                    try await source.start(at: workspaceRoot) { [weak self] events in
+                        guard let self else { return }
+                        await self.handleEvents(events, workspaceRoot: workspaceRoot)
+                    }
+                    return source
+                }
+                slots[workspaceRoot] = .pending(startTask)
+                do {
+                    let resolvedSource = try await startTask.value
+                    switch slots[workspaceRoot] {
+                    case .some(.pending(let stored)) where stored == startTask:
+                        slots[workspaceRoot] = .active(
+                            source: resolvedSource,
+                            session: session
+                        )
+                    case .some(.active):
+                        // A late caller already promoted with their own
+                        // session; respect their choice (LIFO).
+                        break
+                    default:
+                        // Slot vanished (unwatch raced in) or now points
+                        // at a different pending task; leave as-is.
+                        break
+                    }
+                    return
+                } catch {
+                    // Roll back bookkeeping so a retry can succeed;
+                    // propagate the failure to the caller (no silent
+                    // fallback).
+                    if case .some(.pending(let stored)) = slots[workspaceRoot],
+                       stored == startTask {
+                        slots[workspaceRoot] = nil
+                    }
+                    throw error
+                }
             }
-        } catch {
-            // Roll back bookkeeping so a retry can succeed; propagate the
-            // failure to the caller (no silent fallback).
-            watchedRoots_[workspaceRoot] = nil
-            eventSources[workspaceRoot] = nil
-            throw error
         }
     }
 
     /// Stop monitoring `workspaceRoot`. Unwatching an unknown root is a
     /// no-op. The per-workspace `FileSystemEventSource` is stopped and
-    /// released; other watched roots remain unaffected.
+    /// released; other watched roots remain unaffected. If the slot is
+    /// still `.pending`, the pending Task is cancelled and awaited before
+    /// returning so the caller observes a fully torn-down slot.
     func unwatch(workspaceRoot: URL) async {
-        guard watchedRoots_[workspaceRoot] != nil else { return }
-        watchedRoots_[workspaceRoot] = nil
-        if let source = eventSources.removeValue(forKey: workspaceRoot) {
+        guard let slot = slots.removeValue(forKey: workspaceRoot) else { return }
+        switch slot {
+        case .pending(let task):
+            task.cancel()
+            _ = try? await task.value
+        case .active(let source, _):
             await source.stop()
         }
     }
 
     /// Drop every watched root, clear pending suppressions, and stop the
-    /// per-workspace event sources.
+    /// per-workspace event sources. Pending Tasks are cancelled and
+    /// awaited so the caller observes a fully drained manager.
     func stopAll() async {
-        watchedRoots_.removeAll()
+        let allSlots = slots
+        slots.removeAll()
         suppressedEvents.removeAll()
-        let sources = Array(eventSources.values)
-        eventSources.removeAll()
-        for source in sources {
-            await source.stop()
+        for (_, slot) in allSlots {
+            switch slot {
+            case .pending(let task):
+                task.cancel()
+                _ = try? await task.value
+            case .active(let source, _):
+                await source.stop()
+            }
         }
     }
 
     /// Mask exactly one subsequent event for `path`. Calling this N times
     /// masks the next N events. Used by Calyx-side writers to avoid
     /// FSEvents echoes feeding back into LSP traffic.
+    ///
+    /// Keyed by canonical path so `/tmp/foo` (writer-side spelling) and
+    /// `/private/tmp/foo` (FSEvents-canonical spelling on macOS) collapse
+    /// to a single suppression slot — they refer to the same file via the
+    /// `/tmp -> /private/tmp` symlink and must not bypass the echo guard.
     func suppressNextEvent(at path: URL) {
-        suppressedEvents[path, default: 0] += 1
+        let key = Self.suppressionKey(for: path)
+        suppressedEvents[key, default: 0] += 1
     }
 
     // MARK: - Event handling
+
+    /// Canonicalise `path` to a single string key. Resolving symlinks
+    /// collapses the `/tmp` alias, and `standardizedFileURL` removes
+    /// `.` / `..` segments. Both steps are deterministic, so a writer-side
+    /// install and an FSEvents-side consume yield the same key for the
+    /// same underlying file.
+    private static func suppressionKey(for path: URL) -> String {
+        return path.resolvingSymlinksInPath().standardizedFileURL.path
+    }
 
     private func nextVersion() -> Int {
         versionCounter += 1
@@ -226,13 +354,14 @@ actor FileSyncManager {
     /// Returns `true` and decrements the suppression counter when an
     /// event for `path` should be masked; returns `false` otherwise.
     private func consumeSuppression(at path: URL) -> Bool {
-        guard let count = suppressedEvents[path], count > 0 else {
+        let key = Self.suppressionKey(for: path)
+        guard let count = suppressedEvents[key], count > 0 else {
             return false
         }
         if count == 1 {
-            suppressedEvents[path] = nil
+            suppressedEvents[key] = nil
         } else {
-            suppressedEvents[path] = count - 1
+            suppressedEvents[key] = count - 1
         }
         return true
     }
@@ -241,7 +370,9 @@ actor FileSyncManager {
         _ events: [FileSystemEvent],
         workspaceRoot: URL
     ) async {
-        guard let session = watchedRoots_[workspaceRoot] else { return }
+        guard case .some(.active(_, let session)) = slots[workspaceRoot] else {
+            return
+        }
         for event in events {
             if consumeSuppression(at: event.path) {
                 continue
@@ -263,9 +394,14 @@ actor FileSyncManager {
 
         case .modified:
             if isOpen {
-                guard let text = try? String(contentsOf: event.path, encoding: .utf8) else {
-                    return
+                // Read the full document contents off-actor so a large
+                // file (or a slow network volume) does not stall every
+                // other manager operation behind a synchronous read.
+                let path = event.path
+                let readTask = Task.detached {
+                    return try? String(contentsOf: path, encoding: .utf8)
                 }
+                guard let text = await readTask.value else { return }
                 try? await session.didChange(
                     uri: uri,
                     version: nextVersion(),
@@ -291,7 +427,17 @@ actor FileSyncManager {
 
         case .renamed(let toURL):
             let toUri = toURL.absoluteString
-            if isOpen {
+            // FSEvents emits a single Renamed event for a touched path
+            // with no companion target, so `FSEventsEventSource` synthesises
+            // `.renamed(to: url)` where source equals destination. Issuing
+            // `didClose(uri) + didOpen(uri)` for the same URI is a wire-
+            // level malformation strict servers reject; only emit the
+            // close/open pair for a true rename where source and
+            // destination URIs differ. For self-rename we still surface
+            // the structural change to the server via watched-files
+            // (Deleted + Created) but skip the textDocument churn.
+            let isSelfRename = (toUri == uri)
+            if isOpen && !isSelfRename {
                 try? await session.didClose(uri: uri)
                 if let text = try? String(contentsOf: toURL, encoding: .utf8) {
                     try? await session.didOpen(
@@ -433,7 +579,30 @@ final class FSEventsEventSource: FileSystemEventSource, @unchecked Sendable {
             state.continuation = continuation
             state.consumerTask = consumerTask
         }
-        _ = FSEventStreamStart(s)
+        guard FSEventStreamStart(s) else {
+            // `FSEventStreamStart` returns false on process/resource
+            // failure (e.g. event-stream limit exhausted). The previous
+            // implementation discarded the return value and published a
+            // "live" state record regardless, so the caller was told the
+            // watch was up while no callbacks ever fired. Tear down the
+            // bookkeeping we just published, release the stream pointer,
+            // and propagate the failure to the caller so a retry can
+            // succeed.
+            state.withLock { state in
+                state.stream = nil
+                state.continuation = nil
+                state.consumerTask = nil
+            }
+            FSEventStreamInvalidate(s)
+            FSEventStreamRelease(s)
+            continuation.finish()
+            _ = await consumerTask.value
+            throw NSError(
+                domain: "FSEventsEventSource",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "FSEventStreamStart returned false"]
+            )
+        }
     }
 
     func stop() async {

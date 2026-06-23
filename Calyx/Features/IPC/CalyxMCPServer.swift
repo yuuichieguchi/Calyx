@@ -27,6 +27,27 @@ final class CalyxMCPServer {
     /// `startLSP()` (or `_testInjectLSPBridge(_:)`) wires one in.
     private(set) var lspBridge: MCPLSPBridge?
 
+    /// Count of teardown Tasks that are currently in flight — i.e.,
+    /// scheduled by `stop()` but not yet returned. Race-safety tests
+    /// observe this to confirm that the new LSP startup scheduled by
+    /// `start()` has fully waited for the prior bridge teardown before
+    /// running its body. Without that chain, the previous (cancelled
+    /// but still-executing) `lspStartTask` could race the new one to
+    /// install bridges into `self.lspBridge`, with the loser leaking
+    /// a fully-built `LSPService` plus its child language-server
+    /// processes.
+    private(set) var inflightTeardownCount: Int = 0
+
+    /// Snapshot of `inflightTeardownCount` recorded at the moment
+    /// `startLSP()` last began executing its body. Lifecycle race
+    /// tests assert this is `0` after a `start()` → `start()` toggle to
+    /// confirm the new LSP startup chained behind — and waited for —
+    /// the prior teardown. Defaults to `-1` so a test can distinguish
+    /// "startLSP() has never been entered" from "entered with no
+    /// teardown in flight". Internal access so XCTest with
+    /// `@testable import` can read it.
+    private(set) var inflightTeardownCountAtLastStartLSPEntry: Int = -1
+
     // MARK: - Private
 
     private var listener: NWListener?
@@ -59,6 +80,14 @@ final class CalyxMCPServer {
     /// system command runner. Idempotent — re-entry replaces the existing
     /// bridge with a fresh one.
     func startLSP() async {
+        // Test-observable probe: race-safety tests use this to confirm
+        // that the new LSP startup did not begin its body until the
+        // prior teardown drained. With the chain fix in `start()` this
+        // is `0`; without it, this can be non-zero because the new
+        // `lspStartTask` ran on `@MainActor` while the prior teardown
+        // Task was still in flight (suspended in `shutdownAll`).
+        self.inflightTeardownCountAtLastStartLSPEntry = self.inflightTeardownCount
+
         // Defensive teardown of any prior bridge so re-entry replaces it
         // cleanly. In the normal `start()` -> `stop()` -> `start()` flow
         // `stop()` already nils `lspBridge`, but tests that drive
@@ -125,10 +154,38 @@ final class CalyxMCPServer {
         self.lspStartTask = task
     }
 
+    /// For testing only — read the current `lspStartTask` reference so
+    /// race-safety tests can `await` its `.value` and observe the new
+    /// startup body completing. Returns `nil` between `stop()` (which
+    /// clears the slot synchronously) and the next `start()` /
+    /// `_testInjectLSPStartTask` call.
+    func _testCurrentLSPStartTask() -> Task<Void, Never>? {
+        self.lspStartTask
+    }
+
     // MARK: - Lifecycle
 
     func start(token: String, preferredPort: Int = 41830) throws {
-        if isRunning { stop() }
+        // Capture the teardown Task scheduled by the prior `stop()` so
+        // the new LSP startup can wait for it before installing a fresh
+        // bridge. Without this chain the new `lspStartTask` and the
+        // prior teardown would both be live on `@MainActor`: the prior
+        // teardown's `await pendingStartup?.value` and
+        // `await preStartupBridge.shutdownAll()` are suspension points,
+        // during which `@MainActor` happily schedules the freshly
+        // enqueued `lspStartTask` body. The two `lspStartTask`s end up
+        // racing to install bridges into `self.lspBridge`, and the
+        // loser leaks a fully-built `LSPService` plus its child
+        // language-server processes and `FSEvents` watches.
+        //
+        // `stop()` synchronously clears `isRunning` / `listener` /
+        // `lspBridge` / `lspStartTask` and returns the teardown Task
+        // that completes the async portion. Chaining the new
+        // `lspStartTask` body off `await priorTeardown.value` makes the
+        // ordering explicit: the new `startLSP()` body runs only after
+        // the prior teardown has finished its `shutdownAll` and
+        // identity check.
+        let priorTeardown: Task<Void, Never>? = isRunning ? stop() : nil
 
         self.token = token
 
@@ -160,8 +217,16 @@ final class CalyxMCPServer {
                     self.appPeerID = peer.id
                 }
                 // Retain the LSP startup task so `stop()` can cancel + await
-                // it before tearing down the resulting bridge.
+                // it before tearing down the resulting bridge. The body
+                // first awaits the prior teardown (if any) so the new
+                // `startLSP()` install never races a previous bridge
+                // shutdown — see the comment above the `priorTeardown`
+                // capture for the leak this guards against.
                 self.lspStartTask = Task { @MainActor in
+                    if let priorTeardown {
+                        await priorTeardown.value
+                    }
+                    if Task.isCancelled { return }
                     await self.startLSP()
                 }
                 return
@@ -181,7 +246,8 @@ final class CalyxMCPServer {
         )
     }
 
-    func stop() {
+    @discardableResult
+    func stop() -> Task<Void, Never> {
         listener?.cancel()
         listener = nil
         isRunning = false
@@ -200,6 +266,15 @@ final class CalyxMCPServer {
         // — if any — gets cancelled and awaited before we ask its
         // bridge to release every child LSP process and `FSEvents`
         // watch.
+        //
+        // The teardown Task is returned to the caller so a follow-up
+        // `start()` can chain its new `lspStartTask` body off
+        // `await teardown.value` — closing the race where the new
+        // startup body would otherwise run on `@MainActor` while this
+        // teardown was still suspended in `shutdownAll`, allowing both
+        // `lspStartTask`s to race to install bridges. `stopAndWait()`
+        // also uses the return value to drain teardown synchronously
+        // from async contexts.
         //
         // Race-safety: callers polling `lspBridge` right after `stop()`
         // observe a cleared state, and a follow-up `start(B)` landing
@@ -227,7 +302,10 @@ final class CalyxMCPServer {
         let preStartupBridge = lspBridge
         self.lspStartTask = nil
         self.lspBridge = nil
-        Task { @MainActor in
+        self.inflightTeardownCount += 1
+        let teardown = Task { @MainActor in
+            defer { self.inflightTeardownCount -= 1 }
+
             pendingStartup?.cancel()
             _ = await pendingStartup?.value
 
@@ -259,6 +337,17 @@ final class CalyxMCPServer {
                 await bridge.service.shutdownAll()
             }
         }
+        return teardown
+    }
+
+    /// Async variant of `stop()` that awaits the teardown Task to
+    /// completion before returning. Use this from async contexts — most
+    /// importantly any caller racing a follow-up `start()` — where the
+    /// new code path must not run until the prior bridge teardown has
+    /// fully drained.
+    func stopAndWait() async {
+        let teardown = stop()
+        await teardown.value
     }
 
     /// Ensures the app peer is registered before proceeding.

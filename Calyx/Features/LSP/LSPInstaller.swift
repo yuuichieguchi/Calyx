@@ -15,9 +15,32 @@
 //      tracking are isolated to its actor context. Concurrent calls for
 //      the same languageId share the in-flight `Task`, so the install
 //      command runs exactly once even under fan-out.
-//    - The command string in the registry is a whitespace-split shell
-//      one-liner. The registry never uses quoted args (we control the
-//      table), so a plain `split(separator: " ")` is sufficient.
+//    - Concurrent calls for *different* languageIds that share the
+//      same prerequisite (e.g. typescript + python both bootstrap `npm`
+//      via `brew install node`) share a single prerequisite `Task`
+//      keyed by the prerequisite's executable name so the shared
+//      install command runs exactly once across the fan-out.
+//    - Registry command strings are passed through `/bin/sh -c` when
+//      they contain shell metacharacters (pipes, redirects, quoting,
+//      env interpolation, glob, etc.) so the shell can perform
+//      pipeline + quote handling. Plain whitespace-only commands are
+//      `exec`'d directly so the runner sees the binary it actually
+//      invokes — both forms route through the same `runRegistryCommand`
+//      helper for consistency.
+//    - When `LSPSettings.autoInstallEnabled` is `false`, `install(...)`
+//      short-circuits with an explicit "auto-install disabled in
+//      Settings" failure before any task is dispatched. This avoids
+//      the legacy behaviour where the deprecated
+//      `LSPSettings.confirmationMode(...)` bridge mapped the disabled
+//      state onto a rejecting handler and surfaced the misleading
+//      `"user declined: ..."` reason even though no user ever saw a
+//      prompt.
+//    - When the registry entry's `installation.safeToAutoRun` is
+//      `false` and the caller requested `.silent`, both the main
+//      install and any prerequisite install refuse to run and surface
+//      an explicit consent-required failure. This protects unattended
+//      callers (e.g. the MCP bridge) from triggering interactive OS
+//      dialogs such as `xcode-select --install`.
 //    - Failures propagate as `LSPInstallStatus.failed(reason:)`; the
 //      installer never silently swallows errors mid-step.
 //
@@ -191,6 +214,13 @@ actor LSPInstaller {
     /// In-flight installs, keyed by languageId. Used for dedup.
     private var inProgressTasks: [String: Task<LSPInstallStatus, Never>] = [:]
 
+    /// In-flight prerequisite installs, keyed by the prerequisite's
+    /// executable name. Lets concurrent `install(...)` calls for
+    /// *different* languageIds share a single `Task` for a shared
+    /// prerequisite (e.g. typescript + python both need `npm` and
+    /// bootstrap it via `brew install node`).
+    private var prereqInProgress: [String: Task<Bool, Never>] = [:]
+
     // MARK: Init
 
     init(registry: LSPServerRegistry, runner: any LSPCommandRunner) {
@@ -215,9 +245,45 @@ actor LSPInstaller {
             )
         }
 
-        let detectedPath = await runner.locate(entry.executable)
+        // Consult the entry's declared installation probe rather than
+        // assuming the launch executable is always the right marker.
+        // Some entries (notably Swift / `xcrun`) need a richer probe
+        // because the launch executable is a wrapper that ships
+        // unconditionally with the OS.
+        let detectedPath: URL?
+        let isInstalled: Bool
+        switch entry.installationCheck {
+        case .which(let name):
+            let url = await runner.locate(name)
+            detectedPath = url
+            isInstalled = url != nil
+        case .command(let exe, let args, let expectExit0):
+            // Gate the command probe on the wrapper executable
+            // existing on PATH; otherwise we can't run it at all.
+            let url = await runner.locate(exe)
+            if url == nil {
+                detectedPath = nil
+                isInstalled = false
+            } else {
+                let result = try? await runner.run(
+                    executable: exe,
+                    arguments: args,
+                    workingDirectory: nil,
+                    environment: nil
+                )
+                if let result {
+                    let matches = (result.exitCode == 0) == expectExit0
+                    isInstalled = matches
+                    detectedPath = matches ? url : nil
+                } else {
+                    isInstalled = false
+                    detectedPath = nil
+                }
+            }
+        }
+
         var detectedVersion: String? = nil
-        if detectedPath != nil, let versionArgs = entry.versionArguments {
+        if isInstalled, let versionArgs = entry.versionArguments {
             // Best-effort version probe. A failure here only means we
             // can't show a version string; it does not affect the
             // installed-ness verdict.
@@ -240,7 +306,7 @@ actor LSPInstaller {
 
         return InstallationCheck(
             languageId: entry.languageId,
-            isInstalled: detectedPath != nil,
+            isInstalled: isInstalled,
             detectedPath: detectedPath,
             detectedVersion: detectedVersion,
             prerequisiteStatuses: prereqStatuses
@@ -259,11 +325,27 @@ actor LSPInstaller {
 
     /// Installs the server for `languageId`. Concurrent calls for the
     /// same languageId share a single in-flight task.
+    ///
+    /// When `LSPSettings.autoInstallEnabled` is `false`, the install
+    /// short-circuits with an explicit "auto-install disabled in
+    /// Settings" failure *before* any task is dispatched. This avoids
+    /// the misleading `"user declined: ..."` reason the deprecated
+    /// `LSPSettings.confirmationMode(...)` bridge used to produce when
+    /// the master switch was off.
     func install(
         languageId: String,
         approvePrerequisites: Bool,
         confirmationMode: ConfirmationMode
     ) async -> LSPInstallStatus {
+        if !LSPSettings.autoInstallEnabled {
+            let status = LSPInstallStatus.failed(
+                reason: "auto-install disabled in Settings "
+                    + "(LSP Proxy → Auto-install language servers)"
+            )
+            statuses[languageId] = status
+            return status
+        }
+
         if let existing = inProgressTasks[languageId] {
             return await existing.value
         }
@@ -315,7 +397,23 @@ actor LSPInstaller {
                     return status
                 }
 
-                let (prereqExe, prereqArgs) = splitShell(installCommand)
+                // Per-prerequisite safeToAutoRun gate. `LSPPrerequisite`
+                // does not (yet) carry its own `safeToAutoRun` flag, so
+                // we default the gate to the entry-level value — a
+                // language whose main install is unsafe to auto-run
+                // (e.g. swift / xcode-select) should not have its
+                // prerequisites auto-run either.
+                if !entry.installation.safeToAutoRun,
+                   case .silent = confirmationMode {
+                    let status = LSPInstallStatus.failed(
+                        reason: "\(entry.displayName) prerequisite \(prereq.executable) "
+                            + "install requires explicit user consent "
+                            + "(safeToAutoRun=false; set Confirm before each install step)"
+                    )
+                    statuses[languageId] = status
+                    return status
+                }
+
                 let step = "Install prerequisite \(prereq.executable) via \(installCommand)"
                 statuses[languageId] = .inProgress(step: step)
 
@@ -328,23 +426,13 @@ actor LSPInstaller {
                     }
                 }
 
-                do {
-                    let result = try await runner.run(
-                        executable: prereqExe,
-                        arguments: prereqArgs,
-                        workingDirectory: nil,
-                        environment: nil
-                    )
-                    if result.exitCode != 0 {
-                        let status = LSPInstallStatus.failed(
-                            reason: "prerequisite \(prereq.executable) failed: exit \(result.exitCode) \(result.stderr)"
-                        )
-                        statuses[languageId] = status
-                        return status
-                    }
-                } catch {
+                let success = await runPrerequisiteDeduped(
+                    executableName: prereq.executable,
+                    command: installCommand
+                )
+                if !success {
                     let status = LSPInstallStatus.failed(
-                        reason: "command failed: \(error)"
+                        reason: "prerequisite \(prereq.executable) install failed"
                     )
                     statuses[languageId] = status
                     return status
@@ -352,8 +440,22 @@ actor LSPInstaller {
             }
         }
 
-        // 2. Main install command
-        let (mainExe, mainArgs) = splitShell(entry.installation.command)
+        // 2. safeToAutoRun gate for the main install in silent mode.
+        //    The registry pins `safeToAutoRun = false` for entries whose
+        //    install command shows an interactive prompt (e.g. swift's
+        //    `xcode-select --install` opens a macOS GUI dialog). Silent
+        //    callers must not trigger those dialogs without user
+        //    consent.
+        if !entry.installation.safeToAutoRun, case .silent = confirmationMode {
+            let status = LSPInstallStatus.failed(
+                reason: "\(entry.displayName) install requires explicit user consent "
+                    + "(safeToAutoRun=false; set Confirm before each install step)"
+            )
+            statuses[languageId] = status
+            return status
+        }
+
+        // 3. Main install command
         let step = "Install \(entry.displayName) via \(entry.installation.command)"
         statuses[languageId] = .inProgress(step: step)
 
@@ -367,12 +469,7 @@ actor LSPInstaller {
         }
 
         do {
-            let result = try await runner.run(
-                executable: mainExe,
-                arguments: mainArgs,
-                workingDirectory: nil,
-                environment: nil
-            )
+            let result = try await runRegistryCommand(entry.installation.command)
             if result.exitCode != 0 {
                 let status = LSPInstallStatus.failed(
                     reason: "install \(entry.displayName) failed: exit \(result.exitCode) \(result.stderr)"
@@ -390,11 +487,111 @@ actor LSPInstaller {
         return .completed
     }
 
-    /// Whitespace-only split of a shell one-liner into `(executable, args)`.
-    /// The registry table never uses quoted args, so this is sufficient.
+    // MARK: - Command execution helpers
+
+    /// Runs a registry command string against `runner`. Commands that
+    /// contain shell metacharacters (pipes, redirects, quoting, env
+    /// interpolation, glob, etc.) are routed through `/bin/sh -c` so
+    /// the shell can perform pipeline + quote handling. Plain
+    /// whitespace-only commands are exec'd directly so the runner sees
+    /// the binary it actually invokes — this matters because
+    /// `MockCommandRunner` keys its enqueued results by executable name,
+    /// and direct registry tests (e.g. `npm install -g …`) assert that
+    /// the registry's own argv appears in `runner.history()`.
+    private func runRegistryCommand(_ command: String) async throws -> CommandResult {
+        if Self.commandNeedsShell(command) {
+            return try await runner.run(
+                executable: "/bin/sh",
+                arguments: ["-c", command],
+                workingDirectory: nil,
+                environment: nil
+            )
+        }
+        let (exe, args) = splitShell(command)
+        return try await runner.run(
+            executable: exe,
+            arguments: args,
+            workingDirectory: nil,
+            environment: nil
+        )
+    }
+
+    /// Dedup-by-executable-name wrapper around `runRegistryCommand`.
+    /// Concurrent prerequisite installs that target the same executable
+    /// share a single `Task` — the second caller awaits the first
+    /// caller's outcome instead of dispatching a duplicate run. Returns
+    /// `true` on exit-code 0; `false` on any non-zero exit or a thrown
+    /// runner error.
+    private func runPrerequisiteDeduped(
+        executableName: String,
+        command: String
+    ) async -> Bool {
+        if let inFlight = prereqInProgress[executableName] {
+            return await inFlight.value
+        }
+
+        // Capture the runner locally — `Task { ... }` does not inherit
+        // actor isolation, so we cannot touch `self` from inside the
+        // task body. The runner protocol is `Sendable`.
+        let capturedRunner = runner
+        let task = Task<Bool, Never> {
+            do {
+                let result: CommandResult
+                if Self.commandNeedsShell(command) {
+                    result = try await capturedRunner.run(
+                        executable: "/bin/sh",
+                        arguments: ["-c", command],
+                        workingDirectory: nil,
+                        environment: nil
+                    )
+                } else {
+                    let parts = command.split(separator: " ").map(String.init)
+                    guard let head = parts.first else { return false }
+                    result = try await capturedRunner.run(
+                        executable: head,
+                        arguments: Array(parts.dropFirst()),
+                        workingDirectory: nil,
+                        environment: nil
+                    )
+                }
+                return result.exitCode == 0
+            } catch {
+                return false
+            }
+        }
+        prereqInProgress[executableName] = task
+        let success = await task.value
+        // Only the original creator resumes here on the actor with the
+        // slot still pointing at our task; later peers that joined via
+        // `inFlight.value` returned above without touching the slot.
+        prereqInProgress[executableName] = nil
+        return success
+    }
+
+    /// True iff `command` contains characters that require a shell to
+    /// be interpreted correctly: pipes, redirects, command separators,
+    /// subshell parens, env interpolation, backticks, quoting, glob.
+    /// Used to decide whether to route a registry command through
+    /// `/bin/sh -c` or `exec` it directly.
+    private static func commandNeedsShell(_ command: String) -> Bool {
+        let metacharacters: Set<Character> = [
+            "|", "&", ";", "<", ">", "(", ")", "$", "`", "'", "\"", "*", "?", "\\",
+        ]
+        return command.contains(where: metacharacters.contains)
+    }
+
+    /// Whitespace-only split of a shell one-liner into
+    /// `(executable, arguments)`. Used for the simple-command path;
+    /// pipeline-bearing commands go through `/bin/sh -c` via
+    /// `runRegistryCommand` instead. Empty input is folded onto a
+    /// `/bin/sh -c ""` shape rather than crashing — production code
+    /// should never produce an empty command, but a defensive return
+    /// is preferable to a `precondition` trap.
     private func splitShell(_ shell: String) -> (executable: String, arguments: [String]) {
         let parts = shell.split(separator: " ").map(String.init)
-        precondition(!parts.isEmpty, "registry command must not be empty")
+        if parts.isEmpty {
+            return ("/bin/sh", ["-c", shell])
+        }
         return (parts[0], Array(parts.dropFirst()))
     }
 }

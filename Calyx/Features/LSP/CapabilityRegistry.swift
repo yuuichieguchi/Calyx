@@ -20,6 +20,9 @@
 //
 
 import Foundation
+import OSLog
+
+private let logger = Logger(subsystem: "com.calyx", category: "lsp.capability")
 
 /// Tracks the static `ServerCapabilities` from the `initialize` response
 /// together with the dynamic registrations applied via
@@ -170,16 +173,19 @@ actor CapabilityRegistry {
     private static func providerIsTruthy(_ provider: AnyCodable) -> Bool {
         // Fast path: encode to JSON and parse the top-level value.
         guard let data = try? JSONEncoder().encode(provider) else {
-            // Encoding failure on a value we constructed → treat as enabled,
-            // because the value exists. (This branch is not expected to be
-            // hit by any valid AnyCodable.)
-            return true
+            // Encoding failure means we cannot introspect the provider
+            // value. Default to disabled — silently advertising a
+            // capability the server may not actually serve causes
+            // downstream MCP tools to dispatch unsupported methods.
+            logger.error("providerIsTruthy: failed to introspect provider value, defaulting to false")
+            return false
         }
         guard let obj = try? JSONSerialization.jsonObject(
             with: data,
             options: [.fragmentsAllowed]
         ) else {
-            return true
+            logger.error("providerIsTruthy: failed to introspect provider value, defaulting to false")
+            return false
         }
         if let n = obj as? NSNumber {
             // JSONSerialization bridges JSON booleans to NSNumber with the

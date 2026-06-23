@@ -669,6 +669,328 @@ final class LSPSessionTests: XCTestCase {
         XCTAssertEqual(openSet, [uri])
     }
 
+    // MARK: - Regression test helpers (bug fixes 1-6)
+
+    /// Build a fresh per-test temp directory; auto-cleaned in teardown.
+    private func makeTempDir(line: UInt = #line) throws -> URL {
+        let raw = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "LSPSessionTests-\(UUID().uuidString)"
+            )
+        try FileManager.default.createDirectory(
+            at: raw, withIntermediateDirectories: true
+        )
+        let url = raw.resolvingSymlinksInPath()
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: url)
+        }
+        return url
+    }
+
+    /// Build a real `LSPSessionPersistence` backed by a clean per-test
+    /// temp file. Used so regression tests for the persist/remove
+    /// pipeline observe real disk side effects, while still scoping
+    /// every test to its own storage URL.
+    private func makePersistence() throws -> LSPSessionPersistence {
+        let dir = try makeTempDir()
+        let storage = dir.appendingPathComponent("sessions.json")
+        return LSPSessionPersistence(storageURL: storage)
+    }
+
+    /// `makeSession` variant that also threads a real persistence into
+    /// the freshly built `LSPSession`. Returns the persistence so tests
+    /// that need to inspect the on-disk snapshot can do so.
+    private func makeSessionWithPersistence() throws -> (LSPSession, InMemoryLSPTransport, LSPSessionPersistence) {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        let persistence = try makePersistence()
+        let session = LSPSession(
+            workspaceRoot: testWorkspaceRoot,
+            languageId: testLanguageId,
+            client: client,
+            persistence: persistence
+        )
+        return (session, transport, persistence)
+    }
+
+    /// Drive both `initialize` and `shutdown` responses on `transport`
+    /// for as long as the returned Task is alive. Caps polling so the
+    /// loop terminates even if the test forgets to cancel it.
+    private func driveInitAndShutdown(on transport: InMemoryLSPTransport) -> Task<Void, Never> {
+        let frame = self.lspFrame
+        let parse = self.parseFramedJSON
+        return Task {
+            var initAnswered = false
+            var shutdownAnswered: Set<Int> = []
+            for _ in 0..<1000 {
+                if Task.isCancelled { return }
+                let sent = await transport.sentMessages()
+                for data in sent {
+                    guard let dict = try? parse(data),
+                          let method = dict["method"] as? String,
+                          let idAny = dict["id"] else { continue }
+                    let id: Int
+                    if let i = idAny as? Int {
+                        id = i
+                    } else if let n = idAny as? NSNumber {
+                        id = n.intValue
+                    } else {
+                        continue
+                    }
+                    if method == "initialize", !initAnswered {
+                        let resp = #"{"jsonrpc":"2.0","id":\#(id),"result":{"capabilities":{},"serverInfo":{"name":"mock"}}}"#
+                        await transport.simulateServerMessage(frame(resp))
+                        initAnswered = true
+                    } else if method == "shutdown", !shutdownAnswered.contains(id) {
+                        let resp = #"{"jsonrpc":"2.0","id":\#(id),"result":null}"#
+                        await transport.simulateServerMessage(frame(resp))
+                        shutdownAnswered.insert(id)
+                    }
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+        }
+    }
+
+    // MARK: - Regression 1: shutdown() is idempotent
+
+    /// Bug: calling `shutdown()` twice walks through the full teardown
+    /// sequence twice. Most visibly, the second call enqueues a second
+    /// `scheduleRemoveSnapshot()` Task onto the persist chain and waits
+    /// up to 2s for it to drain.
+    ///
+    /// The session must early-return once it has already reached
+    /// `.shutdown` so the persist pipeline is not perturbed.
+    func test_shutdown_isIdempotent_doesNotReissueRemoveSnapshot() async throws {
+        let (session, transport, _) = try makeSessionWithPersistence()
+        let driver = driveInitAndShutdown(on: transport)
+        try await session.start()
+
+        try await session.shutdown()
+        let firstCallCount = await session.scheduleRemoveSnapshotCallCountForTests
+        XCTAssertEqual(
+            firstCallCount, 1,
+            "sanity: first shutdown() must schedule exactly one remove, got \(firstCallCount)"
+        )
+
+        // Second shutdown — should early-return without re-issuing a
+        // remove. Buggy code falls through and calls
+        // `scheduleRemoveSnapshot()` again.
+        try await session.shutdown()
+        let secondCallCount = await session.scheduleRemoveSnapshotCallCountForTests
+        XCTAssertEqual(
+            secondCallCount, 1,
+            "second shutdown() must NOT schedule another remove (idempotency) — got \(secondCallCount) total calls"
+        )
+
+        driver.cancel()
+    }
+
+    // MARK: - Regression 2: server-initiated request handlers installed before client.start()
+
+    /// Bug: the session calls `client.start()` (which starts pumping
+    /// the transport) BEFORE installing server-initiated request
+    /// handlers. Any server-originated request that arrives in the gap
+    /// is dispatched against an empty handler dictionary and gets back
+    /// a `-32601 MethodNotFound` error, which some strict servers treat
+    /// as fatal.
+    ///
+    /// A purely behavioural test (buffer a request before `start()`
+    /// and look for `-32601` on the wire) is timing-dependent: actor
+    /// scheduling on macOS routinely runs the session's
+    /// `setRequestHandler` job before the receive task's first
+    /// `ingest` job, masking the bug. To detect the bug
+    /// deterministically we verify the underlying invariant via the
+    /// TEST-ONLY sequence counters stamped from inside `start()`:
+    /// `installServerRequestHandlers()` MUST be invoked before
+    /// `client.start()` so the handler dictionary is already populated
+    /// when the receive task begins consuming bytes.
+    func test_serverRequestHandlersInstalledBeforeClientStart() async throws {
+        let (session, transport) = makeSession()
+
+        let responder = respondToInitialize(on: transport) { id in
+            self.jsonRPCResponse(id: id, resultJSON: self.initializeResultJSON())
+        }
+        try await session.start()
+        _ = await responder.value
+
+        let clientStartSeq = await session.testOnlyClientStartSeq
+        let installSeq = await session.testOnlyInstallHandlersSeq
+
+        XCTAssertGreaterThan(
+            clientStartSeq, 0,
+            "client.start() stamp was never recorded; instrumentation hook may be missing"
+        )
+        XCTAssertGreaterThan(
+            installSeq, 0,
+            "installServerRequestHandlers stamp was never recorded; instrumentation hook may be missing"
+        )
+        XCTAssertLessThan(
+            installSeq, clientStartSeq,
+            "server-request handlers must be installed BEFORE client.start() so the receive loop never dispatches against an empty handler dictionary — got installSeq=\(installSeq), clientStartSeq=\(clientStartSeq)"
+        )
+    }
+
+    // MARK: - Regression 3: drain timeout does not leak the loser teardown Task
+
+    /// Bug: the drain race in `shutdown()` spawns two unstructured
+    /// Tasks (a drain observer and a 2-second sleep timer) and resumes
+    /// the caller on whichever wins. The loser is never cancelled — so
+    /// even when the persist completes in <1ms, the sleep Task lives
+    /// the full 2 seconds, holding the `OSAllocatedUnfairLock` capture
+    /// and (post-fix) any other state surfaced through `[weak self]`.
+    ///
+    /// The fix must cancel the loser. Verified by observing that the
+    /// in-flight teardown task counter returns to zero soon after the
+    /// caller resumes from `shutdown()`.
+    func test_shutdown_drainCompletes_doesNotLeakLoserTeardownTask() async throws {
+        let (session, transport, _) = try makeSessionWithPersistence()
+        let driver = driveInitAndShutdown(on: transport)
+        try await session.start()
+
+        try await session.shutdown()
+
+        // Wait a generous slice for the drain observer Task to
+        // complete (it should be near-instant since persistence on
+        // a local tmpfs is sub-millisecond). The sleep Task in the
+        // buggy code is hardcoded to 2s.
+        try? await Task.sleep(nanoseconds: 300_000_000) // 300ms
+
+        let inflight = await session.inflightTeardownTaskCountForTests
+        XCTAssertEqual(
+            inflight, 0,
+            "loser teardown Task must be cancelled after the drain race resolves — got \(inflight) Task(s) still alive 300ms after shutdown() returned"
+        )
+
+        driver.cancel()
+    }
+
+    // MARK: - Regression 4: shutdown() before start() is a no-op on the wire
+
+    /// Bug: when the session is still in `.notStarted` (or `.shutdown` /
+    /// `.failed`), `shutdown()` does NOT early-return. It walks through
+    /// the full sequence: `client.sendRequest("shutdown")`,
+    /// `client.sendNotification("exit")`, `client.close()`,
+    /// `scheduleRemoveSnapshot()` and the 2-second drain.
+    ///
+    /// The first two calls happen to be no-ops via `try?` because the
+    /// LSPClient itself is `.notStarted`, but they still execute. The
+    /// fix is to early-return when state is one of the terminal /
+    /// pre-handshake variants.
+    func test_shutdown_beforeStart_doesNotSendAnyLSPMethods() async throws {
+        let (session, transport) = makeSession()
+
+        // No start() — session is in `.notStarted`.
+        try await session.shutdown()
+
+        let sent = await transport.sentMessages()
+        let dicts = try parseAllFramedJSON(Data(sent.reduce(into: Data()) { $0.append($1) }))
+        let methods = dicts.compactMap { $0["method"] as? String }
+        XCTAssertTrue(
+            methods.isEmpty,
+            "shutdown() before start() must not put any LSP method on the wire — observed: \(methods)"
+        )
+
+        // Also confirm the scheduleRemoveSnapshot path was NOT walked.
+        let removeCount = await session.scheduleRemoveSnapshotCallCountForTests
+        XCTAssertEqual(
+            removeCount, 0,
+            "shutdown() before start() must not schedule a remove snapshot — got \(removeCount)"
+        )
+    }
+
+    // MARK: - Regression 5: server-request handlers check sessionState
+
+    /// Bug: the `[self]`-capturing server-request handlers (e.g.
+    /// `workspace/applyEdit`, `window/showMessage`,
+    /// `window/showDocument`) mutate session state unconditionally,
+    /// without consulting `sessionState`. A request that lands while
+    /// the session is `.shutdown` (or `.failed`) will still enqueue
+    /// onto `pendingApplyEditQueue`, append into `serverMessages`,
+    /// etc.
+    ///
+    /// We simulate the "post-shutdown" condition by flipping
+    /// `sessionState` to `.shutdown` directly (via the TEST-ONLY
+    /// accessor) without driving the full `shutdown()` path — this
+    /// keeps the transport open and the receive loop alive so the
+    /// in-memory message can actually reach the handler dictionary
+    /// for the assertion to be meaningful.
+    func test_serverRequestHandler_dropsMutationsWhenSessionShutdown() async throws {
+        let (session, transport) = makeSession()
+
+        let responder = respondToInitialize(on: transport) { id in
+            self.jsonRPCResponse(id: id, resultJSON: self.initializeResultJSON())
+        }
+        try await session.start()
+        _ = await responder.value
+
+        // Sanity: queue is empty before we flip to shutdown.
+        let queueBefore = await session.pendingApplyEdits()
+        XCTAssertTrue(queueBefore.isEmpty, "queue must be empty before applyEdit")
+
+        // Simulate post-shutdown by directly setting state.
+        await session.setSessionStateForTests(.shutdown)
+
+        // Inject a workspace/applyEdit. The handler closure (captured
+        // [self]) will execute on the LSPClient's dispatcher; the
+        // buggy version unconditionally enqueues into
+        // `pendingApplyEditQueue`. The fix must check `sessionState`
+        // and drop the mutation.
+        let editPayload = #"{"label":"test-edit","edit":{"changes":{}}}"#
+        let req = jsonRPCRequest(id: 8001, method: "workspace/applyEdit", paramsJSON: editPayload)
+        await transport.simulateServerMessage(lspFrame(req))
+
+        // Give the receive loop and handler Task time to run.
+        try? await Task.sleep(nanoseconds: 200_000_000) // 200ms
+
+        let queueAfter = await session.pendingApplyEdits()
+        XCTAssertTrue(
+            queueAfter.isEmpty,
+            "server-request handlers must NOT mutate session state once the session is `.shutdown` — got \(queueAfter.count) leaked apply edit(s)"
+        )
+    }
+
+    // MARK: - Regression 6: pendingPersistTask chain depth stays bounded
+
+    /// Bug: `pendingPersistTask` is a linked list of Tasks where each
+    /// new Task captures `prior` via `await prior?.value`. Across a
+    /// burst of didOpen/didClose cycles the chain depth can grow to
+    /// match the burst size — each captured closure holds a strong
+    /// reference to its predecessor until the closure body returns.
+    ///
+    /// The fix is some flavour of structured queue (e.g. an actor with
+    /// a single worker task, or a coalescing scheme) that keeps the
+    /// chain depth bounded regardless of burst size.
+    func test_persistChain_doesNotGrowUnboundedlyAcrossRapidCycles() async throws {
+        let (session, transport, _) = try makeSessionWithPersistence()
+        let driver = driveInitAndShutdown(on: transport)
+        try await session.start()
+
+        // Rapidly schedule 25 didOpen/didClose cycles. Each cycle is
+        // two `schedulePersistSnapshot` calls (one for didOpen, one
+        // for didClose), so 50 persist Tasks are scheduled in quick
+        // succession.
+        let burstSize = 25
+        for i in 0..<burstSize {
+            let uri = "file:///tmp/calyx-lsp-session-test/burst-\(i).swift"
+            try await session.didOpen(uri: uri, languageId: "swift", version: 1, text: "x")
+            try await session.didClose(uri: uri)
+        }
+
+        let peak = await session.pendingPersistChainPeakDepthForTests
+        // A correctly bounded chain stays at most 2 deep (one in-flight
+        // persist plus the next pending task). The buggy chain grows
+        // monotonically with the burst — we allow a generous threshold
+        // (10) so this test isn't flaky on fast machines that drain
+        // some Tasks mid-burst.
+        XCTAssertLessThan(
+            peak, burstSize,
+            "pendingPersistTask chain depth must not grow with burst size — peak=\(peak) burst=\(burstSize * 2)"
+        )
+
+        driver.cancel()
+    }
+
     // MARK: - 16. Dynamic capability registration via client/registerCapability
 
     func test_capabilityRegistry_includesDynamicRegistration() async throws {

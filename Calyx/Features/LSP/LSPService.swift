@@ -211,12 +211,29 @@ final class LSPService {
             )
         }
 
-        let key = SessionKey(workspaceRoot: workspaceRoot, languageId: languageId)
+        // Canonicalize the workspace root so symlink-equivalent spellings
+        // (`/tmp/...` vs `/private/tmp/...` on macOS) collapse to the same
+        // cache key and therefore the same session.
+        let canonicalRoot = Self.canonicalizeWorkspaceRoot(workspaceRoot)
+        let key = SessionKey(workspaceRoot: canonicalRoot, languageId: languageId)
 
-        // 1. Warm cache hit — refresh LRU timestamp and return.
+        // 1. Warm cache hit. Inspect the session's state before handing
+        //    it back: a `.failed` (transport closed / server crashed) or
+        //    `.shutdown` session must NOT be reused. Evict via the normal
+        //    shutdown path and fall through to a fresh build.
         if let entry = sessions[key] {
-            entry.lastAccessed = Date()
-            return entry.session
+            let state = await entry.session.state()
+            switch state {
+            case .failed, .shutdown:
+                await shutdownSession(
+                    workspaceRoot: canonicalRoot,
+                    languageId: languageId
+                )
+                // Fall through to in-flight / new-build path below.
+            default:
+                entry.lastAccessed = Date()
+                return entry.session
+            }
         }
 
         // 2. Build already in flight for this key — share it.
@@ -225,9 +242,19 @@ final class LSPService {
         }
 
         // 3. Kick off a new build and remember the Task so concurrent
-        //    callers can join.
+        //    callers can join. We forward both the canonicalized cache
+        //    key AND the caller's original `workspaceRoot` spelling so
+        //    `buildSession` can hand the original URL to `LSPSession.init`.
+        //    The session embeds its own `workspaceRoot` into every
+        //    persisted snapshot, so propagating the canonical (trailing-
+        //    slash-stripped, symlink-resolved) form would make
+        //    `availableSnapshots()` return a URL that no longer compares
+        //    `==` against the caller's untransformed `workspaceRoot`.
+        //    Restoration consumers (and the wiring tests that pin this
+        //    invariant) compare URLs verbatim, so they must round-trip
+        //    the exact spelling they handed in.
         let task = Task<LSPSession, Error> { [self] in
-            try await self.buildSession(for: key)
+            try await self.buildSession(for: key, originalRoot: workspaceRoot)
         }
         inProgressSessions[key] = task
 
@@ -276,10 +303,37 @@ final class LSPService {
         sessions.values.map { $0.session }
     }
 
+    /// One warm session tagged with the workspace + languageId that keys
+    /// it in the cache. Used by cross-workspace MCP tools
+    /// (`lsp_cross_workspace_definition`) that need to remember which
+    /// workspace produced each result while fanning a single request out
+    /// across every live session.
+    struct WarmSessionInfo: Sendable {
+        let workspaceRoot: URL
+        let languageId: String
+        let session: LSPSession
+    }
+
+    /// Snapshot of every cached `(workspaceRoot, languageId)` triple
+    /// alongside its live `LSPSession`. Like `allSessions()` but
+    /// preserves the cache-key tagging so cross-workspace tools can
+    /// annotate each fan-out result with the workspace it came from.
+    /// Does not bump LRU timestamps and does not touch the cache.
+    func allWarmSessions() -> [WarmSessionInfo] {
+        sessions.map { (key, entry) in
+            WarmSessionInfo(
+                workspaceRoot: key.workspaceRoot,
+                languageId: key.languageId,
+                session: entry.session
+            )
+        }
+    }
+
     /// Shut down and forget the session for `(workspaceRoot, languageId)`.
     /// A subsequent `session(for:)` call will rebuild from scratch.
     func shutdownSession(workspaceRoot: URL, languageId: String) async {
-        let key = SessionKey(workspaceRoot: workspaceRoot, languageId: languageId)
+        let canonicalRoot = Self.canonicalizeWorkspaceRoot(workspaceRoot)
+        let key = SessionKey(workspaceRoot: canonicalRoot, languageId: languageId)
 
         // Cancel any in-flight build for this key. We do NOT await the
         // cancelled task here: `LSPClient.sendRequest` parks on a
@@ -295,7 +349,7 @@ final class LSPService {
         guard let entry = sessions.removeValue(forKey: key) else { return }
         if let fileSyncManager {
             Task {
-                await fileSyncManager.unwatch(workspaceRoot: workspaceRoot)
+                await fileSyncManager.unwatch(workspaceRoot: canonicalRoot)
             }
         }
         try? await entry.session.shutdown()
@@ -347,7 +401,7 @@ final class LSPService {
 
     // MARK: - Private: build pipeline
 
-    private func buildSession(for key: SessionKey) async throws -> LSPSession {
+    private func buildSession(for key: SessionKey, originalRoot: URL) async throws -> LSPSession {
         // Registry lookup ----------------------------------------------------
         guard let entry = registry.entry(forLanguageId: key.languageId) else {
             throw LSPServiceError.languageNotInRegistry(languageId: key.languageId)
@@ -422,8 +476,18 @@ final class LSPService {
             throw LSPServiceError.sessionStartFailed(reason: String(describing: error))
         }
 
+        // Hand the SESSION the caller's original `workspaceRoot` spelling
+        // — not the canonicalized cache key. The session stamps this URL
+        // into every persisted snapshot, and downstream restoration
+        // consumers (and `LSPSessionPersistenceWiringTests`) compare those
+        // snapshots verbatim against the URL they originally passed in.
+        // Canonicalization remains active for the cache key, the
+        // `FileSyncManager` watch/unwatch pairing and the persistence
+        // dedup predicate, so two callers reaching the same physical
+        // workspace under different spellings still share one session
+        // and one persisted entry (Bug 1 / `test_persist_treatsSame...`).
         let session = LSPSession(
-            workspaceRoot: key.workspaceRoot,
+            workspaceRoot: originalRoot,
             languageId: key.languageId,
             client: client,
             persistence: persistence,
@@ -453,7 +517,13 @@ final class LSPService {
         }
 
         // LRU enforcement ---------------------------------------------------
-        if sessions.count >= config.maxConcurrentSessions {
+        // `while`, not `if`: concurrent first-time callers each resume
+        // from `await session.start()` while the cache is still below
+        // capacity. With a single-shot `if`, a build that re-checks
+        // after another build's eviction await has already inserted a
+        // fresh entry would overshoot `maxConcurrentSessions`. Looping
+        // makes the cap an invariant on the post-eviction state.
+        while sessions.count >= config.maxConcurrentSessions {
             await evictOldestEntry()
         }
 
@@ -489,13 +559,18 @@ final class LSPService {
 
     /// Removes the entry with the smallest `lastAccessed` timestamp and
     /// shuts it down. Caller has already confirmed the cache is at
-    /// capacity.
+    /// capacity. Delegating to `shutdownSession(workspaceRoot:languageId:)`
+    /// ensures the FSEvents watch registered by `buildSession` is also
+    /// torn down — otherwise LRU eviction would leak `FileSyncManager`
+    /// state for the evicted workspace.
     private func evictOldestEntry() async {
         guard let oldest = sessions.min(by: { $0.value.lastAccessed < $1.value.lastAccessed }) else {
             return
         }
-        sessions.removeValue(forKey: oldest.key)
-        try? await oldest.value.session.shutdown()
+        await shutdownSession(
+            workspaceRoot: oldest.key.workspaceRoot,
+            languageId: oldest.key.languageId
+        )
     }
 
     /// Starts the background idle-eviction loop if it's not running.
@@ -539,5 +614,39 @@ final class LSPService {
     /// the host process — does not jump when the wall clock changes.
     private static func currentUptimeMillis() -> Int64 {
         Int64(ProcessInfo.processInfo.systemUptime * 1000)
+    }
+
+    // MARK: - Private: workspace canonicalization
+
+    /// Canonicalize a workspace root URL so symlink-equivalent spellings
+    /// collapse to a single `SessionKey`. On macOS `/tmp` is a symlink
+    /// to `/private/tmp`, `/var` → `/private/var`, etc., so two callers
+    /// reaching for the same physical workspace under different
+    /// spellings must share one cached session instead of spawning a
+    /// duplicate child process and a duplicate FSEvents watch.
+    ///
+    /// `URL.resolvingSymlinksInPath()` only resolves symlinks for the
+    /// portion of the path that actually exists on disk; a freshly
+    /// created workspace whose leaf has not been touched yet would not
+    /// canonicalize. As a fallback we resolve the parent directory's
+    /// symlinks and re-append the leaf so the leading symlink (the
+    /// portion that does exist) is always collapsed.
+    private static func canonicalizeWorkspaceRoot(_ url: URL) -> URL {
+        let direct = url.resolvingSymlinksInPath().standardizedFileURL
+        if direct.path != url.path {
+            return direct
+        }
+        let parent = url.deletingLastPathComponent()
+        // `deletingLastPathComponent` on `/` returns `/` — bail out in
+        // that case so we don't infinite-loop building canonical roots
+        // for the filesystem root itself.
+        if parent.path == url.path {
+            return direct
+        }
+        let leaf = url.lastPathComponent
+        let resolvedParent = parent.resolvingSymlinksInPath()
+        return resolvedParent
+            .appendingPathComponent(leaf)
+            .standardizedFileURL
     }
 }

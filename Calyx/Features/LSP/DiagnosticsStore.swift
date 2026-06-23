@@ -150,7 +150,8 @@ actor DiagnosticsStore {
     /// Return the URIs that changed strictly after `snapshotId` was issued.
     /// Throws `unknownSnapshot` if `snapshotId` was never issued (which
     /// includes the case where the workspace has never been touched, or
-    /// has been cleared since).
+    /// has been cleared since, or has been pruned by the bookkeeping at
+    /// the bottom of this method).
     func diff(workspaceRoot: URL, since snapshotId: SnapshotId) throws -> DiagnosticsDiff {
         guard var state = workspaces[workspaceRoot] else {
             throw DiagnosticsStoreError.unknownSnapshot(snapshotId)
@@ -164,6 +165,29 @@ actor DiagnosticsStore {
         let currentId = state.nextSnapshotId
         state.nextSnapshotId += 1
         state.snapshots[currentId] = state.changeCounter
+
+        // Prune dead history. A well-behaved polling client feeds the just-
+        // returned `currentSnapshotId` back as `since` on its next call, so
+        // any id ≤ `snapshotId` will never be queried again. Dropping them
+        // keeps the snapshot dict from growing unboundedly across a long
+        // session.
+        state.snapshots = state.snapshots.filter { $0.key > snapshotId }
+
+        // Hard cap defending against a misbehaving client that never
+        // advances `since` (e.g., always sends a stale id). When the dict
+        // exceeds 64 entries, drop the lowest ids and keep only the most
+        // recent 64. Those dropped ids will then surface as
+        // `unknownSnapshot` on subsequent diff calls — intentional: the
+        // cap defends process memory at the cost of stale clients.
+        let cap = 64
+        if state.snapshots.count > cap {
+            let sortedKeys = state.snapshots.keys.sorted()
+            let dropCount = state.snapshots.count - cap
+            for key in sortedKeys.prefix(dropCount) {
+                state.snapshots.removeValue(forKey: key)
+            }
+        }
+
         workspaces[workspaceRoot] = state
 
         var changed: [DocumentUri: [Diagnostic]] = [:]
@@ -176,6 +200,15 @@ actor DiagnosticsStore {
             currentSnapshotId: currentId,
             changedUris: changed
         )
+    }
+
+    // MARK: - Testing accessors
+
+    /// Internal accessor for unit tests: number of live snapshot dict
+    /// entries for `workspaceRoot`. Not part of the public API and not
+    /// intended for production code paths.
+    func _snapshotCount(workspaceRoot: URL) -> Int {
+        return workspaces[workspaceRoot]?.snapshots.count ?? 0
     }
 
     // MARK: - Clear

@@ -677,6 +677,246 @@ final class LSPClientTests: XCTestCase {
         let err = LSPClientError.malformedFraming(reason: "bad header")
         XCTAssertEqual(err, .malformedFraming(reason: "bad header"))
     }
+
+    // MARK: - Wave 2 regression tests
+
+    /// LSP/JSON-RPC permits string ids and many servers echo the id
+    /// back in whatever shape they prefer. Confirms `LSPRequestID`'s
+    /// lenient lookup matches a `string("1")` response to our
+    /// outbound `int(1)` request.
+    func test_response_withStringId_roundTrips() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let responder = Task { [transport] in
+            for _ in 0..<200 {
+                let sent = await transport.sentMessages()
+                if let first = sent.first,
+                   let dict = try? self.parseFramedJSON(first),
+                   let idAny = dict["id"] {
+                    let intId: Int
+                    if let i = idAny as? Int {
+                        intId = i
+                    } else if let n = idAny as? NSNumber {
+                        intId = n.intValue
+                    } else {
+                        return
+                    }
+                    // Respond echoing id back as a JSON string.
+                    let resp = #"{"jsonrpc":"2.0","id":"\#(intId)","result":{"echoed":"S"}}"#
+                    await transport.simulateServerMessage(self.lspFrame(resp))
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+        }
+
+        let result = try await client.sendRequest(
+            method: "test/string-id",
+            params: EchoParams(text: "S"),
+            resultType: EchoResult.self
+        )
+        _ = await responder.value
+        XCTAssertEqual(result, EchoResult(echoed: "S"))
+    }
+
+    /// A Content-Length above the 64 MiB cap is a fatal framing event:
+    /// every in-flight request must surface `.malformedFraming` and
+    /// the transport must be closed.
+    func test_contentLength_above64MiB_failsAllPending() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let inflight = Task<LSPClientError?, Never> {
+            do {
+                _ = try await client.sendRequest(
+                    method: "test/pending",
+                    params: EchoParams(text: "x"),
+                    resultType: EchoResult.self
+                )
+                return nil
+            } catch let err as LSPClientError {
+                return err
+            } catch {
+                return nil
+            }
+        }
+
+        // Wait for the outbound to land so a pending entry exists.
+        let emitted = await waitUntil { await !transport.sentMessages().isEmpty }
+        XCTAssertTrue(emitted)
+
+        // 100 MB header — 100_000_000 > 64 * 1024 * 1024 (67_108_864).
+        let header = "Content-Length: 100000000\r\n\r\n"
+        await transport.simulateServerMessage(Data(header.utf8))
+
+        let surfaced = await inflight.value
+        guard let surfaced else {
+            XCTFail("expected LSPClientError, got nil")
+            return
+        }
+        if case .malformedFraming = surfaced {
+            // expected
+        } else {
+            XCTFail("expected .malformedFraming, got \(surfaced)")
+        }
+    }
+
+    /// Cancelling the calling task of `sendRequest` must (a) resume
+    /// the continuation with `CancellationError`, and (b) emit a
+    /// `$/cancelRequest` notification carrying the same id so the
+    /// server can stop its work.
+    func test_sendRequest_cancellation_resumesWithCancellationError_andSendsCancelRequest() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let outcome = ActorBox<Error?>(nil)
+
+        let inflight = Task {
+            do {
+                _ = try await client.sendRequest(
+                    method: "test/cancel-me",
+                    params: EchoParams(text: "x"),
+                    resultType: EchoResult.self
+                )
+                await outcome.set(nil)
+            } catch {
+                await outcome.set(error)
+            }
+        }
+
+        // Wait until the request has been emitted, so the actor is
+        // suspended inside the race against the continuation.
+        let emitted = await waitUntil { await transport.sentMessages().count >= 1 }
+        XCTAssertTrue(emitted)
+
+        inflight.cancel()
+        _ = await inflight.value
+
+        let err = await outcome.get()
+        XCTAssertNotNil(err)
+        XCTAssertTrue(err is CancellationError, "expected CancellationError, got \(String(describing: err))")
+
+        // Wait for the $/cancelRequest notification to be written.
+        let cancelled = await waitUntil { await transport.sentMessages().count >= 2 }
+        XCTAssertTrue(cancelled, "$/cancelRequest must be sent after cancellation")
+
+        let sent = await transport.sentMessages()
+        let cancelMsg = try parseFramedJSON(sent[1])
+        XCTAssertEqual(cancelMsg["method"] as? String, "$/cancelRequest")
+        let params = cancelMsg["params"] as? [String: Any]
+        XCTAssertNotNil(params)
+        let cancelledId = params?["id"]
+        // Original request id should be 1.
+        let asInt = (cancelledId as? Int) ?? (cancelledId as? NSNumber)?.intValue
+        XCTAssertEqual(asInt, 1)
+    }
+
+    /// A response that carries neither `result` nor `error` is a
+    /// protocol violation; surface it as `.malformedFraming` rather
+    /// than silently resolving with `nil`.
+    func test_response_missingResultAndError_failsContinuation() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let responder = Task { [transport] in
+            for _ in 0..<200 {
+                let sent = await transport.sentMessages()
+                if let first = sent.first,
+                   let dict = try? self.parseFramedJSON(first),
+                   let idAny = dict["id"] {
+                    let intId: Int = (idAny as? Int)
+                        ?? (idAny as? NSNumber)?.intValue
+                        ?? Int(idAny as? String ?? "")
+                        ?? 0
+                    let resp = #"{"jsonrpc":"2.0","id":\#(intId)}"#
+                    await transport.simulateServerMessage(self.lspFrame(resp))
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+        }
+
+        do {
+            _ = try await client.sendRequest(
+                method: "test/missing",
+                params: EchoParams(text: "x"),
+                resultType: EchoResult.self
+            )
+            XCTFail("expected .malformedFraming")
+        } catch let err as LSPClientError {
+            if case .malformedFraming = err {
+                // expected
+            } else {
+                XCTFail("expected .malformedFraming, got \(err)")
+            }
+        }
+        _ = await responder.value
+    }
+
+    /// The wall-clock timeout must elapse and surface
+    /// `LSPClientError.timeout` when the server never replies.
+    func test_requestTimeout_failsContinuation() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport, requestTimeoutSeconds: 0.1)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        do {
+            _ = try await client.sendRequest(
+                method: "test/never-replies",
+                params: EchoParams(text: "x"),
+                resultType: EchoResult.self
+            )
+            XCTFail("expected .timeout")
+        } catch let err as LSPClientError {
+            XCTAssertEqual(err, .timeout)
+        }
+    }
+
+    /// A `DecodingError` raised inside a server-request handler must
+    /// be reported as JSON-RPC `-32602 InvalidParams` (not the generic
+    /// `-32603 InternalError`) so the server can distinguish "bad
+    /// input" from "handler exploded".
+    func test_serverRequest_decodingError_mapsTo_minus32602() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        struct StrictParams: Decodable, Sendable {
+            let mandatoryNumber: Int
+        }
+
+        await client.setRequestHandler(method: "server/strict") { params in
+            // Force a DecodingError by routing through JSONDecoder.
+            let raw = params ?? AnyCodable(NSNull())
+            let data = try JSONEncoder().encode(raw)
+            _ = try JSONDecoder().decode(StrictParams.self, from: data)
+            return AnyCodable(NSNull())
+        }
+
+        let serverReq = jsonRPCRequest(id: 42, method: "server/strict", paramsJSON: #"{"wrongKey":"oops"}"#)
+        await transport.simulateServerMessage(lspFrame(serverReq))
+
+        let ok = await waitUntil { await !transport.sentMessages().isEmpty }
+        XCTAssertTrue(ok)
+
+        let sent = await transport.sentMessages()
+        let response = try parseFramedJSON(sent[0])
+        XCTAssertEqual(response["id"] as? Int, 42)
+        let errObj = response["error"] as? [String: Any]
+        XCTAssertEqual(errObj?["code"] as? Int, -32602, "DecodingError must map to InvalidParams")
+        XCTAssertNotNil(errObj?["message"])
+    }
 }
 
 // MARK: - Test-only Helpers

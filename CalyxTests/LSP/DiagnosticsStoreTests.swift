@@ -228,6 +228,70 @@ final class DiagnosticsStoreTests: XCTestCase {
     }
 
     // ====================================================================
+    // MARK: - Snapshot dict pruning + hard cap
+    // ====================================================================
+
+    /// A well-behaved polling client always feeds back the previously
+    /// returned `currentSnapshotId`. In that case, every previous id is
+    /// dead history and must be pruned from the internal snapshot dict so
+    /// it does not grow without bound over a long session.
+    func test_diff_prunesSnapshotsOlderThanSince() async throws {
+        let store = makeStore()
+        let anchor = await store.createSnapshot(workspaceRoot: workspaceA)
+        var lastId = anchor
+        for _ in 0..<5 {
+            let diff = try await store.diff(workspaceRoot: workspaceA, since: lastId)
+            lastId = diff.currentSnapshotId
+        }
+
+        // After each diff, the prune drops every id ≤ `since`, leaving
+        // only the freshly-issued currentSnapshotId. The dict should
+        // therefore hold at most that one entry — and certainly nothing
+        // close to the number of diff calls we made.
+        let count = await store._snapshotCount(workspaceRoot: workspaceA)
+        XCTAssertLessThanOrEqual(
+            count, 2,
+            "well-behaved polling must not let the snapshot dict accumulate"
+        )
+
+        // And the original anchor must no longer be referenced — diffing
+        // against it must surface `unknownSnapshot`.
+        do {
+            _ = try await store.diff(workspaceRoot: workspaceA, since: anchor)
+            XCTFail("expected stale anchor snapshot id to have been pruned")
+        } catch DiagnosticsStoreError.unknownSnapshot {
+            // expected
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    /// A misbehaving client that never advances `since` would otherwise
+    /// inflate the snapshot dict forever. The hard cap (64) must clamp
+    /// the dict size even when the per-call prune does nothing useful.
+    ///
+    /// We simulate "since always points at the very first id" by inflating
+    /// the dict with `createSnapshot` (which by design does not prune),
+    /// then firing diff calls that anchor at the earliest id. The literal
+    /// id 0 was never issued, so we use the actual earliest as a proxy.
+    func test_diff_isCappedAt64WhenSinceIsAlwaysZero() async throws {
+        let store = makeStore()
+        let anchor = await store.createSnapshot(workspaceRoot: workspaceA)
+        for _ in 0..<100 {
+            _ = await store.createSnapshot(workspaceRoot: workspaceA)
+        }
+        // Now ~101 snapshot ids are sitting in the dict, all ≥ `anchor`.
+        for _ in 0..<100 {
+            _ = try? await store.diff(workspaceRoot: workspaceA, since: anchor)
+        }
+        let count = await store._snapshotCount(workspaceRoot: workspaceA)
+        XCTAssertLessThanOrEqual(
+            count, 64,
+            "snapshot dict must be capped at 64 entries"
+        )
+    }
+
+    // ====================================================================
     // MARK: - Clear
     // ====================================================================
 

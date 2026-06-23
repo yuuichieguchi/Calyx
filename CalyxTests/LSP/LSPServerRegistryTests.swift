@@ -143,7 +143,11 @@ final class LSPServerRegistryTests: XCTestCase {
             displayName: "Kotlin",
             executable: "kotlin-language-server",
             arguments: [],
-            installCommand: "brew install kotlin-language-server",
+            // The bare `brew install kotlin-language-server` formula does
+            // not exist in homebrew/core; the project is distributed via
+            // the fwcd/kls tap, so the install command must use the
+            // fully-qualified formula path.
+            installCommand: "brew install fwcd/kls/kotlin-language-server",
             prerequisiteExecutables: ["brew"],
             prerequisiteInstallCommands: [nil],
             primaryFileExtension: ".kt"
@@ -161,11 +165,13 @@ final class LSPServerRegistryTests: XCTestCase {
         ExpectedEntry(
             languageId: "csharp",
             displayName: "C#",
-            executable: "omnisharp",
-            arguments: ["--languageserver"],
-            installCommand: "brew install omnisharp",
-            prerequisiteExecutables: ["brew"],
-            prerequisiteInstallCommands: [nil],
+            // The `omnisharp` Homebrew formula has been removed; the
+            // C# language server now ships as a `dotnet` global tool.
+            executable: "csharp-ls",
+            arguments: [],
+            installCommand: "dotnet tool install -g csharp-ls",
+            prerequisiteExecutables: ["dotnet"],
+            prerequisiteInstallCommands: ["brew install --cask dotnet-sdk"],
             primaryFileExtension: ".cs"
         ),
         ExpectedEntry(

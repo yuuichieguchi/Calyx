@@ -85,6 +85,17 @@ struct ServerLogEntry: Sendable, Equatable {
     let message: String
 }
 
+// MARK: - PersistOp
+
+/// A single unit of work for the persist/remove pipeline. The session
+/// enqueues these onto an internal FIFO drained by a single long-lived
+/// worker Task, replacing the previous per-call chain of Tasks that
+/// strongly retained their predecessors.
+private enum PersistOp: Sendable {
+    case persist(LSPSessionPersistence.SessionSnapshot)
+    case remove(workspaceRoot: URL, languageId: String)
+}
+
 // MARK: - PendingApplyEdit
 
 /// A `workspace/applyEdit` request that the server has issued and the
@@ -138,16 +149,22 @@ actor LSPSession {
     private var sessionState: SessionState = .notStarted
     private var openDocs: Set<DocumentUri> = []
 
-    /// Tail of the persist/remove pipeline. Each `schedulePersistSnapshot`
-    /// / `scheduleRemoveSnapshot` call appends a Task that first awaits
-    /// the prior task's value, then dispatches its own `persist` /
-    /// `remove` against the persistence actor. This serialises the
-    /// persist pipeline deterministically — without the chain, the
-    /// unstructured Tasks could reach the persistence actor in an order
-    /// that does not match their spawn order, so a `didOpen → didClose`
-    /// sequence could land as `remove → persist` and the session's open
-    /// set would diverge from the on-disk snapshot.
-    private var pendingPersistTask: Task<Void, Never>?
+    /// FIFO of persist/remove operations awaiting dispatch to the
+    /// persistence actor. A single long-lived worker Task
+    /// (`persistWorkerTask`) drains this queue one op at a time, which
+    /// preserves the spawn-order guarantee callers rely on (a `didOpen
+    /// → didClose` sequence must reach the on-disk snapshot in that
+    /// order, never reversed) without growing a per-call chain of
+    /// Tasks that strongly retain their predecessors.
+    private var persistQueue: [PersistOp] = []
+
+    /// The currently running persist worker, if any. Set when the queue
+    /// transitions from empty → non-empty (`ensurePersistWorker`) and
+    /// cleared by the worker itself when it observes the queue drained
+    /// (`dequeuePersistOp`). `shutdown()`'s drain awaits this Task's
+    /// `value` so the wire-level teardown does not race the final
+    /// snapshot removal.
+    private var persistWorkerTask: Task<Void, Never>?
 
     /// Buffered server-originated message log (showMessage / logMessage /
     /// showMessageRequest / showDocument). FIFO, capped at
@@ -161,6 +178,89 @@ actor LSPSession {
 
     /// Monotonic id source for `PendingApplyEdit.id`. Session-local.
     private var nextApplyEditId: Int = 1
+
+    // MARK: - TEST ONLY instrumentation
+
+    // TEST ONLY: count of `scheduleRemoveSnapshot()` invocations. Used
+    // by regression tests for shutdown idempotency.
+    internal var scheduleRemoveSnapshotCallCountForTests: Int = 0
+
+    // TEST ONLY: current number of unstructured teardown Tasks spawned
+    // by `shutdown()`'s drain race that have not yet decremented their
+    // hook. Should return to 0 once both the drain observer and the
+    // sleep timer have either completed or been cancelled.
+    internal var inflightTeardownTaskCountForTests: Int = 0
+
+    // TEST ONLY: number of Task closures currently alive in the
+    // `pendingPersistTask` chain. Incremented on each
+    // `schedulePersistSnapshot` / `scheduleRemoveSnapshot` and
+    // decremented inside the spawned Task after the persist/remove
+    // work has completed.
+    internal var pendingPersistChainDepthForTests: Int = 0
+
+    // TEST ONLY: peak value observed for `pendingPersistChainDepthForTests`
+    // since session construction. Captures the maximum simultaneously
+    // alive depth so a test that schedules a burst can detect chain
+    // growth even if some Tasks complete mid-burst.
+    internal var pendingPersistChainPeakDepthForTests: Int = 0
+
+    // TEST ONLY: directly set `sessionState`. Used by regression tests
+    // that need to simulate a post-shutdown state without driving the
+    // full `shutdown()` path (which would also close the transport and
+    // clear the handler dictionary, making it impossible to dispatch
+    // any further server requests through the in-memory transport).
+    internal func setSessionStateForTests(_ state: SessionState) {
+        sessionState = state
+    }
+
+    // TEST ONLY: decrement the pending-persist chain depth from
+    // inside a scheduled Task. Exposed as a method so the scheduled
+    // closures (which run outside the actor) can hop back in.
+    internal func testOnlyDecrementPersistChainDepth() {
+        pendingPersistChainDepthForTests -= 1
+    }
+
+    // TEST ONLY: decrement the in-flight teardown task count from
+    // inside the unstructured Tasks spawned by `shutdown()`'s drain
+    // race. Exposed for the same reentry reason as
+    // `testOnlyDecrementPersistChainDepth()`.
+    internal func testOnlyDecrementInflightTeardownTaskCount() {
+        inflightTeardownTaskCountForTests -= 1
+    }
+
+    // TEST ONLY: monotonic sequence counter used by regression tests
+    // to verify the relative order of `client.start()` (which spawns
+    // the transport receive loop) vs `installServerRequestHandlers()`
+    // (which populates the request handler dictionary) inside
+    // `start()`. The bug is that handlers are registered AFTER the
+    // transport is already pumping, so any server-initiated request
+    // that arrives in the gap is dispatched against an empty
+    // dictionary. The fix flips the order. We record both moments and
+    // assert `installHandlersStartSeq < clientStartSeq`.
+    internal var testOnlyClientStartSeq: Int = 0
+    internal var testOnlyInstallHandlersSeq: Int = 0
+    private var testOnlyStartSeqCounter: Int = 0
+
+    // TEST ONLY: stamp the moment `client.start()` is invoked.
+    fileprivate func testOnlyStampClientStart() {
+        testOnlyStartSeqCounter += 1
+        testOnlyClientStartSeq = testOnlyStartSeqCounter
+    }
+
+    // TEST ONLY: stamp the moment `installServerRequestHandlers()` is
+    // invoked.
+    fileprivate func testOnlyStampInstallHandlers() {
+        testOnlyStartSeqCounter += 1
+        testOnlyInstallHandlersSeq = testOnlyStartSeqCounter
+    }
+
+    // TEST ONLY: bump the persist chain depth and update the peak.
+    private func testOnlyBumpPersistChainDepth() {
+        pendingPersistChainDepthForTests += 1
+        if pendingPersistChainDepthForTests > pendingPersistChainPeakDepthForTests {
+            pendingPersistChainPeakDepthForTests = pendingPersistChainDepthForTests
+        }
+    }
 
     // MARK: - Init
 
@@ -243,14 +343,24 @@ actor LSPSession {
         sessionState = .initializing
 
         do {
+            // Install handlers for the server-initiated requests we care
+            // about *before* `client.start()` boots the receive loop, so
+            // the handler dictionary is already populated when the very
+            // first byte arrives. Reversing this order means any
+            // server-initiated request landing in the gap between the
+            // receive task starting and the handler registration
+            // completing is dispatched against an empty dictionary and
+            // gets back `-32601 MethodNotFound`, which strict servers
+            // treat as fatal. The installers don't depend on
+            // `client.start()`'s effects — they only mutate `LSPClient`'s
+            // handler dictionaries — so this reordering is safe.
+            testOnlyStampInstallHandlers() // TEST ONLY
+            await installServerRequestHandlers()
+
             // Begin pumping the transport so we can receive the initialize
             // response and any concurrent server-initiated traffic.
+            testOnlyStampClientStart() // TEST ONLY
             try await client.start()
-
-            // Install handlers for the server-initiated requests we care
-            // about *before* sending initialize, in case the server
-            // pipelines registrations onto the back of its response.
-            await installServerRequestHandlers()
 
             let params = InitializeParams(
                 processId: Int(ProcessInfo.processInfo.processIdentifier),
@@ -336,6 +446,24 @@ actor LSPSession {
     /// write `try await session.shutdown()` continue to compile; the
     /// method itself never throws today.
     func shutdown() async throws {
+        // Idempotency / pre-handshake guard. `shutdown()` is safe to
+        // call from any caller that is unsure whether the session ever
+        // made it past `start()`, so we must short-circuit when the
+        // session is already in a terminal state (`.shutdown`,
+        // `.failed`) or never started (`.notStarted`). Falling through
+        // in those cases would re-issue `client.sendRequest("shutdown")`
+        // / `sendNotification("exit")` (no-op via `try?` on a closed
+        // client, but still walked), re-close the client, and — most
+        // visibly to tests — push another `scheduleRemoveSnapshot()`
+        // onto the persist worker. `.shuttingDown` covers the
+        // reentrant case where a second `shutdown()` slipped past one
+        // of the awaits in the first call.
+        switch sessionState {
+        case .shutdown, .failed, .notStarted, .shuttingDown:
+            return
+        case .initializing, .running:
+            break
+        }
         sessionState = .shuttingDown
         // Best-effort wire teardown: the server may have already exited
         // or half-closed the transport. We still need to release our
@@ -363,41 +491,29 @@ actor LSPSession {
         // flight — a subsequent launch would then `availableSnapshots()`
         // a session that is already shut down.
         //
-        // Bounded wait: cap the drain at 2 seconds so a stuck
-        // persistence actor (disk full, jammed file handle, etc.)
-        // cannot wedge `shutdown()` indefinitely and, by extension,
-        // wedge `LSPService.shutdownAll()` and the app-level IPC
-        // toggle. `Task<_>.value` does not honour cancellation, so a
-        // naive `TaskGroup`-based race-and-cancel would still gate
-        // on the drain — the cancelled child would block the group's
-        // exit. Instead, detach a supervisor: two unstructured Tasks
-        // (the drain observer and a timer) signal a shared
-        // `CheckedContinuation` through an `OSAllocatedUnfairLock`
-        // gate so only the first arrival wakes the caller. The drain
-        // task is left to complete on its own if it overshoots; the
-        // shared persistence actor will quiesce independently and
-        // does not retain `self`.
-        if let task = pendingPersistTask {
-            let signaled = OSAllocatedUnfairLock<Bool>(initialState: false)
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                let signalOnce: @Sendable () -> Void = {
-                    let alreadySignaled = signaled.withLock { (state: inout Bool) -> Bool in
-                        let prev = state
-                        state = true
-                        return prev
-                    }
-                    if !alreadySignaled {
-                        cont.resume()
-                    }
-                }
-                Task {
+        // Bounded wait: cap the drain at 2 seconds via a structured
+        // `withTaskGroup` race between the worker's `value` and a
+        // timer. Once the first child wins (sub-millisecond on a local
+        // tmpfs), we `cancelAll()` the remaining children so the loser
+        // does not stay alive for the full 2 second sleep, holding
+        // captures of `self` and leaking a Task per shutdown. The
+        // structured group implicitly awaits all cancelled children
+        // before returning, but `Task.sleep` honours cancellation and
+        // exits immediately, so total shutdown latency stays bounded
+        // by whichever child won.
+        if let task = persistWorkerTask {
+            inflightTeardownTaskCountForTests += 2 // TEST ONLY
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [weak self] in
                     _ = await task.value
-                    signalOnce()
+                    await self?.testOnlyDecrementInflightTeardownTaskCount() // TEST ONLY
                 }
-                Task {
+                group.addTask { [weak self] in
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
-                    signalOnce()
+                    await self?.testOnlyDecrementInflightTeardownTaskCount() // TEST ONLY
                 }
+                _ = await group.next()
+                group.cancelAll()
             }
         }
     }
@@ -564,41 +680,69 @@ actor LSPSession {
         )
     }
 
-    /// Persist the current snapshot via the `pendingPersistTask` chain.
-    /// No-op when the session was constructed without a persistence store.
+    /// Persist the current snapshot via the persist worker. No-op when
+    /// the session was constructed without a persistence store.
     ///
-    /// Each scheduled Task captures the previous tail of the chain and
-    /// awaits its completion before invoking `persistence.persist`. This
-    /// is the entire ordering guarantee: unstructured `Task { ... }`
-    /// blocks have no spawn-order arrival guarantee against the
-    /// downstream actor, so a naive fire-and-forget pipeline could land
-    /// `didOpen` after `didClose`, leaving the disk snapshot
-    /// inconsistent with the session's open set. The chain serialises
-    /// the pipeline deterministically without blocking the actor that
-    /// scheduled the work.
+    /// The persist pipeline is a `persistQueue` + single
+    /// `persistWorkerTask` consumer: append the op and ensure a worker
+    /// is running. The worker drains ops one at a time, preserving
+    /// spawn order (so a `didOpen → didClose` sequence reaches the
+    /// disk snapshot in that order, never reversed) without growing a
+    /// per-call chain of Tasks. A naive linked chain (each new Task
+    /// `await`s its predecessor) keeps every scheduled Task alive
+    /// across the full burst, because each closure strongly retains
+    /// `prior`; under a burst of N opens/closes the chain reaches
+    /// depth N and the actor pays N times the per-Task overhead.
     private func schedulePersistSnapshot() {
         guard let persistence else { return }
-        let snap = currentSnapshot()
-        let prior = pendingPersistTask
-        pendingPersistTask = Task {
-            await prior?.value
-            try? await persistence.persist(snap)
+        persistQueue.append(.persist(currentSnapshot()))
+        ensurePersistWorker(persistence: persistence)
+    }
+
+    /// Remove this session's persisted entry via the persist worker.
+    /// No-op when the session was constructed without a persistence
+    /// store. Captures `workspaceRoot` / `languageId` into the queued
+    /// op so the worker does not need to reach back into the actor.
+    private func scheduleRemoveSnapshot() {
+        scheduleRemoveSnapshotCallCountForTests += 1 // TEST ONLY
+        guard let persistence else { return }
+        persistQueue.append(.remove(workspaceRoot: workspaceRoot, languageId: languageId))
+        ensurePersistWorker(persistence: persistence)
+    }
+
+    /// Spawn a worker Task that drains `persistQueue` against
+    /// `persistence`, if one is not already running. Called from the
+    /// `schedulePersistSnapshot` / `scheduleRemoveSnapshot` paths once
+    /// a fresh op has been appended.
+    private func ensurePersistWorker(persistence: LSPSessionPersistence) {
+        if persistWorkerTask != nil { return }
+        testOnlyBumpPersistChainDepth() // TEST ONLY
+        persistWorkerTask = Task { [weak self] in
+            while true {
+                guard let strongSelf = self else { break }
+                guard let op = await strongSelf.dequeuePersistOp() else { break }
+                switch op {
+                case .persist(let snap):
+                    try? await persistence.persist(snap)
+                case .remove(let ws, let lang):
+                    try? await persistence.remove(workspaceRoot: ws, languageId: lang)
+                }
+            }
+            await self?.testOnlyDecrementPersistChainDepth() // TEST ONLY
         }
     }
 
-    /// Remove this session's persisted entry via the `pendingPersistTask`
-    /// chain. No-op when the session was constructed without a persistence
-    /// store. Captures `workspaceRoot` / `languageId` into Sendable locals
-    /// so the background Task does not need to reach back into the actor.
-    private func scheduleRemoveSnapshot() {
-        guard let persistence else { return }
-        let ws = workspaceRoot
-        let lang = languageId
-        let prior = pendingPersistTask
-        pendingPersistTask = Task {
-            await prior?.value
-            try? await persistence.remove(workspaceRoot: ws, languageId: lang)
+    /// Pop the next op off `persistQueue`, or return `nil` and clear
+    /// `persistWorkerTask` when the queue is empty so a subsequent
+    /// schedule can spawn a fresh worker. Actor-isolated so the
+    /// `persistWorkerTask = nil` transition is visible atomically to
+    /// the next `ensurePersistWorker` caller.
+    private func dequeuePersistOp() -> PersistOp? {
+        if persistQueue.isEmpty {
+            persistWorkerTask = nil
+            return nil
         }
+        return persistQueue.removeFirst()
     }
 
     // MARK: - Private helpers
@@ -610,6 +754,16 @@ actor LSPSession {
         default:
             throw LSPSessionError.notStarted
         }
+    }
+
+    /// Returns `true` only when the session is in `.running`. Server-
+    /// initiated request / notification handlers consult this before
+    /// performing any mutation so that late traffic arriving after
+    /// `shutdown()` (or arriving against a `.failed` session) cannot
+    /// resurrect state the application has already dismissed.
+    private func isRunningForServerRequest() -> Bool {
+        if case .running = sessionState { return true }
+        return false
     }
 
     private func sendNotification<Params: Encodable & Sendable>(
@@ -772,9 +926,20 @@ actor LSPSession {
         // directly; it buffers them onto `pendingApplyEditQueue` and
         // responds `{ "applied": false }`. The AI / UI consumes the queue
         // and applies edits out-of-band.
+        //
+        // State guard: once the session has left `.running`
+        // (`.shuttingDown`, `.shutdown`, `.failed`) we must NOT mutate
+        // `pendingApplyEditQueue`. A late server request sneaking in
+        // after `shutdown()` has run would otherwise re-populate the
+        // queue and resurrect work the application has already
+        // dismissed. We still reply on the wire with the standard
+        // `{ "applied": false }` so the server does not stall waiting
+        // for a response.
         // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_applyEdit
         await client.setRequestHandler(method: "workspace/applyEdit") { [self] params in
             let response = AnyCodable(["applied": AnyCodable(false)] as [String: AnyCodable])
+            let isRunning = await self.isRunningForServerRequest()
+            guard isRunning else { return response }
             guard let params = params else { return response }
             let label = await self.extractLabel(from: params)
             let edit = await self.extractEdit(from: params) ?? AnyCodable([String: AnyCodable]())

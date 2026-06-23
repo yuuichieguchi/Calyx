@@ -246,6 +246,67 @@ final class ProgressBrokerTests: XCTestCase {
     // MARK: - Reset
     // ====================================================================
 
+    // ====================================================================
+    // MARK: - Live-dict eviction on end (regression)
+    // ====================================================================
+
+    func test_endedToken_isRemovedFromLiveDict_butStaysInRecentlyEnded() async {
+        let broker = makeBroker()
+        let tok = token("tok-end")
+        await broker.registerToken(tok)
+        await broker.handleProgress(token: tok, value: beginValue(title: "Indexing"))
+        await broker.handleProgress(token: tok, value: reportValue(percentage: 50))
+        await broker.handleProgress(token: tok, value: endValue(message: "done"))
+
+        let live = await broker.liveTokenCount
+        XCTAssertEqual(live, 0, "ended token must be evicted from the live dict")
+
+        let snap = await broker.snapshot()
+        XCTAssertEqual(snap.recentlyEnded.count, 1)
+        XCTAssertEqual(snap.recentlyEnded.first?.token, tok)
+        XCTAssertEqual(snap.recentlyEnded.first?.status, .end)
+    }
+
+    func test_statusFor_endedToken_consultsRecentlyEnded() async {
+        let broker = makeBroker()
+        let tok = token("tok-end")
+        await broker.registerToken(tok)
+        await broker.handleProgress(token: tok, value: beginValue(title: "Indexing"))
+        await broker.handleProgress(token: tok, value: endValue(message: "done"))
+
+        let status = await broker.status(for: tok)
+        XCTAssertEqual(status, .end,
+                       "ended token must still report .end via the recentlyEnded fallback")
+    }
+
+    func test_endedTokens_doNotAccumulate() async {
+        let broker = makeBroker()
+        let cycles = 200
+
+        for i in 0..<cycles {
+            let tok = token("cycle-\(i)")
+            await broker.registerToken(tok)
+            await broker.handleProgress(token: tok, value: beginValue(title: "T\(i)"))
+            await broker.handleProgress(token: tok, value: endValue())
+        }
+
+        // After all tokens have ended they must all be gone from the live
+        // dict; the bounded `recentlyEnded` ring is the only retention path.
+        let live = await broker.liveTokenCount
+        XCTAssertEqual(live, 0,
+                       "no ended tokens should linger in the live dict after \(cycles) cycles")
+
+        let snap = await broker.snapshot()
+        XCTAssertTrue(snap.inFlight.isEmpty)
+        // The exact ring capacity is an implementation detail; the contract
+        // is "small and bounded". 200 cycles producing > 200 retained entries
+        // would prove the bug is back.
+        XCTAssertLessThanOrEqual(snap.recentlyEnded.count, cycles,
+                                 "recentlyEnded ring must be bounded")
+        XCTAssertLessThan(snap.recentlyEnded.count, cycles,
+                          "ring should drop oldest entries once capacity is exceeded")
+    }
+
     func test_reset_clearsAllState() async {
         let broker = makeBroker()
         let t1 = token("a")

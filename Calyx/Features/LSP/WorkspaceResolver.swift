@@ -50,11 +50,15 @@ actor WorkspaceResolver {
     /// the resolver previously failed to find one). The optional is
     /// double-wrapped so we can distinguish "cached miss" (`.some(nil)`)
     /// from "never looked up" (`nil`).
-    private var workspaceRootCache: [String: URL?] = [:]
+    ///
+    /// Wrapped in an LRU with a capacity bound so that a long-running
+    /// session that opens tens of thousands of distinct files cannot
+    /// grow the cache without limit.
+    private var workspaceRootCache: LRUCache<String, URL?>
 
     /// Cache: standardized file path → languageId (or `nil` for a
-    /// cached miss). Same double-wrap rationale as above.
-    private var languageIdCache: [String: String?] = [:]
+    /// cached miss). Same double-wrap rationale as above; same LRU bound.
+    private var languageIdCache: LRUCache<String, String?>
 
     /// Hard upper bound on how many parent directories we will walk
     /// before giving up. The deepest reasonable project layout (incl.
@@ -62,10 +66,28 @@ actor WorkspaceResolver {
     /// 32 is a comfortable safety margin that still bounds I/O.
     private static let maxAscendSteps = 32
 
+    /// Maximum entries kept in each resolver cache. 1000 comfortably
+    /// covers the open-file working set of any realistic session while
+    /// putting a firm upper bound on memory used by the actor.
+    private static let cacheCapacity = 1000
+
+    // MARK: - Test hooks (internal)
+
+    /// Number of entries currently held in the workspace-root cache.
+    /// Exposed for regression tests that verify the LRU bound; not
+    /// part of the public API.
+    var workspaceRootCacheCount: Int { workspaceRootCache.count }
+
+    /// Number of entries currently held in the language-id cache.
+    /// Exposed for regression tests.
+    var languageIdCacheCount: Int { languageIdCache.count }
+
     // MARK: - Init
 
     init(registry: LSPServerRegistry = .builtIn()) {
         self.registry = registry
+        self.workspaceRootCache = LRUCache(capacity: Self.cacheCapacity)
+        self.languageIdCache = LRUCache(capacity: Self.cacheCapacity)
     }
 
     // MARK: - Public API
@@ -77,12 +99,12 @@ actor WorkspaceResolver {
         let normalized = Self.normalize(cwd)
         let cacheKey = normalized.path
 
-        if let cached = workspaceRootCache[cacheKey] {
+        if let cached = workspaceRootCache.get(cacheKey) {
             return cached
         }
 
         let resolved = walkUpwards(from: normalized)
-        workspaceRootCache[cacheKey] = resolved
+        workspaceRootCache.set(cacheKey, resolved)
         return resolved
     }
 
@@ -96,12 +118,12 @@ actor WorkspaceResolver {
         let normalized = Self.normalize(file)
         let cacheKey = normalized.path
 
-        if let cached = languageIdCache[cacheKey] {
+        if let cached = languageIdCache.get(cacheKey) {
             return cached
         }
 
         let resolved = computeLanguageId(for: normalized)
-        languageIdCache[cacheKey] = resolved
+        languageIdCache.set(cacheKey, resolved)
         return resolved
     }
 
@@ -135,6 +157,68 @@ actor WorkspaceResolver {
         languageIdCache.removeAll()
     }
 
+    // MARK: - LRUCache
+
+    /// Tiny insertion-ordered LRU.
+    ///
+    /// - `get(key)` returns the cached value (move-to-end on hit) or
+    ///   `nil` if absent.
+    /// - `set(key, value)` inserts/updates the entry (move-to-end), then
+    ///   evicts the least-recently-used entry while `count > capacity`.
+    ///
+    /// The `order` array is intentionally a plain `[Key]` rather than
+    /// a doubly-linked list: with `capacity == 1000` the linear
+    /// `firstIndex(of:)` / `remove(at:)` cost is bounded and negligible
+    /// next to the file-system I/O each cache miss triggers. Promoting
+    /// to a real linked list would only matter at much larger capacities.
+    private struct LRUCache<Key: Hashable, Value> {
+        let capacity: Int
+        private var dict: [Key: Value] = [:]
+        private var order: [Key] = []
+
+        init(capacity: Int) {
+            // A non-positive capacity would silently disable the cache,
+            // which is almost never what we want. Trap loudly in DEBUG.
+            assert(capacity > 0, "LRUCache capacity must be positive.")
+            self.capacity = capacity
+        }
+
+        var count: Int { dict.count }
+
+        /// Look up `key`, promoting it to most-recently-used on hit.
+        /// Returns `nil` when `key` is absent. When `Value` is itself an
+        /// `Optional`, the inner `nil` is preserved (i.e. a cached
+        /// negative result reads back as `.some(nil)`).
+        mutating func get(_ key: Key) -> Value? {
+            guard let value = dict[key] else { return nil }
+            if let idx = order.firstIndex(of: key) {
+                order.remove(at: idx)
+            }
+            order.append(key)
+            return value
+        }
+
+        /// Insert or overwrite `key`, promoting to most-recently-used
+        /// and evicting the least-recently-used entry while above
+        /// `capacity`.
+        mutating func set(_ key: Key, _ value: Value) {
+            if dict[key] != nil, let idx = order.firstIndex(of: key) {
+                order.remove(at: idx)
+            }
+            dict[key] = value
+            order.append(key)
+            while dict.count > capacity, !order.isEmpty {
+                let evict = order.removeFirst()
+                dict.removeValue(forKey: evict)
+            }
+        }
+
+        mutating func removeAll() {
+            dict.removeAll()
+            order.removeAll()
+        }
+    }
+
     // MARK: - Workspace root walk
 
     /// Walk from `start` upwards toward the filesystem root, returning
@@ -161,7 +245,21 @@ actor WorkspaceResolver {
             // root: neither is a meaningful project root in our model,
             // and stepping into them would risk false positives from
             // user-level config files or scratch artifacts.
-            if current.path == homePath || current.path == tempPath {
+            //
+            // We additionally stop when `current` is an *ancestor* of
+            // either boundary — i.e. when the caller asked us to
+            // resolve a path that already lives above HOME or above
+            // the temp dir (e.g. `/private/var/folders/xx/yy` is an
+            // ancestor of `NSTemporaryDirectory()`). Without this
+            // guard, an unresolved symlink or a sandboxed-temp
+            // layout could let the walk slide past the boundary,
+            // matching markers in `/private/var/`, `/private/`, etc.
+            let currentPath = current.path
+            let currentPrefix = currentPath + "/"
+            if currentPath == homePath
+                || currentPath == tempPath
+                || homePath.hasPrefix(currentPrefix)
+                || tempPath.hasPrefix(currentPrefix) {
                 return nil
             }
 

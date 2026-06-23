@@ -48,6 +48,75 @@ struct LSPPrerequisite: Sendable, Codable, Equatable {
     }
 }
 
+// MARK: - InstallationProbe
+
+/// How the installer decides whether a language server is already
+/// present on the user's machine. Two flavours:
+///
+/// - `.which(name:)` — the simple, default case. The installer probes
+///   `runner.locate(name)` and reports "installed" iff that returns a
+///   non-`nil` URL. Equivalent to `which(1)`. Suitable for the majority
+///   of servers whose own executable is the install marker (e.g.
+///   `rust-analyzer`, `typescript-language-server`).
+///
+/// - `.command(executable:arguments:expectExit0:)` — runs an arbitrary
+///   command and treats matching the `expectExit0` expectation as
+///   "installed". This is needed when the binary on PATH is a wrapper
+///   that is always present (the `xcrun` shim ships on every Mac, but
+///   `xcrun -f sourcekit-lsp` only succeeds when the actual
+///   sourcekit-lsp Xcode component is installed).
+///
+/// JSON shape:
+///   `{ "type": "which", "name": "rust-analyzer" }`
+///   `{ "type": "command", "executable": "xcrun",
+///      "arguments": ["-f", "sourcekit-lsp"], "expectExit0": true }`
+enum InstallationProbe: Sendable, Codable, Equatable {
+    case which(name: String)
+    case command(executable: String, arguments: [String], expectExit0: Bool)
+
+    private enum CodingKeys: String, CodingKey {
+        case type, name, executable, arguments, expectExit0
+    }
+
+    private enum Kind: String, Codable {
+        case which
+        case command
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try container.decode(Kind.self, forKey: .type)
+        switch kind {
+        case .which:
+            let name = try container.decode(String.self, forKey: .name)
+            self = .which(name: name)
+        case .command:
+            let executable = try container.decode(String.self, forKey: .executable)
+            let arguments = try container.decode([String].self, forKey: .arguments)
+            let expectExit0 = try container.decode(Bool.self, forKey: .expectExit0)
+            self = .command(
+                executable: executable,
+                arguments: arguments,
+                expectExit0: expectExit0
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .which(let name):
+            try container.encode(Kind.which, forKey: .type)
+            try container.encode(name, forKey: .name)
+        case .command(let executable, let arguments, let expectExit0):
+            try container.encode(Kind.command, forKey: .type)
+            try container.encode(executable, forKey: .executable)
+            try container.encode(arguments, forKey: .arguments)
+            try container.encode(expectExit0, forKey: .expectExit0)
+        }
+    }
+}
+
 // MARK: - LSPInstallationSpec
 
 /// How to install a language server.
@@ -97,6 +166,14 @@ struct LSPInstallationSpec: Sendable, Codable, Equatable {
 /// - `defaultInitializationOptions`: free-form JSON forwarded as
 ///   `initializationOptions` on `initialize`. `nil` for now; reserved
 ///   for per-server tuning.
+/// - `installationCheck`: how the installer decides whether the server
+///   is already present. Defaults to `.which(name: executable)` — i.e.
+///   a plain `which`-style probe of the same binary we'd launch.
+///   Overridden for `swift` so that `xcrun`'s mere presence doesn't
+///   produce a false-positive installed verdict.
+/// - `note`: optional free-text caveat surfaced in the UI alongside
+///   this entry. Used to flag commercial-license / evaluation-only
+///   terms (e.g. Intelephense).
 struct LSPServerDefinition: Sendable, Codable, Equatable {
     let languageId: String
     let displayName: String
@@ -107,6 +184,8 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
     let workspaceMarkers: [String]
     let installation: LSPInstallationSpec
     let defaultInitializationOptions: AnyCodable?
+    let installationCheck: InstallationProbe
+    let note: String?
 
     init(
         languageId: String,
@@ -117,7 +196,9 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
         fileExtensions: [String],
         workspaceMarkers: [String],
         installation: LSPInstallationSpec,
-        defaultInitializationOptions: AnyCodable?
+        defaultInitializationOptions: AnyCodable?,
+        installationCheck: InstallationProbe? = nil,
+        note: String? = nil
     ) {
         self.languageId = languageId
         self.displayName = displayName
@@ -128,6 +209,55 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
         self.workspaceMarkers = workspaceMarkers
         self.installation = installation
         self.defaultInitializationOptions = defaultInitializationOptions
+        // Default probe is a plain `which` of the launch executable.
+        // Caller may override for wrapper-shim cases like `xcrun`.
+        self.installationCheck = installationCheck ?? .which(name: executable)
+        self.note = note
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case languageId
+        case displayName
+        case executable
+        case arguments
+        case versionArguments
+        case fileExtensions
+        case workspaceMarkers
+        case installation
+        case defaultInitializationOptions
+        case installationCheck
+        case note
+    }
+
+    /// Custom decoder so that user-override JSON files written against
+    /// the previous schema (no `installationCheck`, no `note`) still
+    /// load cleanly. Missing `installationCheck` falls back to
+    /// `.which(name: executable)`; missing `note` decodes as `nil`.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let executable = try container.decode(String.self, forKey: .executable)
+        self.languageId = try container.decode(String.self, forKey: .languageId)
+        self.displayName = try container.decode(String.self, forKey: .displayName)
+        self.executable = executable
+        self.arguments = try container.decode([String].self, forKey: .arguments)
+        self.versionArguments = try container.decodeIfPresent(
+            [String].self,
+            forKey: .versionArguments
+        )
+        self.fileExtensions = try container.decode([String].self, forKey: .fileExtensions)
+        self.workspaceMarkers = try container.decode([String].self, forKey: .workspaceMarkers)
+        self.installation = try container.decode(
+            LSPInstallationSpec.self,
+            forKey: .installation
+        )
+        self.defaultInitializationOptions = try container.decodeIfPresent(
+            AnyCodable.self,
+            forKey: .defaultInitializationOptions
+        )
+        self.installationCheck =
+            try container.decodeIfPresent(InstallationProbe.self, forKey: .installationCheck)
+            ?? .which(name: executable)
+        self.note = try container.decodeIfPresent(String.self, forKey: .note)
     }
 }
 
@@ -307,7 +437,15 @@ struct LSPServerRegistry: Sendable, Equatable, Codable {
                     // GUI prompt — never run silently.
                     safeToAutoRun: false
                 ),
-                defaultInitializationOptions: nil
+                defaultInitializationOptions: nil,
+                // `xcrun` ships on every Mac, so a plain `which` would
+                // always report Swift as installed. Probe for the
+                // actual sourcekit-lsp Xcode component instead.
+                installationCheck: .command(
+                    executable: "xcrun",
+                    arguments: ["-f", "sourcekit-lsp"],
+                    expectExit0: true
+                )
             ),
 
             // 4. Rust
@@ -414,7 +552,9 @@ struct LSPServerRegistry: Sendable, Equatable, Codable {
                 fileExtensions: [".kt", ".kts"],
                 workspaceMarkers: ["build.gradle.kts", "build.gradle"],
                 installation: LSPInstallationSpec(
-                    command: "brew install kotlin-language-server",
+                    // `kotlin-language-server` is not in homebrew/core;
+                    // it lives in the fwcd/kls tap.
+                    command: "brew install fwcd/kls/kotlin-language-server",
                     prerequisites: [
                         LSPPrerequisite(
                             executable: "brew",
@@ -447,25 +587,34 @@ struct LSPServerRegistry: Sendable, Equatable, Codable {
                     ],
                     safeToAutoRun: true
                 ),
-                defaultInitializationOptions: nil
+                defaultInitializationOptions: nil,
+                note:
+                    "Intelephense is a commercial product; the npm " +
+                    "package's license permits evaluation/trial use " +
+                    "only. A paid premium license is required for " +
+                    "full features and continued use beyond the trial."
             ),
 
             // 10. C#
             LSPServerDefinition(
                 languageId: "csharp",
                 displayName: "C#",
-                executable: "omnisharp",
-                arguments: ["--languageserver"],
+                // The `omnisharp` Homebrew formula has been removed.
+                // `csharp-ls` is the actively maintained replacement
+                // and is installed via the .NET tool channel.
+                executable: "csharp-ls",
+                arguments: [],
                 versionArguments: ["--version"],
                 fileExtensions: [".cs", ".csx"],
                 workspaceMarkers: ["*.csproj", "*.sln"],
                 installation: LSPInstallationSpec(
-                    command: "brew install omnisharp",
+                    command: "dotnet tool install -g csharp-ls",
                     prerequisites: [
                         LSPPrerequisite(
-                            executable: "brew",
-                            installCommand: nil,
-                            manualInstructions: "Install Homebrew: https://brew.sh"
+                            executable: "dotnet",
+                            installCommand: "brew install --cask dotnet-sdk",
+                            manualInstructions:
+                                "Install the .NET SDK: https://dotnet.microsoft.com/download"
                         ),
                     ],
                     safeToAutoRun: true

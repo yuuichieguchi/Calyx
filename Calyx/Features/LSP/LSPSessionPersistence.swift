@@ -104,8 +104,9 @@ actor LSPSessionPersistence {
     /// on the very next write.
     func persist(_ snapshot: SessionSnapshot) throws {
         var entries = try readForMutation()
+        let key = Self.normalize(snapshot.workspaceRoot)
         entries.removeAll {
-            $0.workspaceRoot == snapshot.workspaceRoot
+            Self.normalize($0.workspaceRoot) == key
                 && $0.languageId == snapshot.languageId
         }
         entries.append(snapshot)
@@ -123,9 +124,10 @@ actor LSPSessionPersistence {
     /// new file on disk).
     func remove(workspaceRoot: URL, languageId: String) throws {
         var entries = try readForMutation()
+        let key = Self.normalize(workspaceRoot)
         let before = entries.count
         entries.removeAll {
-            $0.workspaceRoot == workspaceRoot && $0.languageId == languageId
+            Self.normalize($0.workspaceRoot) == key && $0.languageId == languageId
         }
         guard entries.count != before else { return }
         try writeToDisk(entries)
@@ -207,6 +209,30 @@ actor LSPSessionPersistence {
             try? fm.moveItem(at: storageURL, to: bak)
             return []
         }
+    }
+
+    /// Canonical comparison key for a `workspaceRoot` URL.
+    ///
+    /// Two URLs that point at the same physical workspace can differ
+    /// verbatim — `URL(fileURLWithPath:isDirectory:true)` preserves a
+    /// trailing directory slash, `/var/...` differs from
+    /// `/private/var/...` because the former is the macOS symlink to the
+    /// latter, and any un-resolved component along the path likewise
+    /// produces a distinct `==` value. Comparing `workspaceRoot` verbatim
+    /// in the `persist` / `remove` predicates would therefore let a
+    /// single logical workspace persist twice under different spellings,
+    /// shadowing the freshest entry on the next `load()`.
+    ///
+    /// This mirrors the canonicalization done by
+    /// `WorkspaceResolver.normalize(_:)`: resolve symlinks first, then
+    /// rebuild the URL with `isDirectory: false` so any trailing slash
+    /// is dropped. The result is used purely as a dedup key — the
+    /// snapshot itself is stored and returned with the caller's
+    /// original `workspaceRoot` spelling, so existing round-trip
+    /// equality assertions remain valid.
+    private static func normalize(_ url: URL) -> URL {
+        let resolved = url.resolvingSymlinksInPath()
+        return URL(fileURLWithPath: resolved.path, isDirectory: false)
     }
 
     private func writeToDisk(_ entries: [SessionSnapshot]) throws {

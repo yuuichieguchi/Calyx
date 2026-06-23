@@ -113,6 +113,53 @@ final class SystemCommandRunnerTests: XCTestCase {
     }
 
     // ====================================================================
+    // MARK: - PATH / environment augmentation
+    // ====================================================================
+
+    /// `augmentedPATH()` must always surface the Homebrew bin
+    /// directories regardless of the inherited PATH. A Finder-launched
+    /// app inherits the launchd default
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`), so without this fix every
+    /// `brew`-installed language server would be invisible to the
+    /// runner. This is the core regression guard for that scenario.
+    func test_augmentedPATH_containsHomebrewDirsRegardlessOfInheritedPATH() {
+        let path = SystemCommandRunner.augmentedPATH()
+        let entries = Set(path.split(separator: ":").map(String.init))
+
+        XCTAssertTrue(
+            entries.contains("/opt/homebrew/bin"),
+            "augmentedPATH() should contain Apple-Silicon Homebrew bin dir; got: \(path)"
+        )
+        XCTAssertTrue(
+            entries.contains("/usr/local/bin"),
+            "augmentedPATH() should contain Intel Homebrew bin dir; got: \(path)"
+        )
+    }
+
+    /// `augmentedEnvironment(base:)` must preserve every caller-
+    /// supplied key while still overriding `PATH` with the augmented
+    /// value. The LSPInstaller relies on this contract when threading
+    /// language-server-specific env vars (e.g. `RUSTUP_HOME`) into a
+    /// child process: those vars must survive, and `PATH` must not be
+    /// the bare launchd default.
+    func test_augmentedEnvironment_preservesBaseAndOverridesPATH() {
+        let env = SystemCommandRunner.augmentedEnvironment(base: ["FOO": "bar"])
+
+        XCTAssertEqual(env["FOO"], "bar", "caller-supplied keys must survive")
+
+        let pathValue = env["PATH"] ?? ""
+        let entries = Set(pathValue.split(separator: ":").map(String.init))
+        XCTAssertTrue(
+            entries.contains("/opt/homebrew/bin"),
+            "augmented PATH should contain /opt/homebrew/bin; got: \(pathValue)"
+        )
+        XCTAssertTrue(
+            entries.contains("/usr/local/bin"),
+            "augmented PATH should contain /usr/local/bin; got: \(pathValue)"
+        )
+    }
+
+    // ====================================================================
     // MARK: - Helpers
     // ====================================================================
 

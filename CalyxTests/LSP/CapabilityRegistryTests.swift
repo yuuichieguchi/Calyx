@@ -189,6 +189,32 @@ final class CapabilityRegistryTests: XCTestCase {
     }
 
     // ====================================================================
+    // MARK: - Provider introspection failure
+    // ====================================================================
+
+    /// Regression: previously `providerIsTruthy(_:)` returned `true` on JSON
+    /// encode/decode failure, so a provider value that cannot be introspected
+    /// silently advertised the capability. Downstream MCP tools then
+    /// dispatched LSP methods the server could not actually serve. The
+    /// helper now returns `false` on introspection failure.
+    ///
+    /// `AnyCodable(Double.nan)` exercises the encode-failure branch:
+    /// `JSONEncoder`'s default `NonConformingFloatEncodingStrategy` is
+    /// `.throw`, so encoding a NaN provider value fails and the registry
+    /// must report the capability as disabled.
+    func test_setStaticCapabilities_nonEncodableProviderIsDisabled() async {
+        let registry = makeRegistry()
+        let caps = ServerCapabilities(hoverProvider: AnyCodable(Double.nan))
+        await registry.setStaticCapabilities(caps)
+
+        let hover = await registry.isCapable(method: "textDocument/hover")
+        XCTAssertFalse(
+            hover,
+            "non-encodable provider value must default to disabled, not enabled"
+        )
+    }
+
+    // ====================================================================
     // MARK: - Reset
     // ====================================================================
 

@@ -181,6 +181,83 @@ final class LSPSettingsTests: XCTestCase {
     }
 
     // ====================================================================
+    // MARK: - 3b. LSPSettingsResolution (resolve)
+    // ====================================================================
+
+    /// When the master switch is off, `resolve(...)` must return `.disabled`
+    /// — a distinct case the caller can route on. We pass a handler that
+    /// would answer `true` to prove the resolution does not silently fall
+    /// through to `.prompt`.
+    func test_resolve_autoInstallDisabled_returnsDisabled() {
+        defer { LSPSettings.resetToDefaults() }
+        LSPSettings.autoInstallEnabled = false
+        // `requireInstallConfirmation` must be ignored in this branch — flip
+        // it both ways to make sure neither leaks through.
+        LSPSettings.requireInstallConfirmation = true
+
+        let resolution = LSPSettings.resolve { _ in true }
+        guard case .disabled = resolution else {
+            XCTFail(
+                "Expected .disabled when autoInstallEnabled == false (got \(resolution))"
+            )
+            return
+        }
+
+        LSPSettings.requireInstallConfirmation = false
+        let resolution2 = LSPSettings.resolve { _ in true }
+        guard case .disabled = resolution2 else {
+            XCTFail(
+                "Expected .disabled when autoInstallEnabled == false (got \(resolution2))"
+            )
+            return
+        }
+    }
+
+    /// When auto-install is ON and confirmation is required, `resolve(...)`
+    /// must return `.prompt` carrying the caller-supplied handler verbatim.
+    /// We assert the handler identity by routing a marker string through it.
+    func test_resolve_promptWhenAutoInstallEnabledAndConfirmationRequired() async {
+        defer { LSPSettings.resetToDefaults() }
+        LSPSettings.autoInstallEnabled = true
+        LSPSettings.requireInstallConfirmation = true
+
+        let resolution = LSPSettings.resolve { step in
+            // Caller-supplied handler answers true only for one specific
+            // step — proves the resolver did not substitute its own.
+            step == "approve-me"
+        }
+
+        guard case .prompt(let handler) = resolution else {
+            XCTFail(
+                "Expected .prompt when autoInstall ON && requireConfirmation ON (got \(resolution))"
+            )
+            return
+        }
+
+        let approved = await handler("approve-me")
+        let rejected = await handler("something-else")
+        XCTAssertTrue(approved, "resolve must forward the caller-supplied handler verbatim")
+        XCTAssertFalse(rejected, "resolve must forward the caller-supplied handler verbatim")
+    }
+
+    /// When auto-install is ON and the user opted out of confirmations,
+    /// `resolve(...)` must return `.silent`.
+    func test_resolve_silentWhenAutoInstallEnabledAndNoConfirmation() {
+        defer { LSPSettings.resetToDefaults() }
+        LSPSettings.autoInstallEnabled = true
+        LSPSettings.requireInstallConfirmation = false
+
+        let resolution = LSPSettings.resolve { _ in false }
+
+        guard case .silent = resolution else {
+            XCTFail(
+                "Expected .silent when autoInstall ON && requireConfirmation OFF (got \(resolution))"
+            )
+            return
+        }
+    }
+
+    // ====================================================================
     // MARK: - 4. resetToDefaults
     // ====================================================================
 

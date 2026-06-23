@@ -75,6 +75,9 @@
 //
 
 import Foundation
+import OSLog
+
+private let bridgeLogger = Logger(subsystem: "com.calyx", category: "lsp.bridge")
 
 // MARK: - MCPLSPTool
 
@@ -762,10 +765,17 @@ final class MCPLSPBridge {
     /// `nonisolated static` so the per-tool handlers (which only carry an
     /// `LSPSession` reference, not the `@MainActor` bridge) can call it
     /// without an extra actor hop.
+    ///
+    /// Throws when the URI is truly unparseable (`normalizeFileURI` returns
+    /// nil for the file:// case), or when the file exists on disk but
+    /// cannot be decoded as text in any encoding (UTF-8 attempt followed by
+    /// `usedEncoding:` sniff). Non-file URIs (untitled:, jdt://, …) and
+    /// file URIs that point at a missing on-disk source are left as silent
+    /// no-ops so the downstream LSP request can produce its own diagnostic.
     nonisolated static func ensureFileOpen(
         session: LSPSession,
         uri: DocumentUri
-    ) async {
+    ) async throws {
         // Idempotency guard: skip work when the URI is already tracked.
         let openDocs = await session.openDocuments()
         if openDocs.contains(uri) {
@@ -776,10 +786,43 @@ final class MCPLSPBridge {
         // else (untitled:, jdt://, vscode-notebook-cell:, …) is left
         // alone — the caller is responsible for opening those via the
         // bridge's notebook / explicit didOpen surface.
-        guard let url = URL(string: uri), url.isFileURL else { return }
+        guard uri.hasPrefix("file://") else { return }
+
+        // Normalize via the shared helper so unparseable inputs surface
+        // as a structured error instead of a silent no-op.
+        let normalized = normalizeFileURI(uri)
+        guard let url = normalized.fileURL, url.isFileURL else {
+            throw MCPLSPBridgeError.invalidArgument(
+                name: "uri",
+                reason: "unparseable file URI: \(uri)"
+            )
+        }
         guard FileManager.default.fileExists(atPath: url.path) else { return }
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-            return
+
+        // Try UTF-8 first; fall back to a tolerant `usedEncoding:` sniff
+        // so non-UTF-8 sources still surface a didOpen instead of a
+        // silent skip that hides the encoding issue behind a server-side
+        // "no language service" error. As a final safety net, attempt
+        // `isoLatin1` — every byte 0x00-0xFF maps to a Unicode codepoint
+        // in Latin-1, so the decode is guaranteed to succeed for any
+        // file that opens at all. The throw on the very last branch
+        // therefore only fires when even opening the file fails (e.g.
+        // permissions revoked between the existence check and the read).
+        let text: String
+        if let utf8 = try? String(contentsOf: url, encoding: .utf8) {
+            text = utf8
+        } else {
+            var used = String.Encoding.utf8
+            if let sniffed = try? String(contentsOf: url, usedEncoding: &used) {
+                text = sniffed
+            } else if let latin1 = try? String(contentsOf: url, encoding: .isoLatin1) {
+                text = latin1
+            } else {
+                throw MCPLSPBridgeError.invalidArgument(
+                    name: "uri",
+                    reason: "file not readable as text (utf-8 decode and encoding sniff both failed): \(uri)"
+                )
+            }
         }
 
         // Use the session's default languageId. `didOpen` is itself
@@ -856,6 +899,19 @@ final class MCPLSPBridge {
         return value
     }
 
+    /// Decode a required `Bool` argument; throws `missingArgument` when
+    /// absent and `invalidArgument` when the underlying JSON is the wrong
+    /// shape (e.g. a stray integer or string instead of a boolean).
+    nonisolated static func requireBool(arguments: [String: AnyCodable], key: String) throws -> Bool {
+        guard let raw = arguments[key] else {
+            throw MCPLSPBridgeError.missingArgument(key)
+        }
+        guard let value: Bool = decodeValue(raw) else {
+            throw MCPLSPBridgeError.invalidArgument(name: key, reason: "expected boolean")
+        }
+        return value
+    }
+
     /// Decode an optional `Int` argument; returns `nil` when absent.
     nonisolated static func optionalInt(arguments: [String: AnyCodable], key: String) throws -> Int? {
         guard let raw = arguments[key] else { return nil }
@@ -897,6 +953,13 @@ final class MCPLSPBridge {
 
     /// `AnyCodable.storage` is private; recover the underlying primitive
     /// by round-tripping through `JSONEncoder` + `JSONSerialization`.
+    ///
+    /// `Int` and `Bool` use strict numeric discrimination:
+    ///   - `Int` rejects fractional doubles (`3.9` → nil, not truncated to 3)
+    ///     and CFBoolean values.
+    ///   - `Bool` only accepts actual `CFBoolean` instances, not arbitrary
+    ///     `NSNumber`s coerced via `boolValue` (a JSON `42` must not become
+    ///     `true` just because it is non-zero).
     private nonisolated static func decodeValue<T>(_ raw: AnyCodable) -> T? {
         guard let data = try? JSONEncoder().encode(raw),
               let any = try? JSONSerialization.jsonObject(
@@ -904,39 +967,114 @@ final class MCPLSPBridge {
                 options: [.fragmentsAllowed]
               )
         else { return nil }
-        if let value = any as? T { return value }
-        // JSONSerialization bridges JSON integers to `NSNumber`; peel an
-        // `Int` out of that branch manually so `Int` callers succeed even
-        // when the underlying number was decoded as `Double`.
-        if T.self == Int.self {
-            if let n = any as? NSNumber {
-                return Int(truncating: n) as? T
-            }
-        }
+
+        // Bool: reject NSNumbers that aren't a CFBoolean. This is the only
+        // way to distinguish JSON `true`/`false` from JSON `1`/`0` — the
+        // standard `as? Bool` cast happily succeeds for any 0/1 NSNumber.
         if T.self == Bool.self {
-            if let n = any as? NSNumber {
-                return (n.boolValue as? T)
-            }
+            guard let n = any as? NSNumber,
+                  CFGetTypeID(n) == CFBooleanGetTypeID()
+            else { return nil }
+            return n.boolValue as? T
         }
+
+        // Int: require a whole-number NSNumber. Reject fractional doubles
+        // (truncating 3.9 to 3 was the historical defect) and CFBooleans
+        // (so `include_declaration: true` does not silently become `1`).
+        if T.self == Int.self {
+            guard let n = any as? NSNumber else { return nil }
+            if CFGetTypeID(n) == CFBooleanGetTypeID() { return nil }
+            let d = n.doubleValue
+            guard d.isFinite,
+                  d == d.rounded(.toNearestOrEven),
+                  d == floor(d)
+            else { return nil }
+            return Int(truncating: n) as? T
+        }
+
+        if let value = any as? T { return value }
         return nil
+    }
+
+    /// Normalize `input` (either an absolute filesystem path or a
+    /// `file://` URI) into a `(uri, fileURL)` pair where both fields are
+    /// derived from the same canonical path. The two forms (raw path vs
+    /// `file://`) MUST converge so the session-cache key in
+    /// `LSPService.session(for:)` doesn't split a single logical
+    /// workspace into two sessions.
+    ///
+    /// Returns `fileURL == nil` only for truly unparseable `file://`
+    /// inputs (e.g. `file://[bad]/foo bar baz`) whose path component
+    /// doesn't even start with `/`. Callers that need to react to that
+    /// case (`ensureFileOpen` throws an `invalidArgument` error) inspect
+    /// the optional directly.
+    nonisolated static func normalizeFileURI(_ input: String) -> (uri: String, fileURL: URL?) {
+        if input.hasPrefix("file://") {
+            // Fast path: a well-formed `file://` URI with no query /
+            // fragment / non-empty host. `URL(string:)` correctly
+            // percent-decodes the path portion and round-trips spaces and
+            // friends through `.absoluteString`. We bail to the rebuild
+            // path when:
+            //   * URL(string:) returns nil (someone smuggled in totally
+            //     malformed text after the scheme)
+            //   * isFileURL is false (the scheme was rewritten)
+            //   * query / fragment are present (a `?` in the filename is
+            //     a perfectly legal POSIX path char but URL(string:)
+            //     misinterprets it as a query delimiter — the rebuild
+            //     path correctly re-encodes it)
+            //   * host is non-empty — a well-formed file URI always uses
+            //     the empty-host form (`file:///path`); a non-empty host
+            //     (e.g. `file://[bad]/...`) means the input never had a
+            //     leading slash on the path and is best treated as
+            //     unparseable so the caller surfaces a structured error.
+            if let url = URL(string: input),
+               url.isFileURL,
+               url.query == nil,
+               url.fragment == nil,
+               (url.host?.isEmpty ?? true) {
+                return (url.absoluteString, url)
+            }
+            // Strip the scheme and rebuild via `URL(fileURLWithPath:)`,
+            // which percent-encodes whatever was in the raw path
+            // verbatim. A well-formed file URI always has the shape
+            // `file:///<absolute-path>` — the host between `//` and the
+            // next `/` is empty — so the remainder MUST start with `/`.
+            // Anything else is malformed; return nil so `ensureFileOpen`
+            // can throw a structured error instead of silently inventing
+            // a relative path.
+            let pathPart = String(input.dropFirst("file://".count))
+            guard pathPart.hasPrefix("/") else {
+                return (input, nil)
+            }
+            let fileURL = URL(fileURLWithPath: pathPart)
+            return (fileURL.absoluteString, fileURL)
+        }
+        let fileURL = URL(fileURLWithPath: input)
+        return (fileURL.absoluteString, fileURL)
     }
 
     /// Convert a workspace path (either an absolute filesystem path or a
     /// `file://` URI) into a `URL` suitable for `LSPService.session(for:)`.
+    /// The result is derived from `normalizeFileURI` so raw-path and
+    /// `file://` callers converge on the same `URL` (and therefore the
+    /// same session-cache key).
     nonisolated static func fileURL(fromPathOrUri input: String) -> URL {
-        if input.hasPrefix("file://"), let url = URL(string: input) {
+        if let url = normalizeFileURI(input).fileURL {
             return url
         }
+        // Fall back to a permissive `URL(fileURLWithPath:)` on the raw
+        // input so this helper never returns nil for legitimate workspace
+        // paths. `ensureFileOpen` is the surface that surfaces
+        // "unparseable" as a structured error, not this helper.
         return URL(fileURLWithPath: input)
     }
 
     /// Convert an absolute path or `file://` URI into the LSP
-    /// `DocumentUri` (string) form.
+    /// `DocumentUri` (string) form. Goes through `normalizeFileURI` so
+    /// raw-path callers and `file://` callers produce the same
+    /// percent-encoded string for the same logical file.
     nonisolated static func documentUri(fromPathOrUri input: String) -> DocumentUri {
-        if input.hasPrefix("file://") {
-            return input
-        }
-        return URL(fileURLWithPath: input).absoluteString
+        normalizeFileURI(input).uri
     }
 
     // MARK: - Response shaping helpers
@@ -1222,7 +1360,7 @@ enum HoverTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = HoverParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1257,7 +1395,7 @@ enum DefinitionTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DefinitionParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1292,7 +1430,7 @@ enum DeclarationTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DeclarationParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1327,7 +1465,7 @@ enum TypeDefinitionTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = TypeDefinitionParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1362,7 +1500,7 @@ enum ImplementationTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = ImplementationParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1404,7 +1542,7 @@ enum ReferencesTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let includeDecl = try MCPLSPBridge.optionalBool(
             arguments: arguments,
             key: "include_declaration"
@@ -1444,7 +1582,7 @@ enum DocumentHighlightTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DocumentHighlightParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1491,7 +1629,7 @@ enum DocumentSymbolTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DocumentSymbolParams(
             textDocument: TextDocumentIdentifier(uri: uri)
         )
@@ -1579,7 +1717,7 @@ enum CompletionTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
 
         var context: CompletionContext?
         if let kindRaw = try MCPLSPBridge.optionalInt(arguments: arguments, key: "trigger_kind") {
@@ -1593,6 +1731,13 @@ enum CompletionTool: MCPLSPTool {
                 arguments: arguments,
                 key: "trigger_character"
             )
+            // trigger_kind == 2 (TriggerCharacter) makes no semantic sense
+            // without an accompanying trigger_character — silently
+            // forwarding `triggerCharacter: nil` masks the caller bug
+            // behind a generic "no completions" response from the server.
+            if kind == .triggerCharacter, triggerChar == nil {
+                throw MCPLSPBridgeError.missingArgument("trigger_character")
+            }
             context = CompletionContext(
                 triggerKind: kind,
                 triggerCharacter: triggerChar
@@ -1634,7 +1779,7 @@ enum SignatureHelpTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = SignatureHelpParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1669,7 +1814,7 @@ enum PrepareRenameTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = PrepareRenameParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -1709,7 +1854,7 @@ enum RenameTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let newName = try MCPLSPBridge.requireString(arguments: arguments, key: "new_name")
         let params = RenameParams(
             textDocument: TextDocumentIdentifier(uri: uri),
@@ -1734,7 +1879,32 @@ enum RenameTool: MCPLSPTool {
 enum CodeActionTool: MCPLSPTool {
     static let name = "lsp_code_action"
     static let description = "Request code actions (quick fixes, refactors) for a range in a file."
-    static let inputSchema: [String: AnyCodable] = rangeRequestSchema()
+    static let inputSchema: [String: AnyCodable] = rangeRequestSchema(
+        extraProperties: [
+            "diagnostics": AnyCodable([
+                "type": AnyCodable("array"),
+                "description": AnyCodable(
+                    "Diagnostics overlapping the range. Forwarded into context.diagnostics so quickfix providers see the same set of problems the client surfaces."
+                ),
+                "items": AnyCodable([
+                    "type": AnyCodable("object"),
+                ] as [String: AnyCodable]),
+            ] as [String: AnyCodable]),
+            "only": AnyCodable([
+                "type": AnyCodable("array"),
+                "description": AnyCodable(
+                    "Filter for action kinds the caller is interested in (e.g. ['quickfix','refactor.extract']). Forwarded into context.only."
+                ),
+                "items": AnyCodable([
+                    "type": AnyCodable("string"),
+                ] as [String: AnyCodable]),
+            ] as [String: AnyCodable]),
+            "trigger_kind": prop(
+                "integer",
+                "CodeActionTriggerKind: 1=Invoked, 2=Automatic. Forwarded into context.triggerKind."
+            ),
+        ]
+    )
 
     static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
         let session: LSPSession
@@ -1746,8 +1916,50 @@ enum CodeActionTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
-        let context = CodeActionContext(diagnostics: [])
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+
+        // Decode the optional context fields. `diagnostics` round-trips
+        // verbatim through the LSP Diagnostic shape so a quickfix consumer
+        // sees the exact set of problems the caller fed in; `only` and
+        // `trigger_kind` mirror the LSP spec one-for-one.
+        let diagnostics: [Diagnostic]
+        if let diagnosticsAny = arguments["diagnostics"] {
+            diagnostics = try MCPLSPBridge.decodeFromAnyCodable(
+                diagnosticsAny,
+                as: [Diagnostic].self,
+                argumentName: "diagnostics"
+            )
+        } else {
+            diagnostics = []
+        }
+        let only: [CodeActionKind]?
+        if let onlyAny = arguments["only"] {
+            only = try MCPLSPBridge.decodeFromAnyCodable(
+                onlyAny,
+                as: [CodeActionKind].self,
+                argumentName: "only"
+            )
+        } else {
+            only = nil
+        }
+        let triggerKind: CodeActionTriggerKind?
+        if let kindRaw = try MCPLSPBridge.optionalInt(arguments: arguments, key: "trigger_kind") {
+            guard let kind = CodeActionTriggerKind(rawValue: kindRaw) else {
+                throw MCPLSPBridgeError.invalidArgument(
+                    name: "trigger_kind",
+                    reason: "must be 1 (Invoked) or 2 (Automatic)"
+                )
+            }
+            triggerKind = kind
+        } else {
+            triggerKind = nil
+        }
+
+        let context = CodeActionContext(
+            diagnostics: diagnostics,
+            only: only,
+            triggerKind: triggerKind
+        )
         let params = CodeActionParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             range: range,
@@ -1797,7 +2009,7 @@ enum DiagnosticsTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let identifier = try MCPLSPBridge.optionalString(arguments: arguments, key: "identifier")
         let previousResultId = try MCPLSPBridge.optionalString(
             arguments: arguments,
@@ -2007,7 +2219,7 @@ enum SessionWarmupTool: MCPLSPTool {
             )
             for path in paths {
                 let uri = MCPLSPBridge.documentUri(fromPathOrUri: path)
-                await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+                try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
             }
         }
 
@@ -2075,7 +2287,7 @@ enum CallHierarchyPrepareTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = CallHierarchyPrepareParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -2190,7 +2402,7 @@ enum TypeHierarchyPrepareTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = TypeHierarchyPrepareParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -2305,7 +2517,7 @@ enum MonikerTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = MonikerParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -2340,7 +2552,7 @@ enum CodeLensTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = CodeLensParams(textDocument: TextDocumentIdentifier(uri: uri))
         do {
             let result: [CodeLens]? = try await session.sendRequest(
@@ -2412,7 +2624,7 @@ enum InlayHintTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = InlayHintParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             range: range
@@ -2510,7 +2722,7 @@ enum InlineValueTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let frameId = try MCPLSPBridge.optionalInt(
             arguments: arguments,
             key: "frame_id"
@@ -2586,7 +2798,7 @@ enum FoldingRangeTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = FoldingRangeParams(textDocument: TextDocumentIdentifier(uri: uri))
         do {
             let result: [FoldingRange]? = try await session.sendRequest(
@@ -2654,7 +2866,7 @@ enum SelectionRangeTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         guard let positionsAny = arguments["positions"] else {
             throw MCPLSPBridgeError.missingArgument("positions")
         }
@@ -2709,7 +2921,7 @@ enum SemanticTokensFullTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = SemanticTokensParams(
             textDocument: TextDocumentIdentifier(uri: uri)
         )
@@ -2743,7 +2955,7 @@ enum SemanticTokensRangeTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = SemanticTokensRangeParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             range: range
@@ -2794,7 +3006,7 @@ enum SemanticTokensDeltaTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let previousResultId = try MCPLSPBridge.requireString(
             arguments: arguments,
             key: "previous_result_id"
@@ -2833,7 +3045,7 @@ enum LinkedEditingRangeTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = LinkedEditingRangeParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -2868,7 +3080,7 @@ enum DocumentLinkTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DocumentLinkParams(
             textDocument: TextDocumentIdentifier(uri: uri)
         )
@@ -2942,7 +3154,7 @@ enum DocumentColorTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let params = DocumentColorParams(
             textDocument: TextDocumentIdentifier(uri: uri)
         )
@@ -2986,7 +3198,7 @@ enum ColorPresentationTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         guard let colorAny = arguments["color"] else {
             throw MCPLSPBridgeError.missingArgument("color")
         }
@@ -3113,7 +3325,7 @@ enum FormattingTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let uri = try bridge.extractDocumentUri(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let options = try extractFormattingOptions(arguments: arguments)
         let params = DocumentFormattingParams(
             textDocument: TextDocumentIdentifier(uri: uri),
@@ -3152,7 +3364,7 @@ enum RangeFormattingTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, range) = try bridge.extractRange(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let options = try extractFormattingOptions(arguments: arguments)
         let params = DocumentRangeFormattingParams(
             textDocument: TextDocumentIdentifier(uri: uri),
@@ -3192,7 +3404,7 @@ enum OnTypeFormattingTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
         let ch = try MCPLSPBridge.requireString(arguments: arguments, key: "ch")
         let options = try extractFormattingOptions(arguments: arguments)
         let params = DocumentOnTypeFormattingParams(
@@ -3438,10 +3650,10 @@ enum WorkspaceApplyEditTool: MCPLSPTool {
             as: WorkspaceEdit.self,
             argumentName: "edit"
         )
-        let commit = try MCPLSPBridge.optionalBool(
+        let commit = try MCPLSPBridge.requireBool(
             arguments: arguments,
             key: "commit"
-        ) ?? false
+        )
         let result: ApplyWorkspaceEditResult
         if commit {
             result = ApplyWorkspaceEditResult(applied: true)
@@ -3938,23 +4150,52 @@ enum BatchTool: MCPLSPTool {
 
 enum HoverBundleTool: MCPLSPTool {
     static let name = "lsp_hover_bundle"
-    static let description = "AI-friendly bundle of hover + definition + surrounding source for a position. Fans out textDocument/hover and textDocument/definition in parallel and surfaces them under one JSON envelope."
-    static let inputSchema: [String: AnyCodable] = positionRequestSchema()
+    static let description = "AI-friendly bundle of hover + definition + surrounding source for a position. Fans out textDocument/hover and textDocument/definition in parallel and surfaces them, along with a ±context_lines source snippet around the cursor, and (when discoverable) resolves up to 5 dependent type identifiers via workspace/symbol + follow-up hover lookups."
+    static let inputSchema: [String: AnyCodable] = positionRequestSchema(
+        extraProperties: [
+            "context_lines": prop(
+                "integer",
+                "Lines of source context to include around (line, column) in surrounding_code. Default 10, min 0, max 100."
+            ),
+        ]
+    )
 
-    /// JSON envelope returned by the bundle. `surrounding_code` is kept as
-    /// an empty string in this build; later iterations populate it with a
-    /// few lines of context around `(line, column)`.
+    /// One entry in the `dependent_types` array. Each entry pairs a
+    /// non-primitive type identifier discovered in the cursor hover with
+    /// the first matching `workspace/symbol` `Location` and a follow-up
+    /// `textDocument/hover` payload (when available).
+    struct DependentType: Encodable {
+        let name: String
+        let location: Location
+        let hover: Hover?
+    }
+
+    /// JSON envelope returned by the bundle. `surrounding_code` is the
+    /// formatted source snippet (line-numbered) covering ±context_lines
+    /// around `(line, column)`; an empty string when the source file
+    /// can't be read off disk. `dependent_types` is always present (may
+    /// be empty); `doc_comment` is nil when the hover content does not
+    /// have a fenced code block followed by descriptive prose.
     private struct Bundle: Encodable {
         let hover: Hover?
         let definition: DefinitionResult?
         let surroundingCode: String
+        let dependentTypes: [DependentType]
+        let docComment: String?
 
         enum CodingKeys: String, CodingKey {
             case hover
             case definition
             case surroundingCode = "surrounding_code"
+            case dependentTypes = "dependent_types"
+            case docComment = "doc_comment"
         }
     }
+
+    /// Maximum number of dependent-type entries the bundle will surface.
+    /// Caps the response payload so an AI consumer can't be spammed by a
+    /// signature that references dozens of types.
+    private static let dependentTypeCap = 5
 
     static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
         let session: LSPSession
@@ -3966,7 +4207,16 @@ enum HoverBundleTool: MCPLSPTool {
             return MCPLSPBridge.makeErrorContent(error)
         }
         let (uri, position) = try bridge.extractPosition(arguments: arguments)
-        await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+
+        // Read context_lines (default 10, clamped to [0, 100] so a
+        // misbehaving caller can't ask for a snippet bigger than the
+        // file). A `context_lines` value of the wrong shape surfaces as
+        // `invalidArgument` to the caller — matching the rest of the
+        // bridge rather than silently defaulting.
+        let rawContext = try MCPLSPBridge.optionalInt(arguments: arguments, key: "context_lines") ?? 10
+        let contextLines = min(max(rawContext, 0), 100)
+
         let hoverParams = HoverParams(
             textDocument: TextDocumentIdentifier(uri: uri),
             position: position
@@ -3999,12 +4249,374 @@ enum HoverBundleTool: MCPLSPTool {
         }()
         let hover = await hoverTask
         let definition = await definitionTask
+
+        let surroundingCode = renderSurroundingCode(
+            uri: uri,
+            centerLine: position.line,
+            contextLines: contextLines
+        )
+
+        // Mine dependent-type identifiers from the cursor hover content
+        // and fan out workspace/symbol + textDocument/hover lookups to
+        // populate `dependent_types`. When the cursor hover is absent
+        // there is nothing to mine, so the fan-out is skipped.
+        let dependentTypes: [DependentType]
+        let docComment: String?
+        if let hover {
+            let hoverText = extractHoverText(hover)
+            let identifiers = extractDependentIdentifiers(hoverText)
+            dependentTypes = await resolveDependentTypes(
+                session: session,
+                identifiers: identifiers
+            )
+            docComment = extractDocComment(hover)
+        } else {
+            dependentTypes = []
+            docComment = nil
+        }
+
         let bundle = Bundle(
             hover: hover,
             definition: definition,
-            surroundingCode: ""
+            surroundingCode: surroundingCode,
+            dependentTypes: dependentTypes,
+            docComment: docComment
         )
         return try MCPLSPBridge.makeJSONContent(bundle)
+    }
+
+    /// Flatten a `Hover.contents` payload into a single plain-text
+    /// string. All three `HoverContents` variants are handled so the
+    /// identifier-mining regex sees the same surface regardless of
+    /// which shape the server emitted. Code-block bodies (the typical
+    /// rust-analyzer signature form) are included verbatim because they
+    /// carry the bulk of the meaningful type identifiers.
+    private static func extractHoverText(_ hover: Hover) -> String {
+        switch hover.contents {
+        case .markupContent(let mc):
+            return mc.value
+        case .markedString(let ms):
+            return flatten(markedString: ms)
+        case .markedStrings(let arr):
+            return arr.map { flatten(markedString: $0) }.joined(separator: "\n")
+        }
+    }
+
+    private static func flatten(markedString: MarkedString) -> String {
+        switch markedString {
+        case .string(let s):
+            return s
+        case .codeBlock(_, let value):
+            return value
+        }
+    }
+
+    /// Scan `text` for unique capitalized identifiers and return them in
+    /// first-occurrence order, after dedup, capped at `dependentTypeCap`.
+    ///
+    /// The regex `\b[A-Z][A-Za-z0-9_]*\b` only matches identifiers that
+    /// start with an uppercase letter, so lowercase primitives (`u32`,
+    /// `bool`, `str`, …) are naturally skipped — Swift / Rust / Java
+    /// conventions reserve leading-uppercase for the user-defined types
+    /// we actually want to surface here.
+    ///
+    /// The regex deliberately scans through fenced code blocks as well as
+    /// prose: signatures inside fenced code blocks are the PRIMARY source
+    /// of dependent-type identifiers in markdown hovers
+    /// (`pub fn foo() -> Vec<KeyValue>`), so excluding them would drop
+    /// almost every useful match.
+    private static func extractDependentIdentifiers(_ text: String) -> [String] {
+        guard !text.isEmpty else { return [] }
+        // Cap the scanned region to bound regex work on pathologically
+        // large hover payloads (some servers emit module-level docs that
+        // run to hundreds of KiB). 32 KiB easily covers signatures and
+        // their immediate doc-comment context; anything beyond is
+        // overflow we can safely ignore for identifier mining.
+        let scan = text.count > 32_768 ? String(text.prefix(32_768)) : text
+        let pattern = #"\b[A-Z][A-Za-z0-9_]*\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return []
+        }
+        let ns = scan as NSString
+        let range = NSRange(location: 0, length: ns.length)
+        var seen: Set<String> = []
+        var ordered: [String] = []
+        regex.enumerateMatches(in: scan, range: range) { match, _, stop in
+            guard let match else { return }
+            let id = ns.substring(with: match.range)
+            if seen.contains(id) { return }
+            seen.insert(id)
+            ordered.append(id)
+            if ordered.count >= dependentTypeCap {
+                stop.pointee = true
+            }
+        }
+        return ordered
+    }
+
+    /// Issue `workspace/symbol` for every identifier and, for the first
+    /// matching `Location`, follow up with `textDocument/hover` to
+    /// enrich the entry. Per-identifier failures (server error, no
+    /// match, decode error) skip that entry only — the overall bundle
+    /// always carries whatever could be resolved.
+    ///
+    /// The fan-out runs in parallel via `withTaskGroup`. The shared
+    /// `LSPSession` actor serialises individual requests, but releasing
+    /// the await between requests lets the server pipeline the round
+    /// trips instead of paying N × `(workspace/symbol + hover)` of
+    /// sequential latency. Final ordering is restored by index so the
+    /// caller sees `dependent_types` in the same order
+    /// `extractDependentIdentifiers` produced.
+    private static func resolveDependentTypes(
+        session: LSPSession,
+        identifiers: [String]
+    ) async -> [DependentType] {
+        return await withTaskGroup(of: (Int, DependentType?).self) { group in
+            for (i, identifier) in identifiers.enumerated() {
+                group.addTask {
+                    let entry = await resolveOneDependentType(
+                        identifier: identifier,
+                        session: session
+                    )
+                    return (i, entry)
+                }
+            }
+            var slots: [(Int, DependentType?)] = []
+            slots.reserveCapacity(identifiers.count)
+            for await pair in group {
+                slots.append(pair)
+            }
+            return slots
+                .sorted { $0.0 < $1.0 }
+                .compactMap { $0.1 }
+        }
+    }
+
+    /// Resolve a single dependent-type identifier: query
+    /// `workspace/symbol`, filter for an exact-name hit, then enrich
+    /// with `textDocument/hover` at the resolved location. Returns nil
+    /// when any step yields no usable result.
+    private static func resolveOneDependentType(
+        identifier: String,
+        session: LSPSession
+    ) async -> DependentType? {
+        let params = WorkspaceSymbolParams(query: identifier)
+        let symbolResult: WorkspaceSymbolResult?
+        do {
+            symbolResult = try await session.sendRequest(
+                method: "workspace/symbol",
+                params: params,
+                resultType: WorkspaceSymbolResult?.self
+            )
+        } catch {
+            return nil
+        }
+        guard let firstLocation = firstFullLocation(
+            in: symbolResult,
+            matching: identifier
+        ) else {
+            return nil
+        }
+        // Best-effort `didOpen` on the resolved URI so the follow-up
+        // hover has a chance to hit a parsed document. `ensureFileOpen`
+        // can throw on an unparseable URI; the throw is swallowed via
+        // `try?` because we still want to attempt the hover — the
+        // server may serve it from a previously parsed source, and
+        // failure to do so simply leaves the entry's `hover` as nil.
+        try? await MCPLSPBridge.ensureFileOpen(session: session, uri: firstLocation.uri)
+        let hoverParams = HoverParams(
+            textDocument: TextDocumentIdentifier(uri: firstLocation.uri),
+            position: firstLocation.range.start
+        )
+        let followUp: Hover?
+        do {
+            followUp = try await session.sendRequest(
+                method: "textDocument/hover",
+                params: hoverParams,
+                resultType: Hover?.self
+            )
+        } catch {
+            followUp = nil
+        }
+        return DependentType(
+            name: identifier,
+            location: firstLocation,
+            hover: followUp
+        )
+    }
+
+    /// Extract a usable `Location` from a `workspace/symbol` result,
+    /// keeping only entries whose `name` exactly matches `identifier`.
+    /// `workspace/symbol` is documented as a fuzzy / prefix search, so
+    /// the first hit can be a sibling-name false positive (e.g. a query
+    /// for `Vec` returning `VecDeque` first); the equality filter drops
+    /// those before we commit to a location for the dependent type.
+    ///
+    /// Both result shapes are accepted:
+    ///   - `[WorkspaceSymbol]`: requires the matching entry to carry a
+    ///     full `Location` (the `{uri}`-only lazy form is skipped
+    ///     because we cannot point an LSP `textDocument/hover` at a uri
+    ///     without a range).
+    ///   - `[SymbolInformation]`: always carries a full `Location`.
+    private static func firstFullLocation(
+        in result: WorkspaceSymbolResult?,
+        matching identifier: String
+    ) -> Location? {
+        guard let result else { return nil }
+        switch result {
+        case .workspaceSymbols(let arr):
+            for symbol in arr where symbol.name == identifier {
+                if case .full(let loc) = symbol.location {
+                    return loc
+                }
+            }
+            return nil
+        case .symbolInformations(let arr):
+            for symbol in arr where symbol.name == identifier {
+                return symbol.location
+            }
+            return nil
+        }
+    }
+
+    /// Extract the descriptive prose from a hover payload, peeling off
+    /// any fenced code blocks (the typical signature wrappers used by
+    /// rust-analyzer and other servers). Returns nil when no usable
+    /// prose remains. Handles every `HoverContents` shape:
+    ///
+    ///   - `.markupContent(.markdown)`: walk lines, concatenating
+    ///     anything outside ``` fences. Multi-block hovers (signature →
+    ///     prose → signature → prose) keep their inter-block prose
+    ///     instead of being collapsed by a single `.backwards` search.
+    ///     If there are no fences, the whole markdown is treated as
+    ///     prose.
+    ///   - `.markupContent(.plaintext)`: return the trimmed value if
+    ///     non-empty.
+    ///   - `.markedString(.string)`: return the trimmed value if
+    ///     non-empty (prose-only marked strings carry useful doc text).
+    ///   - `.markedString(.codeBlock)`: nil (pure code carries no
+    ///     prose).
+    ///   - `.markedStrings`: join the prose-only entries with a blank
+    ///     line separator; nil when no prose entries are present.
+    private static func extractDocComment(_ hover: Hover) -> String? {
+        switch hover.contents {
+        case .markupContent(let mc):
+            switch mc.kind {
+            case .markdown:
+                return extractMarkdownProse(mc.value)
+            case .plaintext:
+                let trimmed = mc.value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            }
+        case .markedString(let ms):
+            switch ms {
+            case .string(let s):
+                let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            case .codeBlock:
+                return nil
+            }
+        case .markedStrings(let arr):
+            let proseEntries: [String] = arr.compactMap { entry in
+                if case .string(let s) = entry { return s }
+                return nil
+            }
+            guard !proseEntries.isEmpty else { return nil }
+            let joined = proseEntries.joined(separator: "\n\n")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return joined.isEmpty ? nil : joined
+        }
+    }
+
+    /// Walk a markdown payload line by line, collecting every line that
+    /// is outside a ``` fence as prose. Multi-block hovers (signature →
+    /// prose → signature → prose) are handled correctly because the
+    /// state machine flips on every fence delimiter rather than seeking
+    /// "the last fence". When the payload has no fences at all, the
+    /// entire trimmed value is returned as prose.
+    private static func extractMarkdownProse(_ text: String) -> String? {
+        var insideFence = false
+        var proseLines: [String] = []
+        let lines = text.components(separatedBy: "\n")
+        for line in lines {
+            // Trim trailing \r so CRLF payloads behave the same as LF.
+            let candidate = line.hasSuffix("\r") ? String(line.dropLast()) : line
+            let leading = candidate.trimmingCharacters(in: .whitespaces)
+            if leading.hasPrefix("```") {
+                insideFence.toggle()
+                continue
+            }
+            if !insideFence {
+                proseLines.append(candidate)
+            }
+        }
+        let joined = proseLines.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
+    }
+
+    /// Slice the source file at `uri` and render a line-numbered snippet
+    /// covering `[centerLine - contextLines, centerLine + contextLines]`.
+    /// Returns "" when the URI doesn't point at a readable file on disk
+    /// — the caller's bundle still surfaces hover + definition.
+    private static func renderSurroundingCode(
+        uri: DocumentUri,
+        centerLine: Int,
+        contextLines: Int
+    ) -> String {
+        let normalized = MCPLSPBridge.normalizeFileURI(uri)
+        guard let url = normalized.fileURL, url.isFileURL else { return "" }
+        guard FileManager.default.fileExists(atPath: url.path) else { return "" }
+        let raw: String
+        if let utf8 = try? String(contentsOf: url, encoding: .utf8) {
+            raw = utf8
+        } else {
+            var used = String.Encoding.utf8
+            guard let sniffed = try? String(contentsOf: url, usedEncoding: &used) else {
+                return ""
+            }
+            raw = sniffed
+        }
+        // Split on newline, dropping a final empty trailing entry from a
+        // trailing "\n". `components(separatedBy:)` preserves empty
+        // intermediates which the line-numbered format reproduces
+        // faithfully.
+        var lines = raw.components(separatedBy: "\n")
+        if lines.last == "" { lines.removeLast() }
+        // Normalise CRLF endings: strip a trailing \r from each line so
+        // the rendered snippet doesn't carry stray carriage returns
+        // through into the AI consumer's context.
+        lines = lines.map { $0.hasSuffix("\r") ? String($0.dropLast()) : $0 }
+        guard !lines.isEmpty else { return "" }
+        let lastIdx = lines.count - 1
+        // Clamp `centerLine` into the valid index range BEFORE any
+        // arithmetic. `centerLine` is supplied by an external
+        // `Position` and is unconstrained — without the clamp a hostile
+        // caller could ask for `Int.max` and trip a trap in the
+        // `centerLine ± contextLines` arithmetic. The
+        // addingReportingOverflow / subtractingReportingOverflow checks
+        // then guard against the remaining edge where contextLines
+        // (clamped to ≤ 100 in the handler, but a programmatic caller
+        // could still pass something larger) overflows when added to a
+        // very large clamped center.
+        let clampedCenter = min(max(centerLine, 0), lastIdx)
+        let (sumResult, sumOverflow) = clampedCenter.addingReportingOverflow(contextLines)
+        let end = sumOverflow ? lastIdx : min(lastIdx, sumResult)
+        let (diffResult, diffOverflow) = clampedCenter.subtractingReportingOverflow(contextLines)
+        let start = diffOverflow ? 0 : max(0, diffResult)
+        guard start <= end else { return "" }
+
+        // Width of the line-number gutter so column alignment stays
+        // stable across the snippet.
+        let gutterWidth = String(end).count
+        var out: [String] = []
+        out.reserveCapacity(end - start + 1)
+        for i in start...end {
+            let lineNo = String(i)
+            let pad = String(repeating: " ", count: max(0, gutterWidth - lineNo.count))
+            out.append("\(pad)\(lineNo) | \(lines[i])")
+        }
+        return out.joined(separator: "\n")
     }
 }
 
@@ -4012,7 +4624,7 @@ enum HoverBundleTool: MCPLSPTool {
 
 enum SymbolWalkTool: MCPLSPTool {
     static let name = "lsp_symbol_walk"
-    static let description = "Walk a hierarchy starting from a seed CallHierarchyItem / TypeHierarchyItem. Only direction='call_incoming' with depth=1 is supported in this build; other directions throw invalidArgument."
+    static let description = "BFS a call or type hierarchy from a seed item. `kind` selects the walk direction: call_incoming (default) routes through callHierarchy/incomingCalls, call_outgoing through callHierarchy/outgoingCalls, type_supertypes / type_subtypes prepare via textDocument/prepareTypeHierarchy and then iterate typeHierarchy/{supertypes,subtypes}. Returns `{items: [{level, item, edge?}], depth_reached: Int}`."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
             "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
@@ -4020,17 +4632,22 @@ enum SymbolWalkTool: MCPLSPTool {
             "item": AnyCodable([
                 "type": AnyCodable("object"),
                 "description": AnyCodable(
-                    "Seed CallHierarchyItem (for direction='call_incoming') or TypeHierarchyItem. Forwarded verbatim to the underlying LSP request."
+                    "Seed item. For call_incoming / call_outgoing this is a CallHierarchyItem; for type_supertypes / type_subtypes a TypeHierarchyItem (structurally identical). Forwarded verbatim to the underlying LSP request."
                 ),
             ] as [String: AnyCodable]),
-            "direction": prop(
+            "kind": prop(
                 "string",
-                "Walk direction: 'call_incoming' | 'call_outgoing' | 'type_supertypes' | 'type_subtypes'. Only 'call_incoming' is supported in this build."
+                "Direction to walk. One of: call_incoming (default), call_outgoing, type_supertypes, type_subtypes."
             ),
-            "depth": prop(
-                "integer",
-                "Max recursion depth (default 3; this stub honours depth=1 only for 'call_incoming')"
-            ),
+            "depth": AnyCodable([
+                "type": AnyCodable("integer"),
+                "description": AnyCodable(
+                    "BFS depth (number of hops to expand). Default 1, min 1, max 5 — a hard cap that guards against runaway server fan-out."
+                ),
+                "default": AnyCodable(1),
+                "minimum": AnyCodable(1),
+                "maximum": AnyCodable(5),
+            ] as [String: AnyCodable]),
         ]
         let required = ["workspace_root", "language_id", "item"]
         return [
@@ -4040,17 +4657,89 @@ enum SymbolWalkTool: MCPLSPTool {
         ]
     }()
 
+    /// One BFS visit. `level` is the hop distance from the seed (0 for
+    /// the seed itself); `item` is the visited node serialized as JSON;
+    /// `edge` is the hop that introduced this entry (nil for the seed,
+    /// and for type-hierarchy entries which have no edge metadata).
+    /// Items + edges are stored as `AnyCodable` so a single result
+    /// shape covers both the call-hierarchy and type-hierarchy walks.
+    private struct WalkEntry: Encodable {
+        let level: Int
+        let item: AnyCodable
+        let edge: AnyCodable?
+    }
+
+    private struct WalkResult: Encodable {
+        let items: [WalkEntry]
+        let depthReached: Int
+        /// Surfaces the original error message when
+        /// `textDocument/prepareTypeHierarchy` threw on a type-hierarchy
+        /// walk. Always nil for call-hierarchy walks. Encoded only when
+        /// non-nil so the response shape stays minimal for the common
+        /// success path.
+        let prepareError: String?
+
+        enum CodingKeys: String, CodingKey {
+            case items
+            case depthReached = "depth_reached"
+            case prepareError = "prepare_error"
+        }
+
+        init(
+            items: [WalkEntry],
+            depthReached: Int,
+            prepareError: String? = nil
+        ) {
+            self.items = items
+            self.depthReached = depthReached
+            self.prepareError = prepareError
+        }
+
+        func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(items, forKey: .items)
+            try container.encode(depthReached, forKey: .depthReached)
+            try container.encodeIfPresent(prepareError, forKey: .prepareError)
+        }
+    }
+
+    /// Hard cap on the number of entries the walk emits. Same as the
+    /// historical implementation — guards against runaway servers that
+    /// return enormous fan-out from a single hop.
+    private static let nodeCap = 100
+
     static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
-        let direction = try MCPLSPBridge.optionalString(
-            arguments: arguments,
-            key: "direction"
-        ) ?? "call_incoming"
-        guard direction == "call_incoming" else {
+        // The `kind` parameter is the modern way to select the walk
+        // direction. The historical `direction` parameter is kept as a
+        // backwards-compatible alias for the only value it ever
+        // accepted (`call_incoming`); any other `direction` value
+        // continues to throw `invalidArgument` so existing callers
+        // that relied on the strict-rejection behaviour stay green.
+        //
+        // Passing BOTH `kind` and `direction` is ambiguous and rejected
+        // outright — silently preferring one would mask a caller bug.
+        let kindArg = try MCPLSPBridge.optionalString(arguments: arguments, key: "kind")
+        let directionArg = try MCPLSPBridge.optionalString(arguments: arguments, key: "direction")
+        let walkKind: String
+        if kindArg != nil, directionArg != nil {
             throw MCPLSPBridgeError.invalidArgument(
                 name: "direction",
-                reason: "only 'call_incoming' is supported in this build (got '\(direction)')"
+                reason: "cannot pass both 'kind' and 'direction'; use 'kind' only"
             )
+        } else if let kind = kindArg {
+            walkKind = kind
+        } else if let direction = directionArg {
+            guard direction == "call_incoming" else {
+                throw MCPLSPBridgeError.invalidArgument(
+                    name: "direction",
+                    reason: "legacy 'direction' alias only supports 'call_incoming' (got '\(direction)'); use 'kind' for other walk directions"
+                )
+            }
+            walkKind = direction
+        } else {
+            walkKind = "call_incoming"
         }
+
         let session: LSPSession
         do {
             session = try await bridge.resolveSession(arguments: arguments)
@@ -4062,22 +4751,296 @@ enum SymbolWalkTool: MCPLSPTool {
         guard let itemAny = arguments["item"] else {
             throw MCPLSPBridgeError.missingArgument("item")
         }
-        let item = try MCPLSPBridge.decodeFromAnyCodable(
-            itemAny,
-            as: CallHierarchyItem.self,
-            argumentName: "item"
-        )
-        let params = CallHierarchyIncomingCallsParams(item: item)
-        do {
-            let result: [CallHierarchyIncomingCall]? = try await session.sendRequest(
-                method: "callHierarchy/incomingCalls",
-                params: params,
-                resultType: [CallHierarchyIncomingCall]?.self
+        let rawDepth = try MCPLSPBridge.optionalInt(arguments: arguments, key: "depth") ?? 1
+        // Clamp to [1, 5] — values outside the range are accepted but
+        // pinned so a runaway caller can't stampede the LSP server.
+        let depth = min(max(rawDepth, 1), 5)
+
+        let result: WalkResult
+        switch walkKind {
+        case "call_incoming":
+            let seed = try MCPLSPBridge.decodeFromAnyCodable(
+                itemAny,
+                as: CallHierarchyItem.self,
+                argumentName: "item"
             )
-            return try MCPLSPBridge.makeJSONContent(result)
-        } catch {
-            return MCPLSPBridge.makeErrorContent(error)
+            result = await walkCallHierarchy(
+                seeds: [seed],
+                depth: depth,
+                session: session,
+                outgoing: false
+            )
+        case "call_outgoing":
+            let seed = try MCPLSPBridge.decodeFromAnyCodable(
+                itemAny,
+                as: CallHierarchyItem.self,
+                argumentName: "item"
+            )
+            result = await walkCallHierarchy(
+                seeds: [seed],
+                depth: depth,
+                session: session,
+                outgoing: true
+            )
+        case "type_supertypes":
+            let seed = try MCPLSPBridge.decodeFromAnyCodable(
+                itemAny,
+                as: TypeHierarchyItem.self,
+                argumentName: "item"
+            )
+            let prepared = await prepareTypeHierarchy(seed: seed, session: session)
+            let walked = await walkTypeHierarchy(
+                seeds: prepared.frontier,
+                depth: depth,
+                session: session,
+                subtypes: false
+            )
+            result = WalkResult(
+                items: walked.items,
+                depthReached: walked.depthReached,
+                prepareError: prepared.prepareError
+            )
+        case "type_subtypes":
+            let seed = try MCPLSPBridge.decodeFromAnyCodable(
+                itemAny,
+                as: TypeHierarchyItem.self,
+                argumentName: "item"
+            )
+            let prepared = await prepareTypeHierarchy(seed: seed, session: session)
+            let walked = await walkTypeHierarchy(
+                seeds: prepared.frontier,
+                depth: depth,
+                session: session,
+                subtypes: true
+            )
+            result = WalkResult(
+                items: walked.items,
+                depthReached: walked.depthReached,
+                prepareError: prepared.prepareError
+            )
+        default:
+            throw MCPLSPBridgeError.invalidArgument(
+                name: "kind",
+                reason: "unknown walk kind '\(walkKind)' (expected one of: call_incoming, call_outgoing, type_supertypes, type_subtypes)"
+            )
         }
+
+        return try MCPLSPBridge.makeJSONContent(result)
+    }
+
+    /// Shared BFS over a call hierarchy. `outgoing == true` selects
+    /// `callHierarchy/outgoingCalls` (reading `call.to`); otherwise
+    /// `callHierarchy/incomingCalls` (reading `call.from`).
+    private static func walkCallHierarchy(
+        seeds: [CallHierarchyItem],
+        depth: Int,
+        session: LSPSession,
+        outgoing: Bool
+    ) async -> WalkResult {
+        var frontier: [CallHierarchyItem] = seeds
+        var visited: Set<String> = []
+        var results: [WalkEntry] = []
+        var depthReached = 0
+        let method = outgoing ? "callHierarchy/outgoingCalls" : "callHierarchy/incomingCalls"
+
+        bfs: for level in 0..<depth {
+            var nextFrontier: [CallHierarchyItem] = []
+            for item in frontier {
+                if results.count >= nodeCap { break bfs }
+                let key = walkKey(forCall: item)
+                if visited.contains(key) { continue }
+                visited.insert(key)
+                results.append(WalkEntry(
+                    level: level,
+                    item: AnyCodable.from(item),
+                    edge: nil
+                ))
+
+                if outgoing {
+                    let params = CallHierarchyOutgoingCallsParams(item: item)
+                    let calls: [CallHierarchyOutgoingCall]?
+                    do {
+                        calls = try await session.sendRequest(
+                            method: method,
+                            params: params,
+                            resultType: [CallHierarchyOutgoingCall]?.self
+                        )
+                    } catch {
+                        // A server-side failure on a single frontier
+                        // node must not abort the whole walk; skip the
+                        // failed edge and keep going.
+                        continue
+                    }
+                    guard let calls else { continue }
+                    for call in calls {
+                        if results.count >= nodeCap { break bfs }
+                        results.append(WalkEntry(
+                            level: level + 1,
+                            item: AnyCodable.from(call.to),
+                            edge: AnyCodable.from(call)
+                        ))
+                        nextFrontier.append(call.to)
+                    }
+                } else {
+                    let params = CallHierarchyIncomingCallsParams(item: item)
+                    let calls: [CallHierarchyIncomingCall]?
+                    do {
+                        calls = try await session.sendRequest(
+                            method: method,
+                            params: params,
+                            resultType: [CallHierarchyIncomingCall]?.self
+                        )
+                    } catch {
+                        continue
+                    }
+                    guard let calls else { continue }
+                    for call in calls {
+                        if results.count >= nodeCap { break bfs }
+                        results.append(WalkEntry(
+                            level: level + 1,
+                            item: AnyCodable.from(call.from),
+                            edge: AnyCodable.from(call)
+                        ))
+                        nextFrontier.append(call.from)
+                    }
+                }
+            }
+            depthReached = level + 1
+            frontier = nextFrontier
+            if frontier.isEmpty { break bfs }
+        }
+
+        return WalkResult(items: results, depthReached: depthReached)
+    }
+
+    /// Issue `textDocument/prepareTypeHierarchy` at the seed item's
+    /// selection-range start position. LSP requires a prepare step
+    /// before any `typeHierarchy/{supertypes,subtypes}` request; the
+    /// returned items become the BFS's initial frontier.
+    ///
+    /// Failure modes:
+    ///   - Server error: log via `os_log`, propagate the message back
+    ///     to the caller in `prepareError` so it surfaces in the JSON
+    ///     envelope. The frontier is empty so the walk yields an empty
+    ///     items list alongside the error.
+    ///   - Empty / nil result: fall back to the seed itself as the
+    ///     frontier. Some servers tolerate skipping the prepare step
+    ///     entirely when the caller already has a fully formed
+    ///     `TypeHierarchyItem` (uri + selectionRange + range), so this
+    ///     gives the walk a chance to fan out instead of returning a
+    ///     hollow result.
+    private static func prepareTypeHierarchy(
+        seed: TypeHierarchyItem,
+        session: LSPSession
+    ) async -> (frontier: [TypeHierarchyItem], prepareError: String?) {
+        let params = TypeHierarchyPrepareParams(
+            textDocument: TextDocumentIdentifier(uri: seed.uri),
+            position: seed.selectionRange.start
+        )
+        do {
+            let result: [TypeHierarchyItem]? = try await session.sendRequest(
+                method: "textDocument/prepareTypeHierarchy",
+                params: params,
+                resultType: [TypeHierarchyItem]?.self
+            )
+            let items = result ?? []
+            if items.isEmpty {
+                return (frontier: [seed], prepareError: nil)
+            }
+            return (frontier: items, prepareError: nil)
+        } catch {
+            let message = String(describing: error)
+            bridgeLogger.error(
+                "prepareTypeHierarchy failed for \(seed.uri, privacy: .public): \(message, privacy: .public)"
+            )
+            return (frontier: [], prepareError: message)
+        }
+    }
+
+    /// Shared BFS over a type hierarchy. `subtypes == true` walks
+    /// `typeHierarchy/subtypes`; otherwise `typeHierarchy/supertypes`.
+    private static func walkTypeHierarchy(
+        seeds: [TypeHierarchyItem],
+        depth: Int,
+        session: LSPSession,
+        subtypes: Bool
+    ) async -> WalkResult {
+        var frontier: [TypeHierarchyItem] = seeds
+        var visited: Set<String> = []
+        var results: [WalkEntry] = []
+        var depthReached = 0
+        let method = subtypes ? "typeHierarchy/subtypes" : "typeHierarchy/supertypes"
+
+        bfs: for level in 0..<depth {
+            var nextFrontier: [TypeHierarchyItem] = []
+            for item in frontier {
+                if results.count >= nodeCap { break bfs }
+                let key = walkKey(forType: item)
+                if visited.contains(key) { continue }
+                visited.insert(key)
+                results.append(WalkEntry(
+                    level: level,
+                    item: AnyCodable.from(item),
+                    edge: nil
+                ))
+
+                let children: [TypeHierarchyItem]?
+                do {
+                    if subtypes {
+                        let params = TypeHierarchySubtypesParams(item: item)
+                        children = try await session.sendRequest(
+                            method: method,
+                            params: params,
+                            resultType: [TypeHierarchyItem]?.self
+                        )
+                    } else {
+                        let params = TypeHierarchySupertypesParams(item: item)
+                        children = try await session.sendRequest(
+                            method: method,
+                            params: params,
+                            resultType: [TypeHierarchyItem]?.self
+                        )
+                    }
+                } catch {
+                    continue
+                }
+                guard let children else { continue }
+                for child in children {
+                    if results.count >= nodeCap { break bfs }
+                    results.append(WalkEntry(
+                        level: level + 1,
+                        item: AnyCodable.from(child),
+                        edge: nil
+                    ))
+                    nextFrontier.append(child)
+                }
+            }
+            depthReached = level + 1
+            frontier = nextFrontier
+            if frontier.isEmpty { break bfs }
+        }
+
+        return WalkResult(items: results, depthReached: depthReached)
+    }
+
+    /// Stable identity for visited-set dedup. Uses uri + name + range +
+    /// selectionRange because two distinct nested symbols can share a
+    /// `range` (the enclosing block of code) while differing only by
+    /// `selectionRange` (the name span). Including the selection range
+    /// in the key keeps the BFS from treating nested-but-distinct
+    /// symbols as one. Call- and type-hierarchy items have the same
+    /// key shape (both expose `uri`, `name`, `range`, `selectionRange`),
+    /// so they share the same key format.
+    private static func walkKey(forCall item: CallHierarchyItem) -> String {
+        let r = item.range
+        let s = item.selectionRange
+        return "\(item.uri)#\(item.name)#\(r.start.line):\(r.start.character)-\(r.end.line):\(r.end.character)#\(s.start.line):\(s.start.character)"
+    }
+
+    private static func walkKey(forType item: TypeHierarchyItem) -> String {
+        let r = item.range
+        let s = item.selectionRange
+        return "\(item.uri)#\(item.name)#\(r.start.line):\(r.start.character)-\(r.end.line):\(r.end.character)#\(s.start.line):\(s.start.character)"
     }
 }
 
@@ -4129,11 +5092,136 @@ enum GlobalWorkspaceSymbolTool: MCPLSPTool {
 
 enum CrossWorkspaceDefinitionTool: MCPLSPTool {
     static let name = "lsp_cross_workspace_definition"
-    static let description = "Resolve a definition across workspaces. In this build the tool is a thin wrapper over textDocument/definition against the requested workspace; later iterations will hop through monikers to chase symbols into sibling workspaces."
+    static let description = "Resolve a definition that may live in a sibling workspace. Dispatches textDocument/definition in the requested workspace first; when empty, asks textDocument/moniker for a portable identifier and fans workspace/symbol across every warm LSPService session."
     static let inputSchema: [String: AnyCodable] = positionRequestSchema()
 
+    /// Permissive moniker shape used for the fan-out lookup. The full
+    /// `Moniker` type requires `unique`, which servers don't always
+    /// emit (and which we don't need): all we want is `identifier`.
+    private struct MonikerLite: Decodable, Sendable {
+        let identifier: String
+    }
+
+    /// JSON envelope returned by the tool.
+    private struct CrossDefinitionBundle: Encodable {
+        struct WorkspaceHit: Encodable {
+            let workspace: String
+            let locations: AnyCodable
+        }
+        let resolvedIn: String
+        let definition: AnyCodable
+        let crossWorkspace: [WorkspaceHit]
+
+        enum CodingKeys: String, CodingKey {
+            case resolvedIn = "resolved_in"
+            case definition
+            case crossWorkspace = "cross_workspace"
+        }
+    }
+
     static func handle(arguments: [String: AnyCodable], bridge: MCPLSPBridge) async throws -> MCPContent {
-        try await DefinitionTool.handle(arguments: arguments, bridge: bridge)
+        let session: LSPSession
+        do {
+            session = try await bridge.resolveSession(arguments: arguments)
+        } catch let err as MCPLSPBridgeError {
+            throw err
+        } catch {
+            return MCPLSPBridge.makeErrorContent(error)
+        }
+        let (uri, position) = try bridge.extractPosition(arguments: arguments)
+        try await MCPLSPBridge.ensureFileOpen(session: session, uri: uri)
+
+        let workspaceRootString = try MCPLSPBridge.requireString(
+            arguments: arguments,
+            key: "workspace_root"
+        )
+        let originRoot = MCPLSPBridge.fileURL(fromPathOrUri: workspaceRootString)
+
+        // 1. textDocument/definition in the origin session.
+        let definitionParams = DefinitionParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            position: position
+        )
+        var definitionAny: AnyCodable = AnyCodable(NSNull())
+        var definitionEmpty = true
+        do {
+            let result: DefinitionResult? = try await session.sendRequest(
+                method: "textDocument/definition",
+                params: definitionParams,
+                resultType: DefinitionResult?.self
+            )
+            if let result {
+                let data = try JSONEncoder().encode(result)
+                if let parsed = try? JSONDecoder().decode(AnyCodable.self, from: data) {
+                    definitionAny = parsed
+                }
+                switch result {
+                case .single:
+                    definitionEmpty = false
+                case .array(let arr):
+                    definitionEmpty = arr.isEmpty
+                case .linkArray(let arr):
+                    definitionEmpty = arr.isEmpty
+                }
+            }
+        } catch {
+            // Treat a server error as "no definition here" and proceed
+            // to the moniker fan-out; the caller should see the broader
+            // search rather than a hard failure.
+        }
+
+        // 2. If the local definition is empty, hop through moniker +
+        //    workspace/symbol across every warm session.
+        var crossHits: [CrossDefinitionBundle.WorkspaceHit] = []
+        if definitionEmpty {
+            let monikerParams = MonikerParams(
+                textDocument: TextDocumentIdentifier(uri: uri),
+                position: position
+            )
+            let monikers: [MonikerLite]?
+            do {
+                monikers = try await session.sendRequest(
+                    method: "textDocument/moniker",
+                    params: monikerParams,
+                    resultType: [MonikerLite]?.self
+                )
+            } catch {
+                monikers = nil
+            }
+            let identifier = monikers?.first?.identifier
+            if let identifier {
+                let warmSessions = bridge.service.allWarmSessions()
+                for warm in warmSessions {
+                    let symbolParams = WorkspaceSymbolParams(query: identifier)
+                    do {
+                        let result: WorkspaceSymbolResult? = try await warm.session.sendRequest(
+                            method: "workspace/symbol",
+                            params: symbolParams,
+                            resultType: WorkspaceSymbolResult?.self
+                        )
+                        guard let result else { continue }
+                        let data = try JSONEncoder().encode(result)
+                        let parsed = try JSONDecoder().decode(AnyCodable.self, from: data)
+                        crossHits.append(CrossDefinitionBundle.WorkspaceHit(
+                            workspace: warm.workspaceRoot.absoluteString,
+                            locations: parsed
+                        ))
+                    } catch {
+                        // Per-session failure: skip this workspace and
+                        // continue the fan-out so a single broken server
+                        // doesn't blank the entire response.
+                        continue
+                    }
+                }
+            }
+        }
+
+        let bundle = CrossDefinitionBundle(
+            resolvedIn: originRoot.absoluteString,
+            definition: definitionAny,
+            crossWorkspace: crossHits
+        )
+        return try MCPLSPBridge.makeJSONContent(bundle)
     }
 }
 
@@ -4364,22 +5452,50 @@ enum NotebookDidCloseTool: MCPLSPTool {
 // These DTOs mirror only the fields the MCP surface needs to render, and
 // add explicit Codable conformance with stable JSON shapes.
 
+/// One prerequisite-status entry. Custom `encode(to:)` calls
+/// `container.encode(_:forKey:)` rather than `encodeIfPresent` so a nil
+/// path (the prereq is missing on PATH) still surfaces as
+/// `"<name>": {"path": null}` in the JSON — without the explicit-null
+/// shape the MCP caller can't distinguish "prereq absent" from "prereq
+/// untested".
+private struct PrereqStatusDTO: Codable, Sendable, Equatable {
+    let path: String?
+
+    init(path: String?) {
+        self.path = path
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case path
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.path = try container.decodeIfPresent(String.self, forKey: .path)
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(path, forKey: .path)
+    }
+}
+
 /// JSON shape returned by `lsp_check_installation`.
 private struct InstallationCheckDTO: Codable, Sendable, Equatable {
     let languageId: String
     let isInstalled: Bool
     let detectedPath: String?
     let detectedVersion: String?
-    let prerequisiteStatuses: [String: String?]
+    let prerequisiteStatuses: [String: PrereqStatusDTO]
 
     init(from check: InstallationCheck) {
         self.languageId = check.languageId
         self.isInstalled = check.isInstalled
         self.detectedPath = check.detectedPath?.absoluteString
         self.detectedVersion = check.detectedVersion
-        var prereqs: [String: String?] = [:]
+        var prereqs: [String: PrereqStatusDTO] = [:]
         for (key, value) in check.prerequisiteStatuses {
-            prereqs[key] = value?.absoluteString
+            prereqs[key] = PrereqStatusDTO(path: value?.absoluteString)
         }
         self.prerequisiteStatuses = prereqs
     }

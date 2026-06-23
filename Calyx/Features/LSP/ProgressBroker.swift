@@ -152,8 +152,12 @@ actor ProgressBroker {
                 percentage: existing?.percentage,
                 cancellable: false
             )
-            tokens[token] = .live(entry)
             appendRecentlyEnded(entry)
+            // Ended tokens must not linger in the live dict, otherwise long
+            // sessions accumulate thousands of entries. The bounded
+            // `recentlyEnded` ring is the read source for ended tokens; see
+            // `status(for:)` for the fallback.
+            tokens.removeValue(forKey: token)
         }
     }
 
@@ -162,11 +166,29 @@ actor ProgressBroker {
     /// The coarse status of the last `$/progress` notification for `token`,
     /// or `nil` if the token was never registered or has not yet received
     /// its first notification.
+    ///
+    /// Ended tokens are evicted from the live dict (see `.end` handling) but
+    /// remain in the bounded `recentlyEnded` ring; for those we report
+    /// `.end` by scanning the ring as a fallback.
     func status(for token: ProgressToken) -> ProgressStatus? {
         switch tokens[token] {
-        case .live(let entry): return entry.status
-        case .reserved, .none: return nil
+        case .live(let entry):
+            return entry.status
+        case .reserved:
+            return nil
+        case .none:
+            if let entry = recentlyEnded.last(where: { $0.token == token }) {
+                return entry.status
+            }
+            return nil
         }
+    }
+
+    /// Test-only inspection of the live token dictionary size (counts both
+    /// `.reserved` and `.live` entries). Ended tokens are excluded because
+    /// they are evicted from the dict and tracked in `recentlyEnded`.
+    internal var liveTokenCount: Int {
+        return tokens.count
     }
 
     /// All entries whose last status is `.begin` or `.report`.
