@@ -132,29 +132,6 @@ VSCode-resident AIs (Cursor, Copilot) get to query the IDE's already-warm langua
     - *Confirm before each install step* — when on, the agent (or you) is prompted via MCP before each command runs; when off, install runs silently. Both default to on.
 3. **Have at least one language server reachable.** Install one yourself (see the language table below) or let Calyx run `lsp_install language_id=<id>` on demand.
 
-### Try it: a recordable demo
-
-Open Claude Code (or Codex CLI) in a Calyx tab. Confirm `calyx-ipc` is registered: `/mcp` should list it.
-
-Pick a real project you have on disk. Ask the agent by SYMBOL NAME — never hand-specify `line` / `column`; let the agent resolve the position via LSP itself, since hard-coded coordinates land on token boundaries that some servers reject.
-
-> "In /path/to/your/repo, find every reference to the `<some function or trait>` symbol. Don't use grep, only `calyx-ipc` tools. List each site and summarize what it's used for."
-
-A well-behaved agent runs:
-1. `lsp_workspace_symbol query="<name>"` to look up the symbol's canonical location (file + range, resolved by the LSP server, not by the user).
-2. `lsp_references` at that exact location, with `include_declaration=true`.
-3. `lsp_hover` on each result for local context.
-4. Summarizes.
-
-Compare what the agent reports to `grep -rn <name> .`: the LSP path returns type-resolved sites (declarations, imports, impls, function parameters, etc.) classified by role; grep returns text matches mixed with comments, strings, and partial-word hits.
-
-Other demo prompts (all by-name, no manual coordinates):
-- "Rename the `<method>` symbol to `<newName>` across the codebase using `lsp_rename` and `lsp_workspace_apply_edit`."
-- "Starting from the `<entrypoint>` symbol, show the outgoing call graph down to depth 3 using `lsp_symbol_walk` with `kind: \"call_outgoing\"`."
-- "Use `lsp_diagnostics` to list every type error currently in `<path/to/file>`."
-
-If `lsp_references` returns empty on the first try, the language server's workspace index may still be warming up (rust-analyzer takes 30 s – 1 min on a fresh project). Call `lsp_session_warmup` first, or wait and retry; this is LSP-protocol-level behavior, not Calyx-specific.
-
 ### Settings, config, and persistence
 
 - **Settings window → LSP Proxy.** Two toggles described above.
