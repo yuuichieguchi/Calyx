@@ -23,9 +23,41 @@ final class CalyxMCPServer {
     private(set) var appPeerID: UUID?
     private var peerRegistrationTask: Task<Void, Never>?
 
+    /// Bridge that exposes LSP requests as MCP tools. `nil` until
+    /// `startLSP()` (or `_testInjectLSPBridge(_:)`) wires one in.
+    private(set) var lspBridge: MCPLSPBridge?
+
+    /// Count of teardown Tasks that are currently in flight — i.e.,
+    /// scheduled by `stop()` but not yet returned. Race-safety tests
+    /// observe this to confirm that the new LSP startup scheduled by
+    /// `start()` has fully waited for the prior bridge teardown before
+    /// running its body. Without that chain, the previous (cancelled
+    /// but still-executing) `lspStartTask` could race the new one to
+    /// install bridges into `self.lspBridge`, with the loser leaking
+    /// a fully-built `LSPService` plus its child language-server
+    /// processes.
+    private(set) var inflightTeardownCount: Int = 0
+
+    /// Snapshot of `inflightTeardownCount` recorded at the moment
+    /// `startLSP()` last began executing its body. Lifecycle race
+    /// tests assert this is `0` after a `start()` → `start()` toggle to
+    /// confirm the new LSP startup chained behind — and waited for —
+    /// the prior teardown. Defaults to `-1` so a test can distinguish
+    /// "startLSP() has never been entered" from "entered with no
+    /// teardown in flight". Internal access so XCTest with
+    /// `@testable import` can read it.
+    private(set) var inflightTeardownCountAtLastStartLSPEntry: Int = -1
+
     // MARK: - Private
 
     private var listener: NWListener?
+    /// Background task running `startLSP()`. Retained so `stop()` can
+    /// cancel it (and await its completion) before tearing down the
+    /// resulting `lspBridge`. Without this, a `start()` → `stop()` pair
+    /// fired before `startLSP()` finishes would leak the freshly-built
+    /// `LSPService` plus its child language-server processes and
+    /// `FSEvents` watches.
+    private var lspStartTask: Task<Void, Never>?
 
     private static let iso8601: ISO8601DateFormatter = {
         let fmt = ISO8601DateFormatter()
@@ -42,10 +74,118 @@ final class CalyxMCPServer {
         self.token = token
     }
 
+    // MARK: - LSP Bridge Lifecycle
+
+    /// Spin up the LSP tool bridge with the production stdio transport and
+    /// system command runner. Idempotent — re-entry replaces the existing
+    /// bridge with a fresh one.
+    func startLSP() async {
+        // Test-observable probe: race-safety tests use this to confirm
+        // that the new LSP startup did not begin its body until the
+        // prior teardown drained. With the chain fix in `start()` this
+        // is `0`; without it, this can be non-zero because the new
+        // `lspStartTask` ran on `@MainActor` while the prior teardown
+        // Task was still in flight (suspended in `shutdownAll`).
+        self.inflightTeardownCountAtLastStartLSPEntry = self.inflightTeardownCount
+
+        // Defensive teardown of any prior bridge so re-entry replaces it
+        // cleanly. In the normal `start()` -> `stop()` -> `start()` flow
+        // `stop()` already nils `lspBridge`, but tests that drive
+        // `startLSP()` directly (or `_testInjectLSPBridge` followed by a
+        // real `startLSP()`) can land here with a stale bridge still
+        // attached.
+        if let priorBridge = lspBridge {
+            self.lspBridge = nil
+            await priorBridge.service.shutdownAll()
+        }
+
+        let registry = LSPServerRegistry.builtIn()
+        let runner = SystemCommandRunner()
+        let installer = LSPInstaller(registry: registry, runner: runner)
+        let factory = StdioBackedLSPSessionFactory()
+        // Production wiring uses the FSEvents-backed event source so
+        // on-disk edits outside Calyx's own writers feed back into LSP
+        // synchronisation notifications.
+        let fileSyncManager = FileSyncManager()
+        // Default persistence store under
+        // `~/Library/Application Support/Calyx/lsp/sessions.json`. Snapshots
+        // are written on every `didOpen` / `didClose` and removed on
+        // `shutdown()`, so a subsequent launch can replay the open-file
+        // set via `LSPService.availableSnapshots()`.
+        let persistence = LSPSessionPersistence()
+        // Single `DiagnosticsStore` shared between `LSPService` (which
+        // hands it to every freshly built `LSPSession` so server
+        // `textDocument/publishDiagnostics` notifications are ingested)
+        // and `MCPLSPBridge` (which reads from the same store when
+        // serving the `lsp_diagnostics_diff` tool). Without the shared
+        // reference the store the bridge reads from would never be
+        // populated and the diff would always come back empty.
+        let diagnosticsStore = DiagnosticsStore()
+        let service = LSPService(
+            registry: registry,
+            installer: installer,
+            sessionFactory: factory,
+            config: LSPServiceConfig(),
+            fileSyncManager: fileSyncManager,
+            persistence: persistence,
+            diagnosticsStore: diagnosticsStore
+        )
+        let resolver = WorkspaceResolver(registry: registry)
+        self.lspBridge = MCPLSPBridge(
+            service: service,
+            workspaceResolver: resolver,
+            installer: installer,
+            diagnosticsStore: diagnosticsStore
+        )
+    }
+
+    /// For testing only — inject a pre-built `MCPLSPBridge` (typically
+    /// wired against a fake `LSPSessionFactory`) so tool dispatch can be
+    /// exercised without spawning a real language server.
+    func _testInjectLSPBridge(_ bridge: MCPLSPBridge) {
+        self.lspBridge = bridge
+    }
+
+    /// For testing only — install an arbitrary `Task` reference into the
+    /// `lspStartTask` slot so tests can simulate the `start()` → `stop()`
+    /// → `start()` race the teardown identity check guards against without
+    /// having to bind a real `NWListener` port.
+    func _testInjectLSPStartTask(_ task: Task<Void, Never>?) {
+        self.lspStartTask = task
+    }
+
+    /// For testing only — read the current `lspStartTask` reference so
+    /// race-safety tests can `await` its `.value` and observe the new
+    /// startup body completing. Returns `nil` between `stop()` (which
+    /// clears the slot synchronously) and the next `start()` /
+    /// `_testInjectLSPStartTask` call.
+    func _testCurrentLSPStartTask() -> Task<Void, Never>? {
+        self.lspStartTask
+    }
+
     // MARK: - Lifecycle
 
     func start(token: String, preferredPort: Int = 41830) throws {
-        if isRunning { stop() }
+        // Capture the teardown Task scheduled by the prior `stop()` so
+        // the new LSP startup can wait for it before installing a fresh
+        // bridge. Without this chain the new `lspStartTask` and the
+        // prior teardown would both be live on `@MainActor`: the prior
+        // teardown's `await pendingStartup?.value` and
+        // `await preStartupBridge.shutdownAll()` are suspension points,
+        // during which `@MainActor` happily schedules the freshly
+        // enqueued `lspStartTask` body. The two `lspStartTask`s end up
+        // racing to install bridges into `self.lspBridge`, and the
+        // loser leaks a fully-built `LSPService` plus its child
+        // language-server processes and `FSEvents` watches.
+        //
+        // `stop()` synchronously clears `isRunning` / `listener` /
+        // `lspBridge` / `lspStartTask` and returns the teardown Task
+        // that completes the async portion. Chaining the new
+        // `lspStartTask` body off `await priorTeardown.value` makes the
+        // ordering explicit: the new `startLSP()` body runs only after
+        // the prior teardown has finished its `shutdownAll` and
+        // identity check.
+        let priorTeardown: Task<Void, Never>? = isRunning ? stop() : nil
 
         self.token = token
 
@@ -76,6 +216,19 @@ final class CalyxMCPServer {
                     let peer = await self.store.registerPeer(name: "calyx-app", role: "review-ui")
                     self.appPeerID = peer.id
                 }
+                // Retain the LSP startup task so `stop()` can cancel + await
+                // it before tearing down the resulting bridge. The body
+                // first awaits the prior teardown (if any) so the new
+                // `startLSP()` install never races a previous bridge
+                // shutdown — see the comment above the `priorTeardown`
+                // capture for the leak this guards against.
+                self.lspStartTask = Task { @MainActor in
+                    if let priorTeardown {
+                        await priorTeardown.value
+                    }
+                    if Task.isCancelled { return }
+                    await self.startLSP()
+                }
                 return
             } catch {
                 lastError = error
@@ -93,7 +246,8 @@ final class CalyxMCPServer {
         )
     }
 
-    func stop() {
+    @discardableResult
+    func stop() -> Task<Void, Never> {
         listener?.cancel()
         listener = nil
         isRunning = false
@@ -102,6 +256,98 @@ final class CalyxMCPServer {
         peerRegistrationTask = nil
         port = 0
         Task { await store.cleanup() }
+
+        // LSP bridge teardown. `stop()` is synchronous to match the
+        // existing call sites (`CalyxWindowController.disableIPC`,
+        // `start()`'s reset-on-toggle path) so we schedule the actual
+        // service shutdown on a fire-and-forget Task. The listener is
+        // already cancelled at this point so no new requests can land in
+        // the meantime; what matters is that the in-flight `startLSP()`
+        // — if any — gets cancelled and awaited before we ask its
+        // bridge to release every child LSP process and `FSEvents`
+        // watch.
+        //
+        // The teardown Task is returned to the caller so a follow-up
+        // `start()` can chain its new `lspStartTask` body off
+        // `await teardown.value` — closing the race where the new
+        // startup body would otherwise run on `@MainActor` while this
+        // teardown was still suspended in `shutdownAll`, allowing both
+        // `lspStartTask`s to race to install bridges. `stopAndWait()`
+        // also uses the return value to drain teardown synchronously
+        // from async contexts.
+        //
+        // Race-safety: callers polling `lspBridge` right after `stop()`
+        // observe a cleared state, and a follow-up `start(B)` landing
+        // before the teardown Task wakes must NOT have its
+        // freshly-installed bridge clobbered. We achieve both by:
+        //
+        //   1. Snapshotting `pendingStartup` + `preStartupBridge` and
+        //      synchronously clearing `lspStartTask` / `lspBridge`.
+        //   2. Inside the Task: cancel + await the snapshotted startup
+        //      so any in-flight `startLSP()` finishes before we touch
+        //      its bridge, then unconditionally shut down
+        //      `preStartupBridge` (it belonged to us).
+        //   3. Identity-checking `self.lspStartTask` as the gate: if it
+        //      is still `nil`, no follow-up `start()` has landed and any
+        //      bridge that surfaced in `self.lspBridge` between the sync
+        //      clear and now is also ours (a late `startLSP()` racing
+        //      past the clear). If it is non-`nil`, a follow-up
+        //      `start(B)` has taken over and the bridge in
+        //      `self.lspBridge` belongs to that new startup — we leave
+        //      it untouched. The previous identity-agnostic re-read
+        //      would tear down `start(B)`'s bridge, leaving the server
+        //      in a state where `isRunning == true` yet every `lsp_*`
+        //      tool returned "LSP bridge is not started".
+        let pendingStartup = lspStartTask
+        let preStartupBridge = lspBridge
+        self.lspStartTask = nil
+        self.lspBridge = nil
+        self.inflightTeardownCount += 1
+        let teardown = Task { @MainActor in
+            defer { self.inflightTeardownCount -= 1 }
+
+            pendingStartup?.cancel()
+            _ = await pendingStartup?.value
+
+            // Shut down the bridge that this `stop()` owns. Always
+            // safe — `preStartupBridge` was the live bridge at the
+            // moment of the sync clear, and no later code path
+            // reinstates it.
+            await preStartupBridge?.service.shutdownAll()
+
+            // Identity gate. A non-nil `lspStartTask` means a
+            // follow-up `start(B)` already took over since our sync
+            // clear; the bridge currently in `self.lspBridge` (if
+            // any) belongs to that new startup and must be left
+            // alone.
+            guard self.lspStartTask == nil else {
+                return
+            }
+
+            // No follow-up start landed. If a late `startLSP()`
+            // installed a bridge after our sync clear, it is ours to
+            // tear down. The `!==` guard short-circuits when
+            // `self.lspBridge` somehow points back at the same
+            // instance as `preStartupBridge` (already shut down
+            // above).
+            let postStartupBridge = self.lspBridge
+            if postStartupBridge !== preStartupBridge,
+               let bridge = postStartupBridge {
+                self.lspBridge = nil
+                await bridge.service.shutdownAll()
+            }
+        }
+        return teardown
+    }
+
+    /// Async variant of `stop()` that awaits the teardown Task to
+    /// completion before returning. Use this from async contexts — most
+    /// importantly any caller racing a follow-up `start()` — where the
+    /// new code path must not run until the prior bridge teardown has
+    /// fully drained.
+    func stopAndWait() async {
+        let teardown = stop()
+        await teardown.value
     }
 
     /// Ensures the app peer is registered before proceeding.
@@ -233,6 +479,15 @@ final class CalyxMCPServer {
 
         guard let toolName = extractString(params, "name") else {
             return toolError(id: id, text: "Missing tool name")
+        }
+
+        // LSP route — `lsp_*` tools are dispatched through `MCPLSPBridge`.
+        if MCPRouter.isLSPTool(name: toolName) {
+            return await handleLSPToolCall(
+                id: id,
+                toolName: toolName,
+                params: params
+            )
         }
 
         let arguments = extractDict(params, "arguments")
@@ -390,6 +645,58 @@ final class CalyxMCPServer {
         return toolSuccess(id: id, text: json)
     }
 
+    // MARK: - LSP Tool Dispatch
+
+    /// Route an `lsp_*` tool call to the configured `MCPLSPBridge`.
+    /// Returns a structured error when the bridge has not been started,
+    /// the tool name is unknown, or an argument fails validation. The
+    /// bridge itself catches LSP server errors and shapes them into the
+    /// returned `MCPContent.text`, so this method only has to translate
+    /// bridge-side validation failures into MCP error envelopes.
+    private func handleLSPToolCall(
+        id: JSONRPCId,
+        toolName: String,
+        params: [String: AnyCodable]
+    ) async -> (statusCode: Int, body: Data?) {
+        guard let bridge = lspBridge else {
+            return toolError(
+                id: id,
+                text: "LSP bridge is not started. Call startLSP() first."
+            )
+        }
+
+        let arguments = extractAnyCodableDict(params, "arguments") ?? [:]
+
+        do {
+            let content = try await bridge.handleToolCall(
+                name: toolName,
+                arguments: arguments
+            )
+            let resp = MCPRouter.buildToolCallResponse(
+                id: id,
+                content: [content],
+                isError: false
+            )
+            return (200, encode(resp))
+        } catch let error as MCPLSPBridgeError {
+            let text: String
+            switch error {
+            case .unknownTool(let name):
+                text = "Unknown LSP tool: \(name)"
+            case .missingArgument(let key):
+                text = "Missing argument: \(key)"
+            case .invalidArgument(let name, let reason):
+                text = "Invalid argument \(name): \(reason)"
+            }
+            return toolError(id: id, text: text)
+        } catch {
+            return toolError(
+                id: id,
+                text: "LSP tool error: \(error.localizedDescription)"
+            )
+        }
+    }
+
     // MARK: - Response Helpers
 
     private func unauthorizedResponse() -> (statusCode: Int, body: Data?) {
@@ -457,6 +764,23 @@ final class CalyxMCPServer {
             return nil
         }
         return obj
+    }
+
+    /// Extract a `[String: AnyCodable]` map from an `AnyCodable` value at
+    /// the given key. Used to forward `tools/call.arguments` to the LSP
+    /// bridge, which is keyed on `AnyCodable`.
+    private func extractAnyCodableDict(
+        _ dict: [String: AnyCodable],
+        _ key: String
+    ) -> [String: AnyCodable]? {
+        guard let value = dict[key] else { return nil }
+        guard let data = try? JSONEncoder().encode(value),
+              let decoded = try? JSONDecoder().decode(
+                [String: AnyCodable].self,
+                from: data
+              )
+        else { return nil }
+        return decoded
     }
 
     /// Extract the client name from an initialize request's clientInfo.

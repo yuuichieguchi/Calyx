@@ -1,11 +1,13 @@
-// Command.swift
+// PaletteCommand.swift
 // Calyx
 //
 // A single command that can appear in the command palette.
+// Renamed from `Command` to `PaletteCommand` to avoid colliding with the
+// LSP 3.18 `Command` type defined in `Features/LSP/LSPTypes/Command.swift`.
 
 import Foundation
 
-struct Command: Identifiable, Sendable {
+struct PaletteCommand: Identifiable, Sendable {
     let id: String
     let title: String
     let shortcut: String?

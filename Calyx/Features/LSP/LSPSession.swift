@@ -1,0 +1,1275 @@
+//
+//  LSPSession.swift
+//  Calyx
+//
+//  Actor sitting above `LSPClient` that owns the full LSP 3.18 lifecycle for
+//  a single (workspace root, languageId) pair:
+//
+//    1. `start()`        — drives the `initialize` request, captures the
+//                          server capabilities into a `CapabilityRegistry`,
+//                          installs server-initiated request handlers for
+//                          `client/registerCapability`,
+//                          `client/unregisterCapability` and
+//                          `window/workDoneProgress/create`, and finally
+//                          sends the `initialized` notification.
+//    2. `didOpen` / `didChange` / `didClose` / `didSave` — the textDocument
+//                          synchronization surface. Maintains an in-memory
+//                          set of currently open URIs so duplicate opens are
+//                          deduplicated and changes against unknown URIs
+//                          fail loudly via `LSPSessionError.documentNotOpen`.
+//    3. `shutdown()`     — sends `shutdown` then the `exit` notification and
+//                          closes the underlying transport.
+//
+//  Spec entry points:
+//    - initialize:                  https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#initialize
+//    - initialized:                 https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#initialized
+//    - shutdown:                    https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#shutdown
+//    - exit:                        https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#exit
+//    - client/registerCapability:   https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#client_registerCapability
+//    - client/unregisterCapability: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#client_unregisterCapability
+//
+
+import Foundation
+import os
+
+// MARK: - SessionState
+
+/// Lifecycle phase of an `LSPSession`. The `.running` arm carries the
+/// server-reported `ServerInfo` (if any) for downstream telemetry / UI.
+enum SessionState: Sendable, Equatable {
+    case notStarted
+    case initializing
+    case running(serverInfo: ServerInfo?)
+    case shuttingDown
+    case shutdown
+    case failed(reason: String)
+}
+
+// MARK: - LSPSessionError
+
+/// Errors raised by `LSPSession`. Transport-level failures originating from
+/// the embedded `LSPClient` are wrapped in `.clientError` so the caller can
+/// recover the underlying `LSPClientError` cause when needed.
+enum LSPSessionError: Error, Equatable {
+    /// `start()` was called more than once on the same session.
+    case alreadyStarted
+    /// A textDocument operation was issued before `start()` reached
+    /// `.running`.
+    case notStarted
+    /// A `didChange` / `didSave` / `didClose` referenced a URI that was
+    /// never `didOpen`'d on this session (or has already been closed).
+    case documentNotOpen(DocumentUri)
+    /// The underlying `LSPClient` surfaced an error.
+    case clientError(LSPClientError)
+}
+
+// MARK: - ServerLogEntry
+
+/// A single entry in the session-local server message log. Captures the
+/// payload of `window/showMessage`, `window/logMessage`,
+/// `window/showMessageRequest` and `window/showDocument` traffic so callers
+/// (CLI, MCP bridge, UI) can review what the server has reported.
+///
+/// `type` follows the LSP `MessageType` enum: `1=Error 2=Warning 3=Info
+/// 4=Log`. `showDocument` does not carry a `MessageType`, so the session
+/// records it as `0` and stores the requested URI in `message`.
+struct ServerLogEntry: Sendable, Equatable {
+    enum Source: String, Sendable, Codable {
+        case showMessage
+        case showMessageRequest
+        case showDocument
+        case logMessage
+    }
+    let source: Source
+    let type: Int
+    let message: String
+}
+
+// MARK: - PersistOp
+
+/// A single unit of work for the persist/remove pipeline. The session
+/// enqueues these onto an internal FIFO drained by a single long-lived
+/// worker Task, replacing the previous per-call chain of Tasks that
+/// strongly retained their predecessors.
+private enum PersistOp: Sendable {
+    case persist(LSPSessionPersistence.SessionSnapshot)
+    case remove(workspaceRoot: URL, languageId: String)
+}
+
+// MARK: - PendingApplyEdit
+
+/// A `workspace/applyEdit` request that the server has issued and the
+/// session has buffered for downstream review. The session always responds
+/// to the wire request with `{ "applied": false }` so the AI / UI can opt
+/// in to applying the edit out-of-band; the buffered entries live here
+/// until `consumePendingApplyEdit(id:)` drains them.
+struct PendingApplyEdit: Sendable {
+    /// Monotonically increasing, session-local identifier. Distinct from
+    /// the JSON-RPC request id (which is owned by `LSPClient`).
+    let id: Int
+    /// Optional human-readable label supplied by the server.
+    let label: String?
+    /// Raw `WorkspaceEdit` payload.
+    let edit: AnyCodable
+}
+
+// MARK: - LSPSession
+
+/// Actor owning the full LSP 3.18 lifecycle for one workspace + languageId.
+actor LSPSession {
+
+    // MARK: - Stored properties
+
+    /// Workspace root URI used for `initialize.rootUri` / `workspaceFolders`.
+    /// Set at init and never mutated, so it is safe to read without `await`.
+    nonisolated let workspaceRoot: URL
+
+    /// Default LSP `languageId` for this session (e.g. "swift", "rust"). Set
+    /// at init and never mutated.
+    nonisolated let languageId: String
+
+    private let client: LSPClient
+    private let clientCapabilities: ClientCapabilities
+    private let clientInfo: ClientInfo
+    private let capabilities: CapabilityRegistry
+    private let progress: ProgressBroker
+    /// Optional persistence store. When non-nil the session writes a fresh
+    /// snapshot (workspace + language + currently-open URIs) on every
+    /// `didOpen` / `didClose` and removes the entry on `shutdown()`, so
+    /// callers can rebuild the open-file set across application launches.
+    private let persistence: LSPSessionPersistence?
+    /// Optional diagnostics aggregator. When non-nil the session installs
+    /// a `textDocument/publishDiagnostics` notification handler during
+    /// `start()` that ingests every publish into this store keyed on the
+    /// session's `workspaceRoot`. Multiple sessions can share the same
+    /// store, which is how `MCPLSPBridge` exposes a workspace-wide diff
+    /// view via `lsp_diagnostics_diff`.
+    private let diagnosticsStore: DiagnosticsStore?
+
+    private var sessionState: SessionState = .notStarted
+    private var openDocs: Set<DocumentUri> = []
+
+    /// FIFO of persist/remove operations awaiting dispatch to the
+    /// persistence actor. A single long-lived worker Task
+    /// (`persistWorkerTask`) drains this queue one op at a time, which
+    /// preserves the spawn-order guarantee callers rely on (a `didOpen
+    /// → didClose` sequence must reach the on-disk snapshot in that
+    /// order, never reversed) without growing a per-call chain of
+    /// Tasks that strongly retain their predecessors.
+    private var persistQueue: [PersistOp] = []
+
+    /// The currently running persist worker, if any. Set when the queue
+    /// transitions from empty → non-empty (`ensurePersistWorker`) and
+    /// cleared by the worker itself when it observes the queue drained
+    /// (`dequeuePersistOp`). `shutdown()`'s drain awaits this Task's
+    /// `value` so the wire-level teardown does not race the final
+    /// snapshot removal.
+    private var persistWorkerTask: Task<Void, Never>?
+
+    /// Buffered server-originated message log (showMessage / logMessage /
+    /// showMessageRequest / showDocument). FIFO, capped at
+    /// `serverMessagesCap`.
+    private var serverMessages: [ServerLogEntry] = []
+    private let serverMessagesCap = 100
+
+    /// `workspace/applyEdit` requests the server has issued, in arrival
+    /// order. Drained by callers via `consumePendingApplyEdit(id:)`.
+    private var pendingApplyEditQueue: [PendingApplyEdit] = []
+
+    /// Monotonic id source for `PendingApplyEdit.id`. Session-local.
+    private var nextApplyEditId: Int = 1
+
+    // MARK: - TEST ONLY instrumentation
+
+    // TEST ONLY: count of `scheduleRemoveSnapshot()` invocations. Used
+    // by regression tests for shutdown idempotency.
+    internal var scheduleRemoveSnapshotCallCountForTests: Int = 0
+
+    // TEST ONLY: current number of unstructured teardown Tasks spawned
+    // by `shutdown()`'s drain race that have not yet decremented their
+    // hook. Should return to 0 once both the drain observer and the
+    // sleep timer have either completed or been cancelled.
+    internal var inflightTeardownTaskCountForTests: Int = 0
+
+    // TEST ONLY: number of Task closures currently alive in the
+    // `pendingPersistTask` chain. Incremented on each
+    // `schedulePersistSnapshot` / `scheduleRemoveSnapshot` and
+    // decremented inside the spawned Task after the persist/remove
+    // work has completed.
+    internal var pendingPersistChainDepthForTests: Int = 0
+
+    // TEST ONLY: peak value observed for `pendingPersistChainDepthForTests`
+    // since session construction. Captures the maximum simultaneously
+    // alive depth so a test that schedules a burst can detect chain
+    // growth even if some Tasks complete mid-burst.
+    internal var pendingPersistChainPeakDepthForTests: Int = 0
+
+    // TEST ONLY: directly set `sessionState`. Used by regression tests
+    // that need to simulate a post-shutdown state without driving the
+    // full `shutdown()` path (which would also close the transport and
+    // clear the handler dictionary, making it impossible to dispatch
+    // any further server requests through the in-memory transport).
+    internal func setSessionStateForTests(_ state: SessionState) {
+        sessionState = state
+    }
+
+    // TEST ONLY: decrement the pending-persist chain depth from
+    // inside a scheduled Task. Exposed as a method so the scheduled
+    // closures (which run outside the actor) can hop back in.
+    internal func testOnlyDecrementPersistChainDepth() {
+        pendingPersistChainDepthForTests -= 1
+    }
+
+    // TEST ONLY: decrement the in-flight teardown task count from
+    // inside the unstructured Tasks spawned by `shutdown()`'s drain
+    // race. Exposed for the same reentry reason as
+    // `testOnlyDecrementPersistChainDepth()`.
+    internal func testOnlyDecrementInflightTeardownTaskCount() {
+        inflightTeardownTaskCountForTests -= 1
+    }
+
+    // TEST ONLY: monotonic sequence counter used by regression tests
+    // to verify the relative order of `client.start()` (which spawns
+    // the transport receive loop) vs `installServerRequestHandlers()`
+    // (which populates the request handler dictionary) inside
+    // `start()`. The bug is that handlers are registered AFTER the
+    // transport is already pumping, so any server-initiated request
+    // that arrives in the gap is dispatched against an empty
+    // dictionary. The fix flips the order. We record both moments and
+    // assert `installHandlersStartSeq < clientStartSeq`.
+    internal var testOnlyClientStartSeq: Int = 0
+    internal var testOnlyInstallHandlersSeq: Int = 0
+    private var testOnlyStartSeqCounter: Int = 0
+
+    // TEST ONLY: stamp the moment `client.start()` is invoked.
+    fileprivate func testOnlyStampClientStart() {
+        testOnlyStartSeqCounter += 1
+        testOnlyClientStartSeq = testOnlyStartSeqCounter
+    }
+
+    // TEST ONLY: stamp the moment `installServerRequestHandlers()` is
+    // invoked.
+    fileprivate func testOnlyStampInstallHandlers() {
+        testOnlyStartSeqCounter += 1
+        testOnlyInstallHandlersSeq = testOnlyStartSeqCounter
+    }
+
+    // TEST ONLY: bump the persist chain depth and update the peak.
+    private func testOnlyBumpPersistChainDepth() {
+        pendingPersistChainDepthForTests += 1
+        if pendingPersistChainDepthForTests > pendingPersistChainPeakDepthForTests {
+            pendingPersistChainPeakDepthForTests = pendingPersistChainDepthForTests
+        }
+    }
+
+    // MARK: - Init
+
+    init(
+        workspaceRoot: URL,
+        languageId: String,
+        client: LSPClient,
+        clientCapabilities: ClientCapabilities = ClientCapabilities.calyxDefault(),
+        clientInfo: ClientInfo = ClientInfo(name: "Calyx", version: "0.26.1"),
+        persistence: LSPSessionPersistence? = nil,
+        diagnosticsStore: DiagnosticsStore? = nil
+    ) {
+        self.workspaceRoot = workspaceRoot
+        self.languageId = languageId
+        self.client = client
+        self.clientCapabilities = clientCapabilities
+        self.clientInfo = clientInfo
+        self.capabilities = CapabilityRegistry()
+        self.progress = ProgressBroker()
+        self.persistence = persistence
+        self.diagnosticsStore = diagnosticsStore
+    }
+
+    // MARK: - Introspection
+
+    /// Current lifecycle state.
+    func state() -> SessionState {
+        return sessionState
+    }
+
+    /// Set of URIs currently open on this session.
+    func openDocuments() -> Set<DocumentUri> {
+        return openDocs
+    }
+
+    /// Capability registry tracking the union of static + dynamic capabilities.
+    func capabilityRegistry() -> CapabilityRegistry {
+        return capabilities
+    }
+
+    /// Progress broker tracking work-done progress reservations and updates.
+    func progressBroker() -> ProgressBroker {
+        return progress
+    }
+
+    /// Snapshot of the buffered server message log (FIFO, capped at the
+    /// session-configured maximum). Oldest-first.
+    func recentServerMessages() -> [ServerLogEntry] {
+        return serverMessages
+    }
+
+    /// Snapshot of the pending `workspace/applyEdit` queue.
+    func pendingApplyEdits() -> [PendingApplyEdit] {
+        return pendingApplyEditQueue
+    }
+
+    /// Drop every buffered server message. Used by callers (CLI / MCP /
+    /// UI) that have rendered the log and want a fresh window.
+    func clearServerMessages() {
+        serverMessages.removeAll()
+    }
+
+    /// Remove the pending `workspace/applyEdit` entry whose session-local
+    /// id matches `id`. No-op if no such entry exists.
+    func consumePendingApplyEdit(id: Int) {
+        pendingApplyEditQueue.removeAll { $0.id == id }
+    }
+
+    // MARK: - Lifecycle: start
+
+    /// Run the `initialize` → `initialized` handshake.
+    ///
+    /// On success the session is left in `.running(serverInfo:)`. On any
+    /// failure the session is left in `.failed(reason:)` and the underlying
+    /// error is rethrown wrapped as `LSPSessionError.clientError(...)`.
+    func start() async throws {
+        guard case .notStarted = sessionState else {
+            throw LSPSessionError.alreadyStarted
+        }
+        sessionState = .initializing
+
+        do {
+            // Install handlers for the server-initiated requests we care
+            // about *before* `client.start()` boots the receive loop, so
+            // the handler dictionary is already populated when the very
+            // first byte arrives. Reversing this order means any
+            // server-initiated request landing in the gap between the
+            // receive task starting and the handler registration
+            // completing is dispatched against an empty dictionary and
+            // gets back `-32601 MethodNotFound`, which strict servers
+            // treat as fatal. The installers don't depend on
+            // `client.start()`'s effects — they only mutate `LSPClient`'s
+            // handler dictionaries — so this reordering is safe.
+            testOnlyStampInstallHandlers() // TEST ONLY
+            await installServerRequestHandlers()
+
+            // Begin pumping the transport so we can receive the initialize
+            // response and any concurrent server-initiated traffic.
+            testOnlyStampClientStart() // TEST ONLY
+            try await client.start()
+
+            let params = InitializeParams(
+                processId: Int(ProcessInfo.processInfo.processIdentifier),
+                capabilities: clientCapabilities,
+                clientInfo: clientInfo,
+                rootUri: .present(workspaceRoot.absoluteString),
+                workspaceFolders: .present([
+                    WorkspaceFolder(
+                        uri: workspaceRoot.absoluteString,
+                        name: workspaceRoot.lastPathComponent
+                    )
+                ])
+            )
+
+            let result = try await client.sendRequest(
+                method: "initialize",
+                params: params,
+                resultType: InitializeResult.self
+            )
+
+            await capabilities.setStaticCapabilities(result.capabilities)
+
+            // Emit `initialized` BEFORE flipping the session to `.running`.
+            // The LSP spec forbids the client from sending any other
+            // request/notification between `initialize` and `initialized`
+            // (only telemetry/log/showMessage are server-initiated and
+            // exempt). If we set `.running` first, concurrent callers
+            // that race through `ensureRunning()` while this method is
+            // still suspended on `sendNotification` could enqueue
+            // `textDocument/didOpen` etc. ahead of `initialized` on the
+            // wire — strict servers reject the session for protocol
+            // violation. By holding the state at `.initializing` until
+            // the notification has been handed to the transport, every
+            // user-facing API stays gated behind the handshake.
+            //
+            // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#initialized
+            try await client.sendNotification(
+                method: "initialized",
+                params: InitializedParams()
+            )
+
+            sessionState = .running(serverInfo: result.serverInfo)
+        } catch let err as LSPClientError {
+            sessionState = .failed(reason: String(describing: err))
+            // `installServerRequestHandlers()` ran above and registered
+            // closures that strongly capture `self`. If we leave the
+            // client alive (handler dictionary populated) after the
+            // handshake fails, the `LSPSession ↔ LSPClient ↔ closure ↔
+            // LSPSession` retain cycle keeps the actor — and its
+            // receive task — alive forever. `client.close()` is
+            // idempotent and clears the dictionaries; calling it on
+            // every failure path breaks the cycle deterministically.
+            await client.close()
+            throw LSPSessionError.clientError(err)
+        } catch {
+            sessionState = .failed(reason: String(describing: error))
+            // Same rationale as the LSPClientError arm above:
+            // unconditionally tear down the client so the handlers
+            // registered earlier in this method release their `self`
+            // capture and the session can deinit.
+            await client.close()
+            throw error
+        }
+    }
+
+    // MARK: - Lifecycle: shutdown
+
+    /// Send `shutdown` then the `exit` notification, and close the
+    /// underlying transport. Transitions the session to `.shutdown`.
+    ///
+    /// The wire-level `shutdown` / `exit` calls are best-effort: when the
+    /// server has already exited (process died, transport half-closed,
+    /// stdin pipe broken) either call can throw a `transportClosed` or
+    /// `serverError`. We deliberately swallow those failures because the
+    /// caller's only sensible reaction is to proceed with the local
+    /// teardown anyway — leaking the `LSPClient`'s receive task and the
+    /// underlying `Process` / `Pipe` (the original behaviour, which
+    /// re-threw mid-teardown and skipped `client.close()` /
+    /// `scheduleRemoveSnapshot()`) is strictly worse than dropping the
+    /// wire error.
+    ///
+    /// `throws` is retained on the signature so existing call sites that
+    /// write `try await session.shutdown()` continue to compile; the
+    /// method itself never throws today.
+    func shutdown() async throws {
+        // Idempotency / pre-handshake guard. `shutdown()` is safe to
+        // call from any caller that is unsure whether the session ever
+        // made it past `start()`, so we must short-circuit when the
+        // session is already in a terminal state (`.shutdown`,
+        // `.failed`) or never started (`.notStarted`). Falling through
+        // in those cases would re-issue `client.sendRequest("shutdown")`
+        // / `sendNotification("exit")` (no-op via `try?` on a closed
+        // client, but still walked), re-close the client, and — most
+        // visibly to tests — push another `scheduleRemoveSnapshot()`
+        // onto the persist worker. `.shuttingDown` covers the
+        // reentrant case where a second `shutdown()` slipped past one
+        // of the awaits in the first call.
+        switch sessionState {
+        case .shutdown, .failed, .notStarted, .shuttingDown:
+            return
+        case .initializing, .running:
+            break
+        }
+        sessionState = .shuttingDown
+        // Best-effort wire teardown: the server may have already exited
+        // or half-closed the transport. We still need to release our
+        // side, so swallow any error here and continue.
+        _ = try? await client.sendRequest(
+            method: "shutdown",
+            resultType: AnyCodable.self
+        )
+        try? await client.sendNotification(method: "exit")
+
+        // Mandatory local teardown — runs regardless of any wire-level
+        // failure above. `client.close()` cancels the receive task,
+        // closes the transport, fails any leftover pending requests and
+        // (since Bug B) drops the handler dictionary that captures
+        // `self` strongly.
+        await client.close()
+        sessionState = .shutdown
+        scheduleRemoveSnapshot()
+
+        // Drain the persist/remove pipeline before returning so the
+        // caller (and the surrounding `LSPService`) sees the on-disk
+        // snapshot consistent with the session's final state. Without
+        // this drain, `LSPService.shutdownSession` would return while a
+        // straggler `persist(snapshot-with-open-files)` is still in
+        // flight — a subsequent launch would then `availableSnapshots()`
+        // a session that is already shut down.
+        //
+        // Bounded wait: cap the drain at 2 seconds via a structured
+        // `withTaskGroup` race between the worker's `value` and a
+        // timer. Once the first child wins (sub-millisecond on a local
+        // tmpfs), we `cancelAll()` the remaining children so the loser
+        // does not stay alive for the full 2 second sleep, holding
+        // captures of `self` and leaking a Task per shutdown. The
+        // structured group implicitly awaits all cancelled children
+        // before returning, but `Task.sleep` honours cancellation and
+        // exits immediately, so total shutdown latency stays bounded
+        // by whichever child won.
+        if let task = persistWorkerTask {
+            inflightTeardownTaskCountForTests += 2 // TEST ONLY
+            await withTaskGroup(of: Void.self) { group in
+                group.addTask { [weak self] in
+                    _ = await task.value
+                    await self?.testOnlyDecrementInflightTeardownTaskCount() // TEST ONLY
+                }
+                group.addTask { [weak self] in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    await self?.testOnlyDecrementInflightTeardownTaskCount() // TEST ONLY
+                }
+                _ = await group.next()
+                group.cancelAll()
+            }
+        }
+    }
+
+    // MARK: - textDocument lifecycle
+
+    /// Notify the server of a freshly opened document. Re-opening a URI
+    /// that is already tracked is a no-op (no duplicate notification).
+    func didOpen(
+        uri: DocumentUri,
+        languageId: String,
+        version: Int,
+        text: String
+    ) async throws {
+        try ensureRunning()
+        // Dedup: actor isolation only serialises non-suspending regions, so
+        // we must mark the URI as open *before* the `await` below to block
+        // reentrant callers from slipping past this contains-check while the
+        // notification is in flight. On send failure we roll back so the
+        // caller can retry.
+        if openDocs.contains(uri) {
+            return
+        }
+        openDocs.insert(uri)
+        let params = DidOpenTextDocumentParams(
+            textDocument: TextDocumentItem(
+                uri: uri,
+                languageId: languageId,
+                version: version,
+                text: text
+            )
+        )
+        do {
+            try await sendNotification(method: "textDocument/didOpen", params: params)
+        } catch {
+            openDocs.remove(uri)
+            throw error
+        }
+        schedulePersistSnapshot()
+    }
+
+    /// Notify the server that an open document has changed. Throws
+    /// `LSPSessionError.documentNotOpen` if the URI is not currently
+    /// tracked.
+    func didChange(
+        uri: DocumentUri,
+        version: Int,
+        changes: [TextDocumentContentChangeEvent]
+    ) async throws {
+        try ensureRunning()
+        guard openDocs.contains(uri) else {
+            throw LSPSessionError.documentNotOpen(uri)
+        }
+        let params = DidChangeTextDocumentParams(
+            textDocument: VersionedTextDocumentIdentifier(uri: uri, version: version),
+            contentChanges: changes
+        )
+        try await sendNotification(method: "textDocument/didChange", params: params)
+    }
+
+    /// Notify the server that an open document has been closed.
+    func didClose(uri: DocumentUri) async throws {
+        try ensureRunning()
+        guard openDocs.contains(uri) else {
+            throw LSPSessionError.documentNotOpen(uri)
+        }
+        // Remove the URI from the open set *before* the `await` so concurrent
+        // `didClose` calls don't both pass the guard and end up sending two
+        // close notifications. Re-insert on send failure so the caller can
+        // retry against a consistent in-memory state.
+        openDocs.remove(uri)
+        let params = DidCloseTextDocumentParams(
+            textDocument: TextDocumentIdentifier(uri: uri)
+        )
+        do {
+            try await sendNotification(method: "textDocument/didClose", params: params)
+        } catch {
+            openDocs.insert(uri)
+            throw error
+        }
+        schedulePersistSnapshot()
+    }
+
+    /// Notify the server that an open document has been saved. `text` is
+    /// passed verbatim — pass `nil` unless the server registered the
+    /// `includeText: true` save option.
+    func didSave(uri: DocumentUri, text: String?) async throws {
+        try ensureRunning()
+        guard openDocs.contains(uri) else {
+            throw LSPSessionError.documentNotOpen(uri)
+        }
+        let params = DidSaveTextDocumentParams(
+            textDocument: TextDocumentIdentifier(uri: uri),
+            text: text
+        )
+        try await sendNotification(method: "textDocument/didSave", params: params)
+    }
+
+    // MARK: - Generic request / notification surface
+
+    /// Send a typed LSP request through the embedded `LSPClient`. Used by
+    /// higher layers (e.g. `MCPLSPBridge`) that map their own request
+    /// vocabulary onto the LSP wire protocol. Transport-level failures
+    /// from the client are surfaced as `LSPSessionError.clientError`.
+    func sendRequest<Params: Encodable & Sendable, Result: Decodable & Sendable>(
+        method: String,
+        params: Params,
+        resultType: Result.Type
+    ) async throws -> Result {
+        try ensureRunning()
+        do {
+            return try await client.sendRequest(
+                method: method,
+                params: params,
+                resultType: resultType
+            )
+        } catch let err as LSPClientError {
+            throw LSPSessionError.clientError(err)
+        }
+    }
+
+    /// Send a parameterless LSP request through the embedded `LSPClient`.
+    func sendRequest<Result: Decodable & Sendable>(
+        method: String,
+        resultType: Result.Type
+    ) async throws -> Result {
+        try ensureRunning()
+        do {
+            return try await client.sendRequest(
+                method: method,
+                resultType: resultType
+            )
+        } catch let err as LSPClientError {
+            throw LSPSessionError.clientError(err)
+        }
+    }
+
+    /// Public counterpart to the private `sendNotification(method:params:)`
+    /// helper, exposed for callers that need to ship one-off notifications
+    /// after the session has reached `.running`.
+    func sendGenericNotification<Params: Encodable & Sendable>(
+        method: String,
+        params: Params
+    ) async throws {
+        try ensureRunning()
+        try await sendNotification(method: method, params: params)
+    }
+
+    // MARK: - Persistence helpers
+
+    /// Build a `SessionSnapshot` describing this session's current
+    /// (workspaceRoot, languageId, openFiles) tuple. `initializationOptions`
+    /// is reserved for a future extension that surfaces user-supplied
+    /// init options; the session emits `nil` today. `savedAtUptimeMillis`
+    /// is sampled from `ProcessInfo.processInfo.systemUptime` so callers
+    /// can perform staleness checks across launches.
+    private func currentSnapshot() -> LSPSessionPersistence.SessionSnapshot {
+        LSPSessionPersistence.SessionSnapshot(
+            workspaceRoot: workspaceRoot,
+            languageId: languageId,
+            openFiles: Array(openDocs),
+            initializationOptions: nil,
+            savedAtUptimeMillis: Int64(ProcessInfo.processInfo.systemUptime * 1000)
+        )
+    }
+
+    /// Persist the current snapshot via the persist worker. No-op when
+    /// the session was constructed without a persistence store.
+    ///
+    /// The persist pipeline is a `persistQueue` + single
+    /// `persistWorkerTask` consumer: append the op and ensure a worker
+    /// is running. The worker drains ops one at a time, preserving
+    /// spawn order (so a `didOpen → didClose` sequence reaches the
+    /// disk snapshot in that order, never reversed) without growing a
+    /// per-call chain of Tasks. A naive linked chain (each new Task
+    /// `await`s its predecessor) keeps every scheduled Task alive
+    /// across the full burst, because each closure strongly retains
+    /// `prior`; under a burst of N opens/closes the chain reaches
+    /// depth N and the actor pays N times the per-Task overhead.
+    private func schedulePersistSnapshot() {
+        guard let persistence else { return }
+        persistQueue.append(.persist(currentSnapshot()))
+        ensurePersistWorker(persistence: persistence)
+    }
+
+    /// Remove this session's persisted entry via the persist worker.
+    /// No-op when the session was constructed without a persistence
+    /// store. Captures `workspaceRoot` / `languageId` into the queued
+    /// op so the worker does not need to reach back into the actor.
+    private func scheduleRemoveSnapshot() {
+        scheduleRemoveSnapshotCallCountForTests += 1 // TEST ONLY
+        guard let persistence else { return }
+        persistQueue.append(.remove(workspaceRoot: workspaceRoot, languageId: languageId))
+        ensurePersistWorker(persistence: persistence)
+    }
+
+    /// Spawn a worker Task that drains `persistQueue` against
+    /// `persistence`, if one is not already running. Called from the
+    /// `schedulePersistSnapshot` / `scheduleRemoveSnapshot` paths once
+    /// a fresh op has been appended.
+    private func ensurePersistWorker(persistence: LSPSessionPersistence) {
+        if persistWorkerTask != nil { return }
+        testOnlyBumpPersistChainDepth() // TEST ONLY
+        persistWorkerTask = Task { [weak self] in
+            while true {
+                guard let strongSelf = self else { break }
+                guard let op = await strongSelf.dequeuePersistOp() else { break }
+                switch op {
+                case .persist(let snap):
+                    try? await persistence.persist(snap)
+                case .remove(let ws, let lang):
+                    try? await persistence.remove(workspaceRoot: ws, languageId: lang)
+                }
+            }
+            await self?.testOnlyDecrementPersistChainDepth() // TEST ONLY
+        }
+    }
+
+    /// Pop the next op off `persistQueue`, or return `nil` and clear
+    /// `persistWorkerTask` when the queue is empty so a subsequent
+    /// schedule can spawn a fresh worker. Actor-isolated so the
+    /// `persistWorkerTask = nil` transition is visible atomically to
+    /// the next `ensurePersistWorker` caller.
+    private func dequeuePersistOp() -> PersistOp? {
+        if persistQueue.isEmpty {
+            persistWorkerTask = nil
+            return nil
+        }
+        return persistQueue.removeFirst()
+    }
+
+    // MARK: - Private helpers
+
+    private func ensureRunning() throws {
+        switch sessionState {
+        case .running:
+            return
+        default:
+            throw LSPSessionError.notStarted
+        }
+    }
+
+    /// Returns `true` only when the session is in `.running`. Server-
+    /// initiated request / notification handlers consult this before
+    /// performing any mutation so that late traffic arriving after
+    /// `shutdown()` (or arriving against a `.failed` session) cannot
+    /// resurrect state the application has already dismissed.
+    private func isRunningForServerRequest() -> Bool {
+        if case .running = sessionState { return true }
+        return false
+    }
+
+    private func sendNotification<Params: Encodable & Sendable>(
+        method: String,
+        params: Params
+    ) async throws {
+        do {
+            try await client.sendNotification(method: method, params: params)
+        } catch let err as LSPClientError {
+            throw LSPSessionError.clientError(err)
+        }
+    }
+
+    /// Install handlers for the server-originated requests the session
+    /// reacts to (`client/registerCapability`,
+    /// `client/unregisterCapability`, `window/workDoneProgress/create`).
+    private func installServerRequestHandlers() async {
+        let registry = self.capabilities
+        let broker = self.progress
+
+        await client.setRequestHandler(method: "client/registerCapability") { params in
+            let raw = params ?? AnyCodable(NSNull())
+            let data = try JSONEncoder().encode(raw)
+            let regParams = try JSONDecoder().decode(RegistrationParams.self, from: data)
+            await registry.register(regParams.registrations)
+            return nil
+        }
+
+        await client.setRequestHandler(method: "client/unregisterCapability") { params in
+            let raw = params ?? AnyCodable(NSNull())
+            let data = try JSONEncoder().encode(raw)
+            let unregParams = try JSONDecoder().decode(UnregistrationParams.self, from: data)
+            await registry.unregister(unregParams.unregistrations)
+            return nil
+        }
+
+        await client.setRequestHandler(method: "window/workDoneProgress/create") { params in
+            let raw = params ?? AnyCodable(NSNull())
+            let data = try JSONEncoder().encode(raw)
+            let createParams = try JSONDecoder().decode(WorkDoneProgressCreateParams.self, from: data)
+            await broker.registerToken(createParams.token)
+            return nil
+        }
+
+        // $/progress — notification. Forward begin / report / end payloads
+        // into the broker. Notifications whose `value` is not a
+        // WorkDoneProgress variant (custom server progress) are dropped
+        // silently; the broker only models the standard WorkDone shape.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#progress
+        await client.setNotificationHandler(method: "$/progress") { params in
+            guard let params = params else { return }
+            do {
+                let data = try JSONEncoder().encode(params)
+                let typed = try JSONDecoder().decode(ProgressNotificationParams.self, from: data)
+                await broker.handleProgress(token: typed.token, value: typed.value)
+            } catch {
+                // Custom server progress (non-WorkDoneProgress `value`)
+                // or malformed payload — drop. The user-facing contract
+                // for `ProgressBroker.handleProgress` only covers
+                // WorkDoneProgress; inventing state from unknown shapes
+                // would surface noise via `inFlight()` / `snapshot()`.
+            }
+        }
+
+        // textDocument/publishDiagnostics — notification. Forward into
+        // the (optional) shared `DiagnosticsStore` keyed on this
+        // session's `workspaceRoot`. The notification handler closure
+        // captures the store and root by value (rather than `self`) so
+        // it does not contribute to the LSPSession ↔ LSPClient retain
+        // cycle that the handlers below intentionally form.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#textDocument_publishDiagnostics
+        if let diagnosticsStore = self.diagnosticsStore {
+            let workspaceRoot = self.workspaceRoot
+            await client.setNotificationHandler(method: "textDocument/publishDiagnostics") { params in
+                guard let params = params else { return }
+                do {
+                    let data = try JSONEncoder().encode(params)
+                    let typed = try JSONDecoder().decode(
+                        PublishDiagnosticsParams.self,
+                        from: data
+                    )
+                    await diagnosticsStore.ingest(
+                        workspaceRoot: workspaceRoot,
+                        params: typed
+                    )
+                } catch {
+                    // Malformed publishDiagnostics payload — drop. The
+                    // store keeps the previous state for this URI rather
+                    // than reverting to "no diagnostics", which would
+                    // misrepresent the server's view of the document.
+                }
+            }
+        }
+
+        // The handlers below capture `self` strongly so the session — and
+        // by transitive ownership the underlying `LSPClient` and its
+        // receive task — stay alive for as long as the server can deliver
+        // traffic. The intentional retain cycle `LSPSession ↔ LSPClient ↔
+        // handler closure ↔ LSPSession` is broken when the application
+        // calls `shutdown()`, which closes the transport so the receive
+        // task drains and exits and then transitions the session to
+        // `.shutdown`. The existing handlers above use sub-actor captures
+        // (`registry`, `broker`) and so do not contribute to the cycle.
+
+        // window/showMessage — notification. Buffer into the server log.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_showMessage
+        await client.setNotificationHandler(method: "window/showMessage") { [self] params in
+            guard let params = params else { return }
+            let parsed = await self.decodeMessageParams(params)
+            await self.appendServerMessage(
+                ServerLogEntry(source: .showMessage, type: parsed.type, message: parsed.message)
+            )
+        }
+
+        // window/logMessage — notification. Buffer into the server log.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_logMessage
+        await client.setNotificationHandler(method: "window/logMessage") { [self] params in
+            guard let params = params else { return }
+            let parsed = await self.decodeMessageParams(params)
+            await self.appendServerMessage(
+                ServerLogEntry(source: .logMessage, type: parsed.type, message: parsed.message)
+            )
+        }
+
+        // window/showMessageRequest — request. Buffer into the server log
+        // and reply with `null` (no user selection at the session level).
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_showMessageRequest
+        await client.setRequestHandler(method: "window/showMessageRequest") { [self] params in
+            guard let params = params else { return nil }
+            let parsed = await self.decodeMessageParams(params)
+            await self.appendServerMessage(
+                ServerLogEntry(source: .showMessageRequest, type: parsed.type, message: parsed.message)
+            )
+            return nil
+        }
+
+        // window/showDocument — request. Buffer the URI into the server log
+        // and acknowledge with `{ "success": true }`. The session does not
+        // actually open the document; downstream layers decide.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_showDocument
+        await client.setRequestHandler(method: "window/showDocument") { [self] params in
+            let uri = await self.extractURIFromParams(params)
+            await self.appendServerMessage(
+                ServerLogEntry(source: .showDocument, type: 0, message: uri)
+            )
+            return AnyCodable(["success": AnyCodable(true)] as [String: AnyCodable])
+        }
+
+        // workspace/configuration — request. Reply with a JSON array of
+        // `null`s, one per requested item. Higher layers may later supply
+        // real configuration values.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_configuration
+        await client.setRequestHandler(method: "workspace/configuration") { [self] params in
+            let count = await self.configurationItemCount(params)
+            let nulls: [AnyCodable] = (0..<count).map { _ in AnyCodable(NSNull()) }
+            return AnyCodable(nulls)
+        }
+
+        // workspace/applyEdit — request. The session does not apply edits
+        // directly; it buffers them onto `pendingApplyEditQueue` and
+        // responds `{ "applied": false }`. The AI / UI consumes the queue
+        // and applies edits out-of-band.
+        //
+        // State guard: once the session has left `.running`
+        // (`.shuttingDown`, `.shutdown`, `.failed`) we must NOT mutate
+        // `pendingApplyEditQueue`. A late server request sneaking in
+        // after `shutdown()` has run would otherwise re-populate the
+        // queue and resurrect work the application has already
+        // dismissed. We still reply on the wire with the standard
+        // `{ "applied": false }` so the server does not stall waiting
+        // for a response.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_applyEdit
+        await client.setRequestHandler(method: "workspace/applyEdit") { [self] params in
+            let response = AnyCodable(["applied": AnyCodable(false)] as [String: AnyCodable])
+            let isRunning = await self.isRunningForServerRequest()
+            guard isRunning else { return response }
+            guard let params = params else { return response }
+            let label = await self.extractLabel(from: params)
+            let edit = await self.extractEdit(from: params) ?? AnyCodable([String: AnyCodable]())
+            _ = await self.enqueueApplyEdit(label: label, edit: edit)
+            return response
+        }
+
+        // workspace/workspaceFolders — request. Report the single folder
+        // this session was constructed against.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_workspaceFolders
+        await client.setRequestHandler(method: "workspace/workspaceFolders") { [self] _ in
+            let root = self.workspaceRoot
+            let folder: [String: AnyCodable] = [
+                "uri": AnyCodable(root.absoluteString),
+                "name": AnyCodable(root.lastPathComponent)
+            ]
+            return AnyCodable([AnyCodable(folder)])
+        }
+    }
+
+    // MARK: - Server message log helpers
+
+    /// Append `entry` to the buffered server message log, evicting the
+    /// oldest entries when the cap is exceeded.
+    private func appendServerMessage(_ entry: ServerLogEntry) {
+        serverMessages.append(entry)
+        if serverMessages.count > serverMessagesCap {
+            serverMessages.removeFirst(serverMessages.count - serverMessagesCap)
+        }
+    }
+
+    /// Append a new `PendingApplyEdit` to the queue and return its
+    /// session-local id.
+    @discardableResult
+    private func enqueueApplyEdit(label: String?, edit: AnyCodable) -> Int {
+        let id = nextApplyEditId
+        nextApplyEditId += 1
+        pendingApplyEditQueue.append(PendingApplyEdit(id: id, label: label, edit: edit))
+        return id
+    }
+
+    /// Pull `(type, message)` out of an LSP `ShowMessageParams` /
+    /// `LogMessageParams` / `ShowMessageRequestParams` payload. Falls back
+    /// to `(4, "")` (Log severity, empty message) when the payload can't
+    /// be parsed at all — see the test plan, which pins this behaviour.
+    private func decodeMessageParams(_ params: AnyCodable) -> (type: Int, message: String) {
+        guard let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return (4, "")
+        }
+        let type: Int
+        if let i = json["type"] as? Int {
+            type = i
+        } else if let d = json["type"] as? Double {
+            type = Int(d)
+        } else {
+            type = 4
+        }
+        let message = (json["message"] as? String) ?? ""
+        return (type, message)
+    }
+
+    /// Extract `uri` from a `ShowDocumentParams` payload. Returns the empty
+    /// string when the URI is missing or the payload is malformed.
+    private func extractURIFromParams(_ params: AnyCodable?) -> String {
+        guard let params,
+              let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return ""
+        }
+        return (json["uri"] as? String) ?? ""
+    }
+
+    /// Count the `items` array in a `workspace/configuration` payload.
+    /// Returns 0 when `items` is missing.
+    private func configurationItemCount(_ params: AnyCodable?) -> Int {
+        guard let params,
+              let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let items = json["items"] as? [Any] else {
+            return 0
+        }
+        return items.count
+    }
+
+    /// Extract the optional `label` field from an `ApplyWorkspaceEditParams`
+    /// payload.
+    private func extractLabel(from params: AnyCodable) -> String? {
+        guard let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return json["label"] as? String
+    }
+
+    /// Extract the `edit` field (a `WorkspaceEdit`) from an
+    /// `ApplyWorkspaceEditParams` payload, preserving its structure as
+    /// `AnyCodable` so downstream callers can re-encode it verbatim.
+    private func extractEdit(from params: AnyCodable) -> AnyCodable? {
+        guard let data = try? JSONEncoder().encode(params),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let edit = json["edit"] else {
+            return nil
+        }
+        return AnyCodable(edit)
+    }
+}
+
+// MARK: - WorkDoneProgressCreateParams
+
+/// LSP 3.18 `window/workDoneProgress/create` request params. Not previously
+/// modelled in `LSPTypes/`; declared inline here because `LSPSession` is the
+/// only consumer.
+///
+/// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#window_workDoneProgress_create
+private struct WorkDoneProgressCreateParams: Sendable, Codable, Equatable {
+    let token: ProgressToken
+}
+
+// MARK: - ProgressNotificationParams
+
+/// LSP 3.18 `$/progress` notification params: a `(token, value)` tuple
+/// where `value` is one of the WorkDoneProgress variants. Declared inline
+/// because `LSPSession` is the only consumer — `ProgressBroker` already
+/// decodes the discriminated `value` separately. Non-WorkDoneProgress
+/// values (custom server progress) fail to decode here and are dropped by
+/// the notification handler.
+///
+/// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#progress
+private struct ProgressNotificationParams: Sendable, Codable, Equatable {
+    let token: ProgressToken
+    let value: WorkDoneProgress
+}
+
+// MARK: - ClientCapabilities.calyxDefault
+
+extension ClientCapabilities {
+    /// Calyx default: declares support for the full surface that
+    /// `MCPLSPBridge` exposes. Used as the default value for
+    /// `LSPSession.init(clientCapabilities:)` so production sessions always
+    /// negotiate the complete capability set rather than the empty
+    /// `ClientCapabilities()` placeholder.
+    ///
+    /// Mirrors the LSP 3.18 "maximal client" capability JSON. Sub-trees are
+    /// modelled as `AnyCodable` literals because `ClientCapabilities` keeps
+    /// each field as `AnyCodable?` pending fine-grained Codable modelling.
+    static func calyxDefault() -> ClientCapabilities {
+        let workspace: AnyCodable = AnyCodable([
+            "applyEdit": AnyCodable(true),
+            "workspaceEdit": AnyCodable([
+                "documentChanges": AnyCodable(true),
+                "resourceOperations": AnyCodable([AnyCodable("create"), AnyCodable("rename"), AnyCodable("delete")]),
+                "failureHandling": AnyCodable("textOnlyTransactional"),
+                "normalizesLineEndings": AnyCodable(true),
+                "changeAnnotationSupport": AnyCodable(["groupsOnLabel": AnyCodable(true)]),
+            ] as [String: AnyCodable]),
+            "didChangeConfiguration": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "didChangeWatchedFiles": AnyCodable(["dynamicRegistration": AnyCodable(true), "relativePatternSupport": AnyCodable(true)]),
+            "symbol": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "symbolKind": AnyCodable([
+                    "valueSet": AnyCodable((1...26).map { AnyCodable($0) }),
+                ]),
+                "tagSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1)])]),
+                "resolveSupport": AnyCodable(["properties": AnyCodable([AnyCodable("location.range")])]),
+            ] as [String: AnyCodable]),
+            "executeCommand": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "workspaceFolders": AnyCodable(true),
+            "configuration": AnyCodable(true),
+            "semanticTokens": AnyCodable(["refreshSupport": AnyCodable(true)]),
+            "codeLens": AnyCodable(["refreshSupport": AnyCodable(true)]),
+            "fileOperations": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "didCreate": AnyCodable(true),
+                "willCreate": AnyCodable(true),
+                "didRename": AnyCodable(true),
+                "willRename": AnyCodable(true),
+                "didDelete": AnyCodable(true),
+                "willDelete": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "inlineValue": AnyCodable(["refreshSupport": AnyCodable(true)]),
+            "inlayHint": AnyCodable(["refreshSupport": AnyCodable(true)]),
+            "diagnostics": AnyCodable(["refreshSupport": AnyCodable(true)]),
+        ] as [String: AnyCodable])
+
+        let textDocument: AnyCodable = AnyCodable([
+            "synchronization": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "willSave": AnyCodable(true),
+                "willSaveWaitUntil": AnyCodable(true),
+                "didSave": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "completion": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "completionItem": AnyCodable([
+                    "snippetSupport": AnyCodable(true),
+                    "commitCharactersSupport": AnyCodable(true),
+                    "documentationFormat": AnyCodable([AnyCodable("markdown"), AnyCodable("plaintext")]),
+                    "deprecatedSupport": AnyCodable(true),
+                    "preselectSupport": AnyCodable(true),
+                    "tagSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1)])]),
+                    "insertReplaceSupport": AnyCodable(true),
+                    "resolveSupport": AnyCodable(["properties": AnyCodable([AnyCodable("documentation"), AnyCodable("detail"), AnyCodable("additionalTextEdits")])]),
+                    "insertTextModeSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1), AnyCodable(2)])]),
+                    "labelDetailsSupport": AnyCodable(true),
+                ] as [String: AnyCodable]),
+                "completionItemKind": AnyCodable(["valueSet": AnyCodable((1...25).map { AnyCodable($0) })]),
+                "contextSupport": AnyCodable(true),
+                "insertTextMode": AnyCodable(2),
+                "completionList": AnyCodable(["itemDefaults": AnyCodable([AnyCodable("commitCharacters"), AnyCodable("editRange"), AnyCodable("insertTextFormat"), AnyCodable("insertTextMode"), AnyCodable("data")])]),
+            ] as [String: AnyCodable]),
+            "hover": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "contentFormat": AnyCodable([AnyCodable("markdown"), AnyCodable("plaintext")]),
+            ] as [String: AnyCodable]),
+            "signatureHelp": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "signatureInformation": AnyCodable([
+                    "documentationFormat": AnyCodable([AnyCodable("markdown"), AnyCodable("plaintext")]),
+                    "parameterInformation": AnyCodable(["labelOffsetSupport": AnyCodable(true)]),
+                    "activeParameterSupport": AnyCodable(true),
+                ] as [String: AnyCodable]),
+                "contextSupport": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "declaration": AnyCodable(["dynamicRegistration": AnyCodable(true), "linkSupport": AnyCodable(true)]),
+            "definition": AnyCodable(["dynamicRegistration": AnyCodable(true), "linkSupport": AnyCodable(true)]),
+            "typeDefinition": AnyCodable(["dynamicRegistration": AnyCodable(true), "linkSupport": AnyCodable(true)]),
+            "implementation": AnyCodable(["dynamicRegistration": AnyCodable(true), "linkSupport": AnyCodable(true)]),
+            "references": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "documentHighlight": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "documentSymbol": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "symbolKind": AnyCodable(["valueSet": AnyCodable((1...26).map { AnyCodable($0) })]),
+                "hierarchicalDocumentSymbolSupport": AnyCodable(true),
+                "tagSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1)])]),
+                "labelSupport": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "codeAction": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "codeActionLiteralSupport": AnyCodable([
+                    "codeActionKind": AnyCodable([
+                        "valueSet": AnyCodable([AnyCodable(""), AnyCodable("quickfix"), AnyCodable("refactor"), AnyCodable("refactor.extract"), AnyCodable("refactor.inline"), AnyCodable("refactor.rewrite"), AnyCodable("source"), AnyCodable("source.organizeImports"), AnyCodable("source.fixAll")]),
+                    ] as [String: AnyCodable]),
+                ] as [String: AnyCodable]),
+                "isPreferredSupport": AnyCodable(true),
+                "disabledSupport": AnyCodable(true),
+                "dataSupport": AnyCodable(true),
+                "resolveSupport": AnyCodable(["properties": AnyCodable([AnyCodable("edit")])]),
+                "honorsChangeAnnotations": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "codeLens": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "documentLink": AnyCodable(["dynamicRegistration": AnyCodable(true), "tooltipSupport": AnyCodable(true)]),
+            "colorProvider": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "formatting": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "rangeFormatting": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "onTypeFormatting": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "rename": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "prepareSupport": AnyCodable(true),
+                "prepareSupportDefaultBehavior": AnyCodable(1),
+                "honorsChangeAnnotations": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "publishDiagnostics": AnyCodable([
+                "relatedInformation": AnyCodable(true),
+                "tagSupport": AnyCodable(["valueSet": AnyCodable([AnyCodable(1), AnyCodable(2)])]),
+                "versionSupport": AnyCodable(true),
+                "codeDescriptionSupport": AnyCodable(true),
+                "dataSupport": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "foldingRange": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "rangeLimit": AnyCodable(5000),
+                "lineFoldingOnly": AnyCodable(false),
+                "foldingRangeKind": AnyCodable(["valueSet": AnyCodable([AnyCodable("comment"), AnyCodable("imports"), AnyCodable("region")])]),
+                "foldingRange": AnyCodable(["collapsedText": AnyCodable(true)]),
+            ] as [String: AnyCodable]),
+            "selectionRange": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "linkedEditingRange": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "callHierarchy": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "semanticTokens": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "requests": AnyCodable([
+                    "range": AnyCodable(true),
+                    "full": AnyCodable(["delta": AnyCodable(true)]),
+                ] as [String: AnyCodable]),
+                "tokenTypes": AnyCodable([
+                    AnyCodable("namespace"), AnyCodable("type"), AnyCodable("class"), AnyCodable("enum"), AnyCodable("interface"), AnyCodable("struct"), AnyCodable("typeParameter"), AnyCodable("parameter"), AnyCodable("variable"), AnyCodable("property"), AnyCodable("enumMember"), AnyCodable("event"), AnyCodable("function"), AnyCodable("method"), AnyCodable("macro"), AnyCodable("keyword"), AnyCodable("modifier"), AnyCodable("comment"), AnyCodable("string"), AnyCodable("number"), AnyCodable("regexp"), AnyCodable("operator"), AnyCodable("decorator"),
+                ]),
+                "tokenModifiers": AnyCodable([
+                    AnyCodable("declaration"), AnyCodable("definition"), AnyCodable("readonly"), AnyCodable("static"), AnyCodable("deprecated"), AnyCodable("abstract"), AnyCodable("async"), AnyCodable("modification"), AnyCodable("documentation"), AnyCodable("defaultLibrary"),
+                ]),
+                "formats": AnyCodable([AnyCodable("relative")]),
+                "overlappingTokenSupport": AnyCodable(false),
+                "multilineTokenSupport": AnyCodable(false),
+                "serverCancelSupport": AnyCodable(true),
+                "augmentsSyntaxTokens": AnyCodable(true),
+            ] as [String: AnyCodable]),
+            "moniker": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "typeHierarchy": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "inlineValue": AnyCodable(["dynamicRegistration": AnyCodable(true)]),
+            "inlayHint": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "resolveSupport": AnyCodable(["properties": AnyCodable([AnyCodable("tooltip"), AnyCodable("textEdits"), AnyCodable("label.tooltip"), AnyCodable("label.location"), AnyCodable("label.command")])]),
+            ] as [String: AnyCodable]),
+            "diagnostic": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+                "relatedDocumentSupport": AnyCodable(true),
+            ] as [String: AnyCodable]),
+        ] as [String: AnyCodable])
+
+        let window: AnyCodable = AnyCodable([
+            "workDoneProgress": AnyCodable(true),
+            "showMessage": AnyCodable(["messageActionItem": AnyCodable(["additionalPropertiesSupport": AnyCodable(true)])]),
+            "showDocument": AnyCodable(["support": AnyCodable(true)]),
+        ] as [String: AnyCodable])
+
+        let general: AnyCodable = AnyCodable([
+            "staleRequestSupport": AnyCodable(["cancel": AnyCodable(true), "retryOnContentModified": AnyCodable([] as [AnyCodable])]),
+            "regularExpressions": AnyCodable(["engine": AnyCodable("ECMAScript"), "version": AnyCodable("ES2020")]),
+            "markdown": AnyCodable(["parser": AnyCodable("marked"), "version": AnyCodable("1.1.0")]),
+            "positionEncodings": AnyCodable([AnyCodable("utf-16")]),
+        ] as [String: AnyCodable])
+
+        return ClientCapabilities(
+            workspace: workspace,
+            textDocument: textDocument,
+            notebookDocument: nil,
+            window: window,
+            general: general,
+            experimental: nil
+        )
+    }
+}

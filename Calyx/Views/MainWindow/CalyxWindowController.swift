@@ -136,47 +136,47 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     // MARK: - Setup
 
     private func setupCommandRegistry() {
-        commandRegistry.register(Command(id: "tab.new", title: "New Tab", shortcut: "Cmd+T", category: "Tabs") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "tab.new", title: "New Tab", shortcut: "Cmd+T", category: "Tabs") { [weak self] in
             self?.createNewTab()
         })
-        commandRegistry.register(Command(id: "tab.close", title: "Close Tab", shortcut: "Cmd+W", category: "Tabs") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "tab.close", title: "Close Tab", shortcut: "Cmd+W", category: "Tabs") { [weak self] in
             guard let self, let tab = self.activeTab else { return }
             self.closeTab(id: tab.id)
         })
-        commandRegistry.register(Command(id: "tab.next", title: "Next Tab", shortcut: "Cmd+Shift+]", category: "Tabs") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "tab.next", title: "Next Tab", shortcut: "Cmd+Shift+]", category: "Tabs") { [weak self] in
             self?.selectNextTab(nil)
         })
-        commandRegistry.register(Command(id: "tab.previous", title: "Previous Tab", shortcut: "Cmd+Shift+[", category: "Tabs") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "tab.previous", title: "Previous Tab", shortcut: "Cmd+Shift+[", category: "Tabs") { [weak self] in
             self?.selectPreviousTab(nil)
         })
-        commandRegistry.register(Command(id: "group.new", title: "New Group", shortcut: "Ctrl+Shift+N", category: "Groups") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "group.new", title: "New Group", shortcut: "Ctrl+Shift+N", category: "Groups") { [weak self] in
             self?.createNewGroup()
         })
-        commandRegistry.register(Command(id: "group.close", title: "Close Group", shortcut: "Ctrl+Shift+W", category: "Groups") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "group.close", title: "Close Group", shortcut: "Ctrl+Shift+W", category: "Groups") { [weak self] in
             self?.closeActiveGroup()
         })
-        commandRegistry.register(Command(id: "group.next", title: "Next Group", shortcut: "Ctrl+Shift+]", category: "Groups") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "group.next", title: "Next Group", shortcut: "Ctrl+Shift+]", category: "Groups") { [weak self] in
             self?.switchToNextGroup()
         })
-        commandRegistry.register(Command(id: "group.previous", title: "Previous Group", shortcut: "Ctrl+Shift+[", category: "Groups") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "group.previous", title: "Previous Group", shortcut: "Ctrl+Shift+[", category: "Groups") { [weak self] in
             self?.switchToPreviousGroup()
         })
-        commandRegistry.register(Command(id: "view.sidebar", title: "Toggle Sidebar", shortcut: "Cmd+Opt+S", category: "View") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "view.sidebar", title: "Toggle Sidebar", shortcut: "Cmd+Opt+S", category: "View") { [weak self] in
             self?.toggleSidebar()
         })
-        commandRegistry.register(Command(id: "view.fullscreen", title: "Toggle Full Screen", shortcut: "Ctrl+Cmd+F", category: "View") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "view.fullscreen", title: "Toggle Full Screen", shortcut: "Ctrl+Cmd+F", category: "View") { [weak self] in
             self?.window?.toggleFullScreen(nil)
         })
-        commandRegistry.register(Command(id: "window.new", title: "New Window", shortcut: "Cmd+N", category: "Window") {
+        commandRegistry.register(PaletteCommand(id: "window.new", title: "New Window", shortcut: "Cmd+N", category: "Window") {
             if let appDelegate = NSApp.delegate as? AppDelegate {
                 appDelegate.createNewWindow()
             }
         })
-        commandRegistry.register(Command(id: "edit.find", title: "Find in Terminal", shortcut: "Cmd+F", category: "Edit") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "edit.find", title: "Find in Terminal", shortcut: "Cmd+F", category: "Edit") { [weak self] in
             guard let controller = self?.focusedController else { return }
             controller.performAction("start_search")
         })
-        commandRegistry.register(Command(
+        commandRegistry.register(PaletteCommand(
             id: "edit.compose",
             title: "Compose Input",
             shortcut: "Cmd+Shift+E",
@@ -184,41 +184,41 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ) { [weak self] in
             self?.toggleComposeOverlay()
         })
-        commandRegistry.register(Command(id: "browser.open", title: "Open Browser Tab", category: "Browser") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "browser.open", title: "Open Browser Tab", category: "Browser") { [weak self] in
             self?.promptAndOpenBrowserTab()
         })
-        commandRegistry.register(Command(id: "browser.back", title: "Browser Back", category: "Browser") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "browser.back", title: "Browser Back", category: "Browser") { [weak self] in
             guard case .browser = self?.activeTab?.content else { return }
             self?.activeBrowserController?.goBack()
         })
-        commandRegistry.register(Command(id: "browser.forward", title: "Browser Forward", category: "Browser") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "browser.forward", title: "Browser Forward", category: "Browser") { [weak self] in
             guard case .browser = self?.activeTab?.content else { return }
             self?.activeBrowserController?.goForward()
         })
-        commandRegistry.register(Command(id: "browser.reload", title: "Browser Reload", category: "Browser") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "browser.reload", title: "Browser Reload", category: "Browser") { [weak self] in
             guard case .browser = self?.activeTab?.content else { return }
             self?.activeBrowserController?.reload()
         })
-        commandRegistry.register(Command(id: "git.showChanges", title: "Show Git Changes", category: "Git") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "git.showChanges", title: "Show Git Changes", category: "Git") { [weak self] in
             self?.windowSession.sidebarMode = .changes
             self?.windowSession.showSidebar = true
             self?.refreshGitStatus()
             self?.refreshHostingView()
         })
-        commandRegistry.register(Command(id: "git.refresh", title: "Refresh Git Changes", category: "Git") { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "git.refresh", title: "Refresh Git Changes", category: "Git") { [weak self] in
             self?.refreshGitStatus()
         })
-        commandRegistry.register(Command(id: "ipc.enable", title: "Enable AI Agent IPC", category: "IPC", isAvailable: {
+        commandRegistry.register(PaletteCommand(id: "ipc.enable", title: "Enable AI Agent IPC", category: "IPC", isAvailable: {
             !CalyxMCPServer.shared.isRunning
         }) { [weak self] in
             self?.enableIPC()
         })
-        commandRegistry.register(Command(id: "ipc.disable", title: "Disable AI Agent IPC", category: "IPC", isAvailable: {
+        commandRegistry.register(PaletteCommand(id: "ipc.disable", title: "Disable AI Agent IPC", category: "IPC", isAvailable: {
             CalyxMCPServer.shared.isRunning
         }) { [weak self] in
             self?.disableIPC()
         })
-        commandRegistry.register(Command(id: "cli.install", title: "Install CLI to PATH", category: "System") {
+        commandRegistry.register(PaletteCommand(id: "cli.install", title: "Install CLI to PATH", category: "System") {
             let appPath = Bundle.main.bundlePath
             let cliSource = "\(appPath)/Contents/Resources/bin/calyx"
             let cliDest = "/usr/local/bin/calyx"
@@ -256,13 +256,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 }
             }
         })
-        commandRegistry.register(Command(id: "tab.jumpToUnread", title: "Jump to Unread Tab", shortcut: "Cmd+Shift+U", category: "Tabs", isAvailable: { [weak self] in
+        commandRegistry.register(PaletteCommand(id: "tab.jumpToUnread", title: "Jump to Unread Tab", shortcut: "Cmd+Shift+U", category: "Tabs", isAvailable: { [weak self] in
             guard let self else { return false }
             return self.windowSession.groups.flatMap(\.tabs).contains { $0.unreadNotifications > 0 }
         }) { [weak self] in
             self?.jumpToMostRecentUnreadTab()
         })
-        commandRegistry.register(Command(
+        commandRegistry.register(PaletteCommand(
             id: "review.submitAll",
             title: "Submit All Review Comments",
             category: "Git",
