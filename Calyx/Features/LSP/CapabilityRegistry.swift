@@ -104,6 +104,15 @@ actor CapabilityRegistry {
     /// fall through to the dynamic-registration check in `isCapable`.
     private func isStaticallyCapable(method: String) -> Bool {
         guard let caps = staticCapabilities else { return false }
+
+        // `textDocument/publishDiagnostics` is a server-to-client notification
+        // and the LSP spec does not gate it behind any provider slot — any
+        // server is free to push diagnostics. Treat it as always capable once
+        // static caps have been set.
+        if method == "textDocument/publishDiagnostics" {
+            return true
+        }
+
         guard let provider = Self.staticProvider(caps, for: method) else {
             return false
         }
@@ -113,6 +122,15 @@ actor CapabilityRegistry {
     /// Map an LSP method string to the matching `ServerCapabilities` provider
     /// slot. Returns `nil` either when the method is unmapped (e.g.
     /// `"textDocument/didChange"`) or when the slot itself is `nil`.
+    ///
+    /// For LSP methods whose capability sits inside a sub-flag of a parent
+    /// provider (e.g. `completionItem/resolve` → `completionProvider.resolveProvider`,
+    /// `textDocument/prepareRename` → `renameProvider.prepareProvider`,
+    /// `workspace/willCreateFiles` → `workspace.fileOperations.willCreate`),
+    /// this function extracts the sub-flag and returns it wrapped as a
+    /// fresh `AnyCodable` so the standard `providerIsTruthy` machinery can
+    /// evaluate it uniformly. A missing sub-flag is treated as the slot
+    /// being unadvertised and yields `nil`.
     private static func staticProvider(
         _ caps: ServerCapabilities,
         for method: String
@@ -129,23 +147,41 @@ actor CapabilityRegistry {
         case "textDocument/codeAction":          return caps.codeActionProvider
         case "textDocument/codeLens":            return caps.codeLensProvider
         case "textDocument/documentLink":        return caps.documentLinkProvider
-        case "textDocument/documentColor":       return caps.colorProvider
+        case "textDocument/documentColor",
+             "textDocument/colorPresentation":
+            // Both `documentColor` and `colorPresentation` share the same
+            // `colorProvider` slot per LSP 3.18.
+            return caps.colorProvider
         case "workspace/symbol":                 return caps.workspaceSymbolProvider
         case "textDocument/formatting":          return caps.documentFormattingProvider
         case "textDocument/rangeFormatting":     return caps.documentRangeFormattingProvider
         case "textDocument/onTypeFormatting":    return caps.documentOnTypeFormattingProvider
         case "textDocument/rename":              return caps.renameProvider
+        case "textDocument/prepareRename":
+            // `prepareRename` is gated by `renameProvider.prepareProvider`.
+            // When `renameProvider` is the bare boolean form (`true`), the
+            // spec leaves `prepareProvider` undefined — treat that as
+            // "not advertised" so we do not over-claim.
+            return subFlagProvider(caps.renameProvider, key: "prepareProvider")
         case "textDocument/foldingRange":        return caps.foldingRangeProvider
         case "textDocument/selectionRange":      return caps.selectionRangeProvider
         case "workspace/executeCommand":         return caps.executeCommandProvider
-        case "textDocument/prepareCallHierarchy": return caps.callHierarchyProvider
+        case "textDocument/prepareCallHierarchy",
+             "callHierarchy/incomingCalls",
+             "callHierarchy/outgoingCalls":
+            // All three call-hierarchy methods sit under `callHierarchyProvider`.
+            return caps.callHierarchyProvider
         case "textDocument/linkedEditingRange":  return caps.linkedEditingRangeProvider
         case "textDocument/semanticTokens/full",
              "textDocument/semanticTokens/range",
              "textDocument/semanticTokens/full/delta":
             return caps.semanticTokensProvider
         case "textDocument/moniker":             return caps.monikerProvider
-        case "textDocument/prepareTypeHierarchy": return caps.typeHierarchyProvider
+        case "textDocument/prepareTypeHierarchy",
+             "typeHierarchy/supertypes",
+             "typeHierarchy/subtypes":
+            // All three type-hierarchy methods sit under `typeHierarchyProvider`.
+            return caps.typeHierarchyProvider
         case "textDocument/inlineValue":         return caps.inlineValueProvider
         case "textDocument/inlayHint":           return caps.inlayHintProvider
         case "textDocument/diagnostic",
@@ -153,9 +189,109 @@ actor CapabilityRegistry {
             return caps.diagnosticProvider
         case "textDocument/completion":          return caps.completionProvider
         case "textDocument/signatureHelp":       return caps.signatureHelpProvider
+
+        // MARK: Resolve-variant methods (sub-flag `resolveProvider`).
+        case "completionItem/resolve":
+            return subFlagProvider(caps.completionProvider, key: "resolveProvider")
+        case "codeAction/resolve":
+            return subFlagProvider(caps.codeActionProvider, key: "resolveProvider")
+        case "codeLens/resolve":
+            return subFlagProvider(caps.codeLensProvider, key: "resolveProvider")
+        case "documentLink/resolve":
+            return subFlagProvider(caps.documentLinkProvider, key: "resolveProvider")
+        case "inlayHint/resolve":
+            return subFlagProvider(caps.inlayHintProvider, key: "resolveProvider")
+        case "workspaceSymbol/resolve":
+            return subFlagProvider(caps.workspaceSymbolProvider, key: "resolveProvider")
+
+        // MARK: Notebook document lifecycle.
+        case "notebookDocument/didOpen",
+             "notebookDocument/didChange",
+             "notebookDocument/didClose",
+             "notebookDocument/didSave":
+            return caps.notebookDocumentSync
+
+        // MARK: Workspace file-operation notifications/requests.
+        case "workspace/willCreateFiles":
+            return fileOperationProvider(caps.workspace, key: "willCreate")
+        case "workspace/willRenameFiles":
+            return fileOperationProvider(caps.workspace, key: "willRename")
+        case "workspace/willDeleteFiles":
+            return fileOperationProvider(caps.workspace, key: "willDelete")
+        case "workspace/didCreateFiles":
+            return fileOperationProvider(caps.workspace, key: "didCreate")
+        case "workspace/didRenameFiles":
+            return fileOperationProvider(caps.workspace, key: "didRename")
+        case "workspace/didDeleteFiles":
+            return fileOperationProvider(caps.workspace, key: "didDelete")
+
         default:
             return nil
         }
+    }
+
+    /// Extract a top-level sub-flag (e.g. `resolveProvider`, `prepareProvider`)
+    /// from a parent provider whose `boolean | Options` union is stored in
+    /// `AnyCodable`. Returns:
+    ///   - `nil` if the parent is `nil` or literally `false` (capability not
+    ///     advertised at all, so the sub-flag cannot be advertised either);
+    ///   - `nil` if the parent is an options object that does not contain
+    ///     `key` (sub-flag not advertised);
+    ///   - a fresh `AnyCodable` wrapping the sub-flag's JSON value otherwise,
+    ///     so the standard `providerIsTruthy` machinery can evaluate it.
+    ///
+    /// A bare boolean `true` parent intentionally yields `nil` here: the LSP
+    /// spec does not let bare-`true` providers advertise sub-flags such as
+    /// `resolveProvider` or `prepareProvider`, and silently treating it as
+    /// truthy would over-claim capabilities the server never offered.
+    private static func subFlagProvider(
+        _ parent: AnyCodable?,
+        key: String
+    ) -> AnyCodable? {
+        guard let parent else { return nil }
+        guard let data = try? JSONEncoder().encode(parent),
+              let obj = try? JSONSerialization.jsonObject(
+                with: data,
+                options: [.fragmentsAllowed]
+              ) else {
+            logger.error("subFlagProvider: failed to introspect parent provider for key '\(key)'")
+            return nil
+        }
+        guard let dict = obj as? [String: Any] else {
+            // Bare boolean / null / scalar / array parent. No sub-flag map.
+            return nil
+        }
+        guard let raw = dict[key] else {
+            return nil
+        }
+        return AnyCodable(raw)
+    }
+
+    /// Extract a `workspace.fileOperations.<key>` sub-entry from the
+    /// `workspace` capability slot. The exact shape of each entry is
+    /// `FileOperationRegistrationOptions` (an object with a `filters` array),
+    /// but for capability gating only the presence/truthiness of the entry
+    /// matters. Returns `nil` if `workspace` is unset, lacks a
+    /// `fileOperations` object, or that object lacks the requested key.
+    private static func fileOperationProvider(
+        _ workspace: AnyCodable?,
+        key: String
+    ) -> AnyCodable? {
+        guard let workspace else { return nil }
+        guard let data = try? JSONEncoder().encode(workspace),
+              let obj = try? JSONSerialization.jsonObject(
+                with: data,
+                options: [.fragmentsAllowed]
+              ) else {
+            logger.error("fileOperationProvider: failed to introspect workspace slot for key '\(key)'")
+            return nil
+        }
+        guard let dict = obj as? [String: Any],
+              let fileOps = dict["fileOperations"] as? [String: Any],
+              let raw = fileOps[key] else {
+            return nil
+        }
+        return AnyCodable(raw)
     }
 
     /// Decide whether an `AnyCodable` provider value enables the capability.

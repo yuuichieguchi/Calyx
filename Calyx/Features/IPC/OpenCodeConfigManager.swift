@@ -179,7 +179,7 @@ struct OpenCodeConfigManager: Sendable {
         // are not retained across upserts.
         let calyxEntry: [String: Any] = [
             "type": "remote",
-            "url": "http://localhost:\(port)/mcp",
+            "url": "http://127.0.0.1:\(port)/mcp",
             "headers": [
                 "Authorization": "Bearer \(token)"
             ]

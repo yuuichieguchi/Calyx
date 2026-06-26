@@ -60,7 +60,7 @@ struct CodexConfigManager: Sendable {
         // Build the new section
         let section = """
         [mcp_servers.calyx-ipc]
-        url = "http://localhost:\(port)/mcp"
+        url = "http://127.0.0.1:\(port)/mcp"
         http_headers = { "Authorization" = "Bearer \(token)" }
         """
 

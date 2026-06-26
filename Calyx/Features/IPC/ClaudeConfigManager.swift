@@ -67,7 +67,7 @@ struct ClaudeConfigManager: Sendable {
         // Add/update calyx-ipc entry
         let calyxEntry: [String: Any] = [
             "type": "http",
-            "url": "http://localhost:\(port)/mcp",
+            "url": "http://127.0.0.1:\(port)/mcp",
             "headers": [
                 "Authorization": "Bearer \(token)"
             ]

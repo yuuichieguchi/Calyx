@@ -138,7 +138,7 @@ final class HermesConfigManagerTests: XCTestCase {
         XCTAssertTrue(content.contains(beginLine), "Should contain BEGIN line literal")
         XCTAssertTrue(content.contains("calyx-ipc:"), "Should contain calyx-ipc: key")
         XCTAssertTrue(content.contains(endLine), "Should contain END line literal")
-        XCTAssertTrue(content.contains("url: \"http://localhost:41830/mcp\""),
+        XCTAssertTrue(content.contains("url: \"http://127.0.0.1:41830/mcp\""),
                       "Should contain url scalar with port 41830")
         XCTAssertTrue(content.contains("Authorization: \"Bearer abc123\""),
                       "Should contain Authorization scalar with token")
@@ -250,11 +250,11 @@ final class HermesConfigManagerTests: XCTestCase {
                        "Should have exactly one BEGIN line after second enable")
         XCTAssertEqual(occurrences(of: endLine, in: content), 1,
                        "Should have exactly one END line after second enable")
-        XCTAssertTrue(content.contains("http://localhost:55555/mcp"),
+        XCTAssertTrue(content.contains("http://127.0.0.1:55555/mcp"),
                       "URL should reflect the new port")
         XCTAssertTrue(content.contains("Bearer second-tok"),
                       "Authorization should reflect the new token")
-        XCTAssertFalse(content.contains("http://localhost:41830/mcp"),
+        XCTAssertFalse(content.contains("http://127.0.0.1:41830/mcp"),
                        "Old URL should be gone")
         XCTAssertFalse(content.contains("Bearer first-tok"),
                        "Old token should be gone")
@@ -390,7 +390,7 @@ final class HermesConfigManagerTests: XCTestCase {
                        "After self-heal, exactly one END line should remain")
         XCTAssertTrue(content.contains("Bearer fresh"),
                       "New token should be present")
-        XCTAssertTrue(content.contains("http://localhost:41830/mcp"),
+        XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"),
                       "New URL should be present")
         XCTAssertFalse(content.contains("http://localhost:1111/mcp"),
                        "Stale URL from orphan block should be gone")

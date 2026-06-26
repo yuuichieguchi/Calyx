@@ -186,6 +186,22 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
     let defaultInitializationOptions: AnyCodable?
     let installationCheck: InstallationProbe
     let note: String?
+    /// Ordered list of launcher names the installer should probe when
+    /// the entry's `installationCheck` is a plain `.which(_)`. Defaults
+    /// to `[executable]` so single-name entries work unchanged. Used by
+    /// languages whose community ships under multiple binary names
+    /// (e.g. Java's JDT language server, which appears as `jdtls`,
+    /// `jdt-language-server`, or `eclipse.jdt.ls` depending on how the
+    /// user installed it). The first candidate found wins.
+    let executableCandidates: [String]
+    /// Ordered list of version-flag argument sets the installer should
+    /// probe when capturing `detectedVersion`. Defaults to
+    /// `[versionArguments]` (or empty when `versionArguments == nil`)
+    /// so single-flag entries work unchanged. Used by servers whose CLI
+    /// surface has churned across versions (e.g. gopls, which accepts
+    /// `--version` in some releases and `version` in others). The first
+    /// candidate that exits 0 with non-empty stdout wins.
+    let versionArgumentCandidates: [[String]]
 
     init(
         languageId: String,
@@ -198,7 +214,9 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
         installation: LSPInstallationSpec,
         defaultInitializationOptions: AnyCodable?,
         installationCheck: InstallationProbe? = nil,
-        note: String? = nil
+        note: String? = nil,
+        executableCandidates: [String]? = nil,
+        versionArgumentCandidates: [[String]]? = nil
     ) {
         self.languageId = languageId
         self.displayName = displayName
@@ -213,6 +231,18 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
         // Caller may override for wrapper-shim cases like `xcrun`.
         self.installationCheck = installationCheck ?? .which(name: executable)
         self.note = note
+        // Default candidate list is the single launch executable, so
+        // existing entries behave identically.
+        self.executableCandidates = executableCandidates ?? [executable]
+        // Default version-arg candidate list is the single declared
+        // version-arg form (or empty when no version probe is declared).
+        if let versionArgumentCandidates {
+            self.versionArgumentCandidates = versionArgumentCandidates
+        } else if let versionArguments {
+            self.versionArgumentCandidates = [versionArguments]
+        } else {
+            self.versionArgumentCandidates = []
+        }
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -227,12 +257,18 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
         case defaultInitializationOptions
         case installationCheck
         case note
+        case executableCandidates
+        case versionArgumentCandidates
     }
 
     /// Custom decoder so that user-override JSON files written against
-    /// the previous schema (no `installationCheck`, no `note`) still
+    /// the previous schema (no `installationCheck`, no `note`, no
+    /// `executableCandidates`, no `versionArgumentCandidates`) still
     /// load cleanly. Missing `installationCheck` falls back to
-    /// `.which(name: executable)`; missing `note` decodes as `nil`.
+    /// `.which(name: executable)`; missing `note` decodes as `nil`;
+    /// missing `executableCandidates` falls back to `[executable]`;
+    /// missing `versionArgumentCandidates` falls back to
+    /// `[versionArguments]` (or empty when `versionArguments` is `nil`).
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let executable = try container.decode(String.self, forKey: .executable)
@@ -240,10 +276,11 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
         self.displayName = try container.decode(String.self, forKey: .displayName)
         self.executable = executable
         self.arguments = try container.decode([String].self, forKey: .arguments)
-        self.versionArguments = try container.decodeIfPresent(
+        let versionArguments = try container.decodeIfPresent(
             [String].self,
             forKey: .versionArguments
         )
+        self.versionArguments = versionArguments
         self.fileExtensions = try container.decode([String].self, forKey: .fileExtensions)
         self.workspaceMarkers = try container.decode([String].self, forKey: .workspaceMarkers)
         self.installation = try container.decode(
@@ -258,6 +295,19 @@ struct LSPServerDefinition: Sendable, Codable, Equatable {
             try container.decodeIfPresent(InstallationProbe.self, forKey: .installationCheck)
             ?? .which(name: executable)
         self.note = try container.decodeIfPresent(String.self, forKey: .note)
+        self.executableCandidates =
+            try container.decodeIfPresent([String].self, forKey: .executableCandidates)
+            ?? [executable]
+        if let decodedVAC = try container.decodeIfPresent(
+            [[String]].self,
+            forKey: .versionArgumentCandidates
+        ) {
+            self.versionArgumentCandidates = decodedVAC
+        } else if let versionArguments {
+            self.versionArgumentCandidates = [versionArguments]
+        } else {
+            self.versionArgumentCandidates = []
+        }
     }
 }
 
@@ -492,7 +542,8 @@ struct LSPServerRegistry: Sendable, Equatable, Codable {
                     ],
                     safeToAutoRun: true
                 ),
-                defaultInitializationOptions: nil
+                defaultInitializationOptions: nil,
+                versionArgumentCandidates: [["--version"], ["version"]]
             ),
 
             // 6. Ruby
@@ -539,7 +590,8 @@ struct LSPServerRegistry: Sendable, Equatable, Codable {
                     ],
                     safeToAutoRun: true
                 ),
-                defaultInitializationOptions: nil
+                defaultInitializationOptions: nil,
+                executableCandidates: ["jdtls", "jdt-language-server", "eclipse.jdt.ls"]
             ),
 
             // 8. Kotlin

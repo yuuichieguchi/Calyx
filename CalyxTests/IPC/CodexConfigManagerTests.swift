@@ -51,7 +51,7 @@ final class CodexConfigManagerTests: XCTestCase {
         // Then: file created with correct TOML section
         let content = readConfig()
         XCTAssertTrue(content.contains("[mcp_servers.calyx-ipc]"))
-        XCTAssertTrue(content.contains("http://localhost:41830/mcp"))
+        XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"))
         XCTAssertTrue(content.contains("Bearer abc123"))
     }
 
@@ -73,7 +73,7 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertTrue(content.contains("model = \"gpt-4\""))
         XCTAssertTrue(content.contains("temperature = 0.7"))
         XCTAssertTrue(content.contains("[mcp_servers.calyx-ipc]"))
-        XCTAssertTrue(content.contains("http://localhost:41830/mcp"))
+        XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"))
     }
 
     func test_enableIPC_updatesExistingEntry() throws {
@@ -90,7 +90,7 @@ final class CodexConfigManagerTests: XCTestCase {
 
         // Then: updated with new values
         let content = readConfig()
-        XCTAssertTrue(content.contains("http://localhost:55555/mcp"))
+        XCTAssertTrue(content.contains("http://127.0.0.1:55555/mcp"))
         XCTAssertTrue(content.contains("Bearer new-token"))
         // Old values removed
         XCTAssertFalse(content.contains("http://localhost:40000/mcp"))
@@ -375,7 +375,7 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertTrue(content.contains("[general]"))
         XCTAssertTrue(content.contains("model = \"gpt-4\""))
         XCTAssertTrue(content.contains("[mcp_servers.calyx-ipc]"))
-        XCTAssertTrue(content.contains("http://localhost:41830/mcp"))
+        XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"))
     }
 
     func test_enableIPC_noTrailingNewline() throws {
@@ -391,7 +391,7 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertTrue(content.contains("[general]"))
         XCTAssertTrue(content.contains("model = \"gpt-4\""))
         XCTAssertTrue(content.contains("[mcp_servers.calyx-ipc]"))
-        XCTAssertTrue(content.contains("http://localhost:41830/mcp"))
+        XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"))
     }
 
     func test_enableIPC_duplicateSections() throws {
@@ -418,7 +418,7 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertTrue(content.contains("[other.section]"))
         XCTAssertTrue(content.contains("key = \"value\""))
         XCTAssertTrue(content.contains("[mcp_servers.calyx-ipc]"))
-        XCTAssertTrue(content.contains("http://localhost:41830/mcp"))
+        XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"))
         XCTAssertTrue(content.contains("Bearer new-tok"))
         // Old values must be gone
         XCTAssertFalse(content.contains("http://localhost:40000/mcp"))
@@ -454,7 +454,7 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertFalse(content.contains("http://localhost:40000/mcp"))
         // Fresh section added
         XCTAssertTrue(content.contains("[mcp_servers.calyx-ipc]"))
-        XCTAssertTrue(content.contains("http://localhost:41830/mcp"))
+        XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"))
     }
 
     // MARK: - Concurrency
@@ -511,7 +511,7 @@ final class CodexConfigManagerTests: XCTestCase {
 
             // If calyx-ipc section exists, it should have the url key
             if content.contains("[mcp_servers.calyx-ipc]") {
-                XCTAssertTrue(content.contains("url = \"http://localhost:"),
+                XCTAssertTrue(content.contains("url = \"http://127.0.0.1:"),
                               "calyx-ipc section should have url key")
             }
         }

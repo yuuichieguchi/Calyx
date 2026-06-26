@@ -1009,12 +1009,33 @@ final class MCPLSPBridge {
     /// case (`ensureFileOpen` throws an `invalidArgument` error) inspect
     /// the optional directly.
     nonisolated static func normalizeFileURI(_ input: String) -> (uri: String, fileURL: URL?) {
+        // A registered-name host (RFC 3986 §3.2.2) is composed of
+        // unreserved + sub-delims + percent-encoded octets. We accept
+        // the conservative subset that covers SMB-share / DNS hostnames
+        // in practice (ASCII letters, digits, `.`, `-`, `_`, `~`) and
+        // reject everything else — in particular `[`, `]`, whitespace,
+        // and `/` which would indicate a malformed authority component
+        // (e.g. `file://[bad]/...`).
+        func isValidRegisteredHost(_ host: String) -> Bool {
+            guard !host.isEmpty else { return false }
+            for scalar in host.unicodeScalars {
+                let v = scalar.value
+                let isASCIILetter = (v >= 0x41 && v <= 0x5A) || (v >= 0x61 && v <= 0x7A)
+                let isDigit = v >= 0x30 && v <= 0x39
+                let isOtherUnreserved = scalar == "." || scalar == "-"
+                    || scalar == "_" || scalar == "~"
+                if !(isASCIILetter || isDigit || isOtherUnreserved) {
+                    return false
+                }
+            }
+            return true
+        }
+
         if input.hasPrefix("file://") {
             // Fast path: a well-formed `file://` URI with no query /
-            // fragment / non-empty host. `URL(string:)` correctly
-            // percent-decodes the path portion and round-trips spaces and
-            // friends through `.absoluteString`. We bail to the rebuild
-            // path when:
+            // fragment. `URL(string:)` correctly percent-decodes the
+            // path portion and round-trips spaces and friends through
+            // `.absoluteString`. We bail to the rebuild path when:
             //   * URL(string:) returns nil (someone smuggled in totally
             //     malformed text after the scheme)
             //   * isFileURL is false (the scheme was rewritten)
@@ -1022,32 +1043,73 @@ final class MCPLSPBridge {
             //     a perfectly legal POSIX path char but URL(string:)
             //     misinterprets it as a query delimiter — the rebuild
             //     path correctly re-encodes it)
-            //   * host is non-empty — a well-formed file URI always uses
-            //     the empty-host form (`file:///path`); a non-empty host
-            //     (e.g. `file://[bad]/...`) means the input never had a
-            //     leading slash on the path and is best treated as
-            //     unparseable so the caller surfaces a structured error.
+            //
+            // Per RFC 8089 §3 the `file://<host>/<path>` form is valid
+            // (SMB shares, Windows UNC paths). We accept both the
+            // empty-host (`file:///path`) and the non-empty-host
+            // (`file://server/share/path`) forms here, provided the
+            // path component is absolute. A non-empty host must look
+            // like a registered name — anything that looks like a
+            // malformed IP-literal (`[bad]`) or carries forbidden host
+            // characters is rejected so the caller can surface a
+            // structured "unparseable URI" error.
             if let url = URL(string: input),
                url.isFileURL,
                url.query == nil,
                url.fragment == nil,
-               (url.host?.isEmpty ?? true) {
-                return (url.absoluteString, url)
+               url.path.hasPrefix("/") {
+                // Use URLComponents.host because it preserves the
+                // square-bracket form for IP-literals — e.g.
+                // `file://[bad]/...` exposes host=="[bad]" via
+                // URLComponents but host=="bad" via URL.host, and the
+                // bracketed form is the one we must reject as a
+                // malformed registered name.
+                let host = URLComponents(url: url, resolvingAgainstBaseURL: false)?.host ?? ""
+                if host.isEmpty || isValidRegisteredHost(host) {
+                    return (url.absoluteString, url)
+                }
             }
-            // Strip the scheme and rebuild via `URL(fileURLWithPath:)`,
-            // which percent-encodes whatever was in the raw path
-            // verbatim. A well-formed file URI always has the shape
-            // `file:///<absolute-path>` — the host between `//` and the
-            // next `/` is empty — so the remainder MUST start with `/`.
+            // Strip the scheme and inspect what comes next. A
+            // well-formed file URI is either:
+            //   * `file:///<absolute-path>` — empty host, path starts at
+            //     the third `/`.
+            //   * `file://<host>/<absolute-path>` (RFC 8089 §3) — host
+            //     ends at the first `/` after the scheme, path is
+            //     everything from that `/` onwards.
+            // For the empty-host form we can hand the absolute path to
+            // `URL(fileURLWithPath:)` directly. For the host form we
+            // must preserve the host on the rebuild so the
+            // percent-encoded output keeps the `file://<host>/<path>`
+            // shape.
+            let pathPart = String(input.dropFirst("file://".count))
+            if pathPart.hasPrefix("/") {
+                let fileURL = URL(fileURLWithPath: pathPart)
+                return (fileURL.absoluteString, fileURL)
+            }
+            // Host form: split on the first `/` after the scheme. The
+            // remainder MUST start with `/` (an absolute path) — anything
+            // else is malformed (`file://server` with no path, etc.).
+            if let slashIdx = pathPart.firstIndex(of: "/") {
+                let host = String(pathPart[..<slashIdx])
+                let absolutePath = String(pathPart[slashIdx...])
+                if isValidRegisteredHost(host), absolutePath.hasPrefix("/") {
+                    // Build a `file://<host><absolute-path>` URL via
+                    // URLComponents so the host is preserved and the
+                    // path is percent-encoded consistently with the
+                    // empty-host fast path.
+                    var comps = URLComponents()
+                    comps.scheme = "file"
+                    comps.host = host
+                    comps.path = absolutePath
+                    if let url = comps.url, url.isFileURL {
+                        return (url.absoluteString, url)
+                    }
+                }
+            }
             // Anything else is malformed; return nil so `ensureFileOpen`
             // can throw a structured error instead of silently inventing
             // a relative path.
-            let pathPart = String(input.dropFirst("file://".count))
-            guard pathPart.hasPrefix("/") else {
-                return (input, nil)
-            }
-            let fileURL = URL(fileURLWithPath: pathPart)
-            return (fileURL.absoluteString, fileURL)
+            return (input, nil)
         }
         let fileURL = URL(fileURLWithPath: input)
         return (fileURL.absoluteString, fileURL)
@@ -4360,36 +4422,35 @@ enum HoverBundleTool: MCPLSPTool {
     /// match, decode error) skip that entry only — the overall bundle
     /// always carries whatever could be resolved.
     ///
-    /// The fan-out runs in parallel via `withTaskGroup`. The shared
-    /// `LSPSession` actor serialises individual requests, but releasing
-    /// the await between requests lets the server pipeline the round
-    /// trips instead of paying N × `(workspace/symbol + hover)` of
-    /// sequential latency. Final ordering is restored by index so the
-    /// caller sees `dependent_types` in the same order
-    /// `extractDependentIdentifiers` produced.
+    /// Requests are issued sequentially, in the same order
+    /// `extractDependentIdentifiers` produced, so the caller sees
+    /// `dependent_types` in that order. A previous version of this
+    /// helper used `withTaskGroup` to fan out, but because every
+    /// underlying `session.sendRequest` already serialises through the
+    /// `LSPSession` actor, the fan-out gained no real concurrency while
+    /// making the per-identifier request order non-deterministic — which
+    /// broke test drivers that match queued LSP replies to query
+    /// identifiers by FIFO arrival order, and made debugging real-server
+    /// traces unnecessarily harder.
+    ///
+    /// The cap is small (`dependentTypeCap`, currently 5), so the total
+    /// sequential cost is bounded at 5 × (`workspace/symbol` +
+    /// `textDocument/hover`) round-trips per `lsp_hover_bundle` call.
     private static func resolveDependentTypes(
         session: LSPSession,
         identifiers: [String]
     ) async -> [DependentType] {
-        return await withTaskGroup(of: (Int, DependentType?).self) { group in
-            for (i, identifier) in identifiers.enumerated() {
-                group.addTask {
-                    let entry = await resolveOneDependentType(
-                        identifier: identifier,
-                        session: session
-                    )
-                    return (i, entry)
-                }
+        var resolved: [DependentType] = []
+        resolved.reserveCapacity(identifiers.count)
+        for identifier in identifiers {
+            if let entry = await resolveOneDependentType(
+                identifier: identifier,
+                session: session
+            ) {
+                resolved.append(entry)
             }
-            var slots: [(Int, DependentType?)] = []
-            slots.reserveCapacity(identifiers.count)
-            for await pair in group {
-                slots.append(pair)
-            }
-            return slots
-                .sorted { $0.0 < $1.0 }
-                .compactMap { $0.1 }
         }
+        return resolved
     }
 
     /// Resolve a single dependent-type identifier: query

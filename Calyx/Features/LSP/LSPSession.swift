@@ -269,7 +269,15 @@ actor LSPSession {
         languageId: String,
         client: LSPClient,
         clientCapabilities: ClientCapabilities = ClientCapabilities.calyxDefault(),
-        clientInfo: ClientInfo = ClientInfo(name: "Calyx", version: "0.26.1"),
+        // Read the marketing version from the running bundle so the LSP
+        // initialize handshake tracks the actual build. Previously this
+        // was hardcoded (e.g. "0.26.1") and silently drifted every release.
+        // Fall back to "unknown" only when the Info.plist key is absent
+        // (e.g. some test runner contexts that don't surface CFBundleShortVersionString).
+        clientInfo: ClientInfo = ClientInfo(
+            name: "Calyx",
+            version: (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
+        ),
         persistence: LSPSessionPersistence? = nil,
         diagnosticsStore: DiagnosticsStore? = nil
     ) {

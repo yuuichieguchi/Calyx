@@ -119,6 +119,7 @@ actor LSPClient {
 
     private let transport: any LSPTransport
     private let requestTimeoutSeconds: TimeInterval
+    private let initializeTimeoutSeconds: TimeInterval
     private var state: State = .notStarted
 
     /// Monotonically increasing JSON-RPC request id (client → server).
@@ -139,15 +140,25 @@ actor LSPClient {
     // MARK: - Init
 
     /// - Parameter requestTimeoutSeconds: wall-clock budget for every
-    ///   `sendRequest`. After this elapses the continuation fails with
+    ///   `sendRequest` except the LSP `initialize` handshake. After
+    ///   this elapses the continuation fails with
     ///   `LSPClientError.timeout` and `$/cancelRequest` is sent to the
     ///   server. Default is 120 s, which comfortably accommodates
-    ///   first-time index builds in language servers like
-    ///   `rust-analyzer` and `sourcekit-lsp` without leaking forever
-    ///   on a stuck server.
-    init(transport: any LSPTransport, requestTimeoutSeconds: TimeInterval = 120) {
+    ///   steady-state requests on language servers like `rust-analyzer`
+    ///   and `sourcekit-lsp` without leaking forever on a stuck server.
+    /// - Parameter initializeTimeoutSeconds: wall-clock budget for the
+    ///   `initialize` request specifically. Real-world language servers
+    ///   (`rust-analyzer`, `jdtls`) routinely take 3-10 minutes for
+    ///   first-time workspace indexing, exceeding the steady-state
+    ///   `requestTimeoutSeconds` cap. Default is 600 s (10 minutes).
+    init(
+        transport: any LSPTransport,
+        requestTimeoutSeconds: TimeInterval = 120,
+        initializeTimeoutSeconds: TimeInterval = 600
+    ) {
         self.transport = transport
         self.requestTimeoutSeconds = requestTimeoutSeconds
+        self.initializeTimeoutSeconds = initializeTimeoutSeconds
     }
 
     // MARK: - Lifecycle
@@ -310,8 +321,12 @@ actor LSPClient {
         }
 
         // 3. Race the continuation against the wall-clock timeout while
-        // honoring cooperative task cancellation.
-        let timeout = requestTimeoutSeconds
+        // honoring cooperative task cancellation. The LSP `initialize`
+        // handshake gets a separate, larger budget because first-time
+        // workspace indexing in real-world language servers
+        // (`rust-analyzer`, `jdtls`) can run for several minutes; all
+        // other methods stay on the steady-state `requestTimeoutSeconds`.
+        let timeout = (method == "initialize") ? initializeTimeoutSeconds : requestTimeoutSeconds
         return try await withTaskCancellationHandler {
             try await raceResponseAgainstTimeout(
                 id: id,

@@ -108,7 +108,7 @@ final class OpenCodeConfigManagerTests: XCTestCase {
         XCTAssertNotNil(calyxIPC, "calyx-ipc entry should exist")
         XCTAssertEqual(calyxIPC?["type"] as? String, "remote",
                        "OpenCode MCP entry type should be 'remote'")
-        XCTAssertEqual(calyxIPC?["url"] as? String, "http://localhost:41830/mcp")
+        XCTAssertEqual(calyxIPC?["url"] as? String, "http://127.0.0.1:41830/mcp")
 
         let headers = calyxIPC?["headers"] as? [String: String]
         XCTAssertEqual(headers?["Authorization"], "Bearer abc123")
@@ -210,7 +210,7 @@ final class OpenCodeConfigManagerTests: XCTestCase {
         XCTAssertEqual(mcp?.count, 1, "There should be only one entry under mcp (no duplicates)")
 
         let calyxIPC = mcp?["calyx-ipc"] as? [String: Any]
-        XCTAssertEqual(calyxIPC?["url"] as? String, "http://localhost:55555/mcp",
+        XCTAssertEqual(calyxIPC?["url"] as? String, "http://127.0.0.1:55555/mcp",
                        "URL should be updated to new port")
 
         let headers = calyxIPC?["headers"] as? [String: String]
@@ -245,7 +245,7 @@ final class OpenCodeConfigManagerTests: XCTestCase {
         let dict = try readOpenCodeDict()
         let mcp = dict["mcp"] as? [String: Any]
         let calyxIPC = mcp?["calyx-ipc"] as? [String: Any]
-        XCTAssertEqual(calyxIPC?["url"] as? String, "http://localhost:12345/mcp",
+        XCTAssertEqual(calyxIPC?["url"] as? String, "http://127.0.0.1:12345/mcp",
                        "URL should be 'http://localhost:<port>/mcp' exactly")
     }
 

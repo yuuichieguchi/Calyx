@@ -60,7 +60,7 @@ final class ClaudeConfigManagerTests: XCTestCase {
         let calyxIPC = mcpServers?["calyx-ipc"] as? [String: Any]
         XCTAssertNotNil(calyxIPC, "calyx-ipc entry should exist")
         XCTAssertEqual(calyxIPC?["type"] as? String, "http")
-        XCTAssertEqual(calyxIPC?["url"] as? String, "http://localhost:41830/mcp")
+        XCTAssertEqual(calyxIPC?["url"] as? String, "http://127.0.0.1:41830/mcp")
 
         let headers = calyxIPC?["headers"] as? [String: String]
         XCTAssertEqual(headers?["Authorization"], "Bearer abc123")
@@ -114,7 +114,7 @@ final class ClaudeConfigManagerTests: XCTestCase {
         let dict = try readConfigDict()
         let mcpServers = dict["mcpServers"] as? [String: Any]
         let calyxIPC = mcpServers?["calyx-ipc"] as? [String: Any]
-        XCTAssertEqual(calyxIPC?["url"] as? String, "http://localhost:55555/mcp")
+        XCTAssertEqual(calyxIPC?["url"] as? String, "http://127.0.0.1:55555/mcp")
 
         let headers = calyxIPC?["headers"] as? [String: String]
         XCTAssertEqual(headers?["Authorization"], "Bearer new-token")
@@ -201,7 +201,7 @@ final class ClaudeConfigManagerTests: XCTestCase {
         let dict = try readConfigDict()
         let mcpServers = dict["mcpServers"] as? [String: Any]
         let calyxIPC = mcpServers?["calyx-ipc"] as? [String: Any]
-        XCTAssertEqual(calyxIPC?["url"] as? String, "http://localhost:12345/mcp",
+        XCTAssertEqual(calyxIPC?["url"] as? String, "http://127.0.0.1:12345/mcp",
                        "URL should be http://localhost:{port}/mcp")
     }
 

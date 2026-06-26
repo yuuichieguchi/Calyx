@@ -143,6 +143,26 @@ actor StdioLSPTransport: LSPTransport {
     /// within 5s"; we conservatively give up after 3s.
     private static let writeDeadlineSeconds: TimeInterval = 3.0
 
+    /// Compute a payload-size-aware write deadline for the
+    /// `writeNonBlocking` loop. Small frames (typical JSON-RPC
+    /// requests, ~hundreds of bytes to a few KiB) keep the legacy
+    /// 3-second floor so a wedged child is still detected quickly.
+    /// Larger payloads — notably `textDocument/didChange` carrying a
+    /// full multi-megabyte content replacement — scale linearly so a
+    /// warming-up language server (rust-analyzer / sourcekit-lsp) has
+    /// time to drain the macOS ~64 KiB pipe buffer in many cycles
+    /// without the transport throwing `transportClosed` and tearing
+    /// the session down mid-edit.
+    ///
+    /// Policy: ~0.5 s per 32 KiB chunk, with a 3 s floor.
+    ///   - 1 KiB   → 3.0 s (floor)
+    ///   - 192 KiB → 3.0 s (floor)
+    ///   - 1 MiB   → ~16 s
+    ///   - 10 MiB  → ~160 s
+    internal static func computeWriteDeadline(payloadSize: Int) -> TimeInterval {
+        max(3.0, ceil(Double(payloadSize) / 32_768.0) * 0.5)
+    }
+
     /// Delay between SIGTERM and the SIGKILL escalation inside
     /// `close()`. Matches the implementation guide.
     private static let sigkillEscalationSeconds: TimeInterval = 2.0
@@ -262,9 +282,20 @@ actor StdioLSPTransport: LSPTransport {
             process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
             process.arguments = [executable] + arguments
         }
-        if let environment {
-            process.environment = environment
-        }
+        // Always overlay the augmented PATH on the child's environment,
+        // even when the caller passed `nil` or supplied a minimal env.
+        // A Finder/Dock launch inherits the launchd-minimal PATH
+        // (`/usr/bin:/bin:/usr/sbin:/sbin`) which cannot resolve
+        // version-manager-installed binaries (NVM, asdf, pyenv, mise,
+        // volta, rbenv, …) under the `/usr/bin/env` shim above. The
+        // startup bridge already locates these via
+        // `SystemCommandRunner.augmentedPATH()`; the transport must use
+        // the same PATH or the spawn fails with `env: <name>: No such
+        // file or directory` (exit 127). `augmentedEnvironment(base:)`
+        // handles both branches: `nil` starts from the host env,
+        // non-nil starts from the caller's dict — PATH is always
+        // overridden. See `SystemCommandRunner.augmentedPATH()`.
+        process.environment = SystemCommandRunner.augmentedEnvironment(base: environment)
         if let workingDirectory {
             process.currentDirectoryURL = workingDirectory
         }
@@ -336,7 +367,7 @@ actor StdioLSPTransport: LSPTransport {
     /// Critically, the actor's executor is FREE during the `await` —
     /// no actor method is blocked behind a slow pipe.
     private nonisolated func writeNonBlocking(_ data: Data, fd: Int32) async throws {
-        let deadline = Date().addingTimeInterval(Self.writeDeadlineSeconds)
+        let deadline = Date().addingTimeInterval(Self.computeWriteDeadline(payloadSize: data.count))
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let total = data.count

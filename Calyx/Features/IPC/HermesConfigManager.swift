@@ -110,7 +110,7 @@ struct HermesConfigManager: Sendable {
 
         let cleaned = stripAllManagedRegions(from: existing)
 
-        let url = "http://localhost:\(port)/mcp"
+        let url = "http://127.0.0.1:\(port)/mcp"
         let authorization = "Bearer \(token)"
         let urlScalar = try yamlDoubleQuotedScalar(url)
         let authScalar = try yamlDoubleQuotedScalar(authorization)

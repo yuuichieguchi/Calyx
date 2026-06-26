@@ -74,9 +74,46 @@ protocol LSPCommandRunner: Sendable {
         environment: [String: String]?
     ) async throws -> CommandResult
 
+    /// Runs a long-running install command (`brew install`,
+    /// `ghcup install hls`, `rustup component add`, …). Semantically
+    /// identical to `run(...)` except the implementation is free to
+    /// apply a longer wall-clock budget — install commands routinely
+    /// run 30+ minutes and the standard `run(...)` watchdog would
+    /// terminate them prematurely.
+    ///
+    /// The default implementation simply forwards to `run(...)`, so
+    /// test seams (e.g. `MockCommandRunner`) that don't care about the
+    /// timeout distinction need not override it. `SystemCommandRunner`
+    /// overrides this with its own `installTimeoutSeconds` budget.
+    func installRun(
+        executable: String,
+        arguments: [String],
+        workingDirectory: URL?,
+        environment: [String: String]?
+    ) async throws -> CommandResult
+
     /// Finds `executable` on `PATH`. Returns `nil` when not found.
     /// Equivalent to `which(1)`.
     func locate(_ executable: String) async -> URL?
+}
+
+extension LSPCommandRunner {
+    /// Default `installRun` forwards to `run(...)`. Mock / test runners
+    /// inherit this for free; only `SystemCommandRunner` overrides it
+    /// with the longer wall-clock budget.
+    func installRun(
+        executable: String,
+        arguments: [String],
+        workingDirectory: URL?,
+        environment: [String: String]?
+    ) async throws -> CommandResult {
+        try await run(
+            executable: executable,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            environment: environment
+        )
+    }
 }
 
 // MARK: - MockCommandRunner
@@ -254,9 +291,28 @@ actor LSPInstaller {
         let isInstalled: Bool
         switch entry.installationCheck {
         case .which(let name):
-            let url = await runner.locate(name)
-            detectedPath = url
-            isInstalled = url != nil
+            // Build the launcher-name probe chain: the entry's
+            // declared `.which(_)` name comes first (back-compat with
+            // single-name entries where `installationCheck` was
+            // explicitly set), then any additional names from
+            // `executableCandidates` that aren't already covered.
+            // `executableCandidates` defaults to `[entry.executable]`,
+            // which equals `name` for the common case, so this collapses
+            // to a single probe for entries that didn't opt in to a
+            // fallback chain.
+            var probeChain: [String] = [name]
+            for candidate in entry.executableCandidates where !probeChain.contains(candidate) {
+                probeChain.append(candidate)
+            }
+            var foundURL: URL? = nil
+            for candidate in probeChain {
+                if let url = await runner.locate(candidate) {
+                    foundURL = url
+                    break
+                }
+            }
+            detectedPath = foundURL
+            isInstalled = foundURL != nil
         case .command(let exe, let args, let expectExit0):
             // Gate the command probe on the wrapper executable
             // existing on PATH; otherwise we can't run it at all.
@@ -283,18 +339,38 @@ actor LSPInstaller {
         }
 
         var detectedVersion: String? = nil
-        if isInstalled, let versionArgs = entry.versionArguments {
+        if isInstalled {
+            // Build the version-probe argument chain. The entry's
+            // singular `versionArguments` comes first (back-compat),
+            // then any additional sets from `versionArgumentCandidates`
+            // that aren't already covered. `versionArgumentCandidates`
+            // defaults to `[versionArguments]` when only the singular
+            // is set, so this collapses to a single probe for entries
+            // that didn't opt in to a fallback chain.
+            var argChain: [[String]] = []
+            if let primary = entry.versionArguments {
+                argChain.append(primary)
+            }
+            for candidate in entry.versionArgumentCandidates where !argChain.contains(candidate) {
+                argChain.append(candidate)
+            }
             // Best-effort version probe. A failure here only means we
             // can't show a version string; it does not affect the
-            // installed-ness verdict.
-            if let result = try? await runner.run(
-                executable: entry.executable,
-                arguments: versionArgs,
-                workingDirectory: nil,
-                environment: nil
-            ), result.exitCode == 0 {
-                let trimmed = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { detectedVersion = trimmed }
+            // installed-ness verdict. Accept the first candidate that
+            // exits 0 with non-empty stdout.
+            for versionArgs in argChain {
+                if let result = try? await runner.run(
+                    executable: entry.executable,
+                    arguments: versionArgs,
+                    workingDirectory: nil,
+                    environment: nil
+                ), result.exitCode == 0 {
+                    let trimmed = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty {
+                        detectedVersion = trimmed
+                        break
+                    }
+                }
             }
         }
 
@@ -498,9 +574,15 @@ actor LSPInstaller {
     /// `MockCommandRunner` keys its enqueued results by executable name,
     /// and direct registry tests (e.g. `npm install -g …`) assert that
     /// the registry's own argv appears in `runner.history()`.
+    ///
+    /// Uses `runner.installRun(...)` rather than `runner.run(...)` so
+    /// long-running compile-from-source installs (`ghcup install hls`,
+    /// `brew install` on a cold cache, …) get the longer wall-clock
+    /// budget rather than the 600 s `run(...)` watchdog that would
+    /// terminate them prematurely.
     private func runRegistryCommand(_ command: String) async throws -> CommandResult {
         if Self.commandNeedsShell(command) {
-            return try await runner.run(
+            return try await runner.installRun(
                 executable: "/bin/sh",
                 arguments: ["-c", command],
                 workingDirectory: nil,
@@ -508,7 +590,7 @@ actor LSPInstaller {
             )
         }
         let (exe, args) = splitShell(command)
-        return try await runner.run(
+        return try await runner.installRun(
             executable: exe,
             arguments: args,
             workingDirectory: nil,
@@ -533,12 +615,16 @@ actor LSPInstaller {
         // Capture the runner locally — `Task { ... }` does not inherit
         // actor isolation, so we cannot touch `self` from inside the
         // task body. The runner protocol is `Sendable`.
+        //
+        // Uses `installRun(...)` so prerequisite installers (e.g.
+        // `brew install node` to bootstrap `npm`) get the longer
+        // wall-clock budget rather than the 600 s `run(...)` watchdog.
         let capturedRunner = runner
         let task = Task<Bool, Never> {
             do {
                 let result: CommandResult
                 if Self.commandNeedsShell(command) {
-                    result = try await capturedRunner.run(
+                    result = try await capturedRunner.installRun(
                         executable: "/bin/sh",
                         arguments: ["-c", command],
                         workingDirectory: nil,
@@ -547,7 +633,7 @@ actor LSPInstaller {
                 } else {
                     let parts = command.split(separator: " ").map(String.init)
                     guard let head = parts.first else { return false }
-                    result = try await capturedRunner.run(
+                    result = try await capturedRunner.installRun(
                         executable: head,
                         arguments: Array(parts.dropFirst()),
                         workingDirectory: nil,
@@ -570,14 +656,19 @@ actor LSPInstaller {
 
     /// True iff `command` contains characters that require a shell to
     /// be interpreted correctly: pipes, redirects, command separators,
-    /// subshell parens, env interpolation, backticks, quoting, glob.
-    /// Used to decide whether to route a registry command through
-    /// `/bin/sh -c` or `exec` it directly.
+    /// subshell parens, env interpolation, backticks, quoting, glob,
+    /// brace expansion, char classes, history expansion, variable
+    /// assignments, etc. Implemented as a safe-charset whitelist —
+    /// alphanumerics plus `. - _ / ` and ASCII whitespace (space, tab)
+    /// are considered safe; anything else requires shell evaluation.
+    /// This catches every traditional metacharacter AND newer hazards
+    /// (`{`, `}`, `[`, `]`, `!`, `=`, …) by construction. Used to
+    /// decide whether to route a registry command through `/bin/sh -c`
+    /// or `exec` it directly.
     private static func commandNeedsShell(_ command: String) -> Bool {
-        let metacharacters: Set<Character> = [
-            "|", "&", ";", "<", ">", "(", ")", "$", "`", "'", "\"", "*", "?", "\\",
-        ]
-        return command.contains(where: metacharacters.contains)
+        var safe = CharacterSet.alphanumerics
+        safe.insert(charactersIn: ".-_/ \t")
+        return command.unicodeScalars.contains { !safe.contains($0) }
     }
 
     /// Whitespace-only split of a shell one-liner into
