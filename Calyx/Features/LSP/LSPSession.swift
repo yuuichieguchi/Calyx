@@ -179,6 +179,26 @@ actor LSPSession {
     /// Monotonic id source for `PendingApplyEdit.id`. Session-local.
     private var nextApplyEditId: Int = 1
 
+    /// Optional resolver for `workspace/configuration` requests. Each
+    /// `(scopeUri, section)` pair is passed to the closure; if the closure
+    /// returns a non-nil value that value is placed in the response array,
+    /// otherwise `null` is used. When `nil` (the default — used by test
+    /// code that does not supply a store), every item resolves to `null`.
+    ///
+    /// - SeeAlso: FINDING #16 fix; wired by production callers that have a
+    ///   `configurationStore`; test code leaves this `nil` to keep the
+    ///   previous null-array behaviour.
+    private let configurationResolver: (@Sendable (String?, String?) async -> AnyCodable?)?
+
+    /// Partial-result chunks accumulated for in-progress streaming requests
+    /// that use `partialResultToken`. Keyed by `ProgressToken`; each value
+    /// is the ordered list of raw `AnyCodable` chunks received so far via
+    /// `$/progress` notifications whose `value` did not decode as a
+    /// `WorkDoneProgress` shape.
+    ///
+    /// - SeeAlso: FINDING #18 fix.
+    private var partialResults: [ProgressToken: [AnyCodable]] = [:]
+
     // MARK: - TEST ONLY instrumentation
 
     // TEST ONLY: count of `scheduleRemoveSnapshot()` invocations. Used
@@ -279,7 +299,8 @@ actor LSPSession {
             version: (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "unknown"
         ),
         persistence: LSPSessionPersistence? = nil,
-        diagnosticsStore: DiagnosticsStore? = nil
+        diagnosticsStore: DiagnosticsStore? = nil,
+        configurationResolver: (@Sendable (String?, String?) async -> AnyCodable?)? = nil
     ) {
         self.workspaceRoot = workspaceRoot
         self.languageId = languageId
@@ -290,6 +311,7 @@ actor LSPSession {
         self.progress = ProgressBroker()
         self.persistence = persistence
         self.diagnosticsStore = diagnosticsStore
+        self.configurationResolver = configurationResolver
     }
 
     // MARK: - Introspection
@@ -335,6 +357,24 @@ actor LSPSession {
     /// id matches `id`. No-op if no such entry exists.
     func consumePendingApplyEdit(id: Int) {
         pendingApplyEditQueue.removeAll { $0.id == id }
+    }
+
+    /// Return the accumulated partial-result chunks for `token` without
+    /// clearing them. Returns an empty array if no chunks have arrived yet
+    /// for this token.
+    ///
+    /// - SeeAlso: FINDING #18 fix.
+    func partialResultChunks(token: ProgressToken) -> [AnyCodable] {
+        return partialResults[token] ?? []
+    }
+
+    /// Return and clear the accumulated partial-result chunks for `token`.
+    /// Returns an empty array if no chunks have arrived yet.
+    ///
+    /// - SeeAlso: FINDING #18 fix.
+    func consumePartialResults(token: ProgressToken) -> [AnyCodable] {
+        let chunks = partialResults.removeValue(forKey: token) ?? []
+        return chunks
     }
 
     // MARK: - Lifecycle: start
@@ -816,23 +856,30 @@ actor LSPSession {
             return nil
         }
 
-        // $/progress — notification. Forward begin / report / end payloads
-        // into the broker. Notifications whose `value` is not a
-        // WorkDoneProgress variant (custom server progress) are dropped
-        // silently; the broker only models the standard WorkDone shape.
+        // $/progress — notification. Try to decode the payload as a
+        // WorkDoneProgress first (begin / report / end) and forward into
+        // the broker. When the `value` does not match the WorkDoneProgress
+        // shape (e.g. partial-result chunks carrying `SymbolInformation[]`
+        // or other server-defined arrays), fall through to the partial-result
+        // accumulator: append the raw `value` into `partialResults[token]`
+        // keyed by the notification's token. This lets callers drain chunks
+        // via `partialResultChunks(token:)` / `consumePartialResults(token:)`
+        // without mixing WorkDone state into the `ProgressBroker`.
         // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#progress
-        await client.setNotificationHandler(method: "$/progress") { params in
+        await client.setNotificationHandler(method: "$/progress") { [self] params in
             guard let params = params else { return }
-            do {
-                let data = try JSONEncoder().encode(params)
-                let typed = try JSONDecoder().decode(ProgressNotificationParams.self, from: data)
+            let data: Data
+            do { data = try JSONEncoder().encode(params) } catch { return }
+            // Primary path: standard WorkDoneProgress shape.
+            if let typed = try? JSONDecoder().decode(ProgressNotificationParams.self, from: data) {
                 await broker.handleProgress(token: typed.token, value: typed.value)
-            } catch {
-                // Custom server progress (non-WorkDoneProgress `value`)
-                // or malformed payload — drop. The user-facing contract
-                // for `ProgressBroker.handleProgress` only covers
-                // WorkDoneProgress; inventing state from unknown shapes
-                // would surface noise via `inFlight()` / `snapshot()`.
+                return
+            }
+            // Fallback: treat as a partial-result chunk. Decode the envelope
+            // to extract the token and raw value; malformed payloads are
+            // dropped silently (no token means we cannot key the chunk).
+            if let raw = try? JSONDecoder().decode(ProgressNotificationParamsRaw.self, from: data) {
+                await self.appendPartialResult(token: raw.token, value: raw.value)
             }
         }
 
@@ -920,14 +967,26 @@ actor LSPSession {
             return AnyCodable(["success": AnyCodable(true)] as [String: AnyCodable])
         }
 
-        // workspace/configuration — request. Reply with a JSON array of
-        // `null`s, one per requested item. Higher layers may later supply
-        // real configuration values.
+        // workspace/configuration — request. For each item in the `items`
+        // array, resolve a value via `configurationResolver` (if set) and
+        // fall back to `null` when the resolver returns `nil` or when no
+        // resolver was supplied. This matches the LSP 3.18 contract where
+        // the client returns configuration values it knows about and `null`
+        // for items it cannot resolve.
         // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#workspace_configuration
-        await client.setRequestHandler(method: "workspace/configuration") { [self] params in
-            let count = await self.configurationItemCount(params)
-            let nulls: [AnyCodable] = (0..<count).map { _ in AnyCodable(NSNull()) }
-            return AnyCodable(nulls)
+        let resolver = self.configurationResolver
+        await client.setRequestHandler(method: "workspace/configuration") { params in
+            let items = Self.configurationItems(params)
+            var results: [AnyCodable] = []
+            for (scopeUri, section) in items {
+                if let resolver,
+                   let value = await resolver(scopeUri, section) {
+                    results.append(value)
+                } else {
+                    results.append(AnyCodable(NSNull()))
+                }
+            }
+            return AnyCodable(results)
         }
 
         // workspace/applyEdit — request. The session does not apply edits
@@ -965,6 +1024,42 @@ actor LSPSession {
                 "name": AnyCodable(root.lastPathComponent)
             ]
             return AnyCodable([AnyCodable(folder)])
+        }
+
+        // workspace/<feature>/refresh — requests. The session advertises
+        // `refreshSupport: true` in its ClientCapabilities for every
+        // feature below (see `ClientCapabilities.calyxDefault()`), which
+        // promises the server we will respond to the corresponding
+        // refresh request without -32601. Strict servers (notably
+        // pyright-langserver) treat the missing handler as a protocol
+        // violation and exit immediately after the first refresh round-
+        // trip, taking the entire LSP session down with them
+        // (transport.close → transport closed on the next request).
+        //
+        // The acknowledgement payload is `null`: the spec lets the
+        // client decide when (or whether) to re-fetch the data; the
+        // request itself is a hint, not an instruction. Higher layers
+        // can wire the actual refresh logic later — the immediate
+        // requirement is to keep the wire protocol valid so the server
+        // does not die.
+        //
+        // Spec:
+        //   - https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#semanticTokens_refreshRequest
+        //   - https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#codeLens_refresh
+        //   - https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#inlayHint_refreshRequest
+        //   - https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#inlineValue_refreshRequest
+        //   - https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#diagnostic_refresh
+        let refreshMethods = [
+            "workspace/semanticTokens/refresh",
+            "workspace/codeLens/refresh",
+            "workspace/inlayHint/refresh",
+            "workspace/inlineValue/refresh",
+            "workspace/diagnostic/refresh",
+        ]
+        for method in refreshMethods {
+            await client.setRequestHandler(method: method) { _ in
+                return nil
+            }
         }
     }
 
@@ -1024,13 +1119,38 @@ actor LSPSession {
     /// Count the `items` array in a `workspace/configuration` payload.
     /// Returns 0 when `items` is missing.
     private func configurationItemCount(_ params: AnyCodable?) -> Int {
+        return Self.configurationItems(params).count
+    }
+
+    /// Extract the `items` array from a `workspace/configuration` payload
+    /// as a list of `(scopeUri, section)` pairs. Returns an empty array
+    /// when `items` is absent or the payload is malformed.
+    private static func configurationItems(_ params: AnyCodable?) -> [(scopeUri: String?, section: String?)] {
         guard let params,
               let data = try? JSONEncoder().encode(params),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = json["items"] as? [Any] else {
-            return 0
+              let items = json["items"] as? [[String: Any]] else {
+            // Try the non-object-array path (items present but wrong element type).
+            if let params,
+               let data = try? JSONEncoder().encode(params),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let rawItems = json["items"] as? [Any] {
+                return rawItems.map { _ in (scopeUri: nil, section: nil) }
+            }
+            return []
         }
-        return items.count
+        return items.map { item in
+            (scopeUri: item["scopeUri"] as? String,
+             section: item["section"] as? String)
+        }
+    }
+
+    /// Append a partial-result chunk for `token`. Actor-isolated.
+    private func appendPartialResult(token: ProgressToken, value: AnyCodable) {
+        if partialResults[token] == nil {
+            partialResults[token] = []
+        }
+        partialResults[token]!.append(value)
     }
 
     /// Extract the optional `label` field from an `ApplyWorkspaceEditParams`
@@ -1073,13 +1193,26 @@ private struct WorkDoneProgressCreateParams: Sendable, Codable, Equatable {
 /// where `value` is one of the WorkDoneProgress variants. Declared inline
 /// because `LSPSession` is the only consumer — `ProgressBroker` already
 /// decodes the discriminated `value` separately. Non-WorkDoneProgress
-/// values (custom server progress) fail to decode here and are dropped by
-/// the notification handler.
+/// values (custom server progress) fail to decode here; the notification
+/// handler then falls back to `ProgressNotificationParamsRaw`.
 ///
 /// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#progress
 private struct ProgressNotificationParams: Sendable, Codable, Equatable {
     let token: ProgressToken
     let value: WorkDoneProgress
+}
+
+// MARK: - ProgressNotificationParamsRaw
+
+/// Fallback decoder for `$/progress` notifications whose `value` is not a
+/// `WorkDoneProgress` shape (e.g. partial-result arrays of `SymbolInformation`
+/// or other server-defined payloads). Captures the raw `value` as `AnyCodable`
+/// so the session can accumulate chunks into `partialResults[token]`.
+///
+/// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#progress
+private struct ProgressNotificationParamsRaw: Sendable, Codable, Equatable {
+    let token: ProgressToken
+    let value: AnyCodable
 }
 
 // MARK: - ClientCapabilities.calyxDefault
@@ -1271,10 +1404,28 @@ extension ClientCapabilities {
             "positionEncodings": AnyCodable([AnyCodable("utf-16")]),
         ] as [String: AnyCodable])
 
+        // Notebook-document capability. Mirrors the wire shape of
+        //   NotebookDocumentClientCapabilities(
+        //       synchronization: NotebookDocumentSyncClientCapabilities(
+        //           dynamicRegistration: true,
+        //           executionSummarySupport: nil
+        //       )
+        //   )
+        // — i.e. `{ "synchronization": { "dynamicRegistration": true } }`.
+        // Without this, servers default to `notebookDocumentSync: undefined`
+        // and reject the `notebookDocument/didOpen` / `didChange` / `didClose`
+        // notifications fronted by `MCPLSPBridge` with `-32601 MethodNotFound`.
+        // Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#notebookDocumentClientCapabilities
+        let notebookDocument: AnyCodable = AnyCodable([
+            "synchronization": AnyCodable([
+                "dynamicRegistration": AnyCodable(true),
+            ] as [String: AnyCodable]),
+        ] as [String: AnyCodable])
+
         return ClientCapabilities(
             workspace: workspace,
             textDocument: textDocument,
-            notebookDocument: nil,
+            notebookDocument: notebookDocument,
             window: window,
             general: general,
             experimental: nil

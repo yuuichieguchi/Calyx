@@ -29,8 +29,16 @@ enum DefinitionResult: Sendable, Codable, Equatable {
     init(from decoder: any Decoder) throws {
         // Try LocationLink[] first: required `targetUri` is disjoint from
         // Location.uri so a Location[] payload will fail to decode here.
+        // BUT: an empty JSON array `[]` decodes successfully as BOTH
+        // `[LocationLink]` and `[Location]`. Prefer the simpler `.array([])`
+        // variant in that case so consumers can treat "no result" uniformly
+        // without having to special-case both empty-array enum cases.
         if let links = try? [LocationLink](from: decoder) {
-            self = .linkArray(links)
+            if links.isEmpty {
+                self = .array([])
+            } else {
+                self = .linkArray(links)
+            }
             return
         }
         // Then a plain Location[].

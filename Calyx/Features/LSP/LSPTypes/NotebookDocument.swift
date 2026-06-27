@@ -183,3 +183,32 @@ struct DidCloseNotebookDocumentParams: Sendable, Codable, Equatable {
     let notebookDocument: NotebookDocumentIdentifier
     let cellTextDocuments: [TextDocumentIdentifier]
 }
+
+// MARK: - NotebookDocumentSyncClientCapabilities
+//
+// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#notebookDocumentSyncClientCapabilities
+
+/// Client capabilities for the notebook-document synchronisation feature.
+/// Both fields are optional and drop out of the encoded payload when nil
+/// so the server only sees flags the client actively advertises.
+struct NotebookDocumentSyncClientCapabilities: Sendable, Codable, Equatable {
+    /// Whether the client supports dynamic registration of notebook
+    /// document sync via `client/registerCapability`.
+    let dynamicRegistration: Bool?
+    /// Whether the client supports sending execution-summary changes to
+    /// the server. `nil` means the capability is unadvertised.
+    let executionSummarySupport: Bool?
+}
+
+// MARK: - NotebookDocumentClientCapabilities
+//
+// Spec: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.18/specification/#notebookDocumentClientCapabilities
+
+/// Top-level container for notebook-document client capabilities. Mirrors
+/// the `client.notebookDocument` sub-tree of `ClientCapabilities` so a
+/// server can decide whether to declare `notebookDocumentSync` in its own
+/// capabilities.
+struct NotebookDocumentClientCapabilities: Sendable, Codable, Equatable {
+    /// Notebook-document synchronisation sub-capability.
+    let synchronization: NotebookDocumentSyncClientCapabilities
+}

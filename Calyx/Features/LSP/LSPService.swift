@@ -486,6 +486,10 @@ final class LSPService {
         // dedup predicate, so two callers reaching the same physical
         // workspace under different spellings still share one session
         // and one persisted entry (Bug 1 / `test_persist_treatsSame...`).
+        // TODO Wave 9: wire bridge.configurationStore — pass a configurationResolver
+        // closure here that consults MCPLSPBridge.configurationStore so that
+        // workspace/configuration requests from the server are answered with
+        // the values the AI has previously set via lsp_workspace_configuration_set.
         let session = LSPSession(
             workspaceRoot: originalRoot,
             languageId: key.languageId,

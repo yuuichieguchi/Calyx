@@ -134,6 +134,52 @@ actor LSPClient {
     /// Application-registered handlers for server-initiated notifications.
     private var notificationHandlers: [String: @Sendable (AnyCodable?) async -> Void] = [:]
 
+    /// Methods where the LSP spec permits a client to reply `result: null`
+    /// even when no handler is registered. For these, the dispatcher
+    /// answers with a successful `null` result instead of
+    /// `-32601 MethodNotFound`, so a future-spec or rarely-used
+    /// server→client request cannot reproduce the pyright crash by
+    /// hitting a missing-handler path. Unknown methods OUTSIDE this set
+    /// still get the strict `-32601`.
+    ///
+    /// Membership rationale (LSP 3.18):
+    /// - `workspace/*/refresh`: spec explicitly allows the client to
+    ///   acknowledge without taking action.
+    /// - `window/workDoneProgress/create`: success means the client
+    ///   accepted the token; `null` is the canonical no-op ack.
+    /// - `workspace/workspaceFolders`: response is `WorkspaceFolder[] | null`.
+    /// - `workspace/configuration`: response is `LSPAny[]` of which `null`
+    ///   per item means "no value"; replying top-level `null` is
+    ///   commonly tolerated by servers (and is the safest default when
+    ///   the client has no configuration to report).
+    private static let tolerantUnhandledMethods: Set<String> = [
+        "workspace/semanticTokens/refresh",
+        "workspace/codeLens/refresh",
+        "workspace/inlayHint/refresh",
+        "workspace/inlineValue/refresh",
+        "workspace/diagnostic/refresh",
+        "workspace/foldingRange/refresh",
+        "window/workDoneProgress/create",
+        "workspace/workspaceFolders",
+        "workspace/configuration",
+    ]
+
+    /// In-flight handler tasks for server-initiated requests, keyed by
+    /// the server's request id. Populated when `handleServerRequest`
+    /// spawns the handler Task and cleared when the handler completes
+    /// (success or failure). The `$/cancelRequest` notification handler
+    /// looks up this map and cancels the corresponding Task so the
+    /// handler can observe `Task.isCancelled` / `CancellationError` and
+    /// short-circuit.
+    private var inflightServerRequests: [LSPRequestID: Task<Void, Never>] = [:]
+
+    /// Tasks spawned by `onCancel` in `sendRequestRaw` to bounce back
+    /// into the actor and emit `$/cancelRequest`. `close()` awaits these
+    /// before tearing the transport down so a request cancelled at the
+    /// very end of the client's life still gets its `$/cancelRequest`
+    /// onto the wire instead of racing the transport's teardown.
+    private var pendingCancelTasks: [Task<Void, Never>] = []
+
     /// Parser scratch buffer.
     private var receiveBuffer = Data()
 
@@ -175,6 +221,8 @@ actor LSPClient {
             break
         }
 
+        installBuiltinNotificationHandlers()
+
         let stream = transport.incoming
         let task = Task { [weak self] in
             for await chunk in stream {
@@ -186,6 +234,70 @@ actor LSPClient {
             await self.handleTransportFinished()
         }
         state = .started(receiveTask: task)
+    }
+
+    /// Install the always-on notification handlers that LSPClient owns
+    /// itself (independent of any application-level handler registration).
+    ///
+    /// These are pinned in code (and exercised in tests) so that a
+    /// future refactor of `handleNotification` — for example, adding a
+    /// warning for unknown notifications — cannot silently regress them
+    /// onto the default-drop path.
+    private func installBuiltinNotificationHandlers() {
+        // `$/cancelRequest`: spec-required. When the server cancels a
+        // server-initiated request, look up the in-flight handler Task
+        // for that id and cancel it so the handler observes
+        // `Task.isCancelled` and can return early.
+        notificationHandlers["$/cancelRequest"] = { [weak self] params in
+            guard let self else { return }
+            await self.handleServerCancelRequest(params: params)
+        }
+
+        // `$/setTrace`: spec defines this as CLIENT→SERVER. Some servers
+        // emit it back at the client by mistake; pin a no-op so the
+        // contract is explicit and the default-drop path stays
+        // unreachable for this method.
+        notificationHandlers["$/setTrace"] = { _ in
+            // Intentionally empty.
+        }
+
+        // `$/logTrace`: spec defines this as SERVER→CLIENT. We do not
+        // surface trace data anywhere today, but pinning the empty
+        // handler makes the policy testable and prevents a future
+        // "warn on unknown notification" change from regressing it.
+        notificationHandlers["$/logTrace"] = { _ in
+            // Intentionally empty.
+        }
+
+        // `telemetry/event`: spec-permitted at any time. Calyx does not
+        // forward telemetry anywhere; pin the no-op so the contract is
+        // explicit.
+        notificationHandlers["telemetry/event"] = { _ in
+            // Intentionally empty.
+        }
+    }
+
+    /// Handle a `$/cancelRequest` notification from the server. If the
+    /// id matches an in-flight handler Task we cancel it; if not the
+    /// notification is dropped (the response has already been sent or
+    /// the request was never seen).
+    ///
+    /// `AnyCodable` is opaque-by-design, so the cleanest way to lift
+    /// out the structured `id` field is to round-trip through JSON.
+    /// The payload is small (a single object with one int/string key)
+    /// so the cost is negligible and we avoid coupling LSPClient to
+    /// AnyCodable's private storage.
+    private func handleServerCancelRequest(params: AnyCodable?) {
+        guard let params,
+              let data = try? JSONEncoder().encode(params),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawId = dict["id"],
+              let id = LSPRequestID(fromAny: rawId) else {
+            return
+        }
+        if let task = inflightServerRequests[id] {
+            task.cancel()
+        }
     }
 
     /// Idempotent shutdown. Cancels the receive loop, closes the
@@ -207,6 +319,28 @@ actor LSPClient {
         case .started(let task):
             task.cancel()
             state = .closed
+        }
+
+        // Drain any `$/cancelRequest` emission tasks spawned by an
+        // in-flight `sendRequest`'s `onCancel` before tearing down the
+        // transport. Without this `await`, a `sendRequest` whose calling
+        // task is cancelled at the same instant `close()` runs would
+        // lose the wire-level `$/cancelRequest` because the transport
+        // would already be gone by the time `handleCancellation`
+        // executes.
+        let cancelTasksSnapshot = pendingCancelTasks
+        pendingCancelTasks.removeAll()
+        for task in cancelTasksSnapshot {
+            await task.value
+        }
+
+        // Cancel any still-running server-initiated request handlers so
+        // they observe `Task.isCancelled` and stop touching the
+        // transport on the way out.
+        let inflightSnapshot = inflightServerRequests
+        inflightServerRequests.removeAll()
+        for (_, task) in inflightSnapshot {
+            task.cancel()
         }
 
         await transport.close()
@@ -335,11 +469,34 @@ actor LSPClient {
             )
         } onCancel: { [weak self] in
             // `onCancel` runs synchronously in the cancelling context.
-            // Bounce back to the actor to do the cleanup work.
+            // Bounce back to the actor to do the cleanup work and
+            // register the task with `pendingCancelTasks` so `close()`
+            // can await its completion before tearing down the
+            // transport (otherwise a sendRequest cancelled at the same
+            // instant as close() would lose `$/cancelRequest` on the
+            // wire).
+            let cancelTask = Task { [weak self] in
+                _ = await self?.handleCancellation(id: id)
+            }
             Task { [weak self] in
-                await self?.handleCancellation(id: id)
+                await self?.registerPendingCancelTask(cancelTask)
             }
         }
+    }
+
+    /// Add a cancellation-emission task to the pending set. Called from
+    /// the `onCancel` continuation so `close()` can `await` it later.
+    /// Tasks remove themselves on completion to keep the set bounded.
+    private func registerPendingCancelTask(_ task: Task<Void, Never>) {
+        pendingCancelTasks.append(task)
+        Task { [weak self] in
+            await task.value
+            await self?.removePendingCancelTask(task)
+        }
+    }
+
+    private func removePendingCancelTask(_ task: Task<Void, Never>) {
+        pendingCancelTasks.removeAll { $0 == task }
     }
 
     private func raceResponseAgainstTimeout(

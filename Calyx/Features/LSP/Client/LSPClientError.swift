@@ -43,3 +43,25 @@ enum LSPClientError: Error, Equatable, Sendable {
     /// `start()`.
     case notStarted
 }
+
+/// Typed error a server-initiated request handler can throw to control
+/// which JSON-RPC error code the dispatcher writes back to the server.
+///
+/// Without this, the dispatcher can only special-case Swift's literal
+/// `DecodingError` and treats every other error as `-32603 InternalError`,
+/// even when the handler knows the parameters were malformed
+/// (`-32602 InvalidParams`) or the method is dynamically unsupported
+/// (`-32601 MethodNotFound`). Handlers should prefer raising
+/// `LSPHandlerError` so the wire response code matches semantics
+/// regardless of any wrapped underlying Swift type.
+enum LSPHandlerError: Error, Equatable, Sendable {
+    /// JSON-RPC `-32602`. Parameters did not match the handler's schema.
+    case invalidParams(String)
+
+    /// JSON-RPC `-32601`. Handler determined at runtime that it cannot
+    /// service the method (e.g. dynamic capability gone).
+    case methodNotFound(String)
+
+    /// JSON-RPC `-32603`. Catch-all for handler-internal failures.
+    case internalError(String)
+}

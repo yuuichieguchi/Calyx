@@ -186,14 +186,20 @@ struct CodeAction: Sendable, Codable, Equatable {
 // MARK: - CodeActionItem (union: Command | CodeAction)
 //
 // The result of `textDocument/codeAction` is `(Command | CodeAction)[] | null`.
-// The two variants are discriminated structurally: a `Command` always has a
-// required `command` STRING field, while a `CodeAction` always has a required
-// `title` field and frequently carries CodeAction-only keys such as `edit`,
-// `kind`, `diagnostics`, `disabled`, `isPreferred`, or `data`.
+// The two variants share the `command` key but use it with different types:
+//   - `Command.command`     is a STRING (required).
+//   - `CodeAction.command`  is a `Command` OBJECT (optional).
+// A purely key-based discriminator misclassifies a `CodeAction` that has only
+// `{ title, command: { ... } }` as a bare `Command`, then fails the inner
+// decode because the value at `command` is an object, not a string.
 //
-// We dispatch on presence of any CodeAction-only key. If none of those keys
-// is present, the payload must be a `Command` (per the LSP type union); we
-// then decode it as such.
+// We resolve this by trying `Command` first: its required `command: String`
+// makes the object form fail fast. On any `DecodingError`, we fall through to
+// `CodeAction`. This ordering is safe because every valid `Command` payload
+// is INVALID as a `CodeAction` only when… actually it isn't — `CodeAction`
+// also accepts `command` as an optional `Command` object. To avoid wrongly
+// preferring `.command` when both decode, we also short-circuit to
+// `CodeAction` when CodeAction-only keys are present (cheap structural cue).
 
 enum CodeActionItem: Sendable, Codable, Equatable {
     case command(Command)
@@ -210,17 +216,26 @@ enum CodeActionItem: Sendable, Codable, Equatable {
 
     init(from decoder: any Decoder) throws {
         let probe = try decoder.container(keyedBy: DiscriminatorKey.self)
-        let isAction =
+        let hasActionOnlyKey =
             probe.contains(.edit) ||
             probe.contains(.kind) ||
             probe.contains(.diagnostics) ||
             probe.contains(.disabled) ||
             probe.contains(.isPreferred) ||
             probe.contains(.data)
-        if isAction {
+        if hasActionOnlyKey {
+            // Unambiguously a CodeAction.
             self = .action(try CodeAction(from: decoder))
-        } else {
-            self = .command(try Command(from: decoder))
+            return
+        }
+        // No CodeAction-only key. Try `Command` first: its required
+        // `command: String` forces a fast failure when `command` is an
+        // object (the CodeAction-with-only-title-and-command shape).
+        do {
+            let c = try Command(from: decoder)
+            self = .command(c)
+        } catch is DecodingError {
+            self = .action(try CodeAction(from: decoder))
         }
     }
 
@@ -230,6 +245,49 @@ enum CodeActionItem: Sendable, Codable, Equatable {
             try c.encode(to: encoder)
         case .action(let a):
             try a.encode(to: encoder)
+        }
+    }
+}
+
+// MARK: - CodeActionItemList (filters nulls in streaming partial results)
+//
+// `textDocument/codeAction` is `(Command | CodeAction)[] | null`, but servers
+// implementing `partialResultToken` may also emit individual `null` elements
+// inside the array as they stream partial chunks. A naive `[CodeActionItem]`
+// decode crashes on those nulls because `CodeActionItem` is not optional.
+//
+// `CodeActionItemList` wraps the array and filters `null` entries during
+// enumeration, returning only the well-formed items. Encoding emits the
+// inner items as a plain JSON array.
+
+struct CodeActionItemList: Sendable, Codable, Equatable {
+    let items: [CodeActionItem]
+
+    init(items: [CodeActionItem]) {
+        self.items = items
+    }
+
+    init(from decoder: any Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var collected: [CodeActionItem] = []
+        if let count = container.count {
+            collected.reserveCapacity(count)
+        }
+        while !container.isAtEnd {
+            if try container.decodeNil() {
+                // Skip null entries (streaming partial-result chunks).
+                continue
+            }
+            let item = try container.decode(CodeActionItem.self)
+            collected.append(item)
+        }
+        self.items = collected
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        var container = encoder.unkeyedContainer()
+        for item in items {
+            try container.encode(item)
         }
     }
 }

@@ -2028,12 +2028,15 @@ enum CodeActionTool: MCPLSPTool {
             context: context
         )
         do {
-            let result: [CodeActionItem]? = try await session.sendRequest(
+            // Use `CodeActionItemList` (not `[CodeActionItem]`) so that any
+            // `null` entries streamed alongside a `partialResultToken` chunk
+            // are filtered out rather than crashing the array decode.
+            let result: CodeActionItemList? = try await session.sendRequest(
                 method: "textDocument/codeAction",
                 params: params,
-                resultType: [CodeActionItem]?.self
+                resultType: CodeActionItemList?.self
             )
-            return try MCPLSPBridge.makeJSONContent(result)
+            return try MCPLSPBridge.makeJSONContent(result?.items)
         } catch {
             return MCPLSPBridge.makeErrorContent(error)
         }

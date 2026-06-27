@@ -38,6 +38,15 @@ actor CapabilityRegistry {
     /// Live dynamic registrations keyed by registration `id`.
     private var registrations: [String: Registration] = [:]
 
+    /// Typed sidecar payloads keyed by registration `id`, decoded from each
+    /// `Registration.registerOptions` per method. The original
+    /// `Registration` in `registrations` is preserved unchanged for
+    /// backwards compatibility; this map exposes the structured shape so
+    /// consumers (e.g. `FileSyncManager` deciding which paths warrant a
+    /// `workspace/didChangeWatchedFiles` notification) can dispatch on the
+    /// typed value without re-decoding the raw `AnyCodable`.
+    private var registerOptions: [String: RegisterOptions] = [:]
+
     // MARK: - Init
 
     init() {}
@@ -54,9 +63,18 @@ actor CapabilityRegistry {
     /// is keyed by its `id`; existing entries with the same id are
     /// overwritten (the spec treats id collisions as undefined; last-wins
     /// matches what most clients do).
+    ///
+    /// In addition to storing the raw `Registration`, this also decodes the
+    /// `registerOptions` payload into the typed `RegisterOptions` sidecar
+    /// matching the registration's method. Unknown methods (and decode
+    /// failures) fall through to `.raw`, preserving the original payload.
     func register(_ registrations: [Registration]) {
         for reg in registrations {
             self.registrations[reg.id] = reg
+            self.registerOptions[reg.id] = RegisterOptions.decode(
+                method: reg.method,
+                registerOptions: reg.registerOptions
+            )
         }
     }
 
@@ -66,6 +84,7 @@ actor CapabilityRegistry {
     func unregister(_ unregs: [Unregistration]) {
         for u in unregs {
             self.registrations.removeValue(forKey: u.id)
+            self.registerOptions.removeValue(forKey: u.id)
         }
     }
 
@@ -73,6 +92,7 @@ actor CapabilityRegistry {
     func reset() {
         self.staticCapabilities = nil
         self.registrations.removeAll()
+        self.registerOptions.removeAll()
     }
 
     // MARK: - Read-only
@@ -87,6 +107,14 @@ actor CapabilityRegistry {
         return registrations
     }
 
+    /// Returns the typed-options sidecar table keyed by registration id.
+    /// Each entry corresponds to the same-id entry in
+    /// `currentRegistrations()`. Useful for consumers that want to dispatch
+    /// on the typed shape without re-decoding the raw `AnyCodable`.
+    func currentRegisterOptions() -> [String: RegisterOptions] {
+        return registerOptions
+    }
+
     /// Whether this server currently supports `method`, considering both the
     /// static `ServerCapabilities` and any live dynamic registrations.
     func isCapable(method: String) -> Bool {
@@ -94,6 +122,27 @@ actor CapabilityRegistry {
             return true
         }
         return registrations.values.contains { $0.method == method }
+    }
+
+    /// Returns the union of all `FileSystemWatcher` entries from every
+    /// live registration whose method equals `method`. Intended for
+    /// `method == "workspace/didChangeWatchedFiles"`, where the bridge
+    /// needs to know which globs the server cares about. Returns an empty
+    /// array when no matching registration exists or when no matching
+    /// registration carries a typed `didChangeWatchedFiles` payload.
+    ///
+    /// Order: registrations are iterated in dictionary-iteration order,
+    /// which is not stable across runs; callers that need stable ordering
+    /// should sort the result.
+    func watchers(forMethod method: String) -> [FileSystemWatcher] {
+        var result: [FileSystemWatcher] = []
+        for (id, reg) in registrations where reg.method == method {
+            guard case .didChangeWatchedFiles(let typed) = registerOptions[id] else {
+                continue
+            }
+            result.append(contentsOf: typed.watchers)
+        }
+        return result
     }
 
     // MARK: - Static capability lookup

@@ -42,8 +42,15 @@ enum ImplementationResult: Sendable, Codable, Equatable {
     case linkArray([LocationLink])
 
     init(from decoder: any Decoder) throws {
+        // Empty array `[]` decodes as both `[LocationLink]` and `[Location]`;
+        // prefer `.array([])` for a uniform "no result" representation. See
+        // `DefinitionResult` for the rationale.
         if let links = try? [LocationLink](from: decoder) {
-            self = .linkArray(links)
+            if links.isEmpty {
+                self = .array([])
+            } else {
+                self = .linkArray(links)
+            }
             return
         }
         if let locs = try? [Location](from: decoder) {
