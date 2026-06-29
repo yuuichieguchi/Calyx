@@ -2,6 +2,8 @@
 
 A macOS 26+ native terminal application built on [libghostty](https://github.com/ghostty-org/ghostty) with Liquid Glass UI.
 
+**Documentation**: [help.getcalyx.app](https://help.getcalyx.app)
+
 ![Calyx Terminal](assets/screenshot.png)
 
 ## Features
