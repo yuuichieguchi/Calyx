@@ -61,8 +61,10 @@ struct SidebarContentView: View {
                     Text("Tabs")
                         .font(.system(size: 12, weight: .medium, design: .rounded))
                         .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                         .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 8)
                         .padding(.vertical, 6)
                         .background {
                             if sidebarMode == .tabs {
@@ -85,8 +87,10 @@ struct SidebarContentView: View {
                     Text("Changes")
                         .font(.system(size: 12, weight: .medium, design: .rounded))
                         .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                         .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 8)
                         .padding(.vertical, 6)
                         .background {
                             if sidebarMode == .changes {
@@ -109,8 +113,10 @@ struct SidebarContentView: View {
                     Text("Agents")
                         .font(.system(size: 12, weight: .medium, design: .rounded))
                         .foregroundStyle(.primary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                         .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 12)
+                        .padding(.horizontal, 8)
                         .padding(.vertical, 6)
                         .background {
                             if sidebarMode == .agents {
