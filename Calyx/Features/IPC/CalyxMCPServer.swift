@@ -74,6 +74,31 @@ final class CalyxMCPServer {
         self.token = token
     }
 
+    /// For testing only — directly sets the appPeerID so snapshot tests can
+    /// exercise the `isSelf` flag without going through `start()`.
+    func _testSetAppPeerID(_ id: UUID?) {
+        self.appPeerID = id
+    }
+
+    // MARK: - Agent Snapshot
+
+    /// Returns a snapshot of all currently alive peers mapped to `AgentStatusEntry`.
+    /// Safe to call when the server is not started — returns an empty array.
+    func agentSnapshot(now: Date = Date()) async -> [AgentStatusEntry] {
+        let entries = await store.statusEntries()
+        return entries.map { item in
+            AgentStatusEntry(
+                id: item.peer.id,
+                name: item.peer.name,
+                role: item.peer.role,
+                lastSeen: item.peer.lastSeen,
+                inboxCount: item.inboxCount,
+                isSelf: appPeerID == item.peer.id,
+                state: AgentStatusClassifier.classify(lastSeen: item.peer.lastSeen, now: now)
+            )
+        }
+    }
+
     // MARK: - LSP Bridge Lifecycle
 
     /// Spin up the LSP tool bridge with the production stdio transport and
