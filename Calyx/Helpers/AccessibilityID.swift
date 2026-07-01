@@ -9,6 +9,7 @@ enum AccessibilityID {
     enum Sidebar {
         static let container = "calyx.sidebar"
         static let newGroupButton = "calyx.sidebar.newGroupButton"
+        static let agentModeButton = "calyx.sidebar.agentModeButton"
         static func group(_ id: UUID) -> String { "calyx.sidebar.group.\(id.uuidString)" }
         static func tab(_ id: UUID) -> String { "calyx.sidebar.tab.\(id.uuidString)" }
         static func groupNameTextField(_ id: UUID) -> String { "calyx.sidebar.groupNameTextField.\(id.uuidString)" }
@@ -19,6 +20,7 @@ enum AccessibilityID {
         static func tabAtIndex(_ groupID: UUID, _ index: Int) -> String {
             "calyx.sidebar.group.\(groupID.uuidString).tab.index.\(index)"
         }
+        static func agentRow(id: UUID) -> String { "calyx.sidebar.agentRow.\(id.uuidString)" }
     }
     enum TabBar {
         static let container = "calyx.tabBar"

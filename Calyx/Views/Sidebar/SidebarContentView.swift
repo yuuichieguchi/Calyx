@@ -100,16 +100,48 @@ struct SidebarContentView: View {
                 .buttonStyle(.plain)
                 .accessibilityLabel("Changes")
                 .accessibilityAddTraits(sidebarMode == .changes ? [.isSelected] : [])
+
+                Button {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        sidebarMode = .agents
+                    }
+                } label: {
+                    Text("Agents")
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
+                        .foregroundStyle(.primary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background {
+                            if sidebarMode == .agents {
+                                Color.clear
+                                    .overlay { togglePill }
+                                    .matchedGeometryEffect(id: "togglePill", in: togglePillNS)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Agents")
+                .accessibilityAddTraits(sidebarMode == .agents ? [.isSelected] : [])
+                .accessibilityIdentifier(AccessibilityID.Sidebar.agentModeButton)
             }
             .padding(.horizontal, 12)
             .padding(.top, 8)
             .opacity(controlActiveState == .key ? 1.0 : 0.5)
             .accessibilityElement(children: .contain)
             .accessibilityLabel("Sidebar mode")
-            .accessibilityValue(sidebarMode == .tabs ? "Tabs" : "Changes")
+            .accessibilityValue({
+                switch sidebarMode {
+                case .tabs: return "Tabs"
+                case .changes: return "Changes"
+                case .agents: return "Agents"
+                }
+            }())
             .accessibilityIdentifier(AccessibilityID.Git.modeToggle)
 
-            if sidebarMode == .tabs {
+            switch sidebarMode {
+            case .tabs:
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
                         ForEach(groups) { group in
@@ -150,7 +182,8 @@ struct SidebarContentView: View {
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
                 .accessibilityIdentifier(AccessibilityID.Sidebar.newGroupButton)
-            } else {
+
+            case .changes:
                 GitChangesView(
                     gitChangesState: gitChangesState,
                     gitEntries: gitEntries,
@@ -164,6 +197,10 @@ struct SidebarContentView: View {
                     onExpandCommit: onExpandCommit
                 )
                 .padding(.top, 10)
+
+            case .agents:
+                AgentStatusView()
+                    .padding(.top, 10)
             }
         }
         .frame(minWidth: SidebarLayout.minWidth)
