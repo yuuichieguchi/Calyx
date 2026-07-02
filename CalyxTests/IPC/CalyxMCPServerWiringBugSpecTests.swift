@@ -61,11 +61,24 @@ final class CalyxMCPServerWiringBugSpecTests: XCTestCase {
     /// the rest of the suite does not touch.
     private let basePort = 51830
 
+    /// Test-isolated `agent-endpoint.json` directory, so `start()` /
+    /// `stop()` in this suite never touch the real
+    /// `~/Library/Application Support/Calyx/agent-endpoint.json`.
+    private var agentEndpointDir: String!
+
     // MARK: - Lifecycle
 
     override func setUp() {
         super.setUp()
+        agentEndpointDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).path
         server = CalyxMCPServer()
+        server.agentEndpointDirectory = agentEndpointDir
+        // stop() now also resets agentRegistry; agentRegistry defaults to
+        // the true AgentRegistry.shared singleton, so this suite's
+        // start()/stop() calls would otherwise reset shared app-wide
+        // state on every test.
+        server.agentRegistry = AgentRegistry()
     }
 
     override func tearDown() {
@@ -81,6 +94,10 @@ final class CalyxMCPServerWiringBugSpecTests: XCTestCase {
         // dangling across tests.
         _ = drainTeardownTask
         server = nil
+        if let agentEndpointDir {
+            try? FileManager.default.removeItem(atPath: agentEndpointDir)
+        }
+        agentEndpointDir = nil
         super.tearDown()
     }
 

@@ -27,11 +27,27 @@ final class CalyxMCPServerTests: XCTestCase {
     private var server: CalyxMCPServer!
     private let testToken = "test-token-12345"
 
+    /// Test-isolated `agent-endpoint.json` directory. `stop()` (called
+    /// from `tearDown` and by `start()` on a toggle) always removes
+    /// whatever's at `agentEndpointDirectory`, so every server instance
+    /// in this suite — including the ad-hoc `srv` locals in the lifecycle
+    /// tests below — must be redirected here rather than touching the
+    /// real `~/Library/Application Support/Calyx/agent-endpoint.json`.
+    private var agentEndpointDir: String!
+
     // MARK: - Lifecycle
 
     override func setUp() {
         super.setUp()
+        agentEndpointDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).path
         server = CalyxMCPServer()
+        server.agentEndpointDirectory = agentEndpointDir
+        // stop() (called unconditionally from tearDown) now also resets
+        // agentRegistry; since server.agentRegistry defaults to the true
+        // AgentRegistry.shared singleton, every test in this file would
+        // otherwise reset shared app-wide state on teardown.
+        server.agentRegistry = AgentRegistry()
         // Direct token set for testing, bypassing start() / NWListener
         server._testSetToken(testToken)
     }
@@ -39,6 +55,10 @@ final class CalyxMCPServerTests: XCTestCase {
     override func tearDown() {
         server.stop()
         server = nil
+        if let agentEndpointDir {
+            try? FileManager.default.removeItem(atPath: agentEndpointDir)
+        }
+        agentEndpointDir = nil
         super.tearDown()
     }
 
@@ -569,6 +589,8 @@ final class CalyxMCPServerTests: XCTestCase {
     func test_startStop_lifecycle() throws {
         // Arrange
         let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
 
         // Pre-condition
         XCTAssertFalse(srv.isRunning,
@@ -595,9 +617,105 @@ final class CalyxMCPServerTests: XCTestCase {
                        "Server should not be running after stop()")
     }
 
+    // 18b. start()/stop() drive AgentRegistry.isServerRunning — AgentStatusView
+    // observes AgentRegistry (not CalyxMCPServer, which isn't @Observable)
+    // directly, so this is what actually makes the sidebar redraw.
+    func test_start_marksAgentRegistryServerRunning_stop_resetsIt() throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        let registry = AgentRegistry()
+        srv.agentRegistry = registry
+        XCTAssertFalse(registry.isServerRunning,
+                       "Precondition: a fresh registry reports the server as not running")
+
+        try srv.start(token: "registry-lifecycle-token")
+
+        XCTAssertTrue(registry.isServerRunning,
+                      "start() must mark the injected AgentRegistry as running")
+
+        srv.stop()
+
+        XCTAssertFalse(registry.isServerRunning,
+                       "stop() must mark the injected AgentRegistry as not running")
+    }
+
+    // 18c. stop() clears every AgentRegistry entry, so disabling IPC (or a
+    // start()-triggered restart) doesn't leave stale sidebar rows on screen.
+    func test_stop_clearsAgentRegistryEntries() throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        let registry = AgentRegistry()
+        srv.agentRegistry = registry
+        try srv.start(token: "registry-clear-token")
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "SessionStart", sessionID: "s1", cwd: "/tmp/repo", message: nil),
+            surfaceID: UUID()
+        )
+        XCTAssertEqual(registry.entries.count, 1, "Precondition: an entry must exist before stop()")
+
+        srv.stop()
+
+        XCTAssertTrue(registry.entries.isEmpty, "stop() must clear every AgentRegistry entry")
+    }
+
+    // 18d. agent-endpoint.json is written into the injected directory on
+    // start() and removed from it on stop() — this is what
+    // agentEndpointDirectory exists to redirect away from the real
+    // ~/Library/Application Support/Calyx path in every test in this suite.
+    func test_start_writesAgentEndpointFile_stop_removesIt() throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+
+        try srv.start(token: "endpoint-file-token")
+
+        let filePath = agentEndpointDir + "/agent-endpoint.json"
+        XCTAssertTrue(FileManager.default.fileExists(atPath: filePath),
+                     "start() must write agent-endpoint.json into agentEndpointDirectory")
+        let data = try Data(contentsOf: URL(fileURLWithPath: filePath))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertEqual(json?["port"] as? Int, srv.port)
+        XCTAssertEqual(json?["token"] as? String, "endpoint-file-token")
+
+        srv.stop()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: filePath),
+                       "stop() must remove agent-endpoint.json from agentEndpointDirectory")
+    }
+
+    // 18e. A failure writing agent-endpoint.json (e.g. a plain file already
+    // occupies the configured directory's path) must degrade the Agents
+    // sidebar, not the whole IPC server — its MCP tools have nothing to do
+    // with this file.
+    func test_start_survivesAgentEndpointFileWriteFailure() throws {
+        let srv = CalyxMCPServer()
+        // A regular file (not a directory) at this path does NOT make
+        // AgentEndpointFile.write's `createDirectory` call fail:
+        // `fileExists(atPath:)` returns true for a plain file too, so
+        // `createDirectory` is skipped entirely. The actual failure
+        // happens one step later, inside ConfigFileUtils.atomicWrite:
+        // `open()` on the lock file path (which treats `blockedPath` as an
+        // intermediate directory component) fails with ENOTDIR.
+        let blockedPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString).path
+        FileManager.default.createFile(atPath: blockedPath, contents: Data())
+        srv.agentEndpointDirectory = blockedPath
+        srv.agentRegistry = AgentRegistry()
+        defer { try? FileManager.default.removeItem(atPath: blockedPath) }
+
+        try srv.start(token: "survives-endpoint-failure-token")
+
+        XCTAssertTrue(srv.isRunning,
+                      "start() must succeed even when agent-endpoint.json can't be written")
+
+        srv.stop()
+    }
+
     // 19. Rapid start/stop toggle — no crash, correct final state
     func test_enableDisable_rapidToggle() throws {
         let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
 
         for i in 0..<10 {
             try srv.start(token: "token-\(i)")

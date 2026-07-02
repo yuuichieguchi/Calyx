@@ -82,8 +82,42 @@ final class GhosttySurfaceController: Identifiable {
             logger.warning("scale_factor not set by caller, using fallback 1.0")
         }
 
+        // Inject CALYX_SURFACE_ID so the calyx-agent-hook script (installed
+        // by ClaudeHooksConfigManager) can report this pane's Claude Code
+        // lifecycle events back to the Agents sidebar. `ghostty_surface_new`
+        // copies env_vars into its own arena during the call
+        // (apprt/embedded.zig's dupeZ), so the C strings built below only
+        // need to stay alive for the duration of that call — the nested
+        // `withCString`/`withUnsafeMutableBufferPointer` closures provide
+        // exactly that. Any env_vars already on `baseConfig` are preserved,
+        // with CALYX_SURFACE_ID prepended.
+        var existingEnvKeys: [String] = []
+        var existingEnvValues: [String] = []
+        if baseConfig.env_var_count > 0, let vars = baseConfig.env_vars {
+            for i in 0..<baseConfig.env_var_count {
+                let envVar = vars[i]
+                guard let key = String(cString: envVar.key, encoding: .utf8),
+                      let value = String(cString: envVar.value, encoding: .utf8) else { continue }
+                existingEnvKeys.append(key)
+                existingEnvValues.append(value)
+            }
+        }
+        let envKeys = ["CALYX_SURFACE_ID"] + existingEnvKeys
+        let envValues = [id.uuidString] + existingEnvValues
+
+        let newSurface: ghostty_surface_t? = envKeys.withCStrings { keyPointers in
+            envValues.withCStrings { valuePointers in
+                var envVars = zip(keyPointers, valuePointers).map { ghostty_env_var_s(key: $0, value: $1) }
+                return envVars.withUnsafeMutableBufferPointer { buffer -> ghostty_surface_t? in
+                    config.env_vars = buffer.baseAddress
+                    config.env_var_count = buffer.count
+                    return GhosttyFFI.surfaceNew(app, config: &config)
+                }
+            }
+        }
+
         // Create the surface.
-        guard let newSurface = GhosttyFFI.surfaceNew(app, config: &config) else {
+        guard let newSurface else {
             logger.error("ghostty_surface_new failed")
             return nil
         }
@@ -352,6 +386,33 @@ final class GhosttySurfaceController: Identifiable {
 // MARK: - SearchQuerySender Conformance
 
 extension GhosttySurfaceController: SearchQuerySender {}
+
+// MARK: - Array<String> C String Helper
+
+private extension Array where Element == String {
+    /// Provides a valid `UnsafePointer<Int8>?` for every element,
+    /// simultaneously, for the duration of `body`. Ghostty's own macOS
+    /// target has an equivalent (`Array<String>.withCStrings` in
+    /// `Array+Extension.swift`), but that lives in a separate Xcode
+    /// project/target and isn't reusable from Calyx.
+    ///
+    /// `pointers` is preallocated and written into by index rather than
+    /// grown with `accumulated + [cString]` on each recursive step: array
+    /// concatenation copies the whole accumulated array every time, which
+    /// makes that shape of recursion O(n²) in element count. Writing by
+    /// index keeps each step O(1), for O(n) overall.
+    func withCStrings<T>(_ body: ([UnsafePointer<Int8>?]) throws -> T) rethrows -> T {
+        var pointers = [UnsafePointer<Int8>?](repeating: nil, count: count)
+        func step(_ index: Int) throws -> T {
+            guard index < count else { return try body(pointers) }
+            return try self[index].withCString { cString in
+                pointers[index] = cString
+                return try step(index + 1)
+            }
+        }
+        return try step(0)
+    }
+}
 
 // MARK: - NSScreen Extension
 

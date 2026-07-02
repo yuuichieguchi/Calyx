@@ -5,22 +5,6 @@
 
 import Foundation
 
-// MARK: - ClaudeConfigError
-
-enum ClaudeConfigError: Error, LocalizedError {
-    case invalidJSON
-    case symlinkDetected
-
-    var errorDescription: String? {
-        switch self {
-        case .invalidJSON:
-            return "The config file contains invalid JSON"
-        case .symlinkDetected:
-            return "The config path is a symlink, which is not allowed for security reasons"
-        }
-    }
-}
-
 // MARK: - ClaudeConfigManager
 
 struct ClaudeConfigManager: Sendable {
@@ -33,33 +17,7 @@ struct ClaudeConfigManager: Sendable {
     static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
 
-        // Security: reject symlinks
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw ClaudeConfigError.symlinkDetected
-        }
-
-        let fm = FileManager.default
-        var config: [String: Any]
-
-        if fm.fileExists(atPath: path) {
-            // Read existing content
-            let data = try Data(contentsOf: URL(fileURLWithPath: path))
-
-            // Parse JSON
-            guard let parsed = try? JSONSerialization.jsonObject(with: data),
-                  let dict = parsed as? [String: Any] else {
-                throw ClaudeConfigError.invalidJSON
-            }
-
-            // Create backup with the original content
-            let bakPath = path + ".bak"
-            try data.write(to: URL(fileURLWithPath: bakPath))
-            chmod(bakPath, 0o600)
-
-            config = dict
-        } else {
-            config = [:]
-        }
+        var config = try ConfigFileUtils.readConfigWithBackup(path: path)
 
         // Ensure mcpServers key exists
         var mcpServers = config[mcpServersKey] as? [String: Any] ?? [:]
@@ -87,22 +45,8 @@ struct ClaudeConfigManager: Sendable {
 
     static func disableIPC(configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
-        let fm = FileManager.default
 
-        // No file → no-op
-        guard fm.fileExists(atPath: path) else { return }
-
-        // Security: reject symlinks
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw ClaudeConfigError.symlinkDetected
-        }
-
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-
-        guard let parsed = try? JSONSerialization.jsonObject(with: data),
-              var config = parsed as? [String: Any] else {
-            throw ClaudeConfigError.invalidJSON
-        }
+        var config = try ConfigFileUtils.readConfigWithBackup(path: path)
 
         // Remove calyx-ipc from mcpServers
         guard var mcpServers = config[mcpServersKey] as? [String: Any] else {
