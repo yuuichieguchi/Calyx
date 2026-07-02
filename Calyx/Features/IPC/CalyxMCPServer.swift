@@ -774,6 +774,33 @@ final class CalyxMCPServer {
             return toolError(id: id, text: "Missing tool name")
         }
 
+        let response = await dispatchToolCall(id: id, toolName: toolName, params: params)
+
+        // Refresh every bound peer's unread badge once, at the end of
+        // every calyx-ipc messaging tools/call request, rather than each
+        // individual IPC tool handler syncing only the peer(s) it
+        // directly touched — see `syncBoundPeerInboxCounts`'s doc
+        // comment.
+        await syncBoundPeerInboxCounts(toolName: toolName)
+
+        return response
+    }
+
+    /// The calyx-ipc tools whose effects can change a bound peer's unread
+    /// count (directly, by delivering/acking a message, or indirectly, by
+    /// being the kind of call after which a stale count is worth
+    /// refreshing). `syncBoundPeerInboxCounts` only runs for these —
+    /// see its own doc comment for why.
+    private static let inboxSyncToolNames: Set<String> = [
+        "register_peer", "list_peers", "send_message", "broadcast",
+        "receive_messages", "ack_messages", "get_peer_status"
+    ]
+
+    private func dispatchToolCall(
+        id: JSONRPCId,
+        toolName: String,
+        params: [String: AnyCodable]
+    ) async -> (statusCode: Int, body: Data?) {
         // LSP route — `lsp_*` tools are dispatched through `MCPLSPBridge`.
         if MCPRouter.isLSPTool(name: toolName) {
             return await handleLSPToolCall(
@@ -810,6 +837,40 @@ final class CalyxMCPServer {
         default:
             return toolError(id: id, text: "Unknown tool: \(toolName)")
         }
+    }
+
+    /// Refreshes every currently peer-bound surface's unread-message
+    /// badge in one batch: `IPCStore.inboxCounts(for:)` +
+    /// `AgentRegistry.syncInboxCounts`. Replaces four separate
+    /// per-recipient `inboxCount` round trips that used to live in
+    /// `handleSendMessage` / `handleReceiveMessages` / `handleAckMessages`
+    /// (one each) and `handleBroadcast` (one *per recipient* — K actor
+    /// round trips for a K-recipient broadcast) with exactly one batched
+    /// query.
+    ///
+    /// Gated by two checks, in cost order: `toolName` must be one of
+    /// `inboxSyncToolNames` (a plain `Set` lookup, no actor hop), and only
+    /// then is `agentRegistry.boundPeerIDs` consulted for an early-out
+    /// when nothing is bound. The `toolName` gate matters because
+    /// `tools/call` also carries high-frequency, unrelated traffic (e.g.
+    /// `lsp_*`) that would otherwise pay for an `IPCStore` actor round
+    /// trip on every single call for no reason — badges only ever change
+    /// as a side effect of one of the messaging tools below.
+    ///
+    /// One consequence: a peer's inbox can also shrink from an entry
+    /// aging out under `IPCStore`'s TTL purge, which happens on its own
+    /// schedule, not in response to any particular tool call. That drift
+    /// isn't synced immediately — it's picked up the next time any
+    /// messaging tool below runs and this function's batch query re-reads
+    /// the current counts, which every real client does routinely (e.g.
+    /// polling via `receive_messages`). There is no dedicated eager sync
+    /// for a TTL purge in isolation.
+    private func syncBoundPeerInboxCounts(toolName: String) async {
+        guard Self.inboxSyncToolNames.contains(toolName) else { return }
+        let peerIDs = agentRegistry.boundPeerIDs
+        guard !peerIDs.isEmpty else { return }
+        let counts = await store.inboxCounts(for: peerIDs)
+        agentRegistry.syncInboxCounts(counts)
     }
 
     // MARK: - Tool Handlers
@@ -852,6 +913,10 @@ final class CalyxMCPServer {
 
         do {
             let message = try await store.sendMessage(from: fromUUID, to: toUUID, content: content)
+            // The recipient's unread badge (if a pane has learned a
+            // binding to this peer — see AgentEvent.ipcSelfPeerID) is
+            // refreshed once, after this handler returns, by
+            // `handleToolCall`'s `syncBoundPeerInboxCounts` — not here.
             let json = "{\"messageId\":\"\(message.id.uuidString)\"}"
             return toolSuccess(id: id, text: json)
         } catch let error as IPCError {
@@ -873,6 +938,10 @@ final class CalyxMCPServer {
 
         do {
             let messages = try await store.broadcast(from: fromUUID, content: content)
+            // Every recipient's unread badge is refreshed once, after
+            // this handler returns, by `handleToolCall`'s
+            // `syncBoundPeerInboxCounts` — not with a per-recipient
+            // `inboxCount` round trip here.
             let json = "{\"messageCount\":\(messages.count)}"
             return toolSuccess(id: id, text: json)
         } catch let error as IPCError {
@@ -892,6 +961,10 @@ final class CalyxMCPServer {
         }
 
         let messages = await store.receiveMessages(for: peerUUID)
+        // This peer's unread badge is refreshed once, after this handler
+        // returns, by `handleToolCall`'s `syncBoundPeerInboxCounts` — it
+        // will read 0 for `peerUUID` immediately, since `receiveMessages`
+        // just marked every one of these messages delivered.
         let messageDicts: [[String: Any]] = messages.map { messageToDict($0) }
         let result: [String: Any] = ["messages": messageDicts]
         guard let jsonData = try? JSONSerialization.data(withJSONObject: result),
@@ -913,6 +986,8 @@ final class CalyxMCPServer {
 
         let messageUUIDs = messageIdStrings.compactMap { UUID(uuidString: $0) }
         await store.ackMessages(ids: messageUUIDs, for: peerUUID)
+        // This peer's unread badge is refreshed once, after this handler
+        // returns, by `handleToolCall`'s `syncBoundPeerInboxCounts`.
         let json = "{\"acknowledged\":\(messageUUIDs.count)}"
         return toolSuccess(id: id, text: json)
     }

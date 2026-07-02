@@ -16,15 +16,12 @@ import Foundation
 
 enum OpenCodeConfigError: Error, LocalizedError {
     case invalidJSON
-    case symlinkDetected
     case writeFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidJSON:
             return "The opencode.json file contains invalid JSON"
-        case .symlinkDetected:
-            return "An OpenCode config path is a symlink, which is not allowed for security reasons"
         case .writeFailed(let reason):
             return "Failed to write OpenCode config file: \(reason)"
         }
@@ -85,21 +82,24 @@ struct OpenCodeConfigManager: Sendable {
     /// (or replaces) the managed block in `AGENTS.md`.
     ///
     /// Both files are written atomically under independent `flock`-based locks.
-    /// Symlinks on either target path cause the entire operation to abort before
-    /// any write happens — neither file is partially modified.
+    /// A symlinked target path is followed to its real file
+    /// (`ConfigFileUtils.resolveConfigPath`) and written through, leaving the
+    /// symlink itself intact — a dotfiles-managed OpenCode config root
+    /// commonly symlinks these files elsewhere.
+    ///
+    /// Both resolved paths are preflight-checked for writability (their
+    /// parent directory exists) before either file is touched: without
+    /// this, a failure resolving/writing the *second* file (`AGENTS.md`)
+    /// could leave `opencode.json` enabled while `AGENTS.md`'s managed
+    /// block was never written, a partially-enabled state that's
+    /// confusing to recover from.
     static func enableIPC(port: Int, token: String, configDir: String? = nil) throws {
         let dir = configDir ?? defaultConfigDir
-        let jsonPath = dir + Self.openCodeJSONFilename
-        let agentsPath = dir + Self.agentsMDFilename
+        let jsonPath = try ConfigFileUtils.resolveConfigPath(dir + Self.openCodeJSONFilename)
+        let agentsPath = try ConfigFileUtils.resolveConfigPath(dir + Self.agentsMDFilename)
 
-        // Preflight: reject symlinks on BOTH paths before touching either file.
-        // This gives atomic-ish rejection: neither file is partially modified.
-        guard !ConfigFileUtils.isSymlink(at: jsonPath) else {
-            throw OpenCodeConfigError.symlinkDetected
-        }
-        guard !ConfigFileUtils.isSymlink(at: agentsPath) else {
-            throw OpenCodeConfigError.symlinkDetected
-        }
+        try preflightWritable(jsonPath)
+        try preflightWritable(agentsPath)
 
         try upsertOpenCodeJSON(port: port, token: token, path: jsonPath)
         try upsertAgentsMD(path: agentsPath)
@@ -109,33 +109,22 @@ struct OpenCodeConfigManager: Sendable {
     /// and removing the managed block from `AGENTS.md`. Missing files are a no-op.
     static func disableIPC(configDir: String? = nil) throws {
         let dir = configDir ?? defaultConfigDir
-        let jsonPath = dir + Self.openCodeJSONFilename
-        let agentsPath = dir + Self.agentsMDFilename
-
-        // Preflight: reject symlinks on BOTH paths before touching either file.
-        // Mirrors enableIPC's preflight for atomic-rejection contract consistency —
-        // without this, if opencode.json is a regular file and AGENTS.md is a
-        // symlink, disableIPC would modify opencode.json first and only throw
-        // when it reached AGENTS.md, leaving the user in a half-modified state.
-        if FileManager.default.fileExists(atPath: jsonPath),
-           ConfigFileUtils.isSymlink(at: jsonPath) {
-            throw OpenCodeConfigError.symlinkDetected
-        }
-        if FileManager.default.fileExists(atPath: agentsPath),
-           ConfigFileUtils.isSymlink(at: agentsPath) {
-            throw OpenCodeConfigError.symlinkDetected
-        }
+        let jsonPath = try ConfigFileUtils.resolveConfigPath(dir + Self.openCodeJSONFilename)
+        let agentsPath = try ConfigFileUtils.resolveConfigPath(dir + Self.agentsMDFilename)
 
         try removeFromOpenCodeJSON(path: jsonPath)
         try removeFromAgentsMD(path: agentsPath)
     }
 
     /// Returns whether the Calyx IPC MCP entry is present in `opencode.json`.
-    /// Returns `false` if the file is missing, invalid, or lacks the entry.
+    /// Returns `false` if the file is missing, invalid, lacks the entry, or
+    /// `configDir`'s symlink chain can't be resolved.
     /// Does not inspect AGENTS.md — authoritative truth is opencode.json.
     static func isIPCEnabled(configDir: String? = nil) -> Bool {
         let dir = configDir ?? defaultConfigDir
-        let jsonPath = dir + Self.openCodeJSONFilename
+        guard let jsonPath = try? ConfigFileUtils.resolveConfigPath(dir + Self.openCodeJSONFilename) else {
+            return false
+        }
 
         guard FileManager.default.fileExists(atPath: jsonPath),
               let data = try? Data(contentsOf: URL(fileURLWithPath: jsonPath)),
@@ -146,6 +135,19 @@ struct OpenCodeConfigManager: Sendable {
         }
 
         return mcp[calyxIPCKey] != nil
+    }
+
+    // MARK: - Private: Preflight
+
+    /// Checks that `path`'s parent directory exists, so a subsequent
+    /// `atomicWrite` there won't fail outright. Used by `enableIPC` to
+    /// verify both `opencode.json` and `AGENTS.md`'s resolved paths
+    /// before writing either — see `enableIPC`'s doc comment.
+    private static func preflightWritable(_ path: String) throws {
+        let parentDir = (path as NSString).deletingLastPathComponent
+        guard ConfigFileUtils.directoryExists(at: parentDir) else {
+            throw OpenCodeConfigError.writeFailed("parent directory does not exist: \(parentDir)")
+        }
     }
 
     // MARK: - Private: opencode.json
@@ -194,20 +196,12 @@ struct OpenCodeConfigManager: Sendable {
             options: [.prettyPrinted, .sortedKeys]
         )
 
-        try ConfigFileUtils.atomicWrite(
-            data: outputData,
-            to: path,
-            lockPath: path + ".lock"
-        )
+        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     private static func removeFromOpenCodeJSON(path: String) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: path) else { return }
-
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw OpenCodeConfigError.symlinkDetected
-        }
 
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
 
@@ -238,11 +232,7 @@ struct OpenCodeConfigManager: Sendable {
             options: [.prettyPrinted, .sortedKeys]
         )
 
-        try ConfigFileUtils.atomicWrite(
-            data: outputData,
-            to: path,
-            lockPath: path + ".lock"
-        )
+        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     // MARK: - Private: AGENTS.md
@@ -280,20 +270,12 @@ struct OpenCodeConfigManager: Sendable {
             throw OpenCodeConfigError.writeFailed("UTF-8 encoding failed")
         }
 
-        try ConfigFileUtils.atomicWrite(
-            data: data,
-            to: path,
-            lockPath: path + ".lock"
-        )
+        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     private static func removeFromAgentsMD(path: String) throws {
         let fm = FileManager.default
         guard fm.fileExists(atPath: path) else { return }
-
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw OpenCodeConfigError.symlinkDetected
-        }
 
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
             // Unreadable → treat as no-op (consistent with CodexConfigManager).
@@ -309,11 +291,7 @@ struct OpenCodeConfigManager: Sendable {
             throw OpenCodeConfigError.writeFailed("UTF-8 encoding failed")
         }
 
-        try ConfigFileUtils.atomicWrite(
-            data: data,
-            to: path,
-            lockPath: path + ".lock"
-        )
+        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     /// Removes all `BEGIN CALYX IPC` ... `END CALYX IPC` managed blocks from a string.

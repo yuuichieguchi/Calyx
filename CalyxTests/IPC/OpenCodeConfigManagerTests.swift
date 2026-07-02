@@ -320,7 +320,12 @@ final class OpenCodeConfigManagerTests: XCTestCase {
 
     // MARK: - enableIPC: Security / Errors
 
-    func test_enableIPC_symlinkRejected_opencodeJson() throws {
+    // Contract changed (Round 3): a dotfiles-managed OpenCode config
+    // root commonly symlinks opencode.json / AGENTS.md elsewhere, and
+    // blanket symlink rejection silently broke IPC configuration in that
+    // setup. enableIPC now follows the link and writes through to the
+    // real target file, leaving the link itself intact.
+    func test_enableIPC_symlinkFollowedToRealFile_opencodeJson() throws {
         // Given: opencode.json path is a symlink to a real file
         let realFile = configDir + "/real_opencode.json"
         writeOpenCodeJSON("{}")
@@ -335,18 +340,22 @@ final class OpenCodeConfigManagerTests: XCTestCase {
         XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink,
                        "Test setup: opencode.json should be a symlink")
 
-        // When/Then: enableIPC should throw
-        XCTAssertThrowsError(
-            try OpenCodeConfigManager.enableIPC(
-                port: 41830,
-                token: "tok",
-                configDir: configDir
-            ),
-            "enableIPC should reject symlink opencode.json path"
-        )
+        // When: enableIPC is called through the symlinked path
+        try OpenCodeConfigManager.enableIPC(port: 41830, token: "tok", configDir: configDir)
+
+        // Then: the real file received the calyx-ipc entry...
+        let realData = try Data(contentsOf: URL(fileURLWithPath: realFile))
+        let realDict = try JSONSerialization.jsonObject(with: realData) as? [String: Any]
+        let mcp = realDict?["mcp"] as? [String: Any]
+        XCTAssertNotNil(mcp?["calyx-ipc"], "enableIPC must write through the symlink into the real opencode.json")
+
+        // ...and the symlink itself survives.
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: opencodeJsonPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "opencode.json must remain a symlink after enableIPC")
     }
 
-    func test_enableIPC_symlinkRejected_agentsMD() throws {
+    func test_enableIPC_symlinkFollowedToRealFile_agentsMD() throws {
         // Given: AGENTS.md path is a symlink to a real file
         let realFile = configDir + "/real_AGENTS.md"
         writeAgentsMD("# User\n")
@@ -361,15 +370,50 @@ final class OpenCodeConfigManagerTests: XCTestCase {
         XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink,
                        "Test setup: AGENTS.md should be a symlink")
 
-        // When/Then: enableIPC should throw
-        XCTAssertThrowsError(
-            try OpenCodeConfigManager.enableIPC(
-                port: 41830,
-                token: "tok",
-                configDir: configDir
-            ),
-            "enableIPC should reject symlink AGENTS.md path"
-        )
+        // When: enableIPC is called through the symlinked path
+        try OpenCodeConfigManager.enableIPC(port: 41830, token: "tok", configDir: configDir)
+
+        // Then: the real file received the managed block and the user's heading survived...
+        let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
+        XCTAssertTrue(realContent.contains("# User"), "The user's existing AGENTS.md content must be preserved")
+        XCTAssertTrue(realContent.contains(canarySubstring),
+                      "enableIPC must write the managed block through the symlink into the real AGENTS.md")
+
+        // ...and the symlink itself survives.
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: agentsMDPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "AGENTS.md must remain a symlink after enableIPC")
+    }
+
+    // Round 3 fix: resolveConfigPath now follows a multi-hop *dangling*
+    // symlink chain (link -> link -> not-yet-existing file) all the way
+    // to its final destination, rather than stopping at the first
+    // intermediate link. Same shared ConfigFileUtils primitive as every
+    // other config manager — exercised here via AGENTS.md's path, with
+    // opencode.json left as a plain (non-symlinked) path so the test also
+    // confirms a multi-hop chain on one file doesn't disturb the other.
+    func test_enableIPC_multiHopDanglingSymlink_agentsMD_writesToFinalDestination() throws {
+        let dotfilesDir = configDir + "/dotfiles"
+        try FileManager.default.createDirectory(atPath: dotfilesDir, withIntermediateDirectories: true)
+        let finalTarget = dotfilesDir + "/AGENTS.md"
+        let middleLink = configDir + "/middle-link.md"
+        try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
+        try FileManager.default.createSymbolicLink(atPath: agentsMDPath, withDestinationPath: middleLink)
+
+        try OpenCodeConfigManager.enableIPC(port: 41830, token: "tok", configDir: configDir)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalTarget),
+                      "enableIPC must create AGENTS.md at the multi-hop dangling chain's final destination")
+        let content = try String(contentsOfFile: finalTarget, encoding: .utf8)
+        XCTAssertTrue(content.contains(canarySubstring))
+
+        let middleAttrs = try FileManager.default.attributesOfItem(atPath: middleLink)
+        XCTAssertEqual(middleAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The intermediate link must survive as a symlink, not be replaced with a regular file")
+
+        // opencode.json (a plain, non-symlinked path here) must also have
+        // been written normally.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: opencodeJsonPath))
     }
 
     func test_enableIPC_invalidJSON_throws() {
@@ -392,8 +436,15 @@ final class OpenCodeConfigManagerTests: XCTestCase {
     }
 
     func test_enableIPC_partialFailure_jsonWrittenAgentsFailed() throws {
-        // Given: AGENTS.md path is a directory, causing AGENTS.md write to fail
-        // AFTER opencode.json has already been written.
+        // Given: AGENTS.md's path itself is a directory, causing the
+        // AGENTS.md write to fail AFTER opencode.json has already been
+        // written. This is a distinct failure mode from the Round 3
+        // preflight fix below (`test_enableIPC_agentsMDResolvedParent...`):
+        // the preflight only checks each resolved path's PARENT directory
+        // exists, not that the path itself is free of a conflicting
+        // directory — this scenario's parent (configDir) does exist, so
+        // the preflight passes and the pre-existing non-atomic
+        // cross-file-write behavior documented here is unchanged.
         try FileManager.default.createDirectory(
             atPath: agentsMDPath,
             withIntermediateDirectories: false
@@ -418,6 +469,30 @@ final class OpenCodeConfigManagerTests: XCTestCase {
         let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         let mcp = parsed?["mcp"] as? [String: Any]
         XCTAssertNotNil(mcp?["calyx-ipc"], "partial-failure leaves calyx-ipc entry in opencode.json")
+    }
+
+    // Round 3 fix: preflight both files' resolved paths for writability
+    // (their parent directory exists) before writing either one, so a
+    // predictable failure mode — a not-yet-created parent directory,
+    // e.g. behind a dangling symlink — can't leave opencode.json enabled
+    // while AGENTS.md was never touched.
+    func test_enableIPC_agentsMDResolvedParentDirectoryMissing_preflightThrows_opencodeJSONUntouched() throws {
+        let missingParentTarget = configDir + "/does-not-exist/AGENTS.md"
+        try FileManager.default.createSymbolicLink(atPath: agentsMDPath, withDestinationPath: missingParentTarget)
+
+        XCTAssertThrowsError(
+            try OpenCodeConfigManager.enableIPC(port: 41830, token: "token", configDir: configDir)
+        )
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: opencodeJsonPath),
+            "A preflight failure on AGENTS.md's resolved path must prevent opencode.json from being " +
+            "written at all — no partial enable"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: missingParentTarget),
+            "AGENTS.md's resolved target must also never be written"
+        )
     }
 
     func test_enableIPC_nullRootJSON_throws() throws {
@@ -656,8 +731,11 @@ final class OpenCodeConfigManagerTests: XCTestCase {
                        "opencode.json should not be created by disableIPC")
     }
 
-    func test_disableIPC_symlinkRejected() throws {
-        // Given: opencode.json is a symlink
+    // Contract changed (Round 3): see the enableIPC symlink tests above —
+    // disableIPC now follows the link and removes the entry from the
+    // real target file, leaving the link itself intact.
+    func test_disableIPC_symlinkFollowedToRealFile() throws {
+        // Given: opencode.json is a symlink to a real file with the entry present
         let realFile = configDir + "/real_opencode.json"
         writeOpenCodeJSON("""
         {
@@ -676,11 +754,19 @@ final class OpenCodeConfigManagerTests: XCTestCase {
             withDestinationPath: realFile
         )
 
-        // When/Then: disableIPC should throw
-        XCTAssertThrowsError(
-            try OpenCodeConfigManager.disableIPC(configDir: configDir),
-            "disableIPC should reject symlink paths"
-        )
+        // When: disableIPC is called through the symlinked path
+        try OpenCodeConfigManager.disableIPC(configDir: configDir)
+
+        // Then: the entry is gone from the real file...
+        let realData = try Data(contentsOf: URL(fileURLWithPath: realFile))
+        let realDict = try JSONSerialization.jsonObject(with: realData) as? [String: Any]
+        let mcp = realDict?["mcp"] as? [String: Any]
+        XCTAssertNil(mcp?["calyx-ipc"], "disableIPC must remove the entry from the real file reached through the symlink")
+
+        // ...and the symlink itself survives.
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: opencodeJsonPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "opencode.json must remain a symlink after disableIPC")
     }
 
     // MARK: - isIPCEnabled

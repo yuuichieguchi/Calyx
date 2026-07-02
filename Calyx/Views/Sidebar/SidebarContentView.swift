@@ -614,11 +614,7 @@ private struct TabRowItemView: View {
                 }
                 Spacer()
                 if tab.unreadNotifications > 0 {
-                    Text(tab.unreadNotifications > 99 ? "99+" : "\(tab.unreadNotifications)")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(minWidth: 16, minHeight: 16)
-                        .background(Circle().fill(Color.red))
+                    UnreadCountBadge(count: tab.unreadNotifications)
                 }
                 // Visual-only close icon. No `.onTapGesture`, no
                 // `Button`. Hit detection is done in

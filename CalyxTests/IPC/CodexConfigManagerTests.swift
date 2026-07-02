@@ -309,8 +309,13 @@ final class CodexConfigManagerTests: XCTestCase {
         }
     }
 
-    func test_enableIPC_symlinkRejected() throws {
-        // Given: configPath is a symlink
+    // Contract changed (Round 3): dotfiles-managed setups commonly symlink
+    // ~/.codex/config.toml to a repo elsewhere, and blanket symlink
+    // rejection silently broke IPC configuration for that setup. Calyx
+    // now follows the link and writes through to the real target file,
+    // leaving the link itself intact.
+    func test_enableIPC_symlinkFollowedToRealFile_writesSuccessfullyAndKeepsLinkIntact() throws {
+        // Given: configPath is a symlink to a real (empty) file
         let realFile = tempDir + "/real_config.toml"
         FileManager.default.createFile(atPath: realFile, contents: Data("".utf8))
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: realFile)
@@ -320,43 +325,67 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink,
                        "Test setup: configPath should be a symlink")
 
-        // When/Then: throws symlinkDetected
-        XCTAssertThrowsError(
-            try CodexConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
-        ) { error in
-            guard let configError = error as? CodexConfigError else {
-                XCTFail("Expected CodexConfigError, got \(type(of: error))")
-                return
-            }
-            if case .symlinkDetected = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .symlinkDetected, got \(configError)")
-            }
-        }
+        // When: enableIPC is called through the symlinked path
+        try CodexConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        // Then: the REAL file received the section...
+        let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
+        XCTAssertTrue(realContent.contains("[mcp_servers.calyx-ipc]"),
+                      "enableIPC must write through the symlink into the real file")
+
+        // ...and the symlink itself survives, still pointing at the same target.
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at configPath must survive the write")
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: configPath)
+        XCTAssertEqual(destination, realFile)
     }
 
-    func test_disableIPC_symlinkRejected() throws {
-        // Given: configPath is a symlink
+    // Round 3 fix: resolveConfigPath now follows a multi-hop *dangling*
+    // symlink chain (link -> link -> not-yet-existing file) all the way
+    // to its final destination, rather than stopping at the first
+    // intermediate link. Same shared ConfigFileUtils primitive as every
+    // other config manager.
+    func test_multiHopDanglingSymlink_writesToFinalDestinationKeepingBothLinksIntact() throws {
+        let finalTarget = tempDir + "/dotfiles/config.toml"
+        try FileManager.default.createDirectory(
+            atPath: (finalTarget as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+        let middleLink = tempDir + "/middle-link.toml"
+        try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
+        try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: middleLink)
+
+        try CodexConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        let realContent = try String(contentsOfFile: finalTarget, encoding: .utf8)
+        XCTAssertTrue(realContent.contains("[mcp_servers.calyx-ipc]"),
+                      "enableIPC must create the file at the final destination of a multi-hop dangling chain")
+
+        let middleAttrs = try FileManager.default.attributesOfItem(atPath: middleLink)
+        XCTAssertEqual(middleAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The intermediate link must survive as a symlink, not be replaced with a regular file")
+    }
+
+    func test_disableIPC_symlinkFollowedToRealFile_removesSuccessfullyAndKeepsLinkIntact() throws {
+        // Given: configPath is a symlink to a real file that already has the section
         let realFile = tempDir + "/real_config.toml"
         writeConfig("[mcp_servers.calyx-ipc]\nurl = \"http://localhost:41830/mcp\"\n")
         try FileManager.default.moveItem(atPath: configPath, toPath: realFile)
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: realFile)
 
-        // When/Then: throws symlinkDetected
-        XCTAssertThrowsError(
-            try CodexConfigManager.disableIPC(configPath: configPath)
-        ) { error in
-            guard let configError = error as? CodexConfigError else {
-                XCTFail("Expected CodexConfigError, got \(type(of: error))")
-                return
-            }
-            if case .symlinkDetected = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .symlinkDetected, got \(configError)")
-            }
-        }
+        // When: disableIPC is called through the symlinked path
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        // Then: the section is gone from the REAL file...
+        let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
+        XCTAssertFalse(realContent.contains("[mcp_servers.calyx-ipc]"),
+                       "disableIPC must remove the section from the real file reached through the symlink")
+
+        // ...and the symlink itself survives.
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at configPath must survive the write")
     }
 
     // MARK: - Edge Cases

@@ -522,5 +522,10 @@ extension Notification.Name {
     static let ghosttySearchSelected = Notification.Name("com.calyx.ghostty.searchSelected")
     static let ghosttyGotoTab = Notification.Name("com.calyx.ghostty.gotoTab")
     static let ghosttyConfirmClipboard = Notification.Name("com.calyx.ghostty.confirmClipboard")
+    /// Posted for `GHOSTTY_ACTION_PROGRESS_REPORT` (OSC 9;4), an in-band
+    /// signal for `AgentRegistry.handleProgressReport`'s Herdr-layer-2
+    /// fallback. `userInfo["active"]` is `true` for `SET`/`INDETERMINATE`,
+    /// `false` for `REMOVE`/`ERROR`/`PAUSE`.
+    static let ghosttyProgressReport = Notification.Name("com.calyx.ghostty.progressReport")
     static let smoothScrollSettingChanged = Notification.Name("com.calyx.smoothScrollSettingChanged")
 }

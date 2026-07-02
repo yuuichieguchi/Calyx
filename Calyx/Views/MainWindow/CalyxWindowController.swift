@@ -27,6 +27,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var diffTasks: [UUID: Task<Void, Never>] = [:]
     private var refreshTask: Task<Void, Never>?
     private var loadMoreTask: Task<Void, Never>?
+    /// Herdr layer-2 screen-classification poll (see
+    /// `startScreenPollTask`). Runs for the window's lifetime, cancelled
+    /// in `windowWillClose`.
+    private var screenPollTask: Task<Void, Never>?
     private var expandTasks: [String: Task<Void, Never>] = [:]
     private var hasMoreCommits = true
     private var reviewStores: [UUID: DiffReviewStore] = [:]
@@ -122,6 +126,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         setupUI()
         if !restoring { setupTerminalSurface() }
         registerNotificationObservers()
+        startScreenPollTask()
     }
 
     @available(*, unavailable)
@@ -1119,6 +1124,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .ghosttySetTitle, object: nil)
         center.addObserver(self, selector: #selector(handleSetPwdNotification(_:)),
                            name: .ghosttySetPwd, object: nil)
+        center.addObserver(self, selector: #selector(handleProgressReportNotification(_:)),
+                           name: .ghosttyProgressReport, object: nil)
         center.addObserver(self, selector: #selector(handleDesktopNotification(_:)),
                            name: .ghosttyDesktopNotification, object: nil)
         center.addObserver(self, selector: #selector(handleGotoTabNotification(_:)),
@@ -1129,6 +1136,63 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .calyxFocusSurface, object: nil)
         center.addObserver(self, selector: #selector(handleSurfaceDestroyedForAgentMonitor(_:)),
                            name: .calyxSurfaceDestroyed, object: nil)
+    }
+
+    // MARK: - Screen State Polling (Herdr Layer 2)
+
+    /// Starts the window-lifetime poll loop that feeds `ScreenStateClassifier`
+    /// results into `AgentRegistry.handleScreenClassification` — the
+    /// fallback for panes hooks haven't reported on (or aren't wired up
+    /// at all). Mirrors `AgentRegistry.sweepTask`'s `while !Task.isCancelled`
+    /// shape, but — unlike that task, started/stopped by IPC server
+    /// lifecycle — this one runs for the whole life of the window: there's
+    /// no property-observation hook on `WindowSession.sidebarMode` /
+    /// `showSidebar` to react to (they're mutated from many call sites:
+    /// palette commands, the sidebar's SwiftUI binding, toggles), so each
+    /// tick instead checks the relevant gates itself and skips the
+    /// (expensive — `ghostty_surface_read_text` is documented as costly)
+    /// per-surface read entirely unless warranted.
+    private func startScreenPollTask() {
+        screenPollTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                self?.pollScreenClassificationIfAgentsSidebarVisible()
+            }
+        }
+    }
+
+    /// Three gates, cheapest first, before the expensive per-surface
+    /// `ghostty_surface_read_text` call:
+    /// (a) `AgentRegistry.isServerRunning` — IPC disabled means no
+    ///     Agents sidebar row can be shown at all, so classifying screens
+    ///     into the registry in the background would only produce
+    ///     entries that immediately (and confusingly) populate the
+    ///     sidebar the moment IPC is re-enabled.
+    /// (b) Per-surface: a `.hooks`-sourced entry is authoritative —
+    ///     `handleScreenClassification` already no-ops for one, but
+    ///     skipping here avoids the read itself, not just its effect.
+    /// (c) `AgentRegistry.isAgentsSidebarVisibleAnywhere` (rather than
+    ///     this window's own `sidebarMode`/`showSidebar`) — see that
+    ///     property's doc comment for the cross-window gap this closes.
+    private func pollScreenClassificationIfAgentsSidebarVisible() {
+        guard AgentRegistry.shared.isServerRunning else { return }
+        guard AgentRegistry.shared.isAgentsSidebarVisibleAnywhere else { return }
+
+        for group in windowSession.groups {
+            for tab in group.tabs {
+                for surfaceID in tab.registry.allIDs {
+                    guard AgentRegistry.shared.entries[surfaceID]?.source != .hooks else { continue }
+                    guard let surface = tab.registry.controller(for: surfaceID)?.surface else { continue }
+                    guard let bottomText = GhosttySurfaceSelectionReader(surface: surface)
+                        .readActiveBottomText(rows: 12) else { continue }
+
+                    let kind = AgentRegistry.shared.entries[surfaceID]?.kind ?? AgentEntry.claudeCodeKind
+                    let state = ScreenStateClassifier.classify(bottomText: bottomText, kind: kind)
+                    AgentRegistry.shared.handleScreenClassification(surfaceID: surfaceID, state: state)
+                }
+            }
+        }
     }
 
     // MARK: - Notification Handlers
@@ -1323,6 +1387,20 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             window?.title = tab.titleOverride ?? title
             refreshHostingView()
         }
+    }
+
+    /// OSC 9;4 progress-report signal (`GHOSTTY_ACTION_PROGRESS_REPORT`,
+    /// forwarded as `.ghosttyProgressReport`) — feeds the Herdr layer-2
+    /// fallback for every pane, not just the tab's focused surface,
+    /// mirroring `handleSetTitleNotification`'s title-heuristic feed
+    /// above.
+    @objc private func handleProgressReportNotification(_ notification: Notification) {
+        guard let surfaceView = notification.object as? SurfaceView else { return }
+        guard belongsToThisWindow(surfaceView) else { return }
+        guard let isActive = notification.userInfo?["active"] as? Bool else { return }
+        guard let surfaceID = surfaceView.surfaceController?.id else { return }
+
+        AgentRegistry.shared.handleProgressReport(surfaceID: surfaceID, isActive: isActive)
     }
 
     /// Resolves an Agents sidebar row click to a surface owned by this
@@ -1802,6 +1880,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         expandTasks.removeAll()
         refreshTask?.cancel()
         loadMoreTask?.cancel()
+        screenPollTask?.cancel()
 
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.removeWindowController(self)
@@ -2086,6 +2165,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             // IPC" flow, since the MCP server is already running.
             let hooksResult = AgentHooksCoordinator.install()
 
+            // Persist any hook-install failure as a standing sidebar
+            // banner (AgentStatusView) rather than only the one-shot
+            // alert below — a symlink/permissions failure here otherwise
+            // degrades the Agents sidebar silently for the rest of the
+            // session. `[]` when every tool installed cleanly, clearing
+            // any banner left over from a prior enable attempt.
+            AgentRegistry.shared.setHooksIssues(Self.hooksIssueMessages(hooksResult))
+
             showIPCAlert(
                 title: "IPC Enabled",
                 message: "MCP server running on port \(port).\n\(configStatusMessage(result))\n" +
@@ -2148,6 +2235,22 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             configStatusLabel(result.codex, name: "Codex hooks", verb: verb),
             configStatusLabel(result.openCode, name: "OpenCode plugin", verb: verb),
         ].joined(separator: "\n")
+    }
+
+    /// One `"<name>: <localizedDescription>"` line per `.failed` tool in
+    /// `result`, for `AgentRegistry.hooksIssues`'s persistent sidebar
+    /// banner. `[]` when every tool installed successfully (or was
+    /// skipped) — `AgentStatusView` only renders the banner when this is
+    /// non-empty.
+    private static func hooksIssueMessages(_ result: AgentHooksResult) -> [String] {
+        [
+            ("Claude Code hooks", result.claudeCode),
+            ("Codex hooks", result.codex),
+            ("OpenCode plugin", result.openCode),
+        ].compactMap { name, status in
+            guard case .failed(let error) = status else { return nil }
+            return "\(name): \(error.localizedDescription)"
+        }
     }
 
     // MARK: - AI Agent Tab Detection

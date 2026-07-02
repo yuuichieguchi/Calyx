@@ -22,6 +22,14 @@ struct Message: Sendable, Codable {
     let to: UUID
     let content: String
     var timestamp: Date
+    /// Whether this message has been returned by a `receiveMessages` call
+    /// for its recipient. Set by `receiveMessages`, never cleared. Unlike
+    /// removal (only `ackMessages` does that), delivery alone doesn't
+    /// drop the message from the inbox — it only stops the message from
+    /// counting toward `inboxCount`'s undelivered total, so a peer's
+    /// unread badge clears as soon as it actually retrieves its inbox
+    /// rather than requiring a separate explicit ack.
+    var delivered: Bool = false
 }
 
 // MARK: - Errors
@@ -216,7 +224,7 @@ actor IPCStore {
         guard aliveOrPurge(peerID) != nil else { return [] }
 
         let now = Date()
-        let messages = inbox[peerID] ?? []
+        var messages = inbox[peerID] ?? []
         peers[peerID]?.lastSeen = now
 
         // Bump every distinct sender (no-op if a sender has since been purged).
@@ -226,6 +234,16 @@ actor IPCStore {
                 peers[msg.from]?.lastSeen = now
             }
         }
+
+        // Mark every message this call returns as delivered — in the
+        // stored inbox, not just the returned copies — so `inboxCount`'s
+        // undelivered total (and therefore the unread badge) reflects
+        // that this peer has now retrieved them. Delivery doesn't remove
+        // anything from the inbox; only `ackMessages` does that.
+        for index in messages.indices {
+            messages[index].delivered = true
+        }
+        inbox[peerID] = messages
 
         return messages
     }
@@ -240,6 +258,38 @@ actor IPCStore {
         inbox[peerID]?.removeAll { idSet.contains($0.id) }
 
         peers[peerID]?.lastSeen = Date()
+    }
+
+    /// Number of currently UNDELIVERED messages waiting in `peerID`'s
+    /// inbox (sent but not yet returned by a `receiveMessages` call) —
+    /// what `AgentRegistry`'s unread-message badge reflects. A delivered
+    /// message stays in the inbox (only `ackMessages` removes it) but no
+    /// longer counts here, so retrieving a peer's inbox immediately
+    /// clears its badge rather than requiring a separate explicit ack.
+    /// Without the side effects `receiveMessages` has (bumping
+    /// `lastSeen` on the recipient and every distinct sender) — and
+    /// without `aliveOrPurge`'s purge-on-expiry either, since this is a
+    /// pure read used to refresh the badge after a
+    /// send/broadcast/receive/ack, not a liveness-gated API. An unknown
+    /// `peerID` simply has no inbox entry, reading as `0`.
+    func inboxCount(for peerID: UUID) -> Int {
+        (inbox[peerID] ?? []).filter { !$0.delivered }.count
+    }
+
+    /// Batch form of `inboxCount(for:)`: the undelivered count for every
+    /// `peerID` in `peerIDs`, in one call. Used by `CalyxMCPServer` to
+    /// refresh every bound peer's badge once per `tools/call` request
+    /// instead of one `inboxCount` round trip per affected peer — see
+    /// the call site's doc comment. Same read-only, no-side-effect,
+    /// non-liveness-gated contract as `inboxCount(for:)`; an unknown
+    /// `peerID` in `peerIDs` simply reads as `0`.
+    func inboxCounts(for peerIDs: [UUID]) -> [UUID: Int] {
+        var result: [UUID: Int] = [:]
+        result.reserveCapacity(peerIDs.count)
+        for peerID in peerIDs {
+            result[peerID] = inboxCount(for: peerID)
+        }
+        return result
     }
 
     // MARK: - Cleanup

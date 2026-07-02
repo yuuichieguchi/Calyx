@@ -294,19 +294,83 @@ final class OpenCodePluginManagerTests: XCTestCase {
 
     // MARK: - Security
 
-    func test_install_symlinkAtDestinationPath_throws() throws {
+    // Contract changed (Round 3): a dotfiles-managed OpenCode config root
+    // can legitimately symlink its plugins/ directory (or an individual
+    // plugin file) elsewhere. Blanket symlink rejection silently broke
+    // plugin installation in that setup. install() now follows the link
+    // and overwrites the real target file, leaving the link itself
+    // intact — consistent with install()'s existing plain-overwrite
+    // contract for a non-symlinked destination.
+    func test_install_symlinkAtDestinationPath_followsAndOverwritesRealFileKeepingLinkIntact() throws {
         let pluginsDir = configRoot + "/plugins"
         try FileManager.default.createDirectory(atPath: pluginsDir, withIntermediateDirectories: true)
         let realFile = tempDir + "/real_plugin.js"
-        FileManager.default.createFile(atPath: realFile, contents: Data("".utf8))
-        try FileManager.default.createSymbolicLink(
-            atPath: pluginsDir + "/calyx-agent-monitor.js",
-            withDestinationPath: realFile
-        )
+        FileManager.default.createFile(atPath: realFile, contents: Data("// stale content".utf8))
+        let destinationPath = pluginsDir + "/calyx-agent-monitor.js"
+        try FileManager.default.createSymbolicLink(atPath: destinationPath, withDestinationPath: realFile)
 
-        XCTAssertThrowsError(
-            try OpenCodePluginManager.install(pluginsDirectory: configRoot),
-            "install() must reject a symlink at the plugin's destination path"
-        )
+        _ = try OpenCodePluginManager.install(pluginsDirectory: configRoot)
+
+        let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
+        XCTAssertEqual(realContent, OpenCodePluginManager.scriptBody,
+                       "install() must overwrite the real file reached through the symlink with the plugin body")
+
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: destinationPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at the plugin's destination path must survive the install")
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: destinationPath)
+        XCTAssertEqual(destination, realFile)
+    }
+
+    // Round 3 fix: resolveConfigPath now follows a multi-hop *dangling*
+    // symlink chain (link -> link -> not-yet-existing file) all the way
+    // to its final destination, rather than stopping at the first
+    // intermediate link. Same shared ConfigFileUtils primitive as every
+    // config manager.
+    func test_install_multiHopDanglingSymlink_writesToFinalDestinationKeepingBothLinksIntact() throws {
+        let pluginsDir = configRoot + "/plugins"
+        try FileManager.default.createDirectory(atPath: pluginsDir, withIntermediateDirectories: true)
+        let dotfilesDir = tempDir + "/dotfiles"
+        try FileManager.default.createDirectory(atPath: dotfilesDir, withIntermediateDirectories: true)
+        let finalTarget = dotfilesDir + "/calyx-agent-monitor.js"
+        let middleLink = tempDir + "/middle-link.js"
+        try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
+        let destinationPath = pluginsDir + "/calyx-agent-monitor.js"
+        try FileManager.default.createSymbolicLink(atPath: destinationPath, withDestinationPath: middleLink)
+
+        _ = try OpenCodePluginManager.install(pluginsDirectory: configRoot)
+
+        let realContent = try String(contentsOfFile: finalTarget, encoding: .utf8)
+        XCTAssertEqual(realContent, OpenCodePluginManager.scriptBody,
+                       "install() must create the plugin at the multi-hop dangling chain's final destination")
+
+        let middleAttrs = try FileManager.default.attributesOfItem(atPath: middleLink)
+        XCTAssertEqual(middleAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The intermediate link must survive as a symlink, not be replaced with a regular file")
+    }
+
+    // Round 3 fix: remove() previously deleted the raw (possibly
+    // symlinked) destination path directly — for a symlinked
+    // destination, that deletes the *symlink itself* (unlink(2) doesn't
+    // follow it), leaving the real installed file behind un-removed and
+    // orphaning it, asymmetric with install()'s follow-through-and-write
+    // behavior above. remove() must now resolve the same way and delete
+    // the real target, leaving the (now-dangling) symlink itself intact.
+    func test_remove_symlinkAtDestinationPath_removesRealFileKeepingLinkIntact() throws {
+        let pluginsDir = configRoot + "/plugins"
+        try FileManager.default.createDirectory(atPath: pluginsDir, withIntermediateDirectories: true)
+        let realFile = tempDir + "/real_plugin.js"
+        FileManager.default.createFile(atPath: realFile, contents: Data(OpenCodePluginManager.scriptBody.utf8))
+        let destinationPath = pluginsDir + "/calyx-agent-monitor.js"
+        try FileManager.default.createSymbolicLink(atPath: destinationPath, withDestinationPath: realFile)
+
+        try OpenCodePluginManager.remove(pluginsDirectory: configRoot)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: realFile),
+                       "remove() must delete the real file reached through the symlink")
+
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: destinationPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at the plugin's destination path must survive remove() (now dangling)")
     }
 }

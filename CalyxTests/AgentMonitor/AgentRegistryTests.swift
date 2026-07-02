@@ -730,4 +730,548 @@ final class AgentRegistryTests: XCTestCase {
         XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked,
                        "A stale .blocked entry must never be swept")
     }
+
+    // MARK: - Round 3: handleScreenClassification (Herdr layer 2)
+
+    func test_handleScreenClassification_hooksEntryUnaffected_titleHeuristicEntryReflectsClassification() {
+        let registry = AgentRegistry()
+        let hooksSurface = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: hooksSurface)
+        registry.handleHookEvent(event("UserPromptSubmit", sessionID: "session-a"), surfaceID: hooksSurface)
+        XCTAssertEqual(registry.entries[hooksSurface]?.state, .working,
+                       "Precondition: a hooks-sourced entry must be working")
+
+        let heuristicSurface = UUID()
+        registry.handleTitleChange(surfaceID: heuristicSurface, title: "✳ Compacting conversation")
+        XCTAssertEqual(registry.entries[heuristicSurface]?.source, .titleHeuristic,
+                       "Precondition: a titleHeuristic entry must exist")
+
+        registry.handleScreenClassification(surfaceID: hooksSurface, state: .blocked)
+        registry.handleScreenClassification(surfaceID: heuristicSurface, state: .blocked)
+
+        XCTAssertEqual(registry.entries[hooksSurface]?.state, .working,
+                       "A screen classification must never override a hooks-sourced entry")
+        XCTAssertEqual(registry.entries[heuristicSurface]?.state, .blocked,
+                       "A screen classification must update a titleHeuristic-sourced entry")
+    }
+
+    func test_handleScreenClassification_titleHeuristicEntry_reflectsWorkingThenNilBecomesIdle() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleTitleChange(surfaceID: surfaceID, title: "✳ Compacting conversation")
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .working,
+                       "Precondition: a titleHeuristic entry starts working")
+
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .blocked)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked,
+                       "A .blocked screen classification must update a titleHeuristic entry")
+
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .working,
+                       "A .working screen classification must update a titleHeuristic entry")
+
+        registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .idle,
+                       "A nil screen classification (no known pattern matched) must fall back to idle")
+    }
+
+    func test_handleScreenClassification_unregisteredSurface_createsEntryOnlyForBlockedOrWorking() {
+        let registry = AgentRegistry()
+
+        let blockedSurface = UUID()
+        registry.handleScreenClassification(surfaceID: blockedSurface, state: .blocked)
+        XCTAssertEqual(registry.entries[blockedSurface]?.state, .blocked,
+                       "An unregistered surface classified as blocked must create a heuristic entry")
+
+        let workingSurface = UUID()
+        registry.handleScreenClassification(surfaceID: workingSurface, state: .working)
+        XCTAssertEqual(registry.entries[workingSurface]?.state, .working,
+                       "An unregistered surface classified as working must create a heuristic entry")
+
+        let plainSurface = UUID()
+        registry.handleScreenClassification(surfaceID: plainSurface, state: nil)
+        XCTAssertNil(registry.entries[plainSurface],
+                    "An unregistered surface with no recognized pattern must not create a row at all")
+    }
+
+    // MARK: - Round 3: handleProgressReport (OSC 9;4)
+
+    func test_handleProgressReport_hooksEntryUnaffected_heuristicEntryReflectsActiveState() {
+        let registry = AgentRegistry()
+        let hooksSurface = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: hooksSurface)
+        XCTAssertEqual(registry.entries[hooksSurface]?.state, .idle, "Precondition: hooks entry starts idle")
+
+        let heuristicSurface = UUID()
+        registry.handleTitleChange(surfaceID: heuristicSurface, title: "✳ Compacting conversation")
+        XCTAssertEqual(registry.entries[heuristicSurface]?.state, .working,
+                       "Precondition: heuristic entry starts working")
+
+        registry.handleProgressReport(surfaceID: heuristicSurface, isActive: false)
+        XCTAssertEqual(registry.entries[heuristicSurface]?.state, .idle,
+                       "isActive=false must set a heuristic entry to idle")
+
+        registry.handleProgressReport(surfaceID: heuristicSurface, isActive: true)
+        XCTAssertEqual(registry.entries[heuristicSurface]?.state, .working,
+                       "isActive=true must set a heuristic entry to working")
+
+        registry.handleProgressReport(surfaceID: hooksSurface, isActive: true)
+        XCTAssertEqual(registry.entries[hooksSurface]?.state, .idle,
+                       "handleProgressReport must never override a hooks-sourced entry")
+    }
+
+    // MARK: - Round 3: hooksIssues
+
+    func test_setHooksIssues_reflectsValue_andResetClears() {
+        let registry = AgentRegistry()
+        XCTAssertTrue(registry.hooksIssues.isEmpty, "Precondition: a fresh registry has no hooks issues")
+
+        registry.setHooksIssues(["ClaudeHooksConfigManager: failed to write settings.json"])
+
+        XCTAssertEqual(registry.hooksIssues, ["ClaudeHooksConfigManager: failed to write settings.json"],
+                       "setHooksIssues must update the observable hooksIssues array")
+
+        registry.reset()
+
+        XCTAssertTrue(registry.hooksIssues.isEmpty, "reset() must clear hooksIssues")
+    }
+
+    // MARK: - Round 3: unread message badges (peer binding + updateInbox)
+
+    func test_handleHookEvent_preToolUseWithIpcSelfPeerID_learnsBindingReflectedViaUpdateInbox() {
+        let registry = AgentRegistry()
+        let boundSurface = UUID()
+        let peerID = UUID()
+        // A PreToolUse for a calyx-ipc tool carries this surface's own
+        // peer ID in ipcSelfPeerID — handleHookEvent must learn the
+        // surface -> peer binding from it.
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerID.uuidString),
+            surfaceID: boundSurface
+        )
+
+        let unboundSurface = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-b"), surfaceID: unboundSurface)
+
+        registry.updateInbox(peerID: peerID, count: 3)
+        registry.updateInbox(peerID: UUID(), count: 99)  // an unknown / unbound peer
+
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 3,
+                       "updateInbox must set unreadCount on the surface bound to this peer via PreToolUse")
+        XCTAssertEqual(registry.entries[unboundSurface]?.unreadCount, 0,
+                       "A peer with no bound surface must not affect any entry's unreadCount")
+    }
+
+    func test_updateInbox_bindingForgottenOnHandleSurfaceDestroyed() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let peerID = UUID()
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerID.uuidString),
+            surfaceID: surfaceID
+        )
+        registry.updateInbox(peerID: peerID, count: 5)
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 5,
+                       "updateInbox must set unreadCount for the bound surface")
+
+        registry.handleSurfaceDestroyed(surfaceID: surfaceID)
+        XCTAssertNil(registry.entries[surfaceID], "Precondition: destroying the surface removes its entry")
+
+        // Re-register the same surfaceID fresh and update the same peer's
+        // inbox again: the old binding must have been forgotten, so the
+        // fresh entry must not retroactively pick up the stale count.
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-c"), surfaceID: surfaceID)
+        registry.updateInbox(peerID: peerID, count: 9)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 0,
+                       "A destroyed surface's peer binding must not survive its re-registration")
+    }
+
+    func test_updateInbox_bindingForgottenOnReset() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let peerID = UUID()
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerID.uuidString),
+            surfaceID: surfaceID
+        )
+        registry.updateInbox(peerID: peerID, count: 4)
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 4,
+                       "updateInbox must set unreadCount for the bound surface before reset")
+
+        registry.reset()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-d"), surfaceID: surfaceID)
+        registry.updateInbox(peerID: peerID, count: 8)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 0,
+                       "reset() must forget peer bindings so a re-registered surface doesn't inherit the old peer's count")
+    }
+
+    // MARK: - Round 3 fix: register_peer PostToolUse binding + 1 peer = 1 surface
+
+    func test_handleHookEvent_postToolUseRegisterPeerResponse_learnsBinding() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let peerID = UUID()
+
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PostToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerID.uuidString),
+            surfaceID: surfaceID
+        )
+        registry.updateInbox(peerID: peerID, count: 2)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 2,
+                       "A register_peer PostToolUse's self-reported peer ID must bind the surface " +
+                       "immediately, before any other calyx-ipc tool call")
+    }
+
+    func test_bindSurface_newBindingForSamePeer_replacesOldSurfaceBinding() {
+        // "1 peer = 1 surface": rebinding peerID to a new surface must
+        // remove its previous surface's binding, not let both surfaces
+        // receive updateInbox for the same peer.
+        let registry = AgentRegistry()
+        let peerID = UUID()
+        let oldSurface = UUID()
+        let newSurface = UUID()
+
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerID.uuidString),
+            surfaceID: oldSurface
+        )
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-b", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerID.uuidString),
+            surfaceID: newSurface
+        )
+
+        registry.updateInbox(peerID: peerID, count: 7)
+
+        XCTAssertEqual(registry.entries[newSurface]?.unreadCount, 7,
+                       "The new surface must receive updateInbox for the rebound peer")
+        XCTAssertEqual(registry.entries[oldSurface]?.unreadCount, 0,
+                       "The old surface's stale binding must no longer receive updateInbox for this peer")
+    }
+
+    func test_bindSurface_doubleSteal_surfaceMovesToPeerThatHadADifferentSurface_endsAsCleanBijection() {
+        // The "double-steal" case (post-review follow-up): surface A
+        // moves off its own old peer P1 AND onto peer P2, where P2 was
+        // itself already bound to a different surface B — both
+        // invalidation branches of bindSurface fire in the same call.
+        // The end state must be a true bijection: {A: P2} / {P2: A},
+        // with P1 (A's stale peer) and B (P2's stale surface) fully
+        // absent from both directions.
+        let registry = AgentRegistry()
+        let peer1 = UUID()
+        let peer2 = UUID()
+        let surfaceA = UUID()
+        let surfaceB = UUID()
+
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peer1.uuidString),
+            surfaceID: surfaceA
+        )
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-b", cwd: nil, message: nil,
+                       ipcSelfPeerID: peer2.uuidString),
+            surfaceID: surfaceB
+        )
+
+        // The double-steal: A rebinds to P2, the peer B is currently bound to.
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peer2.uuidString),
+            surfaceID: surfaceA
+        )
+
+        registry.updateInbox(peerID: peer2, count: 9)
+        registry.updateInbox(peerID: peer1, count: 99)
+
+        XCTAssertEqual(registry.entries[surfaceA]?.unreadCount, 9,
+                       "A must receive updateInbox for P2, the peer it just rebound to")
+        XCTAssertEqual(registry.entries[surfaceB]?.unreadCount, 0,
+                       "B's stale binding to P2 must be fully evicted — B must not receive P2's " +
+                       "updateInbox anymore")
+
+        XCTAssertEqual(Set(registry.boundPeerIDs), [peer2],
+                       "Only P2 must remain bound after the double-steal: P1 (A's old peer) is fully " +
+                       "evicted since A moved off it, proving both invalidation branches of " +
+                       "bindSurface fired correctly in the same call")
+    }
+
+    // MARK: - Round 3: boundPeerIDs / syncInboxCounts (batch badge sync)
+
+    func test_boundPeerIDs_reflectsEveryCurrentlyBoundPeer() {
+        let registry = AgentRegistry()
+        let peerA = UUID()
+        let peerB = UUID()
+
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerA.uuidString),
+            surfaceID: UUID()
+        )
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-b", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerB.uuidString),
+            surfaceID: UUID()
+        )
+
+        XCTAssertEqual(Set(registry.boundPeerIDs), Set([peerA, peerB]))
+    }
+
+    func test_syncInboxCounts_appliesCountPerBoundSurface_skipsUnboundPeers() {
+        let registry = AgentRegistry()
+        let boundSurfaceA = UUID()
+        let boundSurfaceB = UUID()
+        let peerA = UUID()
+        let peerB = UUID()
+        let unboundPeer = UUID()
+
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerA.uuidString),
+            surfaceID: boundSurfaceA
+        )
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-b", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerB.uuidString),
+            surfaceID: boundSurfaceB
+        )
+
+        registry.syncInboxCounts([peerA: 3, peerB: 5, unboundPeer: 99])
+
+        XCTAssertEqual(registry.entries[boundSurfaceA]?.unreadCount, 3)
+        XCTAssertEqual(registry.entries[boundSurfaceB]?.unreadCount, 5)
+    }
+
+    func test_syncInboxCounts_purgedPeerNotInCounts_leavesLastKnownCountUnchanged() {
+        // Regression: syncing against a counts map that no longer
+        // includes a since-purged peer must not silently reset that
+        // surface's badge — the batch sync only ever applies counts it
+        // was actually given for a peer it still has a binding for.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let peerID = UUID()
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                       ipcSelfPeerID: peerID.uuidString),
+            surfaceID: surfaceID
+        )
+        registry.updateInbox(peerID: peerID, count: 4)
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 4)
+
+        registry.syncInboxCounts([:])
+
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 4,
+                       "An empty/unrelated counts map must not zero out a surface's last known unreadCount")
+    }
+
+    // MARK: - Round 3 fix: heuristic row retirement (miss-streak)
+
+    func test_handleScreenClassification_fiveConsecutiveNilMisses_removesHeuristicRow() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+        XCTAssertNotNil(registry.entries[surfaceID], "Precondition: a titleHeuristic row must exist")
+
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        XCTAssertNotNil(registry.entries[surfaceID],
+                        "4 consecutive nil misses (below the 5-miss threshold) must not remove the row yet")
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .idle)
+
+        registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+
+        XCTAssertNil(registry.entries[surfaceID],
+                     "The 5th consecutive nil miss must retire (remove) the heuristic row")
+    }
+
+    func test_handleScreenClassification_missStreakResetByPositiveScreenSignal() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        XCTAssertNotNil(registry.entries[surfaceID], "Precondition: row survives 4 misses")
+
+        // A .blocked/.working screen classification is a "positive"
+        // signal that resets the miss streak back to 0.
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        XCTAssertNotNil(registry.entries[surfaceID],
+                        "The reset streak must require a fresh 5 consecutive misses, " +
+                        "not continue accumulating from before the reset")
+    }
+
+    func test_handleScreenClassification_missStreakResetByTitleWorkingSignal() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        XCTAssertNotNil(registry.entries[surfaceID], "Precondition: row survives 4 misses")
+
+        // A .working title classification (the spinner glyph) is also a
+        // "positive" signal that resets the miss streak.
+        registry.handleTitleChange(surfaceID: surfaceID, title: "✳ Compacting conversation")
+
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        XCTAssertNotNil(registry.entries[surfaceID],
+                        "A title-heuristic working signal must reset the miss streak")
+    }
+
+    func test_handleScreenClassification_missStreakResetByProgressActiveSignal() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        XCTAssertNotNil(registry.entries[surfaceID], "Precondition: row survives 4 misses")
+
+        // An isActive=true progress report is also a "positive" signal
+        // that resets the miss streak.
+        registry.handleProgressReport(surfaceID: surfaceID, isActive: true)
+
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        XCTAssertNotNil(registry.entries[surfaceID],
+                        "A progress-report active signal must reset the miss streak")
+    }
+
+    func test_handleSurfaceDestroyed_forgetsMissStreak_freshRegistrationStartsClean() {
+        // Regression ("REMOVE overwrite"): a destroyed surface's prior
+        // miss-streak bookkeeping must not leak into a fresh registration
+        // for the same surfaceID and cause it to be retired prematurely.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        XCTAssertNotNil(registry.entries[surfaceID], "Precondition: row survives 4 misses")
+
+        registry.handleSurfaceDestroyed(surfaceID: surfaceID)
+        XCTAssertNil(registry.entries[surfaceID])
+
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+
+        XCTAssertNotNil(registry.entries[surfaceID],
+                        "A fresh registration after handleSurfaceDestroyed must start with a clean miss " +
+                        "streak, not inherit the 4 misses accumulated before destruction")
+    }
+
+    func test_handleHookEvent_forgetsHeuristicMissStreak() {
+        // A hook event promoting a titleHeuristic row (or registering a
+        // fresh hooks row) must clear any stale heuristic miss-streak
+        // bookkeeping for that surface.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: surfaceID)
+        XCTAssertEqual(registry.entries[surfaceID]?.source, .hooks,
+                       "Precondition: the hook event must promote/replace the row as .hooks-sourced")
+
+        // Demote back to a fresh heuristic row the only way possible —
+        // destroy and re-create — to observe whether the miss streak from
+        // before the hook event leaked through.
+        registry.handleSurfaceDestroyed(surfaceID: surfaceID)
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+        for _ in 0..<4 {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+
+        XCTAssertNotNil(registry.entries[surfaceID],
+                        "A fresh heuristic row must not inherit a miss streak left over from before " +
+                        "the surface was promoted to .hooks")
+    }
+
+    // MARK: - Round 3 fix: heuristic signal arbitration (blocked protection)
+
+    func test_applyHeuristicState_blockedNotClearedByNonAuthoritativeProgressReport() {
+        // Regression: a titleHeuristic row's .blocked state (set by a
+        // screen classification that saw an approval prompt) must not be
+        // cleared by a lower-confidence progress-report signal going
+        // inactive — only a screen classification's own non-blocked
+        // result may clear it.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .blocked)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        registry.handleProgressReport(surfaceID: surfaceID, isActive: false)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked,
+                       "A progress-report isActive=false must not clear a .blocked heuristic row")
+    }
+
+    func test_applyHeuristicState_blockedNotClearedByNonAuthoritativeTitleChange() {
+        // Regression: same protection against a title-heuristic signal
+        // (spinner glyph, i.e. "still working") flapping a .blocked row
+        // back to .working.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .blocked)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        registry.handleTitleChange(surfaceID: surfaceID, title: "✳ Compacting conversation")
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked,
+                       "A title-heuristic working signal must not clear a .blocked heuristic row")
+    }
+
+    func test_applyHeuristicState_blockedClearedOnlyByAuthoritativeScreenNilResult() {
+        // The complementary case: a screen classification's own miss
+        // (nil, falling back to idle) — the authoritative source — DOES
+        // clear .blocked, unlike the non-authoritative signals above.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .blocked)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .idle,
+                       "A screen classification's own non-blocked (nil -> idle) result must clear .blocked")
+    }
+
+    func test_applyHeuristicState_sameStateWriteDoesNotRefreshLastEventAt() {
+        // (a) "don't write an identical state" — verified indirectly via
+        // lastEventAt, since AgentEntry equality would otherwise make a
+        // same-state no-op write unobservable.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+        let firstEventAt = registry.entries[surfaceID]?.lastEventAt
+
+        // Re-applying the identical state must not bump lastEventAt.
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.lastEventAt, firstEventAt,
+                       "Writing the same state again must not refresh lastEventAt (no-op write)")
+    }
 }

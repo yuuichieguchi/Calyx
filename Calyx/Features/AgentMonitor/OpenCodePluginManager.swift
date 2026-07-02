@@ -168,7 +168,11 @@ enum OpenCodePluginManager: Sendable {
     /// that directory if needed, and returns its absolute path. Overwrites
     /// any existing file at that path — reinstalling is idempotent since
     /// `scriptBody` is a fixed constant, not something merged with prior
-    /// content.
+    /// content. A symlink at the destination path (a dotfiles-managed
+    /// OpenCode config root can legitimately symlink `plugins/` or the
+    /// plugin file itself elsewhere) is followed to its real file
+    /// (`ConfigFileUtils.resolveConfigPath`) and overwritten in place,
+    /// leaving the symlink itself intact.
     static func install(pluginsDirectory: String? = nil) throws -> String {
         let scriptPath = pluginPath(pluginsDirectory: pluginsDirectory)
         let pluginsDir = (scriptPath as NSString).deletingLastPathComponent
@@ -178,21 +182,24 @@ enum OpenCodePluginManager: Sendable {
             try fm.createDirectory(atPath: pluginsDir, withIntermediateDirectories: true)
         }
 
-        guard !ConfigFileUtils.isSymlink(at: scriptPath) else {
-            throw ConfigFileError.symlinkDetected
-        }
-
-        try scriptBody.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+        let resolvedScriptPath = try ConfigFileUtils.resolveConfigPath(scriptPath)
+        try scriptBody.write(toFile: resolvedScriptPath, atomically: true, encoding: .utf8)
         return scriptPath
     }
 
     /// Deletes the plugin file. A no-op when nothing is installed; throws
     /// if the file exists but couldn't be removed (e.g. a permissions
-    /// error), rather than silently leaving it in place.
+    /// error), rather than silently leaving it in place. Symmetric with
+    /// `install`: resolves a symlinked destination path
+    /// (`ConfigFileUtils.resolveConfigPath`) and removes the real target
+    /// file, leaving the symlink itself intact (now dangling) — removing
+    /// the raw `path` instead would delete the symlink and leave the
+    /// real installed file behind un-removed.
     static func remove(pluginsDirectory: String? = nil) throws {
         let path = pluginPath(pluginsDirectory: pluginsDirectory)
-        guard FileManager.default.fileExists(atPath: path) else { return }
-        try FileManager.default.removeItem(atPath: path)
+        let resolvedPath = try ConfigFileUtils.resolveConfigPath(path)
+        guard FileManager.default.fileExists(atPath: resolvedPath) else { return }
+        try FileManager.default.removeItem(atPath: resolvedPath)
     }
 
     static func isInstalled(pluginsDirectory: String? = nil) -> Bool {

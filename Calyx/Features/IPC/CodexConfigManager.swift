@@ -9,15 +9,12 @@ import Foundation
 
 enum CodexConfigError: Error, LocalizedError {
     case directoryNotFound
-    case symlinkDetected
     case writeFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .directoryNotFound:
             return "The ~/.codex/ directory does not exist"
-        case .symlinkDetected:
-            return "The config path is a symlink, which is not allowed for security reasons"
         case .writeFailed(let reason):
             return "Failed to write config file: \(reason)"
         }
@@ -31,17 +28,12 @@ struct CodexConfigManager: Sendable {
     // MARK: - Public API
 
     static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
-        let path = configPath ?? defaultConfigPath
+        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
         let parentDir = (path as NSString).deletingLastPathComponent
 
         // Parent directory must exist
         guard ConfigFileUtils.directoryExists(at: parentDir) else {
             throw CodexConfigError.directoryNotFound
-        }
-
-        // Security: reject symlinks
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw CodexConfigError.symlinkDetected
         }
 
         // Read existing content or start empty
@@ -76,19 +68,14 @@ struct CodexConfigManager: Sendable {
         guard let data = result.data(using: .utf8) else {
             throw CodexConfigError.writeFailed("UTF-8 encoding failed")
         }
-        try ConfigFileUtils.atomicWrite(data: data, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     static func disableIPC(configPath: String? = nil) throws {
-        let path = configPath ?? defaultConfigPath
+        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
 
         // No file → no-op
         guard FileManager.default.fileExists(atPath: path) else { return }
-
-        // Security: reject symlinks
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw CodexConfigError.symlinkDetected
-        }
 
         // Unreadable → no-op
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
@@ -102,11 +89,17 @@ struct CodexConfigManager: Sendable {
         guard let data = cleaned.data(using: .utf8) else {
             throw CodexConfigError.writeFailed("UTF-8 encoding failed")
         }
-        try ConfigFileUtils.atomicWrite(data: data, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
+    /// Returns `false` (rather than throwing) when `configPath`'s symlink
+    /// chain can't be resolved — this is a read-only status check, and
+    /// every other unreadable-file case here already resolves to `false`
+    /// the same way.
     static func isIPCEnabled(configPath: String? = nil) -> Bool {
-        let path = configPath ?? defaultConfigPath
+        guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
+            return false
+        }
 
         guard FileManager.default.fileExists(atPath: path),
               let content = try? String(contentsOfFile: path, encoding: .utf8) else {

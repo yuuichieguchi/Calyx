@@ -49,28 +49,10 @@ final class GhosttySurfaceSelectionReader: SelectionReading {
     }
 
     func readSelection() -> (text: String, tlPxX: Double, tlPxY: Double)? {
-        var text = ghostty_text_s()
-        guard GhosttyFFI.surfaceReadSelection(surface, text: &text) else { return nil }
-        defer {
-            var mutableText = text
-            GhosttyFFI.surfaceFreeText(surface, text: &mutableText)
-        }
-
-        // Decode using text_len (not NUL-terminated).
-        let len = Int(text.text_len)
-        guard len > 0 else { return nil }
-
-        let decoded: String
-        if let ptr = text.text {
-            let uint8Ptr = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
-            let buffer = UnsafeBufferPointer(start: uint8Ptr, count: len)
-            decoded = String(decoding: buffer, as: UTF8.self)
-        } else {
+        guard let result = readAndDecodeText({ GhosttyFFI.surfaceReadSelection(surface, text: &$0) }) else {
             return nil
         }
-
-        guard !decoded.isEmpty else { return nil }
-        return (text: decoded, tlPxX: text.tl_px_x, tlPxY: text.tl_px_y)
+        return (text: result.text, tlPxX: result.raw.tl_px_x, tlPxY: result.raw.tl_px_y)
     }
 
     func cellDimensions() -> (cellW: Double, cellH: Double, cols: Int)? {
@@ -81,6 +63,47 @@ final class GhosttySurfaceSelectionReader: SelectionReading {
         return (cellW: cellW, cellH: cellH, cols: Int(size.columns))
     }
 
+    /// Reads the pane's bottom `rows` *active-screen* lines (clamped to
+    /// however many rows the surface actually has), for
+    /// `ScreenStateClassifier`'s Herdr-layer-2 polling. Unlike
+    /// `readSelection()`, this doesn't require an active user selection:
+    /// it builds an explicit `ACTIVE`-relative selection spanning from
+    /// `rows` lines above the bottom (`EXACT` top-left, clamped to row 0)
+    /// to the active screen's `BOTTOM_RIGHT`, non-rectangular so wrapped
+    /// lines read as continuous text. Follows the same decode +
+    /// `defer`-release shape as `readSelection()`.
+    ///
+    /// Deliberately `ACTIVE`, not `VIEWPORT`: `VIEWPORT` is relative to
+    /// wherever the user has scrolled to, so classifying it while
+    /// scrollback is being browsed would read stale, already-scrolled-
+    /// past screen content instead of the pane's actual current
+    /// blocked/working status. `ACTIVE` always addresses the live
+    /// (bottom) screen region regardless of scroll position, which is
+    /// what the classifier needs to reflect the pane's real-time state.
+    func readActiveBottomText(rows: Int) -> String? {
+        let totalRows = Int(GhosttyFFI.surfaceSize(surface).rows)
+        guard totalRows > 0 else { return nil }
+        let startRow = UInt32(max(0, totalRows - rows))
+
+        let selection = ghostty_selection_s(
+            top_left: ghostty_point_s(
+                tag: GHOSTTY_POINT_ACTIVE,
+                coord: GHOSTTY_POINT_COORD_EXACT,
+                x: 0,
+                y: startRow
+            ),
+            bottom_right: ghostty_point_s(
+                tag: GHOSTTY_POINT_ACTIVE,
+                coord: GHOSTTY_POINT_COORD_BOTTOM_RIGHT,
+                x: 0,
+                y: 0
+            ),
+            rectangle: false
+        )
+
+        return readAndDecodeText({ GhosttyFFI.surfaceReadText(surface, selection: selection, text: &$0) })?.text
+    }
+
     func cursorPixelPosition() -> (x: Double, y: Double)? {
         var x: Double = 0
         var y: Double = 0
@@ -88,6 +111,42 @@ final class GhosttySurfaceSelectionReader: SelectionReading {
         var height: Double = 0
         GhosttyFFI.surfaceIMEPoint(surface, x: &x, y: &y, width: &width, height: &height)
         return (x: x, y: y)
+    }
+
+    /// Runs `read` (an FFI call that fills `text` and reports success),
+    /// guarantees `GhosttyFFI.surfaceFreeText` runs on the result before
+    /// returning regardless of outcome, and decodes the UTF-8 text
+    /// buffer (`text.text` / `text.text_len`, not NUL-terminated) into a
+    /// Swift `String` — `nil` for an unsuccessful read, or one whose
+    /// buffer is empty/absent or decodes to an empty string. Shared by
+    /// `readSelection()` and `readActiveBottomText(rows:)`, whose only
+    /// difference is which FFI call fills `text` (and, for
+    /// `readSelection()`, that it also needs `raw`'s `tl_px_x`/`tl_px_y`
+    /// fields) — this keeps the FFI buffer's read/decode/free lifecycle
+    /// in exactly one place. `raw`'s scalar fields remain valid to read
+    /// after this returns even though `raw.text` itself has already been
+    /// freed: `GhosttyFFI.surfaceFreeText` only releases the buffer
+    /// `raw.text` points to, not the `ghostty_text_s` value itself,
+    /// whose other fields were already value-copied by the FFI call.
+    private func readAndDecodeText(
+        _ read: (inout ghostty_text_s) -> Bool
+    ) -> (text: String, raw: ghostty_text_s)? {
+        var text = ghostty_text_s()
+        guard read(&text) else { return nil }
+        defer {
+            var mutableText = text
+            GhosttyFFI.surfaceFreeText(surface, text: &mutableText)
+        }
+
+        let len = Int(text.text_len)
+        guard len > 0, let ptr = text.text else { return nil }
+
+        let uint8Ptr = UnsafeRawPointer(ptr).assumingMemoryBound(to: UInt8.self)
+        let buffer = UnsafeBufferPointer(start: uint8Ptr, count: len)
+        let decoded = String(decoding: buffer, as: UTF8.self)
+        guard !decoded.isEmpty else { return nil }
+
+        return (text: decoded, raw: text)
     }
 }
 

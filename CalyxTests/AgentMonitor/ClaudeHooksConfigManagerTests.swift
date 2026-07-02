@@ -67,8 +67,12 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     }
 
     private func writeConfigDict(_ dict: [String: Any]) throws {
+        try writeConfigDict(dict, to: configPath)
+    }
+
+    private func writeConfigDict(_ dict: [String: Any], to path: String) throws {
         let data = try JSONSerialization.data(withJSONObject: dict)
-        try data.write(to: URL(fileURLWithPath: configPath))
+        try data.write(to: URL(fileURLWithPath: path))
     }
 
     private func readConfigDict() throws -> [String: Any] {
@@ -267,16 +271,30 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
 
     // MARK: - Security
 
-    func test_installHooks_symlinkConfigPath_throws() throws {
+    // Contract changed (Round 3): ~/.claude/settings.json is commonly a
+    // dotfiles-managed symlink, and blanket symlink rejection is exactly
+    // the bug that silently broke hooks installation end-to-end in that
+    // setup (see the dotfiles-fixture tests below for the full
+    // real-environment reproduction). Calyx now follows the link and
+    // writes through to the real target file, leaving the link intact.
+    func test_installHooks_symlinkConfigPath_followsToRealFileAndKeepsLinkIntact() throws {
         let realFile = tempDir + "/real_settings.json"
         writeConfig("{}")
         try FileManager.default.moveItem(atPath: configPath, toPath: realFile)
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: realFile)
 
-        XCTAssertThrowsError(
-            try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath),
-            "Should reject a symlinked config path"
-        )
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+
+        let realFileData = try Data(contentsOf: URL(fileURLWithPath: realFile))
+        let realFileDict = (try JSONSerialization.jsonObject(with: realFileData) as? [String: Any]) ?? [:]
+        XCTAssertFalse(hookGroups(realFileDict, event: "SessionStart").isEmpty,
+                       "installHooks must write through the symlink into the real file")
+
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at configPath must survive the write, not be replaced with a regular file")
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: configPath)
+        XCTAssertEqual(destination, realFile, "The symlink must still point at the same real file")
     }
 
     // MARK: - Backup
@@ -342,5 +360,191 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
 
         XCTAssertTrue(ClaudeHooksConfigManager.areHooksInstalled(configPath: configPath),
                       "After installHooks, hooks must be reported as installed")
+    }
+
+    // MARK: - Round 3: dotfiles symlink real-environment reproduction
+    //
+    // This reproduces the exact layout that broke hooks in production:
+    // `~/dotfiles/.claude/settings.json` holding the real, user-managed
+    // content, with `~/.claude/settings.json` symlinked to it. Earlier
+    // rounds' unit tests all passed against the old "reject symlinks"
+    // contract precisely because they treated that contract as correct —
+    // no test exercised this real directory shape. These do, with no
+    // mocking of the filesystem.
+
+    private func makeDotfilesFixture(existingConfig: [String: Any]) throws -> (dotfilesSettingsPath: String, homeSettingsPath: String) {
+        let dotfilesDir = tempDir + "/dotfiles/.claude"
+        let homeDir = tempDir + "/home/.claude"
+        try FileManager.default.createDirectory(atPath: dotfilesDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: homeDir, withIntermediateDirectories: true)
+
+        let dotfilesSettingsPath = dotfilesDir + "/settings.json"
+        let data = try JSONSerialization.data(withJSONObject: existingConfig)
+        try data.write(to: URL(fileURLWithPath: dotfilesSettingsPath))
+
+        let homeSettingsPath = homeDir + "/settings.json"
+        try FileManager.default.createSymbolicLink(atPath: homeSettingsPath, withDestinationPath: dotfilesSettingsPath)
+
+        return (dotfilesSettingsPath, homeSettingsPath)
+    }
+
+    func test_installHooks_dotfilesSymlinkedSettingsJSON_writesRealFilePreservesUserHooksAndKeepsLinkIntact() throws {
+        let existingConfig: [String: Any] = [
+            "hooks": [
+                "PreToolUse": [
+                    ["matcher": "Bash", "hooks": [
+                        ["type": "command", "command": "/usr/local/bin/user-hook", "timeout": 10],
+                    ]],
+                ],
+            ],
+            "permissions": ["allow": ["read", "write"]],
+        ]
+        let (dotfilesSettingsPath, homeSettingsPath) = try makeDotfilesFixture(existingConfig: existingConfig)
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: homeSettingsPath)
+
+        // The real dotfiles-managed file received Calyx's 7 events...
+        let realData = try Data(contentsOf: URL(fileURLWithPath: dotfilesSettingsPath))
+        let realDict = try XCTUnwrap(try JSONSerialization.jsonObject(with: realData) as? [String: Any])
+        for eventName in Self.expectedEvents {
+            XCTAssertFalse(hookGroups(realDict, event: eventName).isEmpty,
+                           "\(eventName) must be installed into the real dotfiles-managed file")
+        }
+
+        // ...the user's own pre-existing PreToolUse hook survived alongside it...
+        let preToolUseGroups = hookGroups(realDict, event: "PreToolUse")
+        XCTAssertTrue(preToolUseGroups.contains { ($0["matcher"] as? String) == "Bash" },
+                      "The user's existing 'Bash' matcher group must be preserved in the real file")
+
+        // ...unrelated top-level keys survived too...
+        let permissions = realDict["permissions"] as? [String: Any]
+        XCTAssertEqual(permissions?["allow"] as? [String], ["read", "write"])
+
+        // ...and ~/.claude/settings.json is still a symlink, not replaced
+        // by a plain file (a dotfiles manager tracking that path would
+        // otherwise see it "go missing" from its symlink inventory).
+        let attrs = try FileManager.default.attributesOfItem(atPath: homeSettingsPath)
+        XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "~/.claude/settings.json must remain a symlink after installHooks")
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: homeSettingsPath)
+        XCTAssertEqual(destination, dotfilesSettingsPath)
+    }
+
+    func test_installThenRemove_dotfilesSymlink_restoresRealFileAndKeepsLinkIntact() throws {
+        let existingConfig: [String: Any] = [
+            "hooks": [
+                "PreToolUse": [
+                    ["matcher": "Bash", "hooks": [
+                        ["type": "command", "command": "/usr/local/bin/user-hook", "timeout": 10],
+                    ]],
+                ],
+            ],
+        ]
+        let (dotfilesSettingsPath, homeSettingsPath) = try makeDotfilesFixture(existingConfig: existingConfig)
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: homeSettingsPath)
+        try ClaudeHooksConfigManager.removeHooks(configPath: homeSettingsPath)
+
+        let realData = try Data(contentsOf: URL(fileURLWithPath: dotfilesSettingsPath))
+        let realDict = try XCTUnwrap(try JSONSerialization.jsonObject(with: realData) as? [String: Any])
+
+        let preToolUseGroups = hookGroups(realDict, event: "PreToolUse")
+        XCTAssertEqual(preToolUseGroups.count, 1, "Only the user's own PreToolUse group must remain in the real file")
+        XCTAssertEqual(commandEntries(preToolUseGroups).first?["command"] as? String, "/usr/local/bin/user-hook")
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: homeSettingsPath)
+        XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "~/.claude/settings.json must remain a symlink after install+remove")
+    }
+
+    func test_installHooks_danglingDotfilesSymlink_createsRealFileAtLinkTarget() throws {
+        // The classic "pre-linked, target not yet created" dotfiles state:
+        // `chezmoi`/`stow`-style tooling can lay down the symlink before
+        // the tracked file exists in the repo.
+        let dotfilesDir = tempDir + "/dotfiles/.claude"
+        let homeDir = tempDir + "/home/.claude"
+        try FileManager.default.createDirectory(atPath: dotfilesDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: homeDir, withIntermediateDirectories: true)
+        let dotfilesSettingsPath = dotfilesDir + "/settings.json"
+        let homeSettingsPath = homeDir + "/settings.json"
+        try FileManager.default.createSymbolicLink(atPath: homeSettingsPath, withDestinationPath: dotfilesSettingsPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dotfilesSettingsPath),
+                       "Precondition: the symlink's target must not exist yet (dangling)")
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: homeSettingsPath)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dotfilesSettingsPath),
+                      "installHooks must create the file at the dangling symlink's target path")
+        let realData = try Data(contentsOf: URL(fileURLWithPath: dotfilesSettingsPath))
+        let realDict = try XCTUnwrap(try JSONSerialization.jsonObject(with: realData) as? [String: Any])
+        XCTAssertFalse(hookGroups(realDict, event: "SessionStart").isEmpty)
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: homeSettingsPath)
+        XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The now-resolved symlink must remain a symlink, not become a regular file")
+    }
+
+    // Round 3 fix: resolveConfigPath now follows a multi-hop *dangling*
+    // symlink chain (link -> link -> not-yet-existing file) all the way
+    // to its final destination, rather than stopping at the first
+    // intermediate link. Same shared ConfigFileUtils primitive as every
+    // other config manager.
+    func test_installHooks_multiHopDanglingSymlink_createsRealFileAtFinalDestination() throws {
+        let finalTarget = tempDir + "/dotfiles/.claude/settings.json"
+        try FileManager.default.createDirectory(
+            atPath: (finalTarget as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+        let middleLink = tempDir + "/middle-link.json"
+        try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
+        try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: middleLink)
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalTarget),
+                      "installHooks must create the file at the multi-hop dangling chain's final destination")
+        let realData = try Data(contentsOf: URL(fileURLWithPath: finalTarget))
+        let realDict = try XCTUnwrap(try JSONSerialization.jsonObject(with: realData) as? [String: Any])
+        XCTAssertFalse(hookGroups(realDict, event: "SessionStart").isEmpty)
+
+        let middleAttrs = try FileManager.default.attributesOfItem(atPath: middleLink)
+        XCTAssertEqual(middleAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The intermediate link must survive as a symlink, not be replaced with a regular file")
+    }
+
+    func test_installHooks_symlinkedParentDotClaudeDirectory_writesThroughToRealDirectory() throws {
+        // A less common but real dotfiles pattern: the whole `.claude`
+        // directory is symlinked (`ln -s ~/dotfiles/.claude ~/.claude`)
+        // rather than the individual settings.json file.
+        let dotfilesClaudeDir = tempDir + "/dotfiles/.claude"
+        try FileManager.default.createDirectory(atPath: dotfilesClaudeDir, withIntermediateDirectories: true)
+        let dotfilesSettingsPath = dotfilesClaudeDir + "/settings.json"
+        try writeConfigDict(
+            ["hooks": ["PreToolUse": [["matcher": "Bash", "hooks": [
+                ["type": "command", "command": "/usr/local/bin/user-hook", "timeout": 10],
+            ]]]]],
+            to: dotfilesSettingsPath
+        )
+
+        let homeClaudeDir = tempDir + "/home/.claude"
+        try FileManager.default.createDirectory(
+            atPath: (homeClaudeDir as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(atPath: homeClaudeDir, withDestinationPath: dotfilesClaudeDir)
+        let homeSettingsPath = homeClaudeDir + "/settings.json"
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: homeSettingsPath)
+
+        let realData = try Data(contentsOf: URL(fileURLWithPath: dotfilesSettingsPath))
+        let realDict = try XCTUnwrap(try JSONSerialization.jsonObject(with: realData) as? [String: Any])
+        XCTAssertFalse(hookGroups(realDict, event: "SessionStart").isEmpty,
+                       "installHooks must write into the real directory reached through the symlinked parent")
+        XCTAssertTrue(hookGroups(realDict, event: "PreToolUse").contains { ($0["matcher"] as? String) == "Bash" },
+                      "The user's existing hook in the real directory must be preserved")
+
+        let parentAttrs = try FileManager.default.attributesOfItem(atPath: homeClaudeDir)
+        XCTAssertEqual(parentAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlinked .claude directory itself must remain a symlink")
     }
 }

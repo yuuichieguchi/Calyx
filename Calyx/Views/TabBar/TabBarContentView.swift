@@ -431,21 +431,7 @@ private struct TabItemButton: View {
                 }
 
                 if tab.unreadNotifications > 0 {
-                    Text(tab.unreadNotifications > 99 ? "99+" : "\(tab.unreadNotifications)")
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 5)
-                        .padding(.vertical, 2)
-                        .background(
-                            Capsule()
-                                .fill(
-                                    Color.red
-                                )
-                        )
-                        .overlay(
-                            Capsule()
-                                .stroke(Color.white.opacity(0.22), lineWidth: 1)
-                        )
+                    UnreadCountBadge(count: tab.unreadNotifications)
                 }
 
                 // Visual-only close icon. No `.onTapGesture`, no

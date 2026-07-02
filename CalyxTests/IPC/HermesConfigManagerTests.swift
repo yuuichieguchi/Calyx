@@ -11,7 +11,10 @@
 // - Self-healing on malformed managed block during enable
 // - `disableIPC` removal preserving user content
 // - Strict managed-block detection (BEGIN + END + `calyx-ipc:` all required)
-// - Security: symlink rejection, invalid UTF-8 rejection
+// - Security: invalid UTF-8 rejection
+// - Round 3: symlink following (writes through to the real target file,
+//   dangling-link target creation), consistent with the other 6 config
+//   managers
 // - `isIPCEnabled` true/false for various structural states
 
 import XCTest
@@ -329,7 +332,13 @@ final class HermesConfigManagerTests: XCTestCase {
         }
     }
 
-    func test_enableIPC_rejectsSymlink() throws {
+    // Contract changed (Round 3): dotfiles-managed setups commonly symlink
+    // ~/.hermes/config.yaml to a repo elsewhere, and blanket symlink
+    // rejection silently broke IPC configuration entirely for that
+    // (legitimate, self-authored) setup — the same fix as the other 6
+    // config managers. Calyx now follows the link and writes through to
+    // the real target file, leaving the link itself intact.
+    func test_enableIPC_symlinkFollowedToRealFile_writesSuccessfullyAndKeepsLinkIntact() throws {
         // Given: configPath is a symlink to a real file
         let realFile = tempDir + "/real_config.yaml"
         try writeConfig("agent_name: \"hermes\"\n")
@@ -344,20 +353,71 @@ final class HermesConfigManagerTests: XCTestCase {
         XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink,
                        "Test setup: configPath should be a symlink")
 
-        // When/Then: throws .symlinkDetected
-        XCTAssertThrowsError(
-            try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
-        ) { error in
-            guard let configError = error as? HermesConfigError else {
-                XCTFail("Expected HermesConfigError, got \(type(of: error))")
-                return
-            }
-            if case .symlinkDetected = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .symlinkDetected, got \(configError)")
-            }
-        }
+        // When: enableIPC is called through the symlinked path
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        // Then: the REAL file received the managed block, and the user's
+        // existing content survived alongside it...
+        let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
+        XCTAssertTrue(realContent.contains(beginLine),
+                      "enableIPC must write the managed block through the symlink into the real file")
+        XCTAssertTrue(realContent.contains("agent_name: \"hermes\""),
+                      "The user's existing content must be preserved in the real file")
+
+        // ...and the symlink itself is still a symlink pointing at the same target.
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at configPath must survive the write, not be replaced with a regular file")
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: configPath)
+        XCTAssertEqual(destination, realFile, "The symlink must still point at the same real file")
+    }
+
+    func test_enableIPC_danglingSymlink_createsRealFileAtLinkTarget() throws {
+        // The classic "pre-linked, target not yet created" dotfiles state:
+        // `chezmoi`/`stow`-style tooling can lay down the symlink before
+        // the tracked file exists in the repo.
+        let dotfilesDir = tempDir + "/dotfiles"
+        try FileManager.default.createDirectory(atPath: dotfilesDir, withIntermediateDirectories: true)
+        let targetPath = dotfilesDir + "/config.yaml"
+        try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: targetPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: targetPath),
+                       "Precondition: the symlink's target must not exist yet (dangling)")
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: targetPath),
+                      "enableIPC must create the file at the dangling symlink's target path")
+        let content = try String(contentsOfFile: targetPath, encoding: .utf8)
+        XCTAssertTrue(content.contains(beginLine))
+
+        let attrs = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The now-resolved symlink must remain a symlink, not become a regular file")
+    }
+
+    // Round 3 fix: resolveConfigPath now follows a multi-hop *dangling*
+    // symlink chain (link -> link -> not-yet-existing file) all the way
+    // to its final destination, rather than stopping at the first
+    // intermediate link. Same shared ConfigFileUtils primitive as every
+    // other config manager.
+    func test_enableIPC_multiHopDanglingSymlink_writesToFinalDestinationKeepingBothLinksIntact() throws {
+        let dotfilesDir = tempDir + "/dotfiles"
+        try FileManager.default.createDirectory(atPath: dotfilesDir, withIntermediateDirectories: true)
+        let finalTarget = dotfilesDir + "/config.yaml"
+        let middleLink = tempDir + "/middle-link.yaml"
+        try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
+        try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: middleLink)
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalTarget),
+                      "enableIPC must create the file at the multi-hop dangling chain's final destination")
+        let content = try String(contentsOfFile: finalTarget, encoding: .utf8)
+        XCTAssertTrue(content.contains(beginLine))
+
+        let middleAttrs = try FileManager.default.attributesOfItem(atPath: middleLink)
+        XCTAssertEqual(middleAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The intermediate link must survive as a symlink, not be replaced with a regular file")
     }
 
     // MARK: - enableIPC: Self-healing
@@ -624,30 +684,43 @@ final class HermesConfigManagerTests: XCTestCase {
         }
     }
 
-    func test_disableIPC_rejectsSymlink() throws {
-        // Given: configPath is a symlink
+    // Contract changed (Round 3): see the enableIPC symlink tests above —
+    // disableIPC now follows the link and removes the managed block from
+    // the real target file, leaving the link itself intact.
+    func test_disableIPC_symlinkFollowedToRealFile_removesSuccessfullyAndKeepsLinkIntact() throws {
+        // Given: configPath is a symlink to a real file that already has
+        // a well-formed managed block.
         let realFile = tempDir + "/real_config.yaml"
-        try writeConfig("agent_name: \"hermes\"\n")
+        let existing = """
+        agent_name: "hermes"
+        \(beginLine)
+        mcp_servers:
+          calyx-ipc:
+            url: "http://localhost:41830/mcp"
+        \(endLine)
+        """
+        try writeConfig(existing)
         try FileManager.default.moveItem(atPath: configPath, toPath: realFile)
         try FileManager.default.createSymbolicLink(
             atPath: configPath,
             withDestinationPath: realFile
         )
 
-        // When/Then: throws .symlinkDetected
-        XCTAssertThrowsError(
-            try HermesConfigManager.disableIPC(configPath: configPath)
-        ) { error in
-            guard let configError = error as? HermesConfigError else {
-                XCTFail("Expected HermesConfigError, got \(type(of: error))")
-                return
-            }
-            if case .symlinkDetected = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .symlinkDetected, got \(configError)")
-            }
-        }
+        // When: disableIPC is called through the symlinked path
+        try HermesConfigManager.disableIPC(configPath: configPath)
+
+        // Then: the managed block is gone from the REAL file, and the
+        // user's content survived...
+        let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
+        XCTAssertFalse(realContent.contains(beginLine),
+                       "disableIPC must remove the managed block from the real file reached through the symlink")
+        XCTAssertTrue(realContent.contains("agent_name: \"hermes\""),
+                      "The user's existing content must be preserved in the real file")
+
+        // ...and the symlink itself survives.
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at configPath must survive the write")
     }
 
     func test_disableIPC_throwsOnInvalidEncoding() throws {
