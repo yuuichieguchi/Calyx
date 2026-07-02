@@ -304,4 +304,185 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
         ))
         XCTAssertEqual(unknownPathResponse.statusCode, 404)
     }
+
+    // MARK: - Round 3: unread-badge wiring (route() binding + real tool calls)
+    //
+    // No mocking: drives the real PreToolUse-binding path through route(),
+    // then the real send_message/receive_messages/ack_messages tool
+    // handlers through handleJSONRPC, and asserts on the same injected
+    // AgentRegistry both paths share.
+
+    private func rpcToolCallRequest(id: Int, toolName: String, arguments: [String: Any]) -> Data {
+        let dict: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": ["name": toolName, "arguments": arguments],
+        ]
+        return try! JSONSerialization.data(withJSONObject: dict)
+    }
+
+    private func toolResultText(_ body: Data?) throws -> String {
+        let data = try XCTUnwrap(body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let result = try XCTUnwrap(json["result"] as? [String: Any])
+        let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+        return try XCTUnwrap(content.first?["text"] as? String)
+    }
+
+    private func registerPeerID(name: String) async throws -> String {
+        let request = rpcToolCallRequest(id: 1, toolName: "register_peer", arguments: ["name": name, "role": "terminal"])
+        let (status, body) = await server.handleJSONRPC(data: request, authToken: testToken)
+        XCTAssertEqual(status, 200)
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(try toolResultText(body).utf8)) as? [String: Any]
+        )
+        return try XCTUnwrap(json["peerId"] as? String)
+    }
+
+    private func extractMessageIDs(fromReceiveResultText text: String) throws -> [String] {
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        let messages = try XCTUnwrap(json["messages"] as? [[String: Any]])
+        return messages.compactMap { $0["id"] as? String }
+    }
+
+    func test_agentEventBinding_sendMessageIncrementsUnreadCount_ackMessagesClearsIt() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+
+        let p1 = try await registerPeerID(name: "P1")
+        let p2 = try await registerPeerID(name: "P2")
+
+        // P1's pane reports a PreToolUse for its own send_message call —
+        // this is how the registry learns the surface -> peer binding.
+        let boundSurface = UUID()
+        let bindingRequest = agentEventRequest(
+            token: testToken,
+            surfaceIDHeader: boundSurface.uuidString,
+            body: Data("""
+            {"hook_event_name":"PreToolUse","session_id":"s1",
+             "tool_name":"mcp__calyx-ipc__send_message",
+             "tool_input":{"from":"\(p1)","to":"\(p2)","content":"hi"}}
+            """.utf8)
+        )
+        let bindingResponse = await server.route(request: bindingRequest)
+        XCTAssertEqual(bindingResponse.statusCode, 204)
+
+        // P2 now actually sends a message to P1 via the real MCP tool-call
+        // path — this must update the bound surface's unreadCount through
+        // the injected registry (no mocking of IPCStore or the registry).
+        let sendRequest = rpcToolCallRequest(id: 2, toolName: "send_message", arguments: [
+            "from": p2, "to": p1, "content": "hello from P2",
+        ])
+        let (sendStatus, _) = await server.handleJSONRPC(data: sendRequest, authToken: testToken)
+        XCTAssertEqual(sendStatus, 200)
+
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 1,
+                       "Sending a message to the bound peer must increment the surface row's unreadCount")
+
+        // Contract updated post-review: receive_messages alone (no ack)
+        // must already clear unreadCount to 0 — the fix for a defect
+        // where the badge stayed lit even after the agent had genuinely
+        // read its inbox, only clearing once it was separately ack'd.
+        let receiveRequest = rpcToolCallRequest(id: 3, toolName: "receive_messages", arguments: ["peer_id": p1])
+        let (_, receiveBody) = await server.handleJSONRPC(data: receiveRequest, authToken: testToken)
+        let messageIDs = try extractMessageIDs(fromReceiveResultText: try toolResultText(receiveBody))
+
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 0,
+                       "receive_messages alone (no ack yet) must already clear the bound surface's " +
+                       "unreadCount, since it marks the retrieved messages delivered")
+
+        // ack_messages (message removal) must not resurrect the badge.
+        let ackRequest = rpcToolCallRequest(id: 4, toolName: "ack_messages", arguments: [
+            "peer_id": p1, "message_ids": messageIDs,
+        ])
+        let (ackStatus, _) = await server.handleJSONRPC(data: ackRequest, authToken: testToken)
+        XCTAssertEqual(ackStatus, 200)
+
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 0,
+                       "unreadCount must remain 0 after ack_messages too")
+    }
+
+    func test_agentEventBinding_postToolUseRegisterPeerResponse_bindsSurface_firstMessageLightsUpBadge() async throws {
+        // Round 3 fix: a surface is now also bound to its own peer ID
+        // right from register_peer's PostToolUse response
+        // (tool_response.peerId), not only from a later PreToolUse for
+        // one of the other calyx-ipc tools — so a message sent to a pane
+        // immediately after it registers still lights up the badge.
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+
+        let p1 = try await registerPeerID(name: "P1")
+        let p2 = try await registerPeerID(name: "P2")
+
+        let boundSurface = UUID()
+        let bindingRequest = agentEventRequest(
+            token: testToken,
+            surfaceIDHeader: boundSurface.uuidString,
+            body: Data("""
+            {"hook_event_name":"PostToolUse","session_id":"s1",
+             "tool_name":"mcp__calyx-ipc__register_peer",
+             "tool_response":{"peerId":"\(p1)"}}
+            """.utf8)
+        )
+        let bindingResponse = await server.route(request: bindingRequest)
+        XCTAssertEqual(bindingResponse.statusCode, 204)
+
+        let sendRequest = rpcToolCallRequest(id: 2, toolName: "send_message", arguments: [
+            "from": p2, "to": p1, "content": "welcome",
+        ])
+        let (sendStatus, _) = await server.handleJSONRPC(data: sendRequest, authToken: testToken)
+        XCTAssertEqual(sendStatus, 200)
+
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 1,
+                       "A message sent to the peer bound via register_peer's PostToolUse response " +
+                       "must light up the badge on its first send, with no prior PreToolUse needed")
+    }
+
+    // MARK: - Round 3 review follow-up: syncBoundPeerInboxCounts gating
+
+    func test_agentEventBinding_lspToolCall_doesNotRefreshInboxCounts_messagingToolDoes() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+
+        let p1 = try await registerPeerID(name: "P1")
+        let p2 = try await registerPeerID(name: "P2")
+        let p1ID = try XCTUnwrap(UUID(uuidString: p1))
+        let p2ID = try XCTUnwrap(UUID(uuidString: p2))
+
+        let boundSurface = UUID()
+        let bindingRequest = agentEventRequest(
+            token: testToken,
+            surfaceIDHeader: boundSurface.uuidString,
+            body: Data("""
+            {"hook_event_name":"PreToolUse","session_id":"s1",
+             "tool_name":"mcp__calyx-ipc__send_message",
+             "tool_input":{"from":"\(p1)","to":"\(p2)","content":"hi"}}
+            """.utf8)
+        )
+        let bindingResponse = await server.route(request: bindingRequest)
+        XCTAssertEqual(bindingResponse.statusCode, 204)
+
+        // Deliver a message straight through the shared IPCStore, bypassing
+        // the send_message tool handler (and therefore
+        // syncBoundPeerInboxCounts) entirely — this manufactures a stale
+        // unreadCount without going through any tools/call gate, so the
+        // assertions below can attribute a lack of refresh solely to the
+        // lsp_* tool name, not to this setup step.
+        _ = try await server.store.sendMessage(from: p2ID, to: p1ID, content: "hello from P2")
+
+        let lspRequest = rpcToolCallRequest(id: 10, toolName: "lsp_hover", arguments: [:])
+        let (lspStatus, _) = await server.handleJSONRPC(data: lspRequest, authToken: testToken)
+        XCTAssertEqual(lspStatus, 200, "lsp_hover with no bridge started must still return a structured tool error, not fail the HTTP layer")
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 0,
+                       "An lsp_* tools/call must never trigger syncBoundPeerInboxCounts, so the " +
+                       "unreadCount left stale by the direct IPCStore delivery above must stay 0")
+
+        let statusRequest = rpcToolCallRequest(id: 11, toolName: "get_peer_status", arguments: ["peer_id": p1])
+        let (statusStatus, _) = await server.handleJSONRPC(data: statusRequest, authToken: testToken)
+        XCTAssertEqual(statusStatus, 200)
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 1,
+                       "A calyx-ipc messaging tools/call (get_peer_status here) must still trigger " +
+                       "syncBoundPeerInboxCounts and pick up the count left stale by the earlier lsp_* call")
+    }
 }

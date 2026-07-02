@@ -694,8 +694,11 @@ final class CalyxMCPServerTests: XCTestCase {
         // `fileExists(atPath:)` returns true for a plain file too, so
         // `createDirectory` is skipped entirely. The actual failure
         // happens one step later, inside ConfigFileUtils.atomicWrite:
-        // `open()` on the lock file path (which treats `blockedPath` as an
-        // intermediate directory component) fails with ENOTDIR.
+        // `data.write(to: tempPath)` treats `blockedPath` as an
+        // intermediate directory component of `tempPath` and fails with
+        // ENOTDIR (the lock file itself lives elsewhere, under Calyx's
+        // own Application Support directory, so acquiring it succeeds
+        // regardless of `blockedPath`'s validity).
         let blockedPath = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString).path
         FileManager.default.createFile(atPath: blockedPath, contents: Data())

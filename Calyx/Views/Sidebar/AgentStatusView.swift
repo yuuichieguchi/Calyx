@@ -8,6 +8,18 @@ import SwiftUI
 
 struct AgentStatusView: View {
     var body: some View {
+        content
+            // Tracks how many windows currently have this view mounted
+            // (Agents sidebar mode + sidebar visible) via
+            // `AgentRegistry.agentsSidebarVisibleCount`, so
+            // `CalyxWindowController`'s screen-classification poll can
+            // gate on "visible in any window" rather than each window's
+            // own local sidebar state — see that property's doc comment.
+            .onAppear { AgentRegistry.shared.incrementAgentsSidebarVisible() }
+            .onDisappear { AgentRegistry.shared.decrementAgentsSidebarVisible() }
+    }
+
+    private var content: some View {
         Group {
             // Observes AgentRegistry.isServerRunning rather than
             // CalyxMCPServer.isRunning: CalyxMCPServer is a plain
@@ -18,26 +30,62 @@ struct AgentStatusView: View {
                 disabledPlaceholder
             } else {
                 let entries = AgentRegistry.shared.sortedEntries
-                if entries.isEmpty {
-                    emptyPlaceholder
-                } else {
-                    // TimelineView re-renders every second so each row's
-                    // relative "time ago" label stays live; it also stops
-                    // firing automatically while the sidebar isn't visible.
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
-                        ScrollView {
-                            VStack(spacing: 4) {
-                                ForEach(entries) { entry in
-                                    AgentRowView(entry: entry, now: context.date)
+                let hooksIssues = AgentRegistry.shared.hooksIssues
+                VStack(spacing: 0) {
+                    if !hooksIssues.isEmpty {
+                        hooksIssuesBanner(hooksIssues)
+                    }
+                    if entries.isEmpty {
+                        emptyPlaceholder
+                    } else {
+                        // TimelineView re-renders every second so each row's
+                        // relative "time ago" label stays live; it also stops
+                        // firing automatically while the sidebar isn't visible.
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            ScrollView {
+                                VStack(spacing: 4) {
+                                    ForEach(entries) { entry in
+                                        AgentRowView(entry: entry, now: context.date)
+                                    }
                                 }
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 4)
                             }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
                         }
                     }
                 }
             }
         }
+    }
+
+    // MARK: - Hooks Issues Banner
+
+    /// Persistent warning banner surfacing hook-install failures
+    /// (`AgentRegistry.hooksIssues`, set by `CalyxWindowController.
+    /// enableIPC`), so a symlink/permissions failure that used to degrade
+    /// the sidebar silently (only a one-shot alert at enable time) is
+    /// visible for as long as it remains unresolved.
+    private func hooksIssuesBanner(_ issues: [String]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.yellow)
+                Text("Some agent hooks failed to install")
+                    .font(.system(size: 11.5, weight: .medium, design: .rounded))
+                    .foregroundStyle(.primary)
+            }
+            ForEach(issues, id: \.self) { issue in
+                Text(issue)
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.yellow.opacity(0.15))
+        .accessibilityIdentifier(AccessibilityID.Sidebar.agentHooksIssuesBanner)
     }
 
     // MARK: - Placeholders
@@ -129,6 +177,10 @@ private struct AgentRowView: View {
             }
 
             Spacer()
+
+            if entry.unreadCount > 0 {
+                UnreadCountBadge(count: entry.unreadCount)
+            }
 
             Text(Self.relativeDateFormatter.localizedString(for: entry.lastEventAt, relativeTo: now))
                 .font(.system(size: 10))

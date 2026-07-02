@@ -18,7 +18,6 @@ import Foundation
 // MARK: - HermesConfigError
 
 enum HermesConfigError: Error, LocalizedError {
-    case symlinkDetected
     case invalidEncoding
     case unsupportedYamlStructure(String)
     case malformedManagedBlock(String)
@@ -27,8 +26,6 @@ enum HermesConfigError: Error, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .symlinkDetected:
-            return "The Hermes config path is a symlink, which is not allowed for security reasons"
         case .invalidEncoding:
             return "The Hermes config file is not valid UTF-8"
         case .unsupportedYamlStructure(let reason):
@@ -91,11 +88,7 @@ struct HermesConfigManager: Sendable {
     /// or BEGIN/END pairs missing the `calyx-ipc:` body) by stripping anything
     /// that looks like a managed block before writing fresh content.
     static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
-        let path = configPath ?? defaultConfigPath
-
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw HermesConfigError.symlinkDetected
-        }
+        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
 
         let existing: String
         if FileManager.default.fileExists(atPath: path) {
@@ -136,7 +129,7 @@ struct HermesConfigManager: Sendable {
         guard let data = result.data(using: .utf8) else {
             throw HermesConfigError.writeFailed("UTF-8 encoding failed")
         }
-        try ConfigFileUtils.atomicWrite(data: data, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     /// Disables Calyx IPC by removing the managed block(s) from the config.
@@ -144,13 +137,9 @@ struct HermesConfigManager: Sendable {
     /// BEGIN/END pairs lacking the `calyx-ipc:` body, since silent removal
     /// would risk discarding user intent.
     static func disableIPC(configPath: String? = nil) throws {
-        let path = configPath ?? defaultConfigPath
+        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
 
         guard FileManager.default.fileExists(atPath: path) else { return }
-
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw HermesConfigError.symlinkDetected
-        }
 
         let data = try Data(contentsOf: URL(fileURLWithPath: path))
         guard let decoded = String(data: data, encoding: .utf8) else {
@@ -166,14 +155,20 @@ struct HermesConfigManager: Sendable {
         guard let outData = cleaned.data(using: .utf8) else {
             throw HermesConfigError.writeFailed("UTF-8 encoding failed")
         }
-        try ConfigFileUtils.atomicWrite(data: outData, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: outData, to: path)
     }
 
     /// Returns true iff at least one well-formed managed block exists
     /// (BEGIN line, then `calyx-ipc:` line, then END line — in that order,
     /// with no nested BEGIN/END between them).
+    /// Returns `false` (rather than throwing) when `configPath`'s symlink
+    /// chain can't be resolved — this is a read-only status check, and
+    /// every other unreadable/invalid-encoding case here already
+    /// resolves to `false` the same way.
     static func isIPCEnabled(configPath: String? = nil) -> Bool {
-        let path = configPath ?? defaultConfigPath
+        guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
+            return false
+        }
 
         guard FileManager.default.fileExists(atPath: path),
               let data = try? Data(contentsOf: URL(fileURLWithPath: path)),

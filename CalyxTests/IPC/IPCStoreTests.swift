@@ -249,6 +249,16 @@ final class IPCStoreTests: XCTestCase {
                       "Should contain first message")
         XCTAssertTrue(messageIDs.contains(msg2.id),
                       "Should contain second message")
+
+        // Contract updated post-review: "unacked" no longer means
+        // "unread" — receiveMessages marks every message it returns
+        // delivered without removing it (only ackMessages removes), so a
+        // second receiveMessages call for the same peer still returns
+        // both messages again (unread badge is about delivery, not
+        // presence).
+        let secondInbox = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(secondInbox.count, 2,
+                       "receiveMessages must not remove messages from the inbox — only ackMessages does")
     }
 
     // ==================== 9. Ack Messages ====================
@@ -266,7 +276,12 @@ final class IPCStoreTests: XCTestCase {
             from: peerA.id, to: peerB.id, content: "ack me"
         )
 
-        // Act — ack only msg2
+        // Act — ack only msg2, without ever having received (delivered)
+        // it first. Contract updated post-review: ackMessages removes by
+        // ID regardless of whether the message was ever delivered — ack
+        // and delivery are independent (a peer polling get_peer_status
+        // for message IDs it already knows about, say) — so this must
+        // work exactly the same as it did when "unread" meant "present".
         await store.ackMessages(ids: [msg2.id], for: peerB.id)
 
         // Assert
@@ -1001,5 +1016,124 @@ final class IPCStoreTests: XCTestCase {
         let inbox = await store.receiveMessages(for: peerA.id)
         XCTAssertTrue(inbox.isEmpty,
                       "peerStatus should also tear down the inbox of an expired peer")
+    }
+
+    // ==================== Round 3: inboxCount(for:) ====================
+
+    // Unlike receiveMessages, inboxCount is a read-only query used to
+    // refresh AgentRegistry's unread-message badge after a
+    // send/broadcast/ack — it must report the real count without the
+    // liveness side effect (bumping lastSeen) receiveMessages has.
+    func test_inboxCount_returnsMessageCountWithoutMutatingLastSeen() async throws {
+        // Arrange
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "sender", role: "terminal")
+        let recipient = await store.registerPeer(name: "recipient", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+
+        // Push lastSeen into the recent past (well within the TTL) so a
+        // spurious bump by inboxCount is observable via peerStatus.
+        let fiveMinutesAgo = Date().addingTimeInterval(-5 * 60)
+        await store._testSetPeerLastSeen(peerId: recipient.id, date: fiveMinutesAgo)
+        let statusBeforeOptional = await store.peerStatus(id: recipient.id)
+        let statusBefore = try XCTUnwrap(statusBeforeOptional)
+
+        // Act
+        let count = await store.inboxCount(for: recipient.id)
+
+        // Assert: the real count, not a side-effect-only stub value.
+        XCTAssertEqual(count, 2, "inboxCount must return the peer's actual inbox message count")
+
+        // Assert: lastSeen must be untouched — the defining difference
+        // from receiveMessages, which bumps it on every call.
+        let statusAfterOptional = await store.peerStatus(id: recipient.id)
+        let statusAfter = try XCTUnwrap(statusAfterOptional)
+        XCTAssertEqual(statusAfter.lastSeen, statusBefore.lastSeen,
+                       "inboxCount must be read-only: unlike receiveMessages, it must not bump lastSeen")
+    }
+
+    // ==================== Round 3 fix: undelivered-based inboxCount ====================
+
+    // Fixes a defect where the sidebar's unread badge stayed lit even
+    // after the agent had genuinely read its inbox: previously
+    // inboxCount reported total inbox *presence*, which receiveMessages
+    // never changes (only ackMessages removes a message) — so an agent
+    // that calls receive_messages but never separately acks (a common,
+    // valid usage pattern) saw its badge stuck non-zero forever.
+    // inboxCount now reports the UNDELIVERED count instead, and
+    // receiveMessages marks every message it returns delivered.
+
+    func test_receiveMessages_immediatelyClearsInboxCount_withoutRequiringAck() async throws {
+        // Arrange
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "sender", role: "terminal")
+        let recipient = await store.registerPeer(name: "recipient", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+
+        let countBefore = await store.inboxCount(for: recipient.id)
+        XCTAssertEqual(countBefore, 2, "Precondition: both freshly-sent messages are undelivered")
+
+        // Act — receive, but deliberately never ack.
+        _ = await store.receiveMessages(for: recipient.id)
+
+        // Assert
+        let countAfter = await store.inboxCount(for: recipient.id)
+        XCTAssertEqual(countAfter, 0,
+                       "receiveMessages alone (no ack) must immediately clear the undelivered count")
+
+        // The messages are still present, just no longer undelivered —
+        // ackMessages, not receiveMessages, is what removes them.
+        let inbox = await store.receiveMessages(for: recipient.id)
+        XCTAssertEqual(inbox.count, 2, "Delivered messages must remain in the inbox until ack'd")
+    }
+
+    func test_inboxCount_newMessageAfterDelivery_countsOnlyTheNewOne() async throws {
+        // A message sent (and therefore undelivered) AFTER a prior
+        // receiveMessages call must still be counted — delivery is
+        // per-message, not a peer-wide "caught up" flag.
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "sender", role: "terminal")
+        let recipient = await store.registerPeer(name: "recipient", role: "terminal")
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
+        _ = await store.receiveMessages(for: recipient.id)
+        let countAfterDelivery = await store.inboxCount(for: recipient.id)
+        XCTAssertEqual(countAfterDelivery, 0, "Precondition: delivered, so 0")
+
+        _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
+
+        let countAfterNewMessage = await store.inboxCount(for: recipient.id)
+        XCTAssertEqual(countAfterNewMessage, 1,
+                       "A newly-sent message must count as undelivered even though an earlier " +
+                       "message to the same peer was already delivered")
+    }
+
+    // ==================== Round 3: inboxCounts(for:) batch ====================
+
+    func test_inboxCounts_returnsUndeliveredCountPerPeer() async throws {
+        let store = makeStore()
+        let sender = await store.registerPeer(name: "sender", role: "terminal")
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        let peerC = await store.registerPeer(name: "C", role: "terminal")
+
+        _ = try await store.sendMessage(from: sender.id, to: peerA.id, content: "a1")
+        _ = try await store.sendMessage(from: sender.id, to: peerA.id, content: "a2")
+        _ = try await store.sendMessage(from: sender.id, to: peerB.id, content: "b1")
+        // peerC gets nothing.
+
+        let counts = await store.inboxCounts(for: [peerA.id, peerB.id, peerC.id])
+
+        XCTAssertEqual(counts[peerA.id], 2)
+        XCTAssertEqual(counts[peerB.id], 1)
+        XCTAssertEqual(counts[peerC.id], 0)
+    }
+
+    func test_inboxCounts_unknownPeerID_readsZero() async throws {
+        let store = makeStore()
+        let counts = await store.inboxCounts(for: [UUID()])
+        XCTAssertEqual(counts.count, 1)
+        XCTAssertEqual(counts.values.first, 0)
     }
 }

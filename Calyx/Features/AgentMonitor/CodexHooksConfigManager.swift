@@ -69,15 +69,11 @@ struct CodexHooksConfigManager: Sendable {
             throw CodexHooksConfigError.invalidScriptPath
         }
 
-        let path = configPath ?? defaultConfigPath
+        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
         let parentDir = (path as NSString).deletingLastPathComponent
 
         guard ConfigFileUtils.directoryExists(at: parentDir) else {
             throw CodexConfigError.directoryNotFound
-        }
-
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw ConfigFileError.symlinkDetected
         }
 
         let content: String
@@ -102,7 +98,7 @@ struct CodexHooksConfigManager: Sendable {
         guard let data = result.data(using: .utf8) else {
             throw CodexHooksConfigError.writeFailed("UTF-8 encoding failed")
         }
-        try ConfigFileUtils.atomicWrite(data: data, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     /// Removes only Calyx's managed block from `configPath`, leaving the
@@ -112,13 +108,9 @@ struct CodexHooksConfigManager: Sendable {
     /// Self-heals an orphan BEGIN marker (no matching END) rather than
     /// throwing — see `removingManagedBlock`'s doc comment.
     static func removeHooks(configPath: String? = nil) throws {
-        let path = configPath ?? defaultConfigPath
+        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
 
         guard FileManager.default.fileExists(atPath: path) else { return }
-
-        guard !ConfigFileUtils.isSymlink(at: path) else {
-            throw ConfigFileError.symlinkDetected
-        }
 
         guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
         let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
@@ -129,12 +121,18 @@ struct CodexHooksConfigManager: Sendable {
         guard let data = stripped.data(using: .utf8) else {
             throw CodexHooksConfigError.writeFailed("UTF-8 encoding failed")
         }
-        try ConfigFileUtils.atomicWrite(data: data, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     /// Whether Calyx's managed block (its BEGIN marker) is present.
+    /// Returns `false` (rather than throwing) when `configPath`'s
+    /// symlink chain can't be resolved — this is a read-only status
+    /// check, and every other unreadable-file case here already resolves
+    /// to `false` the same way.
     static func areHooksInstalled(configPath: String? = nil) -> Bool {
-        let path = configPath ?? defaultConfigPath
+        guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
+            return false
+        }
 
         guard FileManager.default.fileExists(atPath: path),
               let content = try? String(contentsOfFile: path, encoding: .utf8) else {

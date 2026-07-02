@@ -62,7 +62,7 @@ struct ClaudeHooksConfigManager: Sendable {
             withJSONObject: config,
             options: [.prettyPrinted, .sortedKeys]
         )
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     /// Removes only Calyx's own command entries (identified by the
@@ -100,13 +100,18 @@ struct ClaudeHooksConfigManager: Sendable {
             withJSONObject: config,
             options: [.prettyPrinted, .sortedKeys]
         )
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     /// Whether Calyx's own command entry is present for at least one of the
-    /// 7 target events.
+    /// 7 target events. Returns `false` (rather than throwing) when
+    /// `configPath`'s symlink chain can't be resolved — this is a
+    /// read-only status check, and every other unreadable/invalid-file
+    /// case here already resolves to `false` the same way.
     static func areHooksInstalled(configPath: String? = nil) -> Bool {
-        let path = configPath ?? defaultConfigPath
+        guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
+            return false
+        }
         let fm = FileManager.default
 
         guard fm.fileExists(atPath: path) else { return false }

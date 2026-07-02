@@ -29,7 +29,7 @@ enum AgentEndpointFile {
         let dict: [String: Any] = ["port": port, "token": token]
         let data = try JSONSerialization.data(withJSONObject: dict)
         let filePath = (directory as NSString).appendingPathComponent(fileName)
-        try ConfigFileUtils.atomicWrite(data: data, to: filePath, lockPath: filePath + ".lock")
+        try ConfigFileUtils.atomicWrite(data: data, to: filePath)
     }
 
     /// Removes `agent-endpoint.json` from `directory`, if present.

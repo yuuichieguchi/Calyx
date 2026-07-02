@@ -313,43 +313,72 @@ final class CodexHooksConfigManagerTests: XCTestCase {
 
     // MARK: - Security
 
-    func test_installHooks_symlinkConfigPath_throwsSymlinkDetected() throws {
+    // Contract changed (Round 3): ~/.codex/config.toml is commonly a
+    // dotfiles-managed symlink, and blanket symlink rejection silently
+    // broke hooks installation entirely in that setup. Calyx now follows
+    // the link and writes through to the real target file, leaving the
+    // link itself intact.
+    func test_installHooks_symlinkConfigPath_followsToRealFileAndKeepsLinkIntact() throws {
         let realFile = tempDir + "/real_config.toml"
         FileManager.default.createFile(atPath: realFile, contents: Data("".utf8))
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: realFile)
 
-        XCTAssertThrowsError(
-            try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
-        ) { error in
-            guard let configError = error as? ConfigFileError else {
-                XCTFail("Expected ConfigFileError, got \(type(of: error))")
-                return
-            }
-            guard case .symlinkDetected = configError else {
-                XCTFail("Expected .symlinkDetected, got \(configError)")
-                return
-            }
-        }
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+
+        let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
+        XCTAssertTrue(realContent.contains(Self.beginLine),
+                      "installHooks must write the managed block through the symlink into the real file")
+
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at configPath must survive the write")
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: configPath)
+        XCTAssertEqual(destination, realFile)
     }
 
-    func test_removeHooks_symlinkConfigPath_throwsSymlinkDetected() throws {
+    // Round 3 fix: resolveConfigPath now follows a multi-hop *dangling*
+    // symlink chain (link -> link -> not-yet-existing file) all the way
+    // to its final destination, rather than stopping at the first
+    // intermediate link. Same shared ConfigFileUtils primitive as every
+    // other config manager.
+    func test_installHooks_multiHopDanglingSymlink_createsRealFileAtFinalDestination() throws {
+        let finalTarget = tempDir + "/dotfiles/config.toml"
+        try FileManager.default.createDirectory(
+            atPath: (finalTarget as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
+        )
+        let middleLink = tempDir + "/middle-link.toml"
+        try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
+        try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: middleLink)
+
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+
+        let realContent = try String(contentsOfFile: finalTarget, encoding: .utf8)
+        XCTAssertTrue(realContent.contains(Self.beginLine),
+                      "installHooks must create the file at the multi-hop dangling chain's final destination")
+
+        let middleAttrs = try FileManager.default.attributesOfItem(atPath: middleLink)
+        XCTAssertEqual(middleAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The intermediate link must survive as a symlink, not be replaced with a regular file")
+    }
+
+    func test_removeHooks_symlinkConfigPath_followsToRealFileAndKeepsLinkIntact() throws {
         let realFile = tempDir + "/real_config.toml"
-        writeConfig("profile = \"default\"\n")
+        writeConfig("profile = \"default\"\n" + CodexHooksConfigManager.beginLine + "\n" +
+                    "[[hooks.Stop]]\n" + CodexHooksConfigManager.endLine + "\n")
         try FileManager.default.moveItem(atPath: configPath, toPath: realFile)
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: realFile)
 
-        XCTAssertThrowsError(
-            try CodexHooksConfigManager.removeHooks(configPath: configPath)
-        ) { error in
-            guard let configError = error as? ConfigFileError else {
-                XCTFail("Expected ConfigFileError, got \(type(of: error))")
-                return
-            }
-            guard case .symlinkDetected = configError else {
-                XCTFail("Expected .symlinkDetected, got \(configError)")
-                return
-            }
-        }
+        try CodexHooksConfigManager.removeHooks(configPath: configPath)
+
+        let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
+        XCTAssertFalse(realContent.contains(Self.beginLine),
+                       "removeHooks must remove the managed block from the real file reached through the symlink")
+        XCTAssertTrue(realContent.contains("profile = \"default\""))
+
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at configPath must survive the write")
     }
 
     func test_installHooks_scriptPathContainingSingleQuote_throws() {

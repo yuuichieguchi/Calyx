@@ -40,7 +40,7 @@ struct ClaudeConfigManager: Sendable {
         )
 
         // Atomic write with file locking
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     static func disableIPC(configPath: String? = nil) throws {
@@ -70,11 +70,17 @@ struct ClaudeConfigManager: Sendable {
         )
 
         // Atomic write with file locking
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path, lockPath: path + ".lock")
+        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
+    /// Returns `false` (rather than throwing) when `configPath`'s symlink
+    /// chain can't be resolved — this is a read-only status check, and
+    /// every other unreadable/invalid-file case here already resolves to
+    /// `false` the same way.
     static func isIPCEnabled(configPath: String? = nil) -> Bool {
-        let path = configPath ?? defaultConfigPath
+        guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
+            return false
+        }
         let fm = FileManager.default
 
         guard fm.fileExists(atPath: path) else { return false }

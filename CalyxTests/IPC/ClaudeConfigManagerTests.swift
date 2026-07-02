@@ -343,8 +343,16 @@ final class ClaudeConfigManagerTests: XCTestCase {
 
     // MARK: - Security
 
-    func test_symlink_rejected() throws {
-        // Given: configPath is a symlink
+    // Contract changed (Round 3): dotfiles-managed setups commonly symlink
+    // ~/.claude.json to a repo elsewhere (e.g. `~/dotfiles/.claude.json`),
+    // and blanket symlink rejection silently broke IPC configuration
+    // entirely for that (legitimate, self-authored) setup. Calyx now
+    // follows the link and writes through to the real target file,
+    // leaving the link itself intact — a single-user desktop app
+    // following the user's own symlink is standard behavior, not a
+    // security boundary to enforce.
+    func test_symlink_followedToRealFile_writesSuccessfullyAndKeepsLinkIntact() throws {
+        // Given: configPath is a symlink to a real file
         let realFile = tempDir + "/real_claude.json"
         writeConfig("{}")  // Write to configPath first
         try FileManager.default.moveItem(atPath: configPath, toPath: realFile)
@@ -357,11 +365,53 @@ final class ClaudeConfigManagerTests: XCTestCase {
 
         XCTAssertTrue(isSymlink, "Test setup: configPath should be a symlink")
 
-        // When/Then: enableIPC should throw for symlink path
-        XCTAssertThrowsError(
-            try ClaudeConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath),
-            "Should reject symlink config path"
+        // When: enableIPC is called through the symlinked path
+        try ClaudeConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        // Then: the REAL file received the write...
+        let realFileData = try Data(contentsOf: URL(fileURLWithPath: realFile))
+        let realFileJSON = try JSONSerialization.jsonObject(with: realFileData) as? [String: Any]
+        let mcpServers = realFileJSON?["mcpServers"] as? [String: Any]
+        XCTAssertNotNil(mcpServers?["calyx-ipc"], "enableIPC must write through the symlink into the real file")
+
+        // ...and the symlink itself is still a symlink pointing at the same target.
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(attrsAfter[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The symlink at configPath must survive the write, not be replaced with a regular file")
+        let destination = try FileManager.default.destinationOfSymbolicLink(atPath: configPath)
+        XCTAssertEqual(destination, realFile, "The symlink must still point at the same real file")
+    }
+
+    // Round 3 fix: resolveConfigPath now follows a multi-hop *dangling*
+    // symlink chain all the way to its final destination, rather than
+    // stopping at the first intermediate link (which used to cause the
+    // write to replace that intermediate link with a regular file,
+    // orphaning the real intended target). Same behavior for every
+    // config manager, since they all route through the same shared
+    // ConfigFileUtils.resolveConfigPath/atomicWrite.
+    func test_multiHopDanglingSymlink_writesToFinalDestinationKeepingBothLinksIntact() throws {
+        let finalTarget = tempDir + "/dotfiles/.claude.json"
+        try FileManager.default.createDirectory(
+            atPath: (finalTarget as NSString).deletingLastPathComponent,
+            withIntermediateDirectories: true
         )
+        let middleLink = tempDir + "/middle-link.json"
+        try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
+        try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: middleLink)
+
+        try ClaudeConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalTarget),
+                      "enableIPC must create the file at the final destination of a multi-hop dangling chain")
+        let data = try Data(contentsOf: URL(fileURLWithPath: finalTarget))
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        XCTAssertNotNil((json?["mcpServers"] as? [String: Any])?["calyx-ipc"])
+
+        let middleAttrs = try FileManager.default.attributesOfItem(atPath: middleLink)
+        XCTAssertEqual(middleAttrs[.type] as? FileAttributeType, .typeSymbolicLink,
+                       "The intermediate link must survive as a symlink, not be replaced with a regular file")
+        let outerAttrs = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(outerAttrs[.type] as? FileAttributeType, .typeSymbolicLink)
     }
 
     // MARK: - Concurrency

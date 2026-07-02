@@ -142,8 +142,7 @@ enum GhosttyActionRouter {
             return true
 
         case GHOSTTY_ACTION_PROGRESS_REPORT:
-            logger.debug("Progress report action (stub)")
-            return true
+            return handleProgressReport(app, target: target, value: action.action.progress_report)
 
         case GHOSTTY_ACTION_SECURE_INPUT:
             return handleSecureInput(app, target: target, mode: action.action.secure_input)
@@ -195,6 +194,35 @@ enum GhosttyActionRouter {
             name: .ghosttySetTitle,
             object: surfaceView,
             userInfo: ["title": title]
+        )
+        return true
+    }
+
+    /// OSC 9;4 progress report, forwarded as `.ghosttyProgressReport` for
+    /// `CalyxWindowController` to feed into `AgentRegistry.
+    /// handleProgressReport` (Herdr layer 2). `SET`/`INDETERMINATE` — a
+    /// progress indicator is actively showing — map to `active: true`;
+    /// `REMOVE`/`ERROR`/`PAUSE` all map to `active: false`, mirroring
+    /// `handleProgressReport`'s two-state (`isActive`) contract.
+    private static func handleProgressReport(
+        _ app: ghostty_app_t,
+        target: ghostty_target_s,
+        value: ghostty_action_progress_report_s
+    ) -> Bool {
+        guard let surfaceView = surfaceView(from: target) else { return false }
+
+        let isActive: Bool
+        switch value.state {
+        case GHOSTTY_PROGRESS_STATE_SET, GHOSTTY_PROGRESS_STATE_INDETERMINATE:
+            isActive = true
+        default:
+            isActive = false
+        }
+
+        NotificationCenter.default.post(
+            name: .ghosttyProgressReport,
+            object: surfaceView,
+            userInfo: ["active": isActive]
         )
         return true
     }
