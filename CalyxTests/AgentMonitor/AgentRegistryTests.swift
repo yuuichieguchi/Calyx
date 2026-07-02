@@ -458,6 +458,201 @@ final class AgentRegistryTests: XCTestCase {
         XCTAssertEqual(registry.entries[surfaceID]?.kind, "claude-code")
     }
 
+    // MARK: - PermissionRequest (Phase 2: Codex)
+
+    func test_permissionRequest_registeredSameSession_setsBlocked() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("UserPromptSubmit", sessionID: "session-a"), surfaceID: surfaceID)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .working)
+
+        registry.handleHookEvent(event("PermissionRequest", sessionID: "session-a"), surfaceID: surfaceID)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+    }
+
+    func test_permissionRequest_unregisteredSurface_autoRegistersAsBlocked() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+
+        registry.handleHookEvent(
+            event("PermissionRequest", sessionID: "session-a", cwd: "/Users/dev/repo-a"),
+            surfaceID: surfaceID
+        )
+
+        XCTAssertEqual(registry.entries.count, 1)
+        let entry = registry.entries[surfaceID]
+        XCTAssertEqual(entry?.state, .blocked)
+        XCTAssertEqual(entry?.sessionID, "session-a")
+        XCTAssertEqual(entry?.cwd, "/Users/dev/repo-a")
+    }
+
+    func test_permissionRequest_sessionMismatch_discardedAndNotForwardMoving() {
+        // A PermissionRequest for a session the registry hasn't seen must be
+        // discarded (state unchanged) rather than treated as forward-moving
+        // like UserPromptSubmit/PreToolUse/PostToolUse — see the doc comment
+        // on handleHookEvent's forwardMovingEventNames guard.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("UserPromptSubmit", sessionID: "session-a"), surfaceID: surfaceID)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .working)
+
+        registry.handleHookEvent(event("PermissionRequest", sessionID: "session-b"), surfaceID: surfaceID)
+
+        let entry = registry.entries[surfaceID]
+        XCTAssertEqual(entry?.sessionID, "session-a",
+                       "A mismatched PermissionRequest must be discarded, not replace the entry")
+        XCTAssertEqual(entry?.state, .working,
+                       "State must remain unchanged when the mismatched PermissionRequest is discarded")
+
+        // Sanity: confirm PermissionRequest is actually wired up to .blocked
+        // for the *matching* session — otherwise the discard above would be
+        // indistinguishable from "PermissionRequest is simply unrecognized".
+        registry.handleHookEvent(event("PermissionRequest", sessionID: "session-a"), surfaceID: surfaceID)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+    }
+
+    // MARK: - PermissionRequest session-mismatch rescue (Phase 2: Codex has no SessionEnd)
+
+    func test_permissionRequest_sessionMismatch_entryIdle_replacesEntryAsBlocked() {
+        // Regression: Codex has no SessionEnd hook, so a missed
+        // SessionStart for a new session (IPC enabled mid-session, or
+        // Calyx restarted) can leave a stale-but-idle entry sitting on a
+        // pane. A mismatched PermissionRequest for the real new session
+        // must rescue (replace) an idle entry rather than being discarded
+        // — otherwise the approval-waiting state is invisible in the
+        // sidebar. See `test_permissionRequest_sessionMismatch_discardedAndNotForwardMoving`
+        // for the complementary case where the existing entry is `.working`
+        // and must stay protected instead.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: surfaceID)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .idle)
+
+        registry.handleHookEvent(
+            event("PermissionRequest", sessionID: "session-b", cwd: "/Users/dev/repo-b"),
+            surfaceID: surfaceID
+        )
+
+        let entry = registry.entries[surfaceID]
+        XCTAssertEqual(entry?.sessionID, "session-b",
+                       "A mismatched PermissionRequest must replace an idle entry")
+        XCTAssertEqual(entry?.state, .blocked)
+        XCTAssertEqual(entry?.cwd, "/Users/dev/repo-b")
+    }
+
+    func test_permissionRequest_sessionMismatch_entryDone_replacesEntry() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("SessionEnd", sessionID: "session-a"), surfaceID: surfaceID)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .done)
+
+        registry.handleHookEvent(
+            event("PermissionRequest", sessionID: "session-b", cwd: "/Users/dev/repo-b"),
+            surfaceID: surfaceID
+        )
+
+        let entry = registry.entries[surfaceID]
+        XCTAssertEqual(entry?.sessionID, "session-b",
+                       "A mismatched PermissionRequest must replace a done entry")
+        XCTAssertEqual(entry?.state, .blocked)
+    }
+
+    func test_permissionRequest_sessionMismatch_entryBlocked_discardsEvent() {
+        // Direct regression coverage (final review suggestion) for the
+        // fourth combination alongside the idle/done rescue tests and
+        // test_permissionRequest_sessionMismatch_discardedAndNotForwardMoving's
+        // `.working` case: a `.blocked` entry must never be rescued by a
+        // mismatched PermissionRequest either — the idle-only rescue guard
+        // (`isPermissionRequestIdleRescue`) is `false` here, and `.blocked`
+        // is not `.done`, so the event must be discarded and the entry left
+        // exactly as it was.
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("PermissionRequest", sessionID: "session-a"), surfaceID: surfaceID)
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        registry.handleHookEvent(
+            event("PermissionRequest", sessionID: "session-b", cwd: "/Users/dev/repo-b"),
+            surfaceID: surfaceID
+        )
+
+        let entry = registry.entries[surfaceID]
+        XCTAssertEqual(entry?.sessionID, "session-a",
+                       "A mismatched PermissionRequest must not replace a blocked entry")
+        XCTAssertEqual(entry?.state, .blocked,
+                       "State must remain unchanged when the mismatched PermissionRequest is discarded")
+        XCTAssertEqual(entry?.cwd, "/Users/dev/project",
+                       "cwd must remain unchanged too, confirming the entry was untouched, not just its state")
+    }
+
+    // MARK: - Agent kind (Phase 2: Codex / OpenCode)
+
+    func test_handleHookEvent_kindParameter_appliesToNewEntry() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+
+        registry.handleHookEvent(
+            event("SessionStart", sessionID: "session-a"),
+            surfaceID: surfaceID,
+            kind: AgentEntry.codexKind
+        )
+
+        XCTAssertEqual(registry.entries[surfaceID]?.kind, AgentEntry.codexKind,
+                       "An explicit kind must be applied to a freshly registered entry")
+    }
+
+    func test_handleHookEvent_kindParameter_defaultsToClaudeCodeAndIsPreservedAcrossSameSessionContinuation() {
+        let registry = AgentRegistry()
+
+        // No kind argument -> defaults to claude-code.
+        let claudeSurfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: claudeSurfaceID)
+        XCTAssertEqual(registry.entries[claudeSurfaceID]?.kind, AgentEntry.claudeCodeKind)
+
+        // A different surface, given an explicit kind at SessionStart...
+        let codexSurfaceID = UUID()
+        registry.handleHookEvent(
+            event("SessionStart", sessionID: "session-b"),
+            surfaceID: codexSurfaceID,
+            kind: AgentEntry.codexKind
+        )
+        XCTAssertEqual(registry.entries[codexSurfaceID]?.kind, AgentEntry.codexKind,
+                       "Precondition: SessionStart must apply the given kind")
+
+        // ...must have that kind preserved by a same-session continuation
+        // event that passes no kind argument (defaulting to claude-code).
+        registry.handleHookEvent(event("UserPromptSubmit", sessionID: "session-b"), surfaceID: codexSurfaceID)
+
+        XCTAssertEqual(registry.entries[codexSurfaceID]?.kind, AgentEntry.codexKind,
+                       "Same-session continuation must preserve the entry's existing kind, " +
+                       "not overwrite it with the continuation event's default kind")
+    }
+
+    func test_handleHookEvent_kindParameter_updatesOnSessionMismatchForwardMovingReplace() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("UserPromptSubmit", sessionID: "session-a"), surfaceID: surfaceID)
+        XCTAssertEqual(registry.entries[surfaceID]?.kind, AgentEntry.claudeCodeKind)
+
+        registry.handleHookEvent(
+            event("PreToolUse", sessionID: "session-b", cwd: "/Users/dev/repo-b"),
+            surfaceID: surfaceID,
+            kind: AgentEntry.openCodeKind
+        )
+
+        let entry = registry.entries[surfaceID]
+        XCTAssertEqual(entry?.sessionID, "session-b",
+                       "Precondition: a forward-moving session mismatch must replace the entry")
+        XCTAssertEqual(entry?.kind, AgentEntry.openCodeKind,
+                       "A forward-moving session-mismatch replace must adopt the new event's kind")
+    }
+
     // MARK: - Server lifecycle (isServerRunning / reset)
 
     func test_markServerStarted_setsIsServerRunning() {

@@ -80,6 +80,20 @@ final class AgentHookScriptTests: XCTestCase {
                      "Script must read port/token from agent-endpoint.json on every invocation")
     }
 
+    // MARK: - Phase 2: kind argv + X-Calyx-Agent-Kind header
+
+    func test_scriptBody_defaultsKindArgvToClaudeCode() {
+        XCTAssertTrue(AgentHookScript.scriptBody.contains("${1:-claude-code}"),
+                     "Script must read its kind from $1, defaulting to claude-code when unset " +
+                     "(so existing Claude Code hooks.json entries, which pass no argv, still work)")
+    }
+
+    func test_scriptBody_sendsAgentKindHeader() {
+        XCTAssertTrue(AgentHookScript.scriptBody.contains("X-Calyx-Agent-Kind"),
+                     "Script must send the X-Calyx-Agent-Kind header so the server can attribute " +
+                     "the event to claude-code / codex / opencode")
+    }
+
     // MARK: - install()
 
     func test_install_writesExecutableScriptWith0755Permissions() throws {

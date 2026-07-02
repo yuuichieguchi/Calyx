@@ -2078,25 +2078,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 return
             }
 
-            // Install the calyx-agent-hook script and wire it into Claude
-            // Code's settings.json so panes report lifecycle state to the
-            // Agents sidebar. Same do/catch-and-report shape as
-            // ClaudeConfigManager.enableIPC/disableIPC (see
-            // IPCConfigManager.enableClaudeCode/disableClaudeCode): a hooks
-            // failure degrades the sidebar rather than the whole "Enable AI
-            // Agent IPC" flow, since the MCP server above is already running.
-            let hooksStatus: String
-            do {
-                let scriptPath = try AgentHookScript.install(toDirectory: AgentHookScript.defaultInstallDirectory)
-                try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath)
-                hooksStatus = "Agent hooks: installed"
-            } catch {
-                hooksStatus = "Agent hooks: error - \(error.localizedDescription)"
-            }
+            // Install the calyx-agent-hook script and wire each agent CLI's
+            // own hook/plugin configuration to it so panes report lifecycle
+            // state to the Agents sidebar. Same collect-independently shape
+            // as IPCConfigManager.enableIPC above: an agent-hooks failure
+            // degrades the sidebar rather than the whole "Enable AI Agent
+            // IPC" flow, since the MCP server is already running.
+            let hooksResult = AgentHooksCoordinator.install()
 
             showIPCAlert(
                 title: "IPC Enabled",
-                message: "MCP server running on port \(port).\n\(configStatusMessage(result))\n\(hooksStatus)\nRestart agent instances to connect."
+                message: "MCP server running on port \(port).\n\(configStatusMessage(result))\n" +
+                    "\(agentHooksStatusMessage(hooksResult, mode: .install))\nRestart agent instances to connect."
             )
         } catch {
             showIPCAlert(title: "IPC Error", message: error.localizedDescription)
@@ -2106,37 +2099,54 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private func disableIPC() {
         CalyxMCPServer.shared.stop()
         let result = IPCConfigManager.disableIPC()
-
-        let hooksStatus: String
-        do {
-            try ClaudeHooksConfigManager.removeHooks()
-            hooksStatus = "Agent hooks: removed"
-        } catch {
-            hooksStatus = "Agent hooks: error - \(error.localizedDescription)"
-        }
+        let hooksResult = AgentHooksCoordinator.remove()
 
         showIPCAlert(
             title: "IPC Disabled",
-            message: "MCP server stopped.\n\(configStatusMessage(result))\n\(hooksStatus)"
+            message: "MCP server stopped.\n\(configStatusMessage(result))\n" +
+                "\(agentHooksStatusMessage(hooksResult, mode: .remove))"
         )
     }
 
-    private func configStatusMessage(_ result: IPCConfigResult) -> String {
-        func label(_ status: ConfigStatus, name: String) -> String {
-            switch status {
-            case .success:
-                return "\(name): configured"
-            case .skipped(let reason):
-                return "\(name): \(reason) (skipped)"
-            case .failed(let error):
-                return "\(name): error - \(error.localizedDescription)"
-            }
+    /// Whether an `AgentHooksResult` reflects `AgentHooksCoordinator.install()`
+    /// or `.remove()` — determines the verb `configStatusLabel` reports for
+    /// `.success`, since "configured" reads wrong after a removal.
+    private enum AgentHooksMode {
+        case install
+        case remove
+    }
+
+    /// Formats one tool's `ConfigStatus` as a single status line: `name: verb`
+    /// on success, `name: reason (skipped)` on skip, `name: error - ...` on
+    /// failure. Shared by `configStatusMessage` (always "configured", since
+    /// `IPCConfigManager` has no separate disable-wording need) and
+    /// `agentHooksStatusMessage` (whose verb depends on `AgentHooksMode`).
+    private func configStatusLabel(_ status: ConfigStatus, name: String, verb: String) -> String {
+        switch status {
+        case .success:
+            return "\(name): \(verb)"
+        case .skipped(let reason):
+            return "\(name): \(reason) (skipped)"
+        case .failed(let error):
+            return "\(name): error - \(error.localizedDescription)"
         }
+    }
+
+    private func configStatusMessage(_ result: IPCConfigResult) -> String {
+        [
+            configStatusLabel(result.claudeCode, name: "Claude Code", verb: "configured"),
+            configStatusLabel(result.codex, name: "Codex", verb: "configured"),
+            configStatusLabel(result.openCode, name: "OpenCode", verb: "configured"),
+            configStatusLabel(result.hermes, name: "Hermes", verb: "configured"),
+        ].joined(separator: "\n")
+    }
+
+    private func agentHooksStatusMessage(_ result: AgentHooksResult, mode: AgentHooksMode) -> String {
+        let verb = mode == .install ? "configured" : "removed"
         return [
-            label(result.claudeCode, name: "Claude Code"),
-            label(result.codex, name: "Codex"),
-            label(result.openCode, name: "OpenCode"),
-            label(result.hermes, name: "Hermes"),
+            configStatusLabel(result.claudeCode, name: "Claude Code hooks", verb: verb),
+            configStatusLabel(result.codex, name: "Codex hooks", verb: verb),
+            configStatusLabel(result.openCode, name: "OpenCode plugin", verb: verb),
         ].joined(separator: "\n")
     }
 
@@ -2148,8 +2158,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// Keep the agent list in sync with `IPCConfigResult` axes.
     private static func isAIAgentTitle(_ title: String) -> Bool {
         title.localizedCaseInsensitiveContains("claude") ||
-        title.localizedCaseInsensitiveContains("codex") ||
-        title.localizedCaseInsensitiveContains("opencode") ||
+        title.localizedCaseInsensitiveContains(AgentEntry.codexKind) ||
+        title.localizedCaseInsensitiveContains(AgentEntry.openCodeKind) ||
         title.localizedCaseInsensitiveContains("hermes")
     }
 

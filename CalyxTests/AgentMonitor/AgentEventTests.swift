@@ -217,4 +217,14 @@ final class AgentEventTests: XCTestCase {
         let data = json("this is not { json")
         XCTAssertNil(AgentEvent.decode(from: data))
     }
+
+    // MARK: - displayName(forKind:) — Phase 2 (Codex / OpenCode)
+
+    func test_displayName_codexKind_returnsCodex() {
+        XCTAssertEqual(AgentEntry.displayName(forKind: "codex"), "Codex")
+    }
+
+    func test_displayName_openCodeKind_returnsOpenCode() {
+        XCTAssertEqual(AgentEntry.displayName(forKind: "opencode"), "OpenCode")
+    }
 }

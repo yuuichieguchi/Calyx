@@ -432,8 +432,21 @@ final class CodexConfigManagerTests: XCTestCase {
     }
 
     func test_enableIPC_arrayOfTablesIgnored() throws {
-        // Given: file has [[array_of_tables]] inside the calyx-ipc section area
-        // The [[double bracket]] should NOT be treated as a section boundary
+        // Given: file has [[array_of_tables]] immediately after the
+        // calyx-ipc section header, with no blank-line separator.
+        //
+        // NOTE: this test's expectation was flipped from the original
+        // (which asserted the [[array_of_tables]] block was removed along
+        // with calyx-ipc). Per TOML semantics, `[[array_of_tables]]` is
+        // itself a table header — it always starts a new table, which means
+        // it always ends the calyx-ipc table that precedes it, regardless
+        // of adjacency. The old behavior (treating `[[` as "not a
+        // boundary") was a semantics bug: it caused a real [[hooks.*]] or
+        // other array-of-tables block placed directly after calyx-ipc (no
+        // blank line) to be silently swallowed and deleted. The section
+        // terminator was corrected to match TOML's actual rule (see
+        // CodexConfigManager.anyTableHeaderPattern), so the array-of-tables
+        // block below is now correctly preserved instead of removed.
         let existing = """
         [mcp_servers.calyx-ipc]
         url = "http://localhost:40000/mcp"
@@ -446,15 +459,198 @@ final class CodexConfigManagerTests: XCTestCase {
         // When
         try CodexConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
 
-        // Then: entire old section (including [[array_of_tables]] line) removed
+        // Then: calyx-ipc's own body is removed, but [[array_of_tables]]
+        // (a table header, hence a section boundary) and everything under
+        // it survives.
         let content = readConfig()
-        XCTAssertFalse(content.contains("[[array_of_tables]]"),
-                       "[[array_of_tables]] inside calyx-ipc section should be removed")
-        XCTAssertFalse(content.contains("should be removed with the section"))
+        XCTAssertTrue(content.contains("[[array_of_tables]]"),
+                       "[[array_of_tables]] is a table header and ends the calyx-ipc section")
+        XCTAssertTrue(content.contains("name = \"should be removed with the section\""))
+        XCTAssertTrue(content.contains("http_headers = { \"Authorization\" = \"Bearer old\" }"))
         XCTAssertFalse(content.contains("http://localhost:40000/mcp"))
         // Fresh section added
         XCTAssertTrue(content.contains("[mcp_servers.calyx-ipc]"))
         XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"))
+    }
+
+    // MARK: - Regression (Phase 2): [[hooks.*]] adjacent to calyx-ipc section
+
+    func test_disableIPC_preservesAdjacentCodexHooksArrayOfTablesBlock() throws {
+        // Regression: anyTableHeaderPattern's `^[ \t]*\[(?!\[)` excludes
+        // array-of-tables headers (`[[`), so a `[[hooks.SessionStart]]`
+        // block immediately following `[mcp_servers.calyx-ipc]` was never
+        // recognized as the section's boundary and got swallowed as if it
+        // were part of the calyx-ipc section body.
+        let existing = """
+        [mcp_servers.calyx-ipc]
+        url = "http://localhost:41830/mcp"
+        http_headers = { "Authorization" = "Bearer tok" }
+
+        [[hooks.SessionStart]]
+        [[hooks.SessionStart.hooks]]
+        type = "command"
+        command = "some-other-hook"
+        timeout = 5
+        """
+        writeConfig(existing)
+
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc]"), "calyx-ipc section must be removed")
+        XCTAssertTrue(content.contains("[[hooks.SessionStart]]"),
+                      "A [[hooks.*]] array-of-tables block immediately after [mcp_servers.calyx-ipc] " +
+                      "must survive disableIPC")
+        XCTAssertTrue(content.contains("[[hooks.SessionStart.hooks]]"))
+        XCTAssertTrue(content.contains("command = \"some-other-hook\""))
+        XCTAssertTrue(content.contains("timeout = 5"))
+    }
+
+    func test_disableIPC_preservesAdjacentCalyxAgentHooksManagedBlock() throws {
+        // Regression: the same bug applied to Calyx's own future
+        // CodexHooksConfigManager-managed block — its BEGIN marker line is
+        // an ordinary comment line (not a table header), so it too got
+        // swallowed by the calyx-ipc section removal.
+        let existing = """
+        [mcp_servers.calyx-ipc]
+        url = "http://localhost:41830/mcp"
+        http_headers = { "Authorization" = "Bearer tok" }
+
+        # BEGIN CALYX AGENT HOOKS (managed by Calyx, do not edit)
+        [[hooks.SessionStart]]
+        [[hooks.SessionStart.hooks]]
+        type = "command"
+        command = '"/path/to/calyx-agent-hook" codex'
+        timeout = 5
+        # END CALYX AGENT HOOKS
+        """
+        writeConfig(existing)
+
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc]"), "calyx-ipc section must be removed")
+        XCTAssertTrue(content.contains("# BEGIN CALYX AGENT HOOKS"),
+                      "The managed block's BEGIN marker line itself must survive disableIPC")
+        XCTAssertTrue(content.contains("[[hooks.SessionStart]]"))
+        XCTAssertTrue(content.contains("# END CALYX AGENT HOOKS"),
+                      "The managed block's END marker line must survive disableIPC")
+    }
+
+    // MARK: - Regression (Phase 2 fix): terminator = table header, not blank line
+
+    func test_disableIPC_noBlankLineBeforeHooksArrayOfTablesBlock_survives() throws {
+        // Regression: the section terminator is "any table header line"
+        // (including `[[`), not "a blank line". A [[hooks.*]] block
+        // immediately following calyx-ipc with NO blank-line separator must
+        // still survive disableIPC.
+        let existing = """
+        [mcp_servers.calyx-ipc]
+        url = "http://localhost:41830/mcp"
+        http_headers = { "Authorization" = "Bearer tok" }
+        [[hooks.SessionStart]]
+        [[hooks.SessionStart.hooks]]
+        type = "command"
+        command = "some-other-hook"
+        timeout = 5
+        """
+        writeConfig(existing)
+
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc]"))
+        XCTAssertFalse(content.contains("Bearer tok"))
+        XCTAssertTrue(content.contains("[[hooks.SessionStart]]"))
+        XCTAssertTrue(content.contains("[[hooks.SessionStart.hooks]]"))
+        XCTAssertTrue(content.contains("command = \"some-other-hook\""))
+        XCTAssertTrue(content.contains("timeout = 5"))
+    }
+
+    func test_disableIPC_noBlankLineBeforeCalyxAgentHooksMarker_survives() throws {
+        // Regression: same as above, but for the `# BEGIN CALYX` managed
+        // block marker directly abutting calyx-ipc with no blank line.
+        let existing = """
+        [mcp_servers.calyx-ipc]
+        url = "http://localhost:41830/mcp"
+        http_headers = { "Authorization" = "Bearer tok" }
+        # BEGIN CALYX AGENT HOOKS (managed by Calyx, do not edit)
+        [[hooks.SessionStart]]
+        [[hooks.SessionStart.hooks]]
+        type = "command"
+        command = '"/path/to/calyx-agent-hook" codex'
+        timeout = 5
+        # END CALYX AGENT HOOKS
+        """
+        writeConfig(existing)
+
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc]"))
+        XCTAssertFalse(content.contains("Bearer tok"))
+        XCTAssertTrue(content.contains("# BEGIN CALYX AGENT HOOKS"))
+        XCTAssertTrue(content.contains("[[hooks.SessionStart]]"))
+        XCTAssertTrue(content.contains("# END CALYX AGENT HOOKS"))
+    }
+
+    func test_disableIPC_blankLineInsideSectionBody_wholeSectionRemoved() throws {
+        // Regression: a blank line used to terminate the section
+        // prematurely, leaving the rest of the section's body — including a
+        // token-bearing `http_headers` line — behind in the file after
+        // disableIPC. Blank lines are no longer a terminator, so the whole
+        // section (up to the next real table header) must be removed
+        // together, even when a blank line appears in the middle of it.
+        let existing = """
+        [mcp_servers.calyx-ipc]
+        url = "http://localhost:41830/mcp"
+
+        http_headers = { "Authorization" = "Bearer secret-token" }
+
+        [other.section]
+        key = "value"
+        """
+        writeConfig(existing)
+
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc]"))
+        XCTAssertFalse(content.contains("Bearer secret-token"),
+                       "Bearer token line must not survive even when separated from " +
+                       "the section header by a blank line")
+        XCTAssertTrue(content.contains("[other.section]"))
+        XCTAssertTrue(content.contains("key = \"value\""))
+    }
+
+    func test_disableIPC_removesCalyxIpcSubTables() throws {
+        // A [mcp_servers.calyx-ipc.*] / [[mcp_servers.calyx-ipc.*]]
+        // sub-table header is still part of the calyx-ipc entry per TOML's
+        // dotted-key semantics, so it must NOT terminate the section — it
+        // must be removed along with the rest of it.
+        let existing = """
+        [mcp_servers.calyx-ipc]
+        url = "http://localhost:41830/mcp"
+        http_headers = { "Authorization" = "Bearer tok" }
+        [mcp_servers.calyx-ipc.env]
+        FOO = "bar"
+        [[mcp_servers.calyx-ipc.extra]]
+        name = "baz"
+        [other.section]
+        key = "value"
+        """
+        writeConfig(existing)
+
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc]"))
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc.env]"))
+        XCTAssertFalse(content.contains("FOO = \"bar\""))
+        XCTAssertFalse(content.contains("[[mcp_servers.calyx-ipc.extra]]"))
+        XCTAssertFalse(content.contains("name = \"baz\""))
+        XCTAssertTrue(content.contains("[other.section]"))
+        XCTAssertTrue(content.contains("key = \"value\""))
     }
 
     // MARK: - Concurrency

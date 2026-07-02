@@ -25,16 +25,26 @@ enum AgentHookScript {
     /// time) so a server restart or token rotation never leaves the hook
     /// posting to a stale port/token. Every exit path is `exit 0`: a
     /// failed or unreachable POST must never break the user's hook chain.
+    ///
+    /// `$1` is the agent kind, forwarded as the `X-Calyx-Agent-Kind`
+    /// header so the server can attribute the event to the right CLI.
+    /// Defaulting to `claude-code` when `$1` is unset keeps this script
+    /// compatible with Claude Code's own hook `command` entries (installed
+    /// by `ClaudeHooksConfigManager`), which invoke it with no arguments;
+    /// `CodexHooksConfigManager` installs Codex's entries as
+    /// `"<scriptPath>" codex` to pass `codex` explicitly.
     static let scriptBody: String = """
     #!/bin/sh
     #
     # calyx-agent-hook — forwards a Claude Code hook's stdin JSON to
     # Calyx's local Agent Monitor IPC endpoint. Installed and removed by
-    # ClaudeHooksConfigManager.
+    # ClaudeHooksConfigManager / CodexHooksConfigManager.
 
     if [ -z "$CALYX_SURFACE_ID" ]; then
         exit 0
     fi
+
+    kind="${1:-claude-code}"
 
     endpoint_file="$HOME/Library/Application Support/Calyx/agent-endpoint.json"
     if [ ! -f "$endpoint_file" ]; then
@@ -52,6 +62,7 @@ enum AgentHookScript {
         -X POST \\
         -H "Authorization: Bearer $token" \\
         -H "X-Calyx-Surface-ID: $CALYX_SURFACE_ID" \\
+        -H "X-Calyx-Agent-Kind: $kind" \\
         -H "Content-Type: application/json" \\
         --data-binary @- \\
         "http://127.0.0.1:$port/agent-event" > /dev/null 2>&1

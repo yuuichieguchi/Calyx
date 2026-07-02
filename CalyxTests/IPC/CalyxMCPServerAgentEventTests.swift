@@ -70,11 +70,13 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
     private func agentEventRequest(
         token: String?,
         surfaceIDHeader: String?,
-        body: Data?
+        body: Data?,
+        kindHeader: String? = nil
     ) -> HTTPRequest {
         var headers: [String: String] = [:]
         if let token { headers["Authorization"] = "Bearer \(token)" }
         if let surfaceIDHeader { headers["X-Calyx-Surface-ID"] = surfaceIDHeader }
+        if let kindHeader { headers["X-Calyx-Agent-Kind"] = kindHeader }
         return HTTPRequest(method: "POST", path: "/agent-event", headers: headers, body: body)
     }
 
@@ -98,6 +100,79 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
         XCTAssertEqual(registry.entries[surfaceID]?.sessionID, "session-1")
         XCTAssertEqual(registry.entries[surfaceID]?.cwd, "/Users/dev/repo")
         XCTAssertEqual(registry.entries[surfaceID]?.state, .idle)
+    }
+
+    // MARK: - X-Calyx-Agent-Kind propagation (Phase 2)
+
+    func test_route_agentEvent_agentKindHeader_propagatesToRegistryEntryKind() async {
+        // Case A: X-Calyx-Agent-Kind: codex must propagate to the entry's kind.
+        let registryWithKindHeader = AgentRegistry()
+        server.agentRegistry = registryWithKindHeader
+        let surfaceWithKindHeader = UUID()
+        let requestWithKindHeader = agentEventRequest(
+            token: testToken,
+            surfaceIDHeader: surfaceWithKindHeader.uuidString,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo"),
+            kindHeader: "codex"
+        )
+
+        let responseWithKindHeader = await server.route(request: requestWithKindHeader)
+
+        XCTAssertEqual(responseWithKindHeader.statusCode, 204)
+        XCTAssertEqual(registryWithKindHeader.entries[surfaceWithKindHeader]?.kind, "codex",
+                       "X-Calyx-Agent-Kind: codex must propagate to the registry entry's kind")
+
+        // Case B: a missing header must default to claude-code.
+        let registryWithoutKindHeader = AgentRegistry()
+        server.agentRegistry = registryWithoutKindHeader
+        let surfaceWithoutKindHeader = UUID()
+        let requestWithoutKindHeader = agentEventRequest(
+            token: testToken,
+            surfaceIDHeader: surfaceWithoutKindHeader.uuidString,
+            body: validAgentEventBody(sessionID: "session-2", cwd: "/Users/dev/repo2")
+        )
+
+        let responseWithoutKindHeader = await server.route(request: requestWithoutKindHeader)
+
+        XCTAssertEqual(responseWithoutKindHeader.statusCode, 204)
+        XCTAssertEqual(registryWithoutKindHeader.entries[surfaceWithoutKindHeader]?.kind, "claude-code",
+                       "A missing X-Calyx-Agent-Kind header must default to claude-code")
+    }
+
+    func test_route_agentEvent_emptyStringKindHeader_defaultsToClaudeCode() async {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceID = UUID()
+        let request = agentEventRequest(
+            token: testToken,
+            surfaceIDHeader: surfaceID.uuidString,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo"),
+            kindHeader: ""
+        )
+
+        let response = await server.route(request: request)
+
+        XCTAssertEqual(response.statusCode, 204)
+        XCTAssertEqual(registry.entries[surfaceID]?.kind, "claude-code",
+                       "An empty-string X-Calyx-Agent-Kind header must default to claude-code")
+    }
+
+    func test_route_agentEvent_whitespaceOnlyKindHeader_defaultsToClaudeCode() async {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceID = UUID()
+        let request = agentEventRequest(
+            token: testToken,
+            surfaceIDHeader: surfaceID.uuidString,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo"),
+            kindHeader: "   "
+        )
+
+        let response = await server.route(request: request)
+
+        XCTAssertEqual(response.statusCode, 204)
+        XCTAssertEqual(registry.entries[surfaceID]?.kind, "claude-code",
+                       "A whitespace-only X-Calyx-Agent-Kind header must default to claude-code")
     }
 
     // MARK: - Authentication

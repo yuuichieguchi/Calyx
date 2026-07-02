@@ -12,11 +12,6 @@ final class AgentRegistry {
 
     static let shared = AgentRegistry()
 
-    /// The only agent `kind` `AgentRegistry` produces entries for in v1.
-    /// Phase 2 adds `"codex"` / `"opencode"` alongside their own event
-    /// sources.
-    private static let claudeCodeKind = "claude-code"
-
     /// Case-insensitive notification message substrings that indicate a
     /// blocked (permission / input needed) agent. This is a server-side
     /// backstop for the `Notification` hook's `matcher: "permission_prompt"`
@@ -35,7 +30,13 @@ final class AgentRegistry {
 
     /// Hook events that represent forward progress within a session, used
     /// by the session-mismatch reconciliation in `handleHookEvent` — see
-    /// its doc comment.
+    /// its doc comment. `PermissionRequest` (Codex, Phase 2) is
+    /// deliberately excluded: unlike `UserPromptSubmit`/`PreToolUse`/
+    /// `PostToolUse`, seeing one for an unrecognized session isn't good
+    /// evidence of a genuine new session Calyx missed the `SessionStart`
+    /// for — it's at least as likely a stale/mismatched permission prompt
+    /// from a session that's already ending, and replacing the entry on
+    /// that basis would incorrectly flip an active row to `.blocked`.
     private static let forwardMovingEventNames: Set<String> = [
         "UserPromptSubmit", "PreToolUse", "PostToolUse",
     ]
@@ -125,8 +126,25 @@ final class AgentRegistry {
     ///   the event is discarded, since those are as likely to be a stale
     ///   session's event arriving out of order (e.g. `/clear`'s old-session
     ///   `SessionEnd` landing after the new session's first event) as a
-    ///   genuine new session.
-    func handleHookEvent(_ event: AgentEvent, surfaceID: UUID) {
+    ///   genuine new session. A mismatched `PermissionRequest` gets one more
+    ///   rescue: it also replaces an `.idle` (not just `.done`) existing
+    ///   entry — see `resultingState`'s doc comment for why `PermissionRequest`
+    ///   isn't simply added to `forwardMovingEventNames` instead. Codex has
+    ///   no `SessionEnd` hook, so a missed `SessionStart` (IPC enabled
+    ///   mid-session, or Calyx restarted) can leave a stale-but-idle entry
+    ///   on a pane; without this rescue a subsequent approval prompt for the
+    ///   real new session is discarded and the sidebar never shows it as
+    ///   blocked. `.working` and `.blocked` entries remain protected from a
+    ///   mismatched `PermissionRequest`, exactly as before.
+    /// - Parameter kind: The agent CLI this event came from (Phase 2:
+    ///   Codex / OpenCode alongside the default Claude Code), forwarded by
+    ///   `CalyxMCPServer.routeAgentEvent`'s `X-Calyx-Agent-Kind` header.
+    ///   Applied only when this call creates or replaces an entry —
+    ///   `makeEntry` below — so a same-session continuation event (the
+    ///   `SessionStart` re-send branch, and the "same session" update path
+    ///   at the bottom of this method) never overwrites an existing
+    ///   entry's `kind` with this parameter's default.
+    func handleHookEvent(_ event: AgentEvent, surfaceID: UUID, kind: String = AgentEntry.claudeCodeKind) {
         let now = Date()
 
         func makeEntry(state: AgentState) -> AgentEntry {
@@ -136,7 +154,7 @@ final class AgentRegistry {
                 source: .hooks,
                 state: state,
                 cwd: event.cwd,
-                kind: Self.claudeCodeKind,
+                kind: kind,
                 lastEventAt: now
             )
         }
@@ -164,7 +182,9 @@ final class AgentRegistry {
 
         guard existing.sessionID == event.sessionID else {
             let isForwardMoving = Self.forwardMovingEventNames.contains(event.hookEventName)
-            guard existing.state == .done || isForwardMoving else { return }
+            let isPermissionRequestIdleRescue =
+                event.hookEventName == "PermissionRequest" && existing.state == .idle
+            guard existing.state == .done || isForwardMoving || isPermissionRequestIdleRescue else { return }
             entries[surfaceID] = makeEntry(state: newState)
             return
         }
@@ -193,6 +213,15 @@ final class AgentRegistry {
     /// message field is absent or unparseable. The substring check exists
     /// only to guard against an older Claude Code build that ignores the
     /// matcher and fires `Notification` for unrelated messages too.
+    ///
+    /// `PermissionRequest` (Codex's hook, Phase 2) always resolves to
+    /// `.blocked`, unconditionally — unlike `Notification` there's no
+    /// message-substring backstop to apply, since Codex's hook payload for
+    /// this event carries no equivalent field: `calyx-agent-hook` exiting
+    /// 0 with no output already guarantees the hook never influences
+    /// Codex's own approval decision, so firing it at all is a reliable
+    /// signal that Codex is waiting on the user. It's deliberately absent
+    /// from `forwardMovingEventNames`: see that property's doc comment.
     private static func resultingState(for event: AgentEvent) -> AgentState? {
         switch event.hookEventName {
         case "UserPromptSubmit", "PreToolUse", "PostToolUse":
@@ -201,6 +230,8 @@ final class AgentRegistry {
             return .idle
         case "SessionEnd":
             return .done
+        case "PermissionRequest":
+            return .blocked
         case "Notification":
             guard let message = event.message else { return .blocked }
             let isBlocked = blockedNotificationPatterns.contains {
@@ -229,7 +260,7 @@ final class AgentRegistry {
             source: .titleHeuristic,
             state: classified,
             cwd: existing?.cwd,
-            kind: Self.claudeCodeKind,
+            kind: AgentEntry.claudeCodeKind,
             lastEventAt: Date()
         )
     }

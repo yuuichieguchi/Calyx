@@ -28,6 +28,15 @@ struct ConfigFileUtils: Sendable {
         return (statBuf.st_mode & S_IFMT) == S_IFLNK
     }
 
+    /// Checks that a path exists and is a directory (not a file). Shared by
+    /// every agent-tool config manager's "is this tool even installed"
+    /// pre-check, so that check exists in exactly one place.
+    static func directoryExists(at path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+        return exists && isDirectory.boolValue
+    }
+
     /// Reads, parses, and backs up a JSON config file: rejects a
     /// symlinked `path`, returns `[:]` when `path` doesn't exist yet (an
     /// empty starting config — there is nothing to back up), otherwise
