@@ -375,6 +375,6 @@ struct OpenCodeConfigManager: Sendable {
     // MARK: - Private: Defaults
 
     private static var defaultConfigDir: String {
-        NSHomeDirectory() + "/.config/opencode"
+        AgentToolPaths.openCodeConfigDirectory
     }
 }

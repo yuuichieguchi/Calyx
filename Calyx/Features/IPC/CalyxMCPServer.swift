@@ -127,7 +127,18 @@ final class CalyxMCPServer {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
 
-        agentRegistry.handleHookEvent(event, surfaceID: surfaceID)
+        // Trim whitespace and fall back to claude-code when the header is
+        // absent OR present-but-blank (e.g. a proxy/plugin bug that sends
+        // `X-Calyx-Agent-Kind: ` with no value), rather than letting an
+        // empty-string kind reach the registry and the sidebar.
+        let kind: String
+        if let trimmed = header(named: "X-Calyx-Agent-Kind", in: request.headers)?
+            .trimmingCharacters(in: .whitespaces), !trimmed.isEmpty {
+            kind = trimmed
+        } else {
+            kind = AgentEntry.claudeCodeKind
+        }
+        agentRegistry.handleHookEvent(event, surfaceID: surfaceID, kind: kind)
         return HTTPParser.response(statusCode: 204, body: nil)
     }
 

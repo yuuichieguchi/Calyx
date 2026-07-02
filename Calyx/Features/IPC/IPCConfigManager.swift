@@ -81,8 +81,7 @@ struct IPCConfigManager: Sendable {
     // MARK: - Private: Claude Code
 
     private static func enableClaudeCode(port: Int, token: String) -> ConfigStatus {
-        let claudeDir = NSHomeDirectory() + "/.claude/"
-        guard directoryExists(at: claudeDir) else {
+        guard ConfigFileUtils.directoryExists(at: AgentToolPaths.claudeConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         do {
@@ -105,8 +104,7 @@ struct IPCConfigManager: Sendable {
     // MARK: - Private: Codex
 
     private static func enableCodex(port: Int, token: String) -> ConfigStatus {
-        let codexDir = NSHomeDirectory() + "/.codex/"
-        guard directoryExists(at: codexDir) else {
+        guard ConfigFileUtils.directoryExists(at: AgentToolPaths.codexConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         do {
@@ -129,13 +127,7 @@ struct IPCConfigManager: Sendable {
     // MARK: - Private: OpenCode
 
     private static func enableOpenCode(port: Int, token: String) -> ConfigStatus {
-        // Intentional asymmetry: no trailing slash here (differs from Claude/Codex).
-        // OpenCodeConfigManager.defaultConfigDir uses no trailing slash, and path
-        // construction appends `/opencode.json` and `/AGENTS.md`. Keeping this in
-        // sync avoids doubled `//` in constructed paths. directoryExists handles
-        // the no-trailing-slash form correctly.
-        let openCodeDir = NSHomeDirectory() + "/.config/opencode"
-        guard directoryExists(at: openCodeDir) else {
+        guard ConfigFileUtils.directoryExists(at: AgentToolPaths.openCodeConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         do {
@@ -159,7 +151,7 @@ struct IPCConfigManager: Sendable {
 
     private static func enableHermes(port: Int, token: String) -> ConfigStatus {
         let hermesDir = NSHomeDirectory() + "/.hermes/"
-        guard directoryExists(at: hermesDir) else {
+        guard ConfigFileUtils.directoryExists(at: hermesDir) else {
             return .skipped(reason: "not installed")
         }
         do {
@@ -177,14 +169,5 @@ struct IPCConfigManager: Sendable {
         } catch {
             return .failed(error)
         }
-    }
-
-    // MARK: - Private: Helpers
-
-    /// Checks that a path exists and is a directory (not a file).
-    private static func directoryExists(at path: String) -> Bool {
-        var isDirectory: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
-        return exists && isDirectory.boolValue
     }
 }

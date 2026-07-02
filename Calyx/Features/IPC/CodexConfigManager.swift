@@ -35,9 +35,7 @@ struct CodexConfigManager: Sendable {
         let parentDir = (path as NSString).deletingLastPathComponent
 
         // Parent directory must exist
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: parentDir, isDirectory: &isDir),
-              isDir.boolValue else {
+        guard ConfigFileUtils.directoryExists(at: parentDir) else {
             throw CodexConfigError.directoryNotFound
         }
 
@@ -122,14 +120,30 @@ struct CodexConfigManager: Sendable {
     // MARK: - Private
 
     private static var defaultConfigPath: String {
-        NSHomeDirectory() + "/.codex/config.toml"
+        AgentToolPaths.codexConfigDirectory + "/config.toml"
     }
 
     /// Regex pattern for `[mcp_servers.calyx-ipc]` section header.
     private static let sectionHeaderPattern = #"^[ \t]*\[mcp_servers\.calyx-ipc\][ \t]*(#.*)?$"#
 
-    /// Regex pattern for any standard table header (but not array-of-tables `[[`).
-    private static let anyTableHeaderPattern = #"^[ \t]*\[(?!\[)"#
+    /// Regex pattern for any TOML table header, standard (`[...]`) or
+    /// array-of-tables (`[[...]]`). Per TOML semantics a table header always
+    /// starts a new table and therefore always ends whatever table preceded
+    /// it — including `[mcp_servers.calyx-ipc]` — regardless of whether a
+    /// blank line separates them.
+    private static let anyTableHeaderPattern = #"^[ \t]*\["#
+
+    /// Regex pattern for a `[mcp_servers.calyx-ipc.*]` or
+    /// `[[mcp_servers.calyx-ipc.*]]` sub-table header. Per TOML's dotted-key
+    /// semantics this is still part of the calyx-ipc entry (not a boundary)
+    /// and must be removed along with the rest of the section.
+    private static let calyxIpcSubTableHeaderPattern = #"^[ \t]*\[\[?mcp_servers\.calyx-ipc\."#
+
+    /// Regex pattern for the BEGIN marker of a Calyx-managed block
+    /// (`CodexHooksConfigManager`'s `[[hooks.*]]` block). Recognized as a
+    /// section boundary even though it's an ordinary TOML comment, not a
+    /// table header.
+    private static let calyxManagedBlockMarkerPattern = #"^[ \t]*#\s*BEGIN CALYX"#
 
     private static func isSectionHeader(_ line: String) -> Bool {
         line.range(of: sectionHeaderPattern, options: .regularExpression) != nil
@@ -139,8 +153,23 @@ struct CodexConfigManager: Sendable {
         line.range(of: anyTableHeaderPattern, options: .regularExpression) != nil
     }
 
+    private static func isCalyxIpcSubTableHeader(_ line: String) -> Bool {
+        line.range(of: calyxIpcSubTableHeaderPattern, options: .regularExpression) != nil
+    }
+
+    private static func isCalyxManagedBlockMarker(_ line: String) -> Bool {
+        line.range(of: calyxManagedBlockMarkerPattern, options: .regularExpression) != nil
+    }
+
     /// Remove all `[mcp_servers.calyx-ipc]` sections from the content.
     /// Normalizes `\r\n` to `\n`.
+    ///
+    /// A section's body ends at the next TOML table header (`[...]` or
+    /// `[[...]]`), or at a `# BEGIN CALYX` managed-block marker — never at a
+    /// blank line. Blank lines are ordinary TOML whitespace and can appear
+    /// inside a section's body without ending it; treating them as a
+    /// terminator would leave the section's tail (including its
+    /// `http_headers` / Bearer-token line) behind in the file.
     private static func removeSections(from content: String) -> String {
         let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
         let lines = normalized.components(separatedBy: "\n")
@@ -156,12 +185,20 @@ struct CodexConfigManager: Sendable {
             }
 
             if inSection {
-                if isAnyTableHeader(line) {
-                    // Hit the next table header — end of calyx-ipc section
+                if isCalyxIpcSubTableHeader(line) {
+                    // A [mcp_servers.calyx-ipc.*] sub-table is still part of
+                    // this entry — remove it along with the rest.
+                    continue
+                }
+                if isAnyTableHeader(line) || isCalyxManagedBlockMarker(line) {
+                    // Hit the next table header, or another managed block's
+                    // BEGIN marker comment — end of calyx-ipc section.
                     inSection = false
                     result.append(line)
+                    continue
                 }
-                // Otherwise still inside the section — skip
+                // Otherwise still inside the section (including blank
+                // lines) — skip
                 continue
             }
 

@@ -40,10 +40,27 @@ extension AgentEntry {
     /// line in `AgentStatusView`.
     static func displayName(forKind kind: String) -> String {
         switch kind {
-        case "claude-code": return "Claude Code"
+        case Self.claudeCodeKind: return "Claude Code"
+        case Self.codexKind: return "Codex"
+        case Self.openCodeKind: return "OpenCode"
         default: return kind
         }
     }
+}
+
+extension AgentEntry {
+    /// `kind` constants for the three agent CLIs `AgentRegistry` produces
+    /// entries for: `AgentHookScript`'s `$1` argv default for Claude Code,
+    /// `CodexHooksConfigManager`'s installed `command` argument for Codex,
+    /// and `OpenCodePluginManager`'s `X-Calyx-Agent-Kind` header for
+    /// OpenCode all resolve to one of these three.
+    static let claudeCodeKind = "claude-code"
+    static let codexKind = "codex"
+    /// Keep in sync with the `"opencode"` literal in
+    /// `OpenCodePluginManager.scriptBody`'s `X-Calyx-Agent-Kind` header —
+    /// that value lives in a JS string embedded in a Swift string constant,
+    /// so it can't reference this constant directly.
+    static let openCodeKind = "opencode"
 }
 
 // MARK: - AgentEvent
