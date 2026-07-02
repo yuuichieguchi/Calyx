@@ -1,40 +1,42 @@
 // AgentStatusView.swift
 // Calyx
 //
-// Sidebar view that displays connected AI agent peers and their activity states.
+// Sidebar view that displays AI agent panes and their lifecycle state,
+// sourced live from `AgentRegistry.shared`.
 
 import SwiftUI
 
 struct AgentStatusView: View {
-    @State private var entries: [AgentStatusEntry] = []
-    @State private var isIPCRunning: Bool = false
-    @State private var refreshTask: Task<Void, Never>?
-
-    private let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
-
     var body: some View {
         Group {
-            if !isIPCRunning {
+            // Observes AgentRegistry.isServerRunning rather than
+            // CalyxMCPServer.isRunning: CalyxMCPServer is a plain
+            // @MainActor class, not @Observable, so a view reading its
+            // isRunning directly would never get a re-render signal when
+            // the server starts/stops.
+            if !AgentRegistry.shared.isServerRunning {
                 disabledPlaceholder
-            } else if entries.isEmpty {
-                emptyPlaceholder
             } else {
-                ScrollView {
-                    VStack(spacing: 4) {
-                        ForEach(entries) { entry in
-                            AgentRowView(entry: entry)
+                let entries = AgentRegistry.shared.sortedEntries
+                if entries.isEmpty {
+                    emptyPlaceholder
+                } else {
+                    // TimelineView re-renders every second so each row's
+                    // relative "time ago" label stays live; it also stops
+                    // firing automatically while the sidebar isn't visible.
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        ScrollView {
+                            VStack(spacing: 4) {
+                                ForEach(entries) { entry in
+                                    AgentRowView(entry: entry, now: context.date)
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
                         }
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
                 }
             }
-        }
-        .onAppear { refresh() }
-        .onReceive(timer) { _ in refresh() }
-        .onDisappear {
-            refreshTask?.cancel()
-            refreshTask = nil
         }
     }
 
@@ -69,32 +71,16 @@ struct AgentStatusView: View {
         .padding(.horizontal, 16)
         .frame(maxWidth: .infinity)
     }
-
-    // MARK: - Data Refresh
-
-    private func refresh() {
-        // Cancel any in-flight refresh so a slow prior snapshot cannot
-        // overwrite a fresher one, and so a Task started right before
-        // `.onDisappear` cannot write into `@State` after the view is gone.
-        refreshTask?.cancel()
-        refreshTask = Task { @MainActor in
-            // Read running state BEFORE awaiting so a stop() during the actor
-            // hop does not desync `isIPCRunning` from `entries` (an old-server
-            // stop() → new-server start() sequence otherwise briefly shows
-            // "no agents" with running=true).
-            let running = CalyxMCPServer.shared.isRunning
-            let snapshot = await CalyxMCPServer.shared.agentSnapshot()
-            if Task.isCancelled { return }
-            self.isIPCRunning = running
-            self.entries = snapshot
-        }
-    }
 }
 
 // MARK: - Agent Row View
 
 private struct AgentRowView: View {
-    let entry: AgentStatusEntry
+    let entry: AgentEntry
+    /// The "current" instant used to render `lastEventAt`'s relative
+    /// label, supplied by the enclosing `TimelineView` so it stays live
+    /// without this row managing its own timer.
+    let now: Date
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.controlActiveState) private var controlActiveState
@@ -106,18 +92,22 @@ private struct AgentRowView: View {
         return fmt
     }()
 
-    /// Self entries render as blue unconditionally. The Calyx app peer's
-    /// `lastSeen` is bumped every time an agent broadcasts or messages it,
-    /// so in normal operation `state` stays `.active`; even if the app peer
-    /// went idle/stale between broadcasts, the "this is me" affordance is
-    /// more useful than surfacing the app's own activity level.
     private var dotColor: Color {
-        if entry.isSelf { return .blue }
         switch entry.state {
-        case .active: return .green
-        case .idle:   return .yellow
-        case .stale:  return Color(white: 0.5)
+        case .blocked: return .red
+        case .working: return .yellow
+        case .done:    return .blue
+        case .idle:    return .green
         }
+    }
+
+    /// The row's primary label: the pane's working directory basename, or
+    /// "Claude Code" when no `cwd` has been reported yet. Reuses
+    /// `AgentRegistry.basename` rather than re-deriving it, so the
+    /// basename logic exists in exactly one place.
+    private var displayName: String {
+        let basename = AgentRegistry.basename(entry.cwd)
+        return basename.isEmpty ? "Claude Code" : basename
     }
 
     var body: some View {
@@ -127,12 +117,12 @@ private struct AgentRowView: View {
                 .fill(dotColor)
                 .frame(width: 8, height: 8)
 
-            // Name + role
+            // Name + agent kind
             VStack(alignment: .leading, spacing: 2) {
-                Text(entry.name)
+                Text(displayName)
                     .font(.system(size: 12.5, weight: .semibold, design: .rounded))
                     .lineLimit(1)
-                Text(entry.role)
+                Text(AgentEntry.displayName(forKind: entry.kind))
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -140,19 +130,9 @@ private struct AgentRowView: View {
 
             Spacer()
 
-            // Right side: inbox badge + relative time
-            VStack(alignment: .trailing, spacing: 2) {
-                if entry.inboxCount > 0 {
-                    Text(entry.inboxCount > 99 ? "99+" : "\(entry.inboxCount)")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(minWidth: 16, minHeight: 16)
-                        .background(Circle().fill(Color.red))
-                }
-                Text(Self.relativeDateFormatter.localizedString(for: entry.lastSeen, relativeTo: Date()))
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-            }
+            Text(Self.relativeDateFormatter.localizedString(for: entry.lastEventAt, relativeTo: now))
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
         }
         .contentShape(Rectangle())
         .padding(.horizontal, 14)
@@ -167,5 +147,12 @@ private struct AgentRowView: View {
         .onAssumeInsideHover($isHovering)
         .opacity(controlActiveState == .key ? 1.0 : 0.5)
         .accessibilityIdentifier(AccessibilityID.Sidebar.agentRow(id: entry.id))
+        .onTapGesture {
+            NotificationCenter.default.post(
+                name: .calyxFocusSurface,
+                object: nil,
+                userInfo: ["surfaceID": entry.surfaceID]
+            )
+        }
     }
 }

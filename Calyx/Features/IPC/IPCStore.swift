@@ -116,26 +116,6 @@ actor IPCStore {
         inbox.removeValue(forKey: id)
     }
 
-    /// Returns all alive peers paired with their current inbox size.
-    /// Applies the same liveness filter as `listPeers()`. No `now` parameter:
-    /// liveness is a store-internal concept driven by `Date()` inside
-    /// `isAlive(_:)`, and callers that need clock injection for activity
-    /// classification (see `CalyxMCPServer.agentSnapshot(now:)`) supply their
-    /// own `now` to `AgentStatusClassifier.classify` without touching the
-    /// store's liveness gate.
-    func statusEntries() -> [(peer: Peer, inboxCount: Int)] {
-        let allIDs = Array(peers.keys)
-        var result: [(peer: Peer, inboxCount: Int)] = []
-        result.reserveCapacity(allIDs.count)
-        for id in allIDs {
-            if let peer = aliveOrPurge(id) {
-                let count = inbox[id]?.count ?? 0
-                result.append((peer: peer, inboxCount: count))
-            }
-        }
-        return result
-    }
-
     /// Returns all peers that are alive. A peer is alive when its `lastSeen`
     /// is within `peerTTL` OR it is pinned by an in-flight message (sender or
     /// recipient). Lazily purges any peer that is no longer alive.

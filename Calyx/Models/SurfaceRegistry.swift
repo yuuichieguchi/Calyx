@@ -106,6 +106,12 @@ final class SurfaceRegistry {
 
         entries.removeValue(forKey: id)
         logger.info("Surface destroyed: \(id)")
+
+        NotificationCenter.default.post(
+            name: .calyxSurfaceDestroyed,
+            object: nil,
+            userInfo: ["surfaceID": id]
+        )
     }
 
     func completeDragAndDestroyIfNeeded(_ id: UUID) {

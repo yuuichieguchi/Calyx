@@ -1125,6 +1125,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .ghosttyGotoTab, object: nil)
         center.addObserver(self, selector: #selector(handleConfirmClipboardNotification(_:)),
                            name: .ghosttyConfirmClipboard, object: nil)
+        center.addObserver(self, selector: #selector(handleFocusSurfaceNotification(_:)),
+                           name: .calyxFocusSurface, object: nil)
+        center.addObserver(self, selector: #selector(handleSurfaceDestroyedForAgentMonitor(_:)),
+                           name: .calyxSurfaceDestroyed, object: nil)
     }
 
     // MARK: - Notification Handlers
@@ -1302,6 +1306,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard let surfaceView = notification.object as? SurfaceView else { return }
         guard belongsToThisWindow(surfaceView) else { return }
         guard let title = notification.userInfo?["title"] as? String else { return }
+
+        // Feed the title-heuristic fallback for every pane's title change,
+        // not just the tab's focused surface — a background split running
+        // Claude Code still needs to report into the Agents sidebar.
+        if let surfaceID = surfaceView.surfaceController?.id {
+            AgentRegistry.shared.handleTitleChange(surfaceID: surfaceID, title: title)
+        }
+
         guard let tab = activeTab else { return }
 
         if let focusedID = tab.splitTree.focusedLeafID,
@@ -1311,6 +1323,36 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             window?.title = tab.titleOverride ?? title
             refreshHostingView()
         }
+    }
+
+    /// Resolves an Agents sidebar row click to a surface owned by this
+    /// window and focuses it. A no-op in every other window's controller
+    /// (its `windowSession` won't resolve the surface), and a no-op for
+    /// QuickTerminal-hosted panes, which aren't part of any `windowSession`
+    /// (out of scope for v1 — the row is still shown, just not focusable).
+    @objc private func handleFocusSurfaceNotification(_ notification: Notification) {
+        guard let surfaceID = notification.userInfo?["surfaceID"] as? UUID else { return }
+        guard let tab = findTab(surfaceID: surfaceID) else { return }
+
+        switchToTab(id: tab.id)
+        if let view = tab.registry.view(for: surfaceID) {
+            window?.makeFirstResponder(view)
+        }
+        // Every window's controller observes this notification, but only
+        // the one that actually resolves the surface (above) should come
+        // to the front — otherwise clicking a sidebar row for a pane in a
+        // background window would focus that pane without raising its
+        // window, leaving it invisible behind the current one.
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    /// Relays `.calyxSurfaceDestroyed` (posted by `SurfaceRegistry`) into
+    /// `AgentRegistry`. Every window's controller observes this
+    /// independently; `AgentRegistry.handleSurfaceDestroyed` is idempotent,
+    /// so the redundant calls across windows are harmless.
+    @objc private func handleSurfaceDestroyedForAgentMonitor(_ notification: Notification) {
+        guard let surfaceID = notification.userInfo?["surfaceID"] as? UUID else { return }
+        AgentRegistry.shared.handleSurfaceDestroyed(surfaceID: surfaceID)
     }
 
     @objc private func handleSetPwdNotification(_ notification: Notification) {
@@ -1632,6 +1674,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 if tab.registry.id(for: surfaceView) != nil {
                     return (tab, group)
                 }
+            }
+        }
+        return nil
+    }
+
+    /// Finds the tab (in this window) whose `SurfaceRegistry` owns
+    /// `surfaceID`. Used by `handleFocusSurfaceNotification` to resolve an
+    /// Agents sidebar row click — each window's controller independently
+    /// checks its own `windowSession`, so only the owning window acts.
+    private func findTab(surfaceID: UUID) -> Tab? {
+        for group in windowSession.groups {
+            for tab in group.tabs where tab.registry.contains(surfaceID) {
+                return tab
             }
         }
         return nil
@@ -2023,9 +2078,25 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 return
             }
 
+            // Install the calyx-agent-hook script and wire it into Claude
+            // Code's settings.json so panes report lifecycle state to the
+            // Agents sidebar. Same do/catch-and-report shape as
+            // ClaudeConfigManager.enableIPC/disableIPC (see
+            // IPCConfigManager.enableClaudeCode/disableClaudeCode): a hooks
+            // failure degrades the sidebar rather than the whole "Enable AI
+            // Agent IPC" flow, since the MCP server above is already running.
+            let hooksStatus: String
+            do {
+                let scriptPath = try AgentHookScript.install(toDirectory: AgentHookScript.defaultInstallDirectory)
+                try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath)
+                hooksStatus = "Agent hooks: installed"
+            } catch {
+                hooksStatus = "Agent hooks: error - \(error.localizedDescription)"
+            }
+
             showIPCAlert(
                 title: "IPC Enabled",
-                message: "MCP server running on port \(port).\n\(configStatusMessage(result))\nRestart agent instances to connect."
+                message: "MCP server running on port \(port).\n\(configStatusMessage(result))\n\(hooksStatus)\nRestart agent instances to connect."
             )
         } catch {
             showIPCAlert(title: "IPC Error", message: error.localizedDescription)
@@ -2035,9 +2106,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private func disableIPC() {
         CalyxMCPServer.shared.stop()
         let result = IPCConfigManager.disableIPC()
+
+        let hooksStatus: String
+        do {
+            try ClaudeHooksConfigManager.removeHooks()
+            hooksStatus = "Agent hooks: removed"
+        } catch {
+            hooksStatus = "Agent hooks: error - \(error.localizedDescription)"
+        }
+
         showIPCAlert(
             title: "IPC Disabled",
-            message: "MCP server stopped.\n\(configStatusMessage(result))"
+            message: "MCP server stopped.\n\(configStatusMessage(result))\n\(hooksStatus)"
         )
     }
 

@@ -5,12 +5,15 @@ import Foundation
 
 enum ConfigFileError: Error, LocalizedError, Sendable {
     case symlinkDetected
+    case invalidJSON
     case writeFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .symlinkDetected:
             return "The config path is a symlink, which is not allowed for security reasons"
+        case .invalidJSON:
+            return "The config file contains invalid JSON"
         case .writeFailed(let reason):
             return "Failed to write config file: \(reason)"
         }
@@ -23,6 +26,33 @@ struct ConfigFileUtils: Sendable {
         var statBuf = stat()
         guard lstat(path, &statBuf) == 0 else { return false }
         return (statBuf.st_mode & S_IFMT) == S_IFLNK
+    }
+
+    /// Reads, parses, and backs up a JSON config file: rejects a
+    /// symlinked `path`, returns `[:]` when `path` doesn't exist yet (an
+    /// empty starting config — there is nothing to back up), otherwise
+    /// parses the file's JSON object and writes a `.bak` backup (0600) of
+    /// the original bytes before returning. Shared by `ClaudeConfigManager`
+    /// and `ClaudeHooksConfigManager` so the symlink-check / exists-check /
+    /// read / parse / backup sequence, and its safety guarantees, exist in
+    /// exactly one place.
+    static func readConfigWithBackup(path: String) throws -> [String: Any] {
+        guard !isSymlink(at: path) else {
+            throw ConfigFileError.symlinkDetected
+        }
+        guard FileManager.default.fileExists(atPath: path) else { return [:] }
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: path))
+        guard let parsed = try? JSONSerialization.jsonObject(with: data),
+              let dict = parsed as? [String: Any] else {
+            throw ConfigFileError.invalidJSON
+        }
+
+        let bakPath = path + ".bak"
+        try data.write(to: URL(fileURLWithPath: bakPath))
+        chmod(bakPath, 0o600)
+
+        return dict
     }
 
     static func atomicWrite(data: Data, to path: String, lockPath: String) throws {

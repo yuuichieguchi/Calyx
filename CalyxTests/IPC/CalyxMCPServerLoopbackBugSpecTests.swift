@@ -72,6 +72,15 @@ final class CalyxMCPServerLoopbackBugSpecTests: XCTestCase {
             withIntermediateDirectories: true
         )
         configPath = tempDir + "/claude.json"
+        // Redirect agent-endpoint.json into the same per-test tempdir so
+        // start()/stop() never touch the real
+        // ~/Library/Application Support/Calyx/agent-endpoint.json.
+        server.agentEndpointDirectory = tempDir
+        // stop() now also resets agentRegistry; agentRegistry defaults to
+        // the true AgentRegistry.shared singleton, so this suite's
+        // start()/stop() calls would otherwise reset shared app-wide
+        // state on every test.
+        server.agentRegistry = AgentRegistry()
     }
 
     override func tearDown() {

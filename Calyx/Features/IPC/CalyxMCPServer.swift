@@ -74,29 +74,76 @@ final class CalyxMCPServer {
         self.token = token
     }
 
-    /// For testing only — directly sets the appPeerID so snapshot tests can
-    /// exercise the `isSelf` flag without going through `start()`.
-    func _testSetAppPeerID(_ id: UUID?) {
-        self.appPeerID = id
+    // MARK: - Agent Monitor
+
+    /// Registry that `/agent-event` writes into. Defaults to the shared
+    /// singleton; tests inject an isolated instance so assertions don't
+    /// leak state across cases.
+    var agentRegistry: AgentRegistry = .shared
+
+    /// Directory `agent-endpoint.json` is written to (by `finishStart`)
+    /// and removed from (by `stop()`). Defaults to
+    /// `AgentEndpointFile.defaultDirectory`
+    /// (`~/Library/Application Support/Calyx`); tests inject a per-test
+    /// temp directory so `start()`/`stop()` never touch the real file.
+    var agentEndpointDirectory: String = AgentEndpointFile.defaultDirectory
+
+    /// Routes an `HTTPRequest` by path. `POST /mcp` dispatches to the
+    /// existing `handleJSONRPC`; `POST /agent-event` dispatches to
+    /// `handleAgentEvent`. Everything else is 404. Extracted from
+    /// `handleConnection` so tests can drive routing directly without a
+    /// real `NWConnection`.
+    func route(request: HTTPRequest) async -> HTTPResponse {
+        switch (request.method, request.path) {
+        case ("POST", "/mcp"):
+            return await routeMCP(request: request)
+        case ("POST", "/agent-event"):
+            return await routeAgentEvent(request: request)
+        default:
+            return HTTPParser.response(statusCode: 404, body: nil)
+        }
     }
 
-    // MARK: - Agent Snapshot
-
-    /// Returns a snapshot of all currently alive peers mapped to `AgentStatusEntry`.
-    /// Safe to call when the server is not started — returns an empty array.
-    func agentSnapshot(now: Date = Date()) async -> [AgentStatusEntry] {
-        let entries = await store.statusEntries()
-        return entries.map { item in
-            AgentStatusEntry(
-                id: item.peer.id,
-                name: item.peer.name,
-                role: item.peer.role,
-                lastSeen: item.peer.lastSeen,
-                inboxCount: item.inboxCount,
-                isSelf: appPeerID == item.peer.id,
-                state: AgentStatusClassifier.classify(lastSeen: item.peer.lastSeen, now: now)
-            )
+    private func routeMCP(request: HTTPRequest) async -> HTTPResponse {
+        let authToken = bearerToken(from: request.headers)
+        guard let body = request.body else {
+            return HTTPParser.response(statusCode: 400, body: nil)
         }
+        let (statusCode, responseBody) = await handleJSONRPC(data: body, authToken: authToken)
+        return HTTPParser.response(statusCode: statusCode, body: responseBody)
+    }
+
+    private func routeAgentEvent(request: HTTPRequest) async -> HTTPResponse {
+        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+            return HTTPParser.response(statusCode: 401, body: nil)
+        }
+
+        guard let surfaceIDHeader = header(named: "X-Calyx-Surface-ID", in: request.headers),
+              let surfaceID = UUID(uuidString: surfaceIDHeader) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        guard let body = request.body, let event = AgentEvent.decode(from: body) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        agentRegistry.handleHookEvent(event, surfaceID: surfaceID)
+        return HTTPParser.response(statusCode: 204, body: nil)
+    }
+
+    /// Case-insensitive `Authorization: Bearer <token>` extraction, shared
+    /// by both `/mcp` and `/agent-event`. Built on `header(named:in:)` so
+    /// the case-insensitive lookup itself exists in exactly one place.
+    private func bearerToken(from headers: [String: String]) -> String? {
+        guard let value = header(named: "Authorization", in: headers), value.hasPrefix("Bearer ") else {
+            return nil
+        }
+        return String(value.dropFirst(7))
+    }
+
+    /// Case-insensitive header lookup by name.
+    private func header(named name: String, in headers: [String: String]) -> String? {
+        headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
     }
 
     // MARK: - LSP Bridge Lifecycle
@@ -446,11 +493,23 @@ final class CalyxMCPServer {
     /// and in `.ready` state, so we only need to replace the
     /// `stateUpdateHandler` / `newConnectionHandler` with the
     /// production wiring.
+    ///
+    /// Writes `agent-endpoint.json` (port/token for the calyx-agent-hook
+    /// script) on a best-effort basis: a write failure only degrades the
+    /// Agents sidebar (hook events from panes have nowhere to POST to)
+    /// and must not take down the whole IPC server, whose MCP tools have
+    /// nothing to do with this file.
     private func finishStart(
         listener nl: NWListener,
         boundPort: Int,
         priorTeardown: Task<Void, Never>?
     ) {
+        do {
+            try AgentEndpointFile.write(port: boundPort, token: token, directory: agentEndpointDirectory)
+        } catch {
+            NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: \(error)")
+        }
+
         // Drop the probe handler — from here on we don't need to
         // observe further state transitions.
         nl.stateUpdateHandler = nil
@@ -463,6 +522,10 @@ final class CalyxMCPServer {
         self.listener = nl
         self.port = boundPort
         self.isRunning = true
+        // AgentStatusView observes AgentRegistry (not this @MainActor,
+        // non-@Observable class) directly, so it needs this signal to
+        // redraw out of the "disabled" placeholder.
+        agentRegistry.markServerStarted()
         self.peerRegistrationTask = Task {
             let peer = await self.store.registerPeer(name: "calyx-app", role: "review-ui")
             self.appPeerID = peer.id
@@ -491,6 +554,12 @@ final class CalyxMCPServer {
         peerRegistrationTask?.cancel()
         peerRegistrationTask = nil
         port = 0
+        AgentEndpointFile.remove(directory: agentEndpointDirectory)
+        // Clears every Agents sidebar row and flips AgentStatusView back
+        // to its "disabled" placeholder — without this, disabling IPC
+        // (or a start()-triggered restart) leaves stale rows on screen
+        // for panes the registry will never hear from again.
+        agentRegistry.reset()
         Task { await store.cleanup() }
 
         // LSP bridge teardown. `stop()` is synchronous to match the
@@ -605,30 +674,7 @@ final class CalyxMCPServer {
 
                 do {
                     let httpRequest = try HTTPParser.parse(data)
-
-                    // Only accept POST /mcp
-                    guard httpRequest.method == "POST", httpRequest.path == "/mcp" else {
-                        self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 404, body: nil))
-                        return
-                    }
-
-                    // Extract bearer token from Authorization header (case-insensitive)
-                    let authToken: String? = {
-                        for (key, value) in httpRequest.headers {
-                            if key.lowercased() == "authorization", value.hasPrefix("Bearer ") {
-                                return String(value.dropFirst(7))
-                            }
-                        }
-                        return nil
-                    }()
-
-                    guard let body = httpRequest.body else {
-                        self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 400, body: nil))
-                        return
-                    }
-
-                    let (statusCode, responseBody) = await self.handleJSONRPC(data: body, authToken: authToken)
-                    let httpResponse = HTTPParser.response(statusCode: statusCode, body: responseBody)
+                    let httpResponse = await self.route(request: httpRequest)
                     self.sendHTTPResponse(connection: connection, httpResponse: httpResponse)
                 } catch let error as HTTPParseError {
                     let statusCode: Int
