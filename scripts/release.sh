@@ -139,10 +139,16 @@ echo "Distributed artifact verification passed."
 
 # 7.5. Sparkle EdDSA signing (must be AFTER re-zip so signature matches the final artifact)
 echo "Signing final zip with Sparkle EdDSA..."
-SPARKLE_SIGN=$(find ~/Library/Developer/Xcode/DerivedData -name "sign_update" -path "*/Sparkle/bin/*" 2>/dev/null | head -1)
-if [ -z "$SPARKLE_SIGN" ]; then
-  echo "ERROR: sign_update not found. Cannot sign for Sparkle."
-  echo "Build Sparkle tools first: swift build -c release --package-path path/to/Sparkle"
+# Resolve Sparkle tools from THIS build's DerivedData. A find over
+# ~/Library/Developer/Xcode/DerivedData is order-dependent (APFS directory
+# enumeration reshuffles as sibling dirs come and go) and once matched the
+# legacy DSA *shell script* (Sparkle/bin/old_dsa_scripts/sign_update), which
+# blocks on stdin when called without a key file.
+SPARKLE_BIN="/tmp/CalyxRelease/SourcePackages/artifacts/sparkle/Sparkle/bin"
+SPARKLE_SIGN="$SPARKLE_BIN/sign_update"
+if [ ! -x "$SPARKLE_SIGN" ]; then
+  echo "ERROR: sign_update not found at $SPARKLE_SIGN."
+  echo "The release build should have resolved the Sparkle artifact bundle there."
   exit 1
 fi
 SPARKLE_SIG=$("$SPARKLE_SIGN" "$ZIP_PATH")
@@ -171,8 +177,8 @@ echo "GitHub release v$VERSION created."
 
 # 10. Generate and push appcast
 echo "Generating appcast..."
-GENERATE_APPCAST=$(find ~/Library/Developer/Xcode/DerivedData -name "generate_appcast" -path "*/Sparkle/bin/*" 2>/dev/null | head -1)
-if [ -n "$GENERATE_APPCAST" ]; then
+GENERATE_APPCAST="$SPARKLE_BIN/generate_appcast"
+if [ -x "$GENERATE_APPCAST" ]; then
   APPCAST_DIR="/tmp/CalyxAppcast"
   mkdir -p "$APPCAST_DIR"
   cp "$ZIP_PATH" "$APPCAST_DIR/"
