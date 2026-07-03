@@ -734,4 +734,811 @@ final class CalyxMCPServerTests: XCTestCase {
                        "Server should not be running after all toggle iterations")
         // The test passing without crash is itself a success
     }
+
+    // ==================== Round 5: bound-port recording (task #47) ====================
+    //
+    // `start(token:preferredPort:)`'s canonical scan passes the *requested*
+    // `tryPort` straight to `finishStart(boundPort:)` instead of the port
+    // the listener actually bound. With `preferredPort: 0` some
+    // environments let the `requiredLocalEndpoint` bind with the literal
+    // port 0 reach `.ready` (see `bindListener(onPort:)`'s doc comment,
+    // which documents the opposite as the *intended* macOS behavior — the
+    // discrepancy is exactly what task #47 flagged as needing a real
+    // assertion rather than a comment). When that happens, `self.port`
+    // and `agent-endpoint.json`'s `port` both end up `0`, publishing an
+    // unreachable endpoint to both MCP clients and calyx-agent-hook.
+    //
+    // Real Calyx instances hold 41830-41839 on this host, so both tests
+    // below stay out of that range: the zero-port test never touches it
+    // (kernel fallback lands far above it), and the free-port regression
+    // test's `findFreeHighPort()` explicitly excludes it.
+
+    /// Find a free loopback port via `CalyxMCPServer.askKernelForFreeLoopbackPort()`
+    /// — Round 5 review made that production method `internal` precisely
+    /// so this test suite no longer needs to maintain its own duplicate
+    /// BSD-socket probe (see that method's doc comment). Retries if the
+    /// kernel hands back a port inside the canonical `41830-41839` scan
+    /// window, since the real Calyx app may be holding `41830` on this
+    /// host.
+    private func findFreeHighPort() -> Int? {
+        for _ in 0..<10 {
+            guard let port = server.askKernelForFreeLoopbackPort() else { continue }
+            if !(41830...41839).contains(port) {
+                return port
+            }
+        }
+        return nil
+    }
+
+    /// Perform a real HTTP POST to `http://127.0.0.1:<port>/mcp` with an
+    /// `initialize` JSON-RPC body — an actual `URLSession` request over a
+    /// real socket, not a direct `handleJSONRPC` call, so this exercises
+    /// whatever `server.port` claims is reachable. Uses a short request
+    /// timeout so an unreachable port (e.g. the port-0 bug under test,
+    /// where the published port never matches anything actually bound)
+    /// fails fast instead of hanging for `URLSession`'s default 60s.
+    /// Returns `(-1, nil)` on any transport-level failure rather than
+    /// throwing, so a caller's other assertions in the same test still
+    /// run and report their own failures.
+    private func sendRealInitializeRequest(
+        port: Int,
+        token: String
+    ) async -> (statusCode: Int, body: Data?) {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/mcp") else {
+            return (-1, nil)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 3.0
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let bodyDict: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": [
+                "protocolVersion": "2024-11-05",
+                "capabilities": [:] as [String: Any],
+                "clientInfo": ["name": "port-fix-test", "version": "1.0"],
+            ],
+        ]
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: bodyDict) else {
+            return (-1, nil)
+        }
+        request.httpBody = bodyData
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+            return (statusCode, data)
+        } catch {
+            return (-1, nil)
+        }
+    }
+
+    // 20. RED (task #47): `preferredPort: 0` must record the actual
+    // kernel-bound port — `server.port > 0`, `agent-endpoint.json`'s
+    // `port` matching that same non-zero value, and the published port
+    // reachable over a real HTTP `initialize` call — never the requested
+    // value of 0. Pre-fix, the canonical scan's first iteration
+    // (`tryPort = 0`) can reach `.ready` and `finishStart(boundPort:
+    // tryPort)` then records `self.port = 0` and writes `port: 0` into
+    // `agent-endpoint.json`, unreachable by any MCP client or hook.
+    // `start()` not throwing is itself part of the contract here — a
+    // throw is also treated as a failure below rather than skipped,
+    // since "fails to start" is not an acceptable alternative to "starts
+    // unreachable".
+    func test_start_preferredPortZero_recordsActualBoundPortAndIsReachable() async throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+        let token = "port-zero-token"
+
+        do {
+            try srv.start(token: token, preferredPort: 0)
+        } catch {
+            XCTFail(
+                """
+                start(preferredPort: 0) must not throw — it must fall \
+                back to a kernel-assigned ephemeral port and record the \
+                actual bound port. Threw: \(error)
+                """
+            )
+            return
+        }
+
+        // (a) server.port must be the actual bound port, not the
+        // requested 0.
+        XCTAssertGreaterThan(
+            srv.port, 0,
+            "server.port must be the actual kernel-bound port after preferredPort: 0, not the requested value 0"
+        )
+
+        // (b) agent-endpoint.json must publish that same non-zero port.
+        let filePath = agentEndpointDir + "/agent-endpoint.json"
+        let fileData = try Data(contentsOf: URL(fileURLWithPath: filePath))
+        let fileJSON = try JSONSerialization.jsonObject(with: fileData) as? [String: Any]
+        let publishedPort = fileJSON?["port"] as? Int
+        XCTAssertEqual(
+            publishedPort, srv.port,
+            "agent-endpoint.json's port must match server.port exactly; got \(String(describing: publishedPort)) vs server.port=\(srv.port)"
+        )
+        XCTAssertNotEqual(
+            publishedPort, 0,
+            "agent-endpoint.json must not publish port: 0 — calyx-agent-hook cannot reach that"
+        )
+
+        // (c) the published port must actually be reachable over a real
+        // HTTP connection.
+        let (statusCode, body) = await sendRealInitializeRequest(port: srv.port, token: token)
+        XCTAssertEqual(
+            statusCode, 200,
+            "http://127.0.0.1:\(srv.port)/mcp must accept a real HTTP initialize request and return 200"
+        )
+        if statusCode == 200 {
+            let result = try? resultFromBody(body)
+            XCTAssertNotNil(
+                result?["protocolVersion"],
+                "initialize response over the real bound port must contain protocolVersion"
+            )
+        }
+
+        srv.stop()
+    }
+
+    // 21. Regression (should stay GREEN both pre- and post-fix): a free
+    // high port passed as `preferredPort` must record exactly that port.
+    // The canonical scan's first iteration binds it and `finishStart`
+    // records `tryPort == preferredPort` — this is the common,
+    // already-working path the port-0 fix must not disturb.
+    func test_start_freeHighPort_recordsRequestedPort() throws {
+        guard let freePort = findFreeHighPort() else {
+            throw XCTSkip("Could not find a free loopback port to use as preferredPort on this host")
+        }
+
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+
+        try srv.start(token: "free-high-port-token", preferredPort: freePort)
+
+        XCTAssertEqual(
+            srv.port, freePort,
+            "start() with a free preferredPort must record exactly that requested port"
+        )
+
+        srv.stop()
+    }
+
+    // 22. RED: TCP-level split between the HTTP header segment and the
+    // body segment. `handleConnection` passes whatever a *single*
+    // `NWConnection.receive` call returns straight to `HTTPParser.parse`
+    // without re-issuing `receive` for a request whose `Content-Length`
+    // promises more body than actually arrived in that one read.
+    // `HTTPParser.parse` doesn't treat that as an error either — with
+    // the body segment not yet present, `bodyStart == data.endIndex`
+    // and the parsed `HTTPRequest.body` is silently left `nil` rather
+    // than an `HTTPParseError` being thrown, so `routeMCP`'s `guard let
+    // body else { 400 }` fires on a request that is actually
+    // well-formed, just not fully arrived yet. Reproduced here by
+    // sending the header segment (through the terminating `\r\n\r\n`)
+    // and the JSON body as two separate `send()` calls over a raw BSD
+    // socket, with a sleep between them to force the server's
+    // `receive` callback to fire on the header-only segment first —
+    // this is the failure mode behind
+    // `test_start_preferredPortZero_recordsActualBoundPortAndIsReachable`
+    // intermittently seeing a 400 instead of 200 in full-suite runs.
+    func test_realHTTPRequest_headersAndBodySplitAcrossTCPSegments_stillParsesCompleteRequest() async throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+        let token = "split-segment-token"
+
+        try srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+        XCTAssertGreaterThan(port, 0, "Precondition: server must be bound to a real, reachable port")
+
+        // Off the @MainActor entirely (Task.detached + a `nonisolated`
+        // helper) so the blocking BSD socket calls below — including
+        // the deliberate sleep between the two `send()`s — never
+        // occupy the main thread the server's own
+        // `Task { @MainActor in ... }` connection handling needs to
+        // run on.
+        let statusCode = try await Task.detached {
+            try sendSplitInitializeRequestOverRawSocket(port: port, token: token)
+        }.value
+
+        XCTAssertEqual(
+            statusCode, 200,
+            """
+            A request whose header segment (ending in \\r\\n\\r\\n) and \
+            Content-Length-declared body arrive as two separate TCP \
+            segments must still be parsed as one complete request once \
+            the body arrives — not answered with 400 off the \
+            header-only segment.
+            """
+        )
+
+        srv.stop()
+    }
+
+    // ==================== Round 5 review fixes ====================
+
+    // Fix 1 (pre-auth DoS / integer overflow): a `Content-Length` near
+    // `Int.max` must be rejected with 413 immediately, not crash the
+    // process by overflowing `headerLength + contentLength` inside
+    // `HTTPParser.completeness(of:)`.
+    func test_contentLengthNearIntMax_doesNotCrash_returns413() async throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+        let token = "overflow-token"
+
+        try srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let statusCode = try await Task.detached {
+            try sendHeadersOnlyOverRawSocket(port: port, token: token, declaredBodyLength: Int.max)
+        }.value
+
+        XCTAssertEqual(
+            statusCode, 413,
+            """
+            An absurd Content-Length (Int.max) must be rejected with 413 \
+            immediately — not crash the process via integer overflow, \
+            and not wait for a body that will never fully arrive.
+            """
+        )
+
+        srv.stop()
+    }
+
+    // Fix 1 / 3 (gate-vs-parse 413 threshold mismatch): a Content-Length
+    // just over maxBodySize must be rejected with 413 as soon as the
+    // header block arrives, without ever waiting to receive
+    // maxBodySize+1 bytes of body that were never sent.
+    func test_contentLengthJustOverMaxBodySize_headersOnlySent_returns413Promptly() async throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+        let token = "oversized-body-token"
+
+        try srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let statusCode = try await Task.detached {
+            try sendHeadersOnlyOverRawSocket(port: port, token: token, declaredBodyLength: HTTPParser.maxBodySize + 1)
+        }.value
+
+        XCTAssertEqual(
+            statusCode, 413,
+            """
+            A Content-Length just over maxBodySize must be rejected with \
+            413 as soon as the header block arrives, not left waiting \
+            for a body that was never sent.
+            """
+        )
+
+        srv.stop()
+    }
+
+    // Fix 2 (deadline scope): receiving is fast, but `route(request:)`
+    // itself (simulated via the `_testRouteDelay` hook — standing in
+    // for a slow `lsp_*` tool call, which can legitimately run for up
+    // to an hour) outlasts the — deliberately shortened for this test —
+    // receive-only deadline. The real response must still come back,
+    // never a spurious 408.
+    func test_slowRouteProcessing_doesNotTriggerReceiveDeadline408() async throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+        srv.connectionReceiveDeadline = .milliseconds(100)
+        srv._testRouteDelay = .milliseconds(400)
+        let token = "slow-route-token"
+
+        try srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let (statusCode, body) = await sendRealInitializeRequest(port: port, token: token)
+
+        XCTAssertEqual(
+            statusCode, 200,
+            """
+            route(request:) outlasting the (shortened) receive-only \
+            deadline must not be cut off with 408 — the deadline bounds \
+            receiving the request, not processing it.
+            """
+        )
+        if statusCode == 200 {
+            let result = try? resultFromBody(body)
+            XCTAssertNotNil(result?["protocolVersion"], "The real initialize response must still come back once route(request:) finishes")
+        }
+
+        srv.stop()
+    }
+
+    // Fix 2 (slow-loris guard retained): headers arrive, but the
+    // Content-Length-declared body never does. The connection must
+    // eventually be cut off with 408 by `connectionReceiveDeadline`
+    // (shortened for this test), not left open indefinitely.
+    func test_headersOnlyNoBodySent_hitsReceiveDeadline_returns408() async throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+        srv.connectionReceiveDeadline = .milliseconds(300)
+        let token = "headers-only-token"
+
+        try srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let statusCode = try await Task.detached {
+            try sendHeadersOnlyOverRawSocket(port: port, token: token, declaredBodyLength: 100, recvTimeoutSeconds: 5)
+        }.value
+
+        XCTAssertEqual(
+            statusCode, 408,
+            """
+            A connection whose headers arrive but whose declared body \
+            never does must be cut off by the receive-only deadline \
+            with 408, not left open indefinitely.
+            """
+        )
+
+        srv.stop()
+    }
+
+    // Critical (Round 5 final review): the receive-deadline Task's 408
+    // send calls `connection.cancel()`, which completes the
+    // still-outstanding `receive()` call `receiveUntilComplete` had
+    // re-issued while waiting for the (never-sent) body. That
+    // completion used to re-enter `receiveUntilComplete`'s
+    // `isComplete || error != nil` branch — indistinguishable there
+    // from a genuine peer close — and send a *second*, spurious
+    // response (a 400, since the accumulated buffer has headers but no
+    // body) on the connection the 408 had already cancelled.
+    // `sendHTTPResponse`'s `accumulator.didRespond` check-and-set is
+    // what now guarantees only the first of the two ever actually
+    // sends. `readRawSocketStatusCode` (used by the sibling test above)
+    // only inspects the *first* status line and would not have caught
+    // a second response silently concatenated after it — this test
+    // reads the complete raw response text instead and asserts there
+    // is exactly one HTTP status line in it.
+    func test_headersOnlyRequest_neverReceivesASecondResponseAfter408() async throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+        srv.connectionReceiveDeadline = .milliseconds(300)
+        let token = "headers-only-double-send-token"
+
+        try srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let fullResponse = try await Task.detached {
+            try sendHeadersOnlyOverRawSocketFullResponse(port: port, token: token, declaredBodyLength: 100, recvTimeoutSeconds: 5)
+        }.value
+
+        // Give any stale, already-outstanding `receive()` a chance to
+        // complete and (pre-fix) attempt a second response even after
+        // the client above has already finished reading and closed its
+        // side. `_testSendHTTPResponseSentCount` — not a second
+        // response actually landing on the wire, and not
+        // `_testSendHTTPResponseAttemptCount` either — is the reliable
+        // correctness signal here: this scenario deterministically
+        // enters `sendHTTPResponse` *twice* (the deadline's 408, then a
+        // stale `finishRequest` triggered by that 408's own
+        // `connection.cancel()` completing the still-outstanding
+        // `receive()` from before) even with the fix in place — the
+        // fix's job is only to make the second entry a no-op past its
+        // `accumulator.didRespond` guard, not to prevent the entry
+        // itself. See both counters' doc comments on `CalyxMCPServer`.
+        try? await Task.sleep(for: .milliseconds(200))
+
+        XCTAssertEqual(
+            srv._testSendHTTPResponseAttemptCount, 2,
+            """
+            Precondition: this scenario is expected to deterministically \
+            enter sendHTTPResponse twice for one connection (the \
+            deadline's 408, then a stale finishRequest unblocked by that \
+            408's own connection.cancel()) — if this ever reads 1, the \
+            race this test exercises isn't actually happening anymore \
+            and the test should be revisited.
+            """
+        )
+        XCTAssertEqual(
+            srv._testSendHTTPResponseSentCount, 1,
+            "Exactly one of the two sendHTTPResponse entries above must actually proceed to connection.send(...) — the accumulator.didRespond guard must block the other"
+        )
+
+        let responseCount = fullResponse.components(separatedBy: "HTTP/1.1 ").count - 1
+        XCTAssertEqual(
+            responseCount, 1,
+            """
+            Exactly one HTTP response must reach the client on this \
+            connection — got \(responseCount) concatenated response(s). \
+            Full response: \(fullResponse)
+            """
+        )
+        XCTAssertTrue(
+            fullResponse.hasPrefix("HTTP/1.1 408"),
+            "The single response must be the 408 the receive-only deadline sends. Full response: \(fullResponse)"
+        )
+
+        srv.stop()
+    }
+
+    // Fix 4 (O(n²) accumulation → linear): a request split into many
+    // single-byte TCP segments — the extreme case for
+    // `CalyxMCPServer.ReceiveAccumulator`'s append loop — must still
+    // assemble into one complete, correctly-parsed request. Doesn't
+    // assert on timing/complexity directly (that would be a flaky
+    // benchmark); it's a functional regression test for the refactor
+    // from a per-call `Data` parameter to the reference-typed
+    // accumulator with a cached `requiredTotal`.
+    func test_manySingleByteChunksAcrossTCP_stillAssemblesOneCompleteRequest() async throws {
+        let srv = CalyxMCPServer()
+        srv.agentEndpointDirectory = agentEndpointDir
+        srv.agentRegistry = AgentRegistry()
+        let token = "many-chunks-token"
+
+        try srv.start(token: token, preferredPort: 0)
+        let port = srv.port
+
+        let bodyDict: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": [
+                "protocolVersion": "2024-11-05",
+                "capabilities": [:] as [String: Any],
+                "clientInfo": ["name": "many-chunks-test", "version": "1.0"],
+            ],
+        ]
+        let bodyData = try JSONSerialization.data(withJSONObject: bodyDict)
+
+        var headerString = "POST /mcp HTTP/1.1\r\n"
+        headerString += "Host: 127.0.0.1:\(port)\r\n"
+        headerString += "Authorization: Bearer \(token)\r\n"
+        headerString += "Content-Type: application/json\r\n"
+        headerString += "Content-Length: \(bodyData.count)\r\n"
+        headerString += "Connection: close\r\n"
+        headerString += "\r\n"
+        let headerData = Data(headerString.utf8)
+
+        var chunks: [Data] = []
+        chunks.append(contentsOf: headerData.map { Data([$0]) })
+        chunks.append(contentsOf: bodyData.map { Data([$0]) })
+
+        let statusCode = try await Task.detached {
+            try sendChunkedRequestOverRawSocket(port: port, chunks: chunks)
+        }.value
+
+        XCTAssertEqual(
+            statusCode, 200,
+            "A request split into many single-byte TCP segments must still assemble into one complete, correctly-parsed request"
+        )
+
+        srv.stop()
+    }
+
+    // Fix 5 (bindKernelAssignedListener port-readback symmetry): the
+    // returned port must match the listener's own resolved
+    // `nl.port?.rawValue`, not merely the pre-bind BSD-socket probe
+    // value — exercised directly now that Round 5 review made this
+    // method `internal` for testability.
+    func test_bindKernelAssignedListener_recordsListenersActualResolvedPort() throws {
+        let srv = CalyxMCPServer()
+
+        guard let (listener, port) = srv.bindKernelAssignedListener() else {
+            XCTFail("bindKernelAssignedListener should succeed on a host with free ephemeral loopback ports available")
+            return
+        }
+        defer { listener.cancel() }
+
+        XCTAssertGreaterThan(port, 0, "Returned port must be a real, non-zero bound port")
+        XCTAssertEqual(
+            Int(listener.port?.rawValue ?? 0), port,
+            "The returned port must match the listener's own resolved port, not merely the pre-bind BSD-socket probe value"
+        )
+    }
+
+}
+
+/// Connects to `127.0.0.1:port` over a raw BSD socket and sends an
+/// `initialize` JSON-RPC request's HTTP header block and JSON body as
+/// two separate `send()` calls, sleeping between them, to force the
+/// server's `NWConnection.receive` callback to fire on the header-only
+/// segment before the body segment arrives. Returns the numeric HTTP
+/// status code parsed from the response's status line.
+///
+/// Declared at file scope (not as a method on
+/// `CalyxMCPServerTests`) so it carries no `@MainActor` isolation and
+/// can run synchronously inside `Task.detached` — a same-actor
+/// blocking call here would starve the server's own
+/// connection-handling Task and deadlock the test.
+private func sendSplitInitializeRequestOverRawSocket(port: Int, token: String) throws -> Int {
+    let bodyDict: [String: Any] = [
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": [
+            "protocolVersion": "2024-11-05",
+            "capabilities": [:] as [String: Any],
+            "clientInfo": ["name": "split-segment-test", "version": "1.0"],
+        ],
+    ]
+    let bodyData = try JSONSerialization.data(withJSONObject: bodyDict)
+
+    var headerString = "POST /mcp HTTP/1.1\r\n"
+    headerString += "Host: 127.0.0.1:\(port)\r\n"
+    headerString += "Authorization: Bearer \(token)\r\n"
+    headerString += "Content-Type: application/json\r\n"
+    headerString += "Content-Length: \(bodyData.count)\r\n"
+    headerString += "Connection: close\r\n"
+    headerString += "\r\n"
+    let headerData = Data(headerString.utf8)
+
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = UInt16(port).bigEndian
+    addr.sin_addr.s_addr = UInt32(0x7F00_0001).bigEndian  // 127.0.0.1
+    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+
+    let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    guard fd >= 0 else {
+        throw NSError(domain: "SplitSegmentTest", code: 1, userInfo: [NSLocalizedDescriptionKey: "socket() failed: errno \(errno)"])
+    }
+    defer { close(fd) }
+
+    // Fail fast instead of hanging if the server never answers.
+    var recvTimeout = timeval(tv_sec: 5, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &recvTimeout, socklen_t(MemoryLayout<timeval>.size))
+
+    let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+            Darwin.connect(fd, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard connectResult == 0 else {
+        throw NSError(domain: "SplitSegmentTest", code: 2, userInfo: [NSLocalizedDescriptionKey: "connect() to 127.0.0.1:\(port) failed: errno \(errno)"])
+    }
+
+    // Segment 1: everything through the header/body separator.
+    try headerData.withUnsafeBytes { (rawBuf: UnsafeRawBufferPointer) in
+        let sent = Darwin.send(fd, rawBuf.baseAddress, rawBuf.count, 0)
+        guard sent == rawBuf.count else {
+            throw NSError(domain: "SplitSegmentTest", code: 3, userInfo: [NSLocalizedDescriptionKey: "send(headers) sent \(sent)/\(rawBuf.count) bytes, errno \(errno)"])
+        }
+    }
+
+    // Give the server's single `receive` callback a chance to fire on
+    // the header-only segment before segment 2 arrives.
+    usleep(80_000) // 80ms
+
+    // Segment 2: the JSON body, declared by Content-Length above but
+    // not yet sent.
+    try bodyData.withUnsafeBytes { (rawBuf: UnsafeRawBufferPointer) in
+        let sent = Darwin.send(fd, rawBuf.baseAddress, rawBuf.count, 0)
+        guard sent == rawBuf.count else {
+            throw NSError(domain: "SplitSegmentTest", code: 4, userInfo: [NSLocalizedDescriptionKey: "send(body) sent \(sent)/\(rawBuf.count) bytes, errno \(errno)"])
+        }
+    }
+
+    // Read the response until the peer closes (the server always
+    // responds with `Connection: close`).
+    var responseData = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let received = buffer.withUnsafeMutableBytes { rawBuf -> Int in
+            Darwin.recv(fd, rawBuf.baseAddress, rawBuf.count, 0)
+        }
+        if received <= 0 { break }
+        responseData.append(contentsOf: buffer[0..<received])
+    }
+
+    guard let responseString = String(data: responseData, encoding: .utf8) else {
+        throw NSError(domain: "SplitSegmentTest", code: 5, userInfo: [NSLocalizedDescriptionKey: "response was not valid UTF-8: \(responseData.count) bytes"])
+    }
+    let statusLine = responseString.components(separatedBy: "\r\n").first ?? ""
+    let parts = statusLine.split(separator: " ", maxSplits: 2)
+    guard parts.count >= 2, let statusCode = Int(parts[1]) else {
+        throw NSError(domain: "SplitSegmentTest", code: 6, userInfo: [NSLocalizedDescriptionKey: "could not parse status code from response: \(responseString)"])
+    }
+    return statusCode
+}
+
+/// Reads a raw-socket response (already fully written to `fd` by the
+/// caller) until the peer closes, returning the complete decoded text
+/// — which, per the Round 5 final review's Critical finding, may
+/// contain *more than one* concatenated HTTP response if
+/// `CalyxMCPServer` double-sends on this connection. Callers that only
+/// care about the first response's status code should go through
+/// `readRawSocketStatusCode`; callers checking for a double-send (e.g.
+/// `test_headersOnlyRequest_neverReceivesASecondResponseAfter408`)
+/// need the raw text itself.
+private func readRawSocketFullResponseText(fd: Int32, errorDomain: String) throws -> String {
+    var responseData = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let received = buffer.withUnsafeMutableBytes { rawBuf -> Int in
+            Darwin.recv(fd, rawBuf.baseAddress, rawBuf.count, 0)
+        }
+        if received <= 0 { break }
+        responseData.append(contentsOf: buffer[0..<received])
+    }
+
+    guard let responseString = String(data: responseData, encoding: .utf8) else {
+        throw NSError(domain: errorDomain, code: 5, userInfo: [NSLocalizedDescriptionKey: "response was not valid UTF-8: \(responseData.count) bytes"])
+    }
+    return responseString
+}
+
+/// Reads a raw-socket HTTP response until the peer closes and parses
+/// the numeric status code from its *first* status line only. Built on
+/// `readRawSocketFullResponseText` — shared tail end for every
+/// raw-socket test helper in this file except
+/// `sendSplitInitializeRequestOverRawSocket`, which keeps its own
+/// inline copy (predates this one) rather than being rewired to it, to
+/// avoid touching a helper an already-green test depends on.
+///
+/// Deliberately blind to whatever follows the first status line — a
+/// second, concatenated HTTP response would be silently absorbed here
+/// without failing anything (this is exactly why the Round 5 final
+/// review's Critical double-send bug went undetected by every test
+/// built on this helper until `readRawSocketFullResponseText` was
+/// added alongside it). Callers that need to assert "at most one
+/// response" must use `readRawSocketFullResponseText` directly instead.
+private func readRawSocketStatusCode(fd: Int32, errorDomain: String) throws -> Int {
+    let responseString = try readRawSocketFullResponseText(fd: fd, errorDomain: errorDomain)
+    let statusLine = responseString.components(separatedBy: "\r\n").first ?? ""
+    let parts = statusLine.split(separator: " ", maxSplits: 2)
+    guard parts.count >= 2, let statusCode = Int(parts[1]) else {
+        throw NSError(domain: errorDomain, code: 6, userInfo: [NSLocalizedDescriptionKey: "could not parse status code from response: \(responseString)"])
+    }
+    return statusCode
+}
+
+/// Opens a raw BSD socket to `127.0.0.1:port` with `SO_RCVTIMEO` set to
+/// `recvTimeoutSeconds`. Shared connection setup for
+/// `sendHeadersOnlyOverRawSocket` and `sendChunkedRequestOverRawSocket`
+/// below.
+private func openRawSocketToLoopback(port: Int, recvTimeoutSeconds: Int32, errorDomain: String) throws -> Int32 {
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = UInt16(port).bigEndian
+    addr.sin_addr.s_addr = UInt32(0x7F00_0001).bigEndian  // 127.0.0.1
+    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+
+    let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    guard fd >= 0 else {
+        throw NSError(domain: errorDomain, code: 1, userInfo: [NSLocalizedDescriptionKey: "socket() failed: errno \(errno)"])
+    }
+
+    var recvTimeout = timeval(tv_sec: Int(recvTimeoutSeconds), tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &recvTimeout, socklen_t(MemoryLayout<timeval>.size))
+
+    let connectResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+            Darwin.connect(fd, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard connectResult == 0 else {
+        close(fd)
+        throw NSError(domain: errorDomain, code: 2, userInfo: [NSLocalizedDescriptionKey: "connect() to 127.0.0.1:\(port) failed: errno \(errno)"])
+    }
+    return fd
+}
+
+/// Connects to `127.0.0.1:port` and sends only an HTTP header block
+/// (through the terminating `\r\n\r\n`) — declaring `declaredBodyLength`
+/// in `Content-Length` but never actually sending a body at all. Shared
+/// send-only half of `sendHeadersOnlyOverRawSocket` /
+/// `sendHeadersOnlyOverRawSocketFullResponse` below — returns the
+/// connected socket, still open, with the header block already
+/// written; the caller is responsible for reading the response and
+/// closing it.
+private func sendHeadersOnlyRequest(
+    port: Int,
+    token: String,
+    declaredBodyLength: Int,
+    recvTimeoutSeconds: Int32,
+    errorDomain: String
+) throws -> Int32 {
+    var headerString = "POST /mcp HTTP/1.1\r\n"
+    headerString += "Host: 127.0.0.1:\(port)\r\n"
+    headerString += "Authorization: Bearer \(token)\r\n"
+    headerString += "Content-Type: application/json\r\n"
+    headerString += "Content-Length: \(declaredBodyLength)\r\n"
+    headerString += "Connection: close\r\n"
+    headerString += "\r\n"
+    let headerData = Data(headerString.utf8)
+
+    let fd = try openRawSocketToLoopback(port: port, recvTimeoutSeconds: recvTimeoutSeconds, errorDomain: errorDomain)
+
+    do {
+        try headerData.withUnsafeBytes { (rawBuf: UnsafeRawBufferPointer) in
+            let sent = Darwin.send(fd, rawBuf.baseAddress, rawBuf.count, 0)
+            guard sent == rawBuf.count else {
+                throw NSError(domain: errorDomain, code: 3, userInfo: [NSLocalizedDescriptionKey: "send(headers) sent \(sent)/\(rawBuf.count) bytes, errno \(errno)"])
+            }
+        }
+    } catch {
+        close(fd)
+        throw error
+    }
+
+    // Deliberately never sends a body — `declaredBodyLength` in
+    // Content-Length is a promise the server must not keep waiting on
+    // forever.
+    return fd
+}
+
+/// Used by the Round 5 review regression tests for the size gate (an
+/// absurd `declaredBodyLength` must be rejected immediately, before the
+/// connection ever waits for a body) and the receive-only deadline (a
+/// `declaredBodyLength` within bounds, but never satisfied, must
+/// eventually be cut off with 408). Returns the numeric HTTP status
+/// code parsed from the response's *first* status line only — see
+/// `sendHeadersOnlyOverRawSocketFullResponse` for a variant that
+/// returns the complete raw text instead.
+///
+/// Declared at file scope for the same reason as
+/// `sendSplitInitializeRequestOverRawSocket`: no `@MainActor`
+/// isolation, so it can block synchronously inside `Task.detached`
+/// without starving the server's own connection-handling Task.
+private func sendHeadersOnlyOverRawSocket(
+    port: Int,
+    token: String,
+    declaredBodyLength: Int,
+    recvTimeoutSeconds: Int32 = 5
+) throws -> Int {
+    let errorDomain = "HeadersOnlyTest"
+    let fd = try sendHeadersOnlyRequest(port: port, token: token, declaredBodyLength: declaredBodyLength, recvTimeoutSeconds: recvTimeoutSeconds, errorDomain: errorDomain)
+    defer { close(fd) }
+    return try readRawSocketStatusCode(fd: fd, errorDomain: errorDomain)
+}
+
+/// Like `sendHeadersOnlyOverRawSocket`, but returns the complete raw
+/// response text instead of just the first status code. Used by
+/// `test_headersOnlyRequest_neverReceivesASecondResponseAfter408` to
+/// assert at most one HTTP response ever comes back on the connection
+/// — the Round 5 final review's Critical finding was exactly that
+/// `readRawSocketStatusCode`-based assertions alone cannot detect a
+/// second, concatenated response following the first.
+private func sendHeadersOnlyOverRawSocketFullResponse(
+    port: Int,
+    token: String,
+    declaredBodyLength: Int,
+    recvTimeoutSeconds: Int32 = 5
+) throws -> String {
+    let errorDomain = "HeadersOnlyFullResponseTest"
+    let fd = try sendHeadersOnlyRequest(port: port, token: token, declaredBodyLength: declaredBodyLength, recvTimeoutSeconds: recvTimeoutSeconds, errorDomain: errorDomain)
+    defer { close(fd) }
+    return try readRawSocketFullResponseText(fd: fd, errorDomain: errorDomain)
+}
+
+/// Connects to `127.0.0.1:port` and sends `chunks` as `chunks.count`
+/// separate `send()` calls — one `NWConnection.receive` callback per
+/// chunk on the server side, in the common case — forcing
+/// `CalyxMCPServer.ReceiveAccumulator` to accumulate one logical
+/// request across many small appends. Returns the numeric HTTP status
+/// code parsed from the response's status line.
+///
+/// Declared at file scope for the same reason as
+/// `sendSplitInitializeRequestOverRawSocket`.
+private func sendChunkedRequestOverRawSocket(port: Int, chunks: [Data], recvTimeoutSeconds: Int32 = 5) throws -> Int {
+    let errorDomain = "ChunkedRequestTest"
+    let fd = try openRawSocketToLoopback(port: port, recvTimeoutSeconds: recvTimeoutSeconds, errorDomain: errorDomain)
+    defer { close(fd) }
+
+    for (index, chunk) in chunks.enumerated() {
+        try chunk.withUnsafeBytes { (rawBuf: UnsafeRawBufferPointer) in
+            guard rawBuf.count > 0 else { return }
+            let sent = Darwin.send(fd, rawBuf.baseAddress, rawBuf.count, 0)
+            guard sent == rawBuf.count else {
+                throw NSError(domain: errorDomain, code: 3, userInfo: [NSLocalizedDescriptionKey: "send(chunk \(index)) sent \(sent)/\(rawBuf.count) bytes, errno \(errno)"])
+            }
+        }
+    }
+
+    return try readRawSocketStatusCode(fd: fd, errorDomain: errorDomain)
 }

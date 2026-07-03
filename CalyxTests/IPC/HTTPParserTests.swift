@@ -317,4 +317,205 @@ final class HTTPParserTests: XCTestCase {
     func test_maxBodySize_is1MB() {
         XCTAssertEqual(HTTPParser.maxBodySize, 1 * 1024 * 1024)
     }
+
+    // ==================== Round 5 review: shared Content-Length lookup ====================
+    //
+    // `contentLength(inHeaderString:)` is the single implementation
+    // `parse(_:)` and `CalyxMCPServer.receiveUntilComplete`'s pre-parse
+    // buffer-completeness gate (`HTTPParser.completeness(of:)`) both now
+    // route through, so a duplicate or mixed-case `Content-Length`
+    // header can never be resolved differently by the two.
+
+    // Duplicate `Content-Length` headers, identical casing: the shared
+    // lookup takes the first occurrence in document order. This is a
+    // deliberate behavior change from the pre-Round-5 implementation
+    // (a `[String: String]` dictionary where a same-case duplicate key
+    // simply overwrote the earlier value, so the *last* occurrence won)
+    // — see `contentLength(inHeaderString:)`'s doc comment for why
+    // "first occurrence, case-insensitively" was chosen as the one
+    // deterministic rule both call sites now share.
+    func test_contentLength_duplicateHeaders_sameCasing_firstOccurrenceWins() {
+        let headerString =
+            "POST /data HTTP/1.1\r\n"
+            + "Content-Length: 5\r\n"
+            + "Content-Length: 999\r\n"
+
+        let result = HTTPParser.contentLength(inHeaderString: headerString)
+        guard case .success(let length) = result else {
+            return XCTFail("Expected .success, got \(result)")
+        }
+        XCTAssertEqual(length, 5, "Duplicate Content-Length headers must resolve to the first occurrence")
+    }
+
+    // Duplicate `Content-Length` headers with mixed casing: previously
+    // non-deterministic (Dictionary iteration order over two
+    // differently-cased keys); the shared lookup is a simple ordered
+    // scan, so this is now deterministic too — same rule, same result.
+    func test_contentLength_duplicateHeaders_mixedCasing_firstOccurrenceWins() {
+        let headerString =
+            "POST /data HTTP/1.1\r\n"
+            + "content-length: 7\r\n"
+            + "Content-Length: 999\r\n"
+            + "CONTENT-LENGTH: 42\r\n"
+
+        let result = HTTPParser.contentLength(inHeaderString: headerString)
+        guard case .success(let length) = result else {
+            return XCTFail("Expected .success, got \(result)")
+        }
+        XCTAssertEqual(length, 7, "Duplicate, mixed-case Content-Length headers must resolve to the first occurrence")
+    }
+
+    // The gate (`completeness(of:)`) and `parse(_:)` must agree on
+    // which of several duplicate/mixed-case Content-Length values wins
+    // — both route through `contentLength(inHeaderString:)`, so a
+    // complete buffer built with a duplicate header must be judged
+    // `.complete` by the gate at exactly the byte count `parse(_:)`
+    // itself then successfully parses.
+    func test_gateAndParse_agreeOnDuplicateContentLengthSelection() throws {
+        let body = "{}"
+        let bodyData = Data(body.utf8)
+        let rawString =
+            "POST /data HTTP/1.1\r\n"
+            + "content-length: \(bodyData.count)\r\n"
+            + "Content-Length: 999999\r\n"
+            + "\r\n"
+            + body
+        let raw = makeRawData(rawString)
+
+        let (state, requiredTotal) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .complete, "Gate must judge the buffer complete using the same (first-occurrence) Content-Length parse(_:) will use")
+        XCTAssertEqual(requiredTotal, raw.count, "Gate's requiredTotal must match the buffer's actual size once complete")
+
+        let request = try HTTPParser.parse(raw)
+        XCTAssertEqual(request.body, bodyData, "parse(_:) must select the same first-occurrence Content-Length the gate used")
+    }
+
+    // ==================== Round 5 review: completeness(of:) ====================
+
+    func test_completeness_headersNotYetTerminated_isIncomplete() {
+        let raw = makeRawData("POST /data HTTP/1.1\r\nContent-Length: 2\r\n")
+        let (state, requiredTotal) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .incomplete)
+        XCTAssertNil(requiredTotal, "requiredTotal must be nil until the header terminator itself has been found")
+    }
+
+    func test_completeness_headersTerminatedBodyNotYetArrived_isIncompleteWithKnownTotal() {
+        let headerOnly = "POST /data HTTP/1.1\r\nContent-Length: 5\r\n\r\n"
+        let raw = makeRawData(headerOnly)
+        let (state, requiredTotal) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .incomplete)
+        XCTAssertEqual(requiredTotal, headerOnly.utf8.count + 5, "requiredTotal must be headerLength + Content-Length once the terminator is known")
+    }
+
+    func test_completeness_fullRequest_isComplete() {
+        let raw = makeRawRequest(method: "POST", path: "/data", body: "{}")
+        let (state, requiredTotal) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .complete)
+        XCTAssertEqual(requiredTotal, raw.count)
+    }
+
+    func test_completeness_noContentLengthHeader_isCompleteAssoonAsHeadersTerminate() {
+        let raw = makeRawRequest(method: "GET", path: "/health", headers: ["Host": "localhost"])
+        let (state, _) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .complete, "A request with no Content-Length has no body to wait for once headers terminate")
+    }
+
+    // MARK: - Round 5 review: integer-overflow-safe size gating (pre-auth DoS)
+
+    // A `Content-Length` near `Int.max` must be rejected as `.tooLarge`
+    // immediately — not crash the process by overflowing `headerLength +
+    // contentLength` (a client-triggerable, pre-authentication integer
+    // overflow trap otherwise reachable with a single header line).
+    func test_completeness_contentLengthNearIntMax_isTooLarge_doesNotCrash() {
+        let rawString =
+            "POST /data HTTP/1.1\r\n"
+            + "Content-Length: \(Int.max)\r\n"
+            + "\r\n"
+        let raw = makeRawData(rawString)
+
+        let (state, requiredTotal) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .tooLarge)
+        XCTAssertNil(requiredTotal, "A too-large Content-Length must not report a requiredTotal to accumulate toward")
+    }
+
+    // The gate's size threshold must match `parse(_:)`'s own
+    // `length > maxBodySize` rejection exactly — previously the gate
+    // compared `headerLength + contentLength` against the looser
+    // `maxHeaderSize + maxBodySize`, which could accept (as still
+    // "waiting for more data") a Content-Length `parse(_:)` would
+    // itself reject as `.bodyTooLarge` once the buffer did complete.
+    func test_completeness_contentLengthJustOverMaxBodySize_isTooLarge() {
+        let rawString =
+            "POST /data HTTP/1.1\r\n"
+            + "Content-Length: \(HTTPParser.maxBodySize + 1)\r\n"
+            + "\r\n"
+        let raw = makeRawData(rawString)
+
+        let (state, _) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .tooLarge)
+    }
+
+    func test_completeness_contentLengthAtMaxBodySize_isNotTooLarge() {
+        let rawString =
+            "POST /data HTTP/1.1\r\n"
+            + "Content-Length: \(HTTPParser.maxBodySize)\r\n"
+            + "\r\n"
+        let raw = makeRawData(rawString)
+
+        let (state, requiredTotal) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .incomplete, "Exactly maxBodySize is still an acceptable Content-Length — only strictly greater is rejected")
+        XCTAssertEqual(requiredTotal, rawString.utf8.count + HTTPParser.maxBodySize)
+    }
+
+    // ==================== Round 5 final review (Warning): request line must never be scanned for Content-Length ====================
+    //
+    // Before this diff, `parse(_:)` built its `headers` dictionary from
+    // `lines[1...]` — explicitly excluding the request line (`lines[0]`).
+    // `contentLength(inHeaderString:)` initially scanned the *entire*
+    // `headerString` including the request line. `parse(_:)`'s own
+    // request-line parser is lenient (`lines[0].split(separator: " ",
+    // maxSplits: 2)` only requires `count >= 2`), so a request line
+    // shaped like `Content-Length: 999999` parses structurally without
+    // throwing `.malformedRequest`, and used to *also* be picked up as
+    // a genuine Content-Length declaration. Fixed via `.dropFirst()` in
+    // `contentLength(inHeaderString:)`.
+
+    func test_contentLength_ignoresPathologicalRequestLine() {
+        // The request line itself looks like a Content-Length header;
+        // no real one follows. Must resolve to .success(nil), never
+        // picking up "999999" from the request line.
+        let headerString =
+            "Content-Length: 999999\r\n"
+            + "Host: localhost\r\n"
+
+        let result = HTTPParser.contentLength(inHeaderString: headerString)
+        guard case .success(let length) = result else {
+            return XCTFail("Expected .success, got \(result)")
+        }
+        XCTAssertNil(length, "The request line must never be scanned for Content-Length, even when it happens to look like one")
+    }
+
+    func test_completeness_pathologicalRequestLine_notTreatedAsContentLength() {
+        let rawString =
+            "Content-Length: 999999\r\n"
+            + "Host: localhost\r\n"
+            + "\r\n"
+        let raw = makeRawData(rawString)
+
+        let (state, requiredTotal) = HTTPParser.completeness(of: raw)
+        XCTAssertEqual(state, .complete, "With no real Content-Length header, the buffer is complete as soon as headers terminate — the request line's 'Content-Length: 999999' must not be mistaken for a real header")
+        XCTAssertEqual(requiredTotal, rawString.utf8.count)
+    }
+
+    func test_parse_pathologicalRequestLine_notTreatedAsContentLength() throws {
+        let rawString =
+            "Content-Length: 999999\r\n"
+            + "Host: localhost\r\n"
+            + "\r\n"
+            + "trailing-bytes-that-must-not-be-read-as-a-body"
+        let raw = makeRawData(rawString)
+
+        let request = try HTTPParser.parse(raw)
+        XCTAssertNil(request.body, "With no real Content-Length header, parse(_:) must not extract a body — even though the request line looks like a Content-Length header")
+    }
 }
