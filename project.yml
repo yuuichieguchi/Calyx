@@ -81,8 +81,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.calyx.terminal
         PRODUCT_NAME: Calyx
-        MARKETING_VERSION: "0.27.0"
-        CURRENT_PROJECT_VERSION: 49
+        MARKETING_VERSION: "0.28.0"
+        CURRENT_PROJECT_VERSION: 50
         ASSETCATALOG_COMPILER_APPICON_NAME: ""
         CODE_SIGN_ENTITLEMENTS: Calyx/Calyx.entitlements
         CODE_SIGN_STYLE: Automatic
