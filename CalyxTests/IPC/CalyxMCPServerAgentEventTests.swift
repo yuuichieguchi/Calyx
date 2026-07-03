@@ -524,16 +524,26 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
         return try! JSONSerialization.data(withJSONObject: dict)
     }
 
+    /// Extracts the `instructions` prose from an `initialize` response
+    /// body. Shared by `peerID(fromInitializeResponseBody:)` below (which
+    /// additionally requires a `peer_id` sentence to be present) and by
+    /// callers that need to assert on the prose itself, including when no
+    /// peer was auto-registered at all (see the invalid-header cases in
+    /// `test_initializeHeaderBinding_onlyValidUUIDHeaderBinds`).
+    private func instructionsText(fromInitializeResponseBody body: Data?) throws -> String {
+        let data = try XCTUnwrap(body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let result = try XCTUnwrap(json["result"] as? [String: Any])
+        return try XCTUnwrap(result["instructions"] as? String)
+    }
+
     /// `initialize`'s response carries the auto-registered peer ID only
     /// inside the `instructions` prose (`MCPRouter.buildInitializeResponse`),
     /// not as a separate JSON field the way `register_peer`'s tool result
     /// does — so extraction here parses that sentence with a regex, rather
     /// than reusing `registerPeerID`'s `json["peerId"]` lookup.
     private func peerID(fromInitializeResponseBody body: Data?) throws -> String {
-        let data = try XCTUnwrap(body)
-        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
-        let result = try XCTUnwrap(json["result"] as? [String: Any])
-        let instructions = try XCTUnwrap(result["instructions"] as? String)
+        let instructions = try instructionsText(fromInitializeResponseBody: body)
 
         let regex = try NSRegularExpression(pattern: #"Your peer_id is: ([0-9A-Fa-f-]+)\."#)
         let fullRange = NSRange(instructions.startIndex..<instructions.endIndex, in: instructions)
@@ -622,6 +632,17 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
 
     // MARK: - initialize header validation
 
+    // Round 6 review: `initialize`'s auto-registration is now itself
+    // gated on a valid `X-Calyx-Surface-ID` header (see
+    // `test_initialize_withoutSurfaceHeader_doesNotAutoRegisterPeer`) —
+    // a surfaceless connection has no surface for a peer to ever be bound
+    // to, so registering one for it just leaves an orphaned identity
+    // behind. That subsumes what this test originally checked (a peer was
+    // always auto-registered, but only *bound* when the header was
+    // valid): for the three invalid-header cases there is now no
+    // auto-registered peer at all, so the contract under test for those
+    // cases is "no peer_id is reported in `instructions`", not "a peer_id
+    // is reported but left unbound".
     func test_initializeHeaderBinding_onlyValidUUIDHeaderBinds() async throws {
         let validSurfaceID = UUID()
         let cases: [(label: String, header: String?, shouldBind: Bool)] = [
@@ -640,13 +661,20 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
                 token: testToken, surfaceIDHeader: testCase.header, body: initializeRequestBody(id: 1)
             ))
             XCTAssertEqual(initResponse.statusCode, 200, "[\(testCase.label)] initialize must still succeed")
+
+            guard testCase.shouldBind else {
+                let instructions = try instructionsText(fromInitializeResponseBody: initResponse.body)
+                XCTAssertFalse(instructions.contains("Your peer_id is:"),
+                               "[\(testCase.label)] an invalid/missing X-Calyx-Surface-ID header must not " +
+                               "auto-register a peer at all — there is no surface to ever bind it to")
+                continue
+            }
+
             let recipientPeerID = try peerID(fromInitializeResponseBody: initResponse.body)
 
-            // The recipient's row must exist regardless of the initialize
-            // header's validity — created via the same real surface UUID
-            // used for the initialize call in the valid case, or a
-            // throwaway one otherwise (the row's own surface identity is
-            // not what's under test here).
+            // The recipient's row must exist for the valid-header case —
+            // created via the same real surface UUID used for the
+            // initialize call.
             let sessionStart = await server.route(request: agentEventRequest(
                 token: testToken, surfaceIDHeader: surfaceID.uuidString,
                 body: validAgentEventBody(sessionID: "session-\(testCase.label)", cwd: "/Users/dev/repo")
@@ -662,11 +690,9 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
             ))
             XCTAssertEqual(sendResponse.statusCode, 200, "[\(testCase.label)] send_message must still succeed")
 
-            let expectedCount = testCase.shouldBind ? 1 : 0
-            XCTAssertEqual(registry.entries[surfaceID]?.unreadCount ?? 0, expectedCount,
-                           "[\(testCase.label)] initialize's X-Calyx-Surface-ID header of " +
-                           "\(String(describing: testCase.header)) must " +
-                           "\(testCase.shouldBind ? "" : "not ")bind the auto-registered peer to the surface")
+            XCTAssertEqual(registry.entries[surfaceID]?.unreadCount ?? 0, 1,
+                           "[\(testCase.label)] a valid X-Calyx-Surface-ID header must auto-register and " +
+                           "bind a peer to the surface")
         }
     }
 
@@ -707,9 +733,23 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
                        "peer to that surface, the same way initialize's auto-registered peer does")
     }
 
-    // MARK: - Round 4 review: initialize only binds an unbound surface
+    // MARK: - Round 4 review / Round 6 fix review: initialize only binds
+    // an unbound surface
+    //
+    // This test originally (Round 4) asserted that a second `initialize`
+    // on an already-bound surface mints a distinct "ghost" peer whose
+    // binding must not steal the first peer's — i.e. it treated the ghost
+    // peer as an accepted side effect and only guarded against its
+    // binding leaking. That ghost peer WAS the Round 6 defect (see
+    // `test_initialize_sameSurfaceReconnect_reportsSamePeerID_singleListPeersEntry_registerPeerAlsoSameID`
+    // for the direct contract): a second `initialize` on a still-alive,
+    // already-bound surface no longer mints anything at all, so there is
+    // no second peer here to compare bindings against. This test now
+    // instead confirms the ORIGINAL Round 4 concern — that message
+    // delivery/badges keep working across a reconnect — holds under the
+    // new single-identity behavior.
 
-    func test_initialize_surfaceAlreadyBound_doesNotRebindToNewAutoRegisteredPeer() async throws {
+    func test_initialize_surfaceAlreadyBound_secondInitializeDoesNotDisruptMessageDelivery() async throws {
         let registry = AgentRegistry()
         server.agentRegistry = registry
         let surfaceID = UUID()
@@ -724,15 +764,16 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
 
         // A second `initialize` on the SAME surface (e.g. a reconnect, or
         // a nested `claude` invoked as a subprocess and inheriting the
-        // same CALYX_SURFACE_ID env var) mints a brand-new peer via its
-        // own auto-registration — this must NOT steal the surface's
-        // existing binding away from the first peer.
+        // same CALYX_SURFACE_ID env var) resolves to the SAME peer — the
+        // surface is still bound and that peer is still alive.
         let secondInit = await server.route(request: mcpRequest(
             token: testToken, surfaceIDHeader: surfaceID.uuidString, body: initializeRequestBody(id: 2)
         ))
         XCTAssertEqual(secondInit.statusCode, 200)
         let secondPeer = try peerID(fromInitializeResponseBody: secondInit.body)
-        XCTAssertNotEqual(firstPeer, secondPeer, "Precondition: each initialize mints a distinct peer")
+        XCTAssertEqual(firstPeer, secondPeer,
+                       "a second initialize on an already-bound, still-alive surface must resolve to " +
+                       "the SAME peer_id as the first, not mint a distinct one")
 
         let sessionStart = await server.route(request: agentEventRequest(
             token: testToken, surfaceIDHeader: surfaceID.uuidString,
@@ -742,8 +783,8 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
 
         let senderPeerID = try await registerPeerID(name: "sender")
 
-        // A message to the FIRST (originally bound) peer must still light
-        // up the badge...
+        // A message to the shared peer must still light up the badge,
+        // unaffected by the intervening second initialize...
         let sendToFirst = await server.route(request: mcpRequest(
             token: testToken, surfaceIDHeader: nil,
             body: rpcToolCallRequest(id: 3, toolName: "send_message", arguments: [
@@ -752,28 +793,15 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
         ))
         XCTAssertEqual(sendToFirst.statusCode, 200)
         XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 1,
-                       "The surface's original binding (from the first initialize) must still be the " +
-                       "one that lights up the badge")
+                       "the surface's binding must still be lit up by a message to the shared peer id")
 
+        // ...and receive_messages on that same shared peer clears it.
         let receiveFirst = await server.route(request: mcpRequest(
             token: testToken, surfaceIDHeader: nil,
             body: rpcToolCallRequest(id: 4, toolName: "receive_messages", arguments: ["peer_id": firstPeer])
         ))
         XCTAssertEqual(receiveFirst.statusCode, 200)
         XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 0)
-
-        // ...while a message to the SECOND (later, would-be) peer must
-        // not, proving the second initialize never rebound the surface.
-        let sendToSecond = await server.route(request: mcpRequest(
-            token: testToken, surfaceIDHeader: nil,
-            body: rpcToolCallRequest(id: 5, toolName: "send_message", arguments: [
-                "from": senderPeerID, "to": secondPeer, "content": "hi again",
-            ])
-        ))
-        XCTAssertEqual(sendToSecond.statusCode, 200)
-        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 0,
-                       "A message to the second initialize's peer must NOT light up the badge — the " +
-                       "surface's binding must still point at the first peer, not the second")
     }
 
     // MARK: - Round 4 review: shared surface-ID header parsing (trim)
@@ -819,5 +847,457 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
         XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 1,
                        "A padded X-Calyx-Surface-ID on /mcp's initialize must bind the trimmed UUID, " +
                        "lighting up the same surface's badge")
+    }
+
+    // MARK: - Round 6: register_peer rename semantics (single identity per surface)
+    //
+    // Bug: register_peer always minted a fresh UUID (IPCStore.registerPeer),
+    // so a pane that followed the (pre-Round-6) instructions' "call
+    // register_peer once after connecting" ended up with TWO registered
+    // identities for the same surface — the auto-registered peer from
+    // `initialize`, and a second, disconnected one from its own
+    // register_peer call. Senders addressing the auto-registered id never
+    // reached the pane's own inbox. Fix: when the connecting surface
+    // already has a bound, still-alive peer, register_peer now RENAMES
+    // that peer in place (same peer_id returned) instead of creating a
+    // second one.
+
+    func test_registerPeer_boundSurfaceWithAlivePeer_renamesInPlace_singleListPeersEntry() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceA = UUID()
+
+        // initialize with surface header A auto-registers a peer and binds
+        // surfaceA to it.
+        let initA = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(initA.statusCode, 200)
+        let autoPeerID = try peerID(fromInitializeResponseBody: initA.body)
+
+        // register_peer on the SAME surface header, with a descriptive
+        // name — per the new instructions contract, this must RENAME the
+        // existing bound peer rather than mint a second identity.
+        let registerResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: rpcToolCallRequest(id: 2, toolName: "register_peer", arguments: ["name": "my-task", "role": "worker"])
+        ))
+        XCTAssertEqual(registerResponse.statusCode, 200)
+        let renamedPeerID = try peerID(fromToolResultBody: registerResponse.body)
+
+        XCTAssertEqual(renamedPeerID, autoPeerID,
+                       "register_peer on a surface with an already-bound, still-alive peer must return " +
+                       "the SAME peer_id as initialize's auto-registration (rename, not a new identity)")
+
+        let listResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 3, toolName: "list_peers", arguments: [:])
+        ))
+        XCTAssertEqual(listResponse.statusCode, 200)
+        let listText = try toolResultText(listResponse.body)
+        let listJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(listText.utf8)) as? [String: Any])
+        let peers = try XCTUnwrap(listJSON["peers"] as? [[String: Any]])
+
+        XCTAssertEqual(peers.count, 1,
+                       "Exactly one peer entry must exist for this single pane — no ghost duplicate " +
+                       "left behind by the auto-registration")
+        XCTAssertEqual(peers.first?["id"] as? String, autoPeerID,
+                       "The single surviving entry must be the original auto-registered peer, renamed in place")
+        XCTAssertEqual(peers.first?["name"] as? String, "my-task",
+                       "The single surviving entry's name must reflect register_peer's rename")
+        XCTAssertEqual(peers.first?["role"] as? String, "worker",
+                       "The single surviving entry's role must reflect register_peer's rename")
+    }
+
+    func test_registerPeer_rename_doesNotBreakMessageDelivery_badgeStillLightsUp() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceA = UUID()
+
+        let initA = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(initA.statusCode, 200)
+
+        // SessionStart creates surfaceA's Agents sidebar row (independent
+        // of the peer binding under test) — this is what carries unreadCount.
+        let sessionStart = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo")
+        ))
+        XCTAssertEqual(sessionStart.statusCode, 204)
+
+        let registerResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: rpcToolCallRequest(id: 2, toolName: "register_peer", arguments: ["name": "my-task", "role": "worker"])
+        ))
+        XCTAssertEqual(registerResponse.statusCode, 200)
+        let renamedPeerID = try peerID(fromToolResultBody: registerResponse.body)
+
+        // A different peer sends to the RENAMED peer_id.
+        let otherPeerID = try await registerPeerID(name: "other")
+        let sendResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 3, toolName: "send_message", arguments: [
+                "from": otherPeerID, "to": renamedPeerID, "content": "hello after rename",
+            ])
+        ))
+        XCTAssertEqual(sendResponse.statusCode, 200)
+
+        XCTAssertEqual(registry.entries[surfaceA]?.unreadCount, 1,
+                       "A message sent to the renamed peer_id must still light up surface A's badge — " +
+                       "the rename must not break the surface -> peer binding")
+    }
+
+    func test_registerPeer_noSurfaceHeader_alwaysRegistersNewPeer() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+
+        // An external MCP client without X-Calyx-Surface-ID (e.g. a
+        // non-Ghostty-pane client) has no surface binding, so register_peer
+        // must keep its pre-Round-6 behavior: always mint a fresh peer.
+        // Non-regression — this must pass both before and after the fix.
+        let register1 = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 1, toolName: "register_peer", arguments: ["name": "ext-client", "role": "cli"])
+        ))
+        XCTAssertEqual(register1.statusCode, 200)
+        let peer1 = try peerID(fromToolResultBody: register1.body)
+
+        let register2 = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 2, toolName: "register_peer", arguments: ["name": "ext-client-2", "role": "cli"])
+        ))
+        XCTAssertEqual(register2.statusCode, 200)
+        let peer2 = try peerID(fromToolResultBody: register2.body)
+
+        XCTAssertNotEqual(peer1, peer2,
+                          "register_peer without a surface header must keep registering brand-new peers " +
+                          "every time, exactly like before Round 6 — there is no binding to rename")
+    }
+
+    func test_registerPeer_boundPeerNotAliveInStore_selfHeals_createsNewAndRebinds() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceA = UUID()
+
+        // Simulate a stale binding: surfaceA is bound to a peer id that was
+        // never registered in (or has since been TTL-purged from) the
+        // IPCStore. bindSurface is called directly, standing in for that
+        // purge, rather than driving a real TTL expiry through the store.
+        let staleBoundPeerID = UUID()
+        registry.bindSurface(surfaceA, toPeer: staleBoundPeerID)
+
+        let sessionStart = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo")
+        ))
+        XCTAssertEqual(sessionStart.statusCode, 204)
+
+        let registerResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: rpcToolCallRequest(id: 1, toolName: "register_peer", arguments: ["name": "my-task", "role": "worker"])
+        ))
+        XCTAssertEqual(registerResponse.statusCode, 200)
+        let newPeerID = try peerID(fromToolResultBody: registerResponse.body)
+
+        XCTAssertNotEqual(newPeerID, staleBoundPeerID.uuidString,
+                          "A stale/purged bound peer must not be resurrected by rename — a fresh peer " +
+                          "must be created")
+
+        // Self-repair is observed by continuity: a message sent to the
+        // fresh peer id must light up surface A's badge, proving
+        // register_peer rebound the surface to the newly created peer.
+        let otherPeerID = try await registerPeerID(name: "other")
+        let sendResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 2, toolName: "send_message", arguments: [
+                "from": otherPeerID, "to": newPeerID, "content": "hello",
+            ])
+        ))
+        XCTAssertEqual(sendResponse.statusCode, 200)
+
+        XCTAssertEqual(registry.entries[surfaceA]?.unreadCount, 1,
+                       "register_peer must rebind surfaceA to the freshly created peer when the " +
+                       "previously bound peer is no longer alive in the store — self-healing")
+    }
+
+    // MARK: - Round 6 review: initialize's auto-registration limited to
+    // surface-bound connections
+    //
+    // The rename semantics above only help a surface-bound pane — an
+    // external MCP client with no X-Calyx-Surface-ID (e.g. OpenCode) has
+    // no surface for a renamed peer to ever be bound to, so
+    // auto-registering one for it on every `initialize` just leaves an
+    // orphaned, unaddressable identity behind on every reconnect. Fix:
+    // `initialize` now only auto-registers (and binds) a peer when a
+    // valid X-Calyx-Surface-ID is present; instructions retain the
+    // original "call register_peer yourself" guidance for the no-header
+    // case (see MCPProtocolTests' peerID-nil instructions tests).
+
+    func test_initialize_withoutSurfaceHeader_doesNotAutoRegisterPeer() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+
+        // An already-registered peer, used purely as a vantage point from
+        // which to call list_peers before/after — its own registration
+        // (via register_peer, not initialize) is unaffected by this fix.
+        _ = try await registerPeerID(name: "observer")
+
+        let countBefore = try await currentPeerCount()
+
+        // initialize WITHOUT a surface header — e.g. an OpenCode / generic
+        // MCP client that can't send X-Calyx-Surface-ID.
+        let initResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil, body: initializeRequestBody(id: 2)
+        ))
+        XCTAssertEqual(initResponse.statusCode, 200, "initialize must still succeed with no surface header")
+
+        let countAfter = try await currentPeerCount()
+
+        XCTAssertEqual(countAfter, countBefore,
+                       "initialize without X-Calyx-Surface-ID must not auto-register a new peer — " +
+                       "there is no surface to bind it to, so it would just be an orphaned, " +
+                       "unaddressable identity")
+    }
+
+    /// Calls list_peers (through a fresh, unbound connection) and returns
+    /// the current peer count. Helper for
+    /// `test_initialize_withoutSurfaceHeader_doesNotAutoRegisterPeer`.
+    private func currentPeerCount() async throws -> Int {
+        let response = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 999, toolName: "list_peers", arguments: [:])
+        ))
+        let text = try toolResultText(response.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        let peers = try XCTUnwrap(json["peers"] as? [[String: Any]])
+        return peers.count
+    }
+
+    /// Returns `peers` (as parsed from `list_peers`' JSON result) for
+    /// assertions that need to inspect a peer's current name/role, not
+    /// just its count or id.
+    private func listPeersDicts() async throws -> [[String: Any]] {
+        let response = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 998, toolName: "list_peers", arguments: [:])
+        ))
+        XCTAssertEqual(response.statusCode, 200)
+        let text = try toolResultText(response.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        return try XCTUnwrap(json["peers"] as? [[String: Any]])
+    }
+
+    // MARK: - Round 6 fix review: reconnect on an already-bound, still-
+    // alive surface must not mint a ghost peer
+    //
+    // The Round 6 fix above only auto-registers a peer for a surface-bound
+    // `initialize`, but it originally still called `registerPeer`
+    // unconditionally whenever a surface header was present — including a
+    // RECONNECT on a surface that was already bound to a still-alive peer
+    // (e.g. an MCP client restart mid-session). That minted a second,
+    // ghost identity on every reconnect and reported ITS id back as
+    // "already registered", which `register_peer` could then never
+    // reproduce — breaking the very promise the Round 6 instructions text
+    // makes. Fix: `initialize` on an already-bound surface whose peer is
+    // still alive in `IPCStore` reports that SAME peer_id and does
+    // nothing else (no new `registerPeer`, no rebind).
+
+    func test_initialize_sameSurfaceReconnect_reportsSamePeerID_singleListPeersEntry_registerPeerAlsoSameID() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceA = UUID()
+
+        let init1 = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(init1.statusCode, 200)
+        let peerID1 = try peerID(fromInitializeResponseBody: init1.body)
+
+        // Reconnect on the SAME surface header (e.g. the MCP client
+        // restarted mid-session) while the original peer is still alive.
+        let init2 = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 2)
+        ))
+        XCTAssertEqual(init2.statusCode, 200)
+        let peerID2 = try peerID(fromInitializeResponseBody: init2.body)
+
+        XCTAssertEqual(peerID2, peerID1,
+                       "reconnecting on an already-bound, still-alive surface must report the SAME " +
+                       "peer_id as the original initialize, not mint a ghost second identity")
+
+        let peers = try await listPeersDicts()
+        XCTAssertEqual(peers.count, 1,
+                       "a same-surface reconnect must not leave a ghost second list_peers entry behind")
+
+        // register_peer on the reconnected surface must ALSO return the
+        // same peer_id, fulfilling the instructions' "already
+        // registered... register_peer returns the SAME peer_id" promise
+        // even after a reconnect.
+        let registerResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: rpcToolCallRequest(id: 3, toolName: "register_peer", arguments: ["name": "renamed", "role": "worker"])
+        ))
+        XCTAssertEqual(registerResponse.statusCode, 200)
+        let registeredPeerID = try peerID(fromToolResultBody: registerResponse.body)
+        XCTAssertEqual(registeredPeerID, peerID1,
+                       "register_peer after a same-surface reconnect must still return the SAME " +
+                       "peer_id as the very first initialize")
+    }
+
+    func test_initialize_boundPeerTTLPurged_selfHeals_newPeerIDAndRebinds() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceA = UUID()
+
+        let init1 = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(init1.statusCode, 200)
+        let originalPeerID = try peerID(fromInitializeResponseBody: init1.body)
+        let originalUUID = try XCTUnwrap(UUID(uuidString: originalPeerID))
+
+        // Simulate the bound peer having aged out of IPCStore's TTL.
+        await server.store._testSetPeerLastSeen(peerId: originalUUID, date: Date().addingTimeInterval(-3600))
+
+        // Give surface A's Agents sidebar row somewhere to observe a badge.
+        let sessionStart = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo")
+        ))
+        XCTAssertEqual(sessionStart.statusCode, 204)
+
+        let init2 = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 2)
+        ))
+        XCTAssertEqual(init2.statusCode, 200)
+        let newPeerID = try peerID(fromInitializeResponseBody: init2.body)
+
+        XCTAssertNotEqual(newPeerID, originalPeerID,
+                          "a TTL-purged bound peer must not be resurrected by reconnecting — a fresh " +
+                          "peer must be minted")
+
+        // Self-repair is observed by continuity: a message sent to the
+        // fresh peer id must light up surface A's badge, proving
+        // initialize rebound the surface to the newly created peer.
+        let otherPeerID = try await registerPeerID(name: "other")
+        let sendResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 3, toolName: "send_message", arguments: [
+                "from": otherPeerID, "to": newPeerID, "content": "hello",
+            ])
+        ))
+        XCTAssertEqual(sendResponse.statusCode, 200)
+
+        XCTAssertEqual(registry.entries[surfaceA]?.unreadCount, 1,
+                       "initialize must rebind surfaceA to the freshly created peer when the " +
+                       "previously bound peer has been TTL-purged from the store — self-healing")
+    }
+
+    // MARK: - Round 6 fix review: register_peer rename must not blank out
+    // an omitted/empty name or role
+    //
+    // `handleRegisterPeer`'s rename path originally passed the raw
+    // `name`/`role` arguments straight through to `IPCStore.updatePeer`,
+    // defaulting a missing argument to `""`. A caller that only supplied
+    // one of the two (e.g. "just set a descriptive name") therefore wiped
+    // out the other field's existing value. Fix: an omitted or
+    // empty-string argument is passed through as `nil`, which
+    // `updatePeer` treats as "leave this field unchanged".
+
+    func test_registerPeer_rename_missingRoleArgument_preservesExistingRole() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceA = UUID()
+
+        // initialize's auto-registration sets role to "claude-code" (see
+        // CalyxMCPServer's `initialize` case) — the value the omitted
+        // `role` argument below must not blank out.
+        let initA = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(initA.statusCode, 200)
+
+        let registerResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: rpcToolCallRequest(id: 2, toolName: "register_peer", arguments: ["name": "my-task"])
+        ))
+        XCTAssertEqual(registerResponse.statusCode, 200)
+        let renamedPeerID = try peerID(fromToolResultBody: registerResponse.body)
+
+        let peers = try await listPeersDicts()
+        let renamed = try XCTUnwrap(peers.first { $0["id"] as? String == renamedPeerID })
+
+        XCTAssertEqual(renamed["name"] as? String, "my-task", "the supplied name must apply")
+        XCTAssertEqual(renamed["role"] as? String, "claude-code",
+                       "omitting role from register_peer must preserve initialize's auto-registered " +
+                       "role, not blank it out to an empty string")
+    }
+
+    func test_registerPeer_rename_emptyNameArgument_preservesExistingName() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceA = UUID()
+
+        // initialize's auto-registration derives name from clientInfo.name
+        // ("test", per `initializeRequestBody`) — the value the
+        // empty-string `name` argument below must not blank out.
+        let initA = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(initA.statusCode, 200)
+
+        let registerResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: rpcToolCallRequest(id: 2, toolName: "register_peer", arguments: ["name": "", "role": "worker"])
+        ))
+        XCTAssertEqual(registerResponse.statusCode, 200)
+        let renamedPeerID = try peerID(fromToolResultBody: registerResponse.body)
+
+        let peers = try await listPeersDicts()
+        let renamed = try XCTUnwrap(peers.first { $0["id"] as? String == renamedPeerID })
+
+        XCTAssertEqual(renamed["name"] as? String, "test",
+                       "an empty-string name argument to register_peer must preserve the existing " +
+                       "name, not blank it out")
+        XCTAssertEqual(renamed["role"] as? String, "worker", "the supplied role must apply")
+    }
+
+    // Code review follow-up: a whitespace-only argument (not just the
+    // exact empty string `""`) must also be treated as "omitted" — the
+    // one case Round 6 specifically set out to protect against, since a
+    // caller sending `"name": " "` would otherwise blank out the
+    // existing name with a whitespace-only value instead of preserving
+    // it. Mirrors the header-parsing trim-before-isEmpty convention used
+    // elsewhere in `CalyxMCPServer` (`parseSurfaceID`, the
+    // `X-Calyx-Agent-Kind` handling in `routeAgentEvent`).
+    func test_registerPeer_rename_whitespaceOnlyNameArgument_preservesExistingName() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceA = UUID()
+
+        // initialize's auto-registration derives name from clientInfo.name
+        // ("test", per `initializeRequestBody`) — the value the
+        // whitespace-only `name` argument below must not blank out.
+        let initA = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(initA.statusCode, 200)
+
+        let registerResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: rpcToolCallRequest(id: 2, toolName: "register_peer", arguments: ["name": " ", "role": "worker"])
+        ))
+        XCTAssertEqual(registerResponse.statusCode, 200)
+        let renamedPeerID = try peerID(fromToolResultBody: registerResponse.body)
+
+        let peers = try await listPeersDicts()
+        let renamed = try XCTUnwrap(peers.first { $0["id"] as? String == renamedPeerID })
+
+        XCTAssertEqual(renamed["name"] as? String, "test",
+                       "a whitespace-only name argument to register_peer must preserve the existing " +
+                       "name, not overwrite it with whitespace")
+        XCTAssertEqual(renamed["role"] as? String, "worker", "the supplied role must apply")
     }
 }

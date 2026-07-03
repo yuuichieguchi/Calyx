@@ -584,6 +584,20 @@ final class AgentRegistry {
         surfaceToPeer[surfaceID] != nil
     }
 
+    /// Returns the peer ID currently bound to `surfaceID` via `bindSurface`,
+    /// or `nil` if the surface has no binding. Round 6: unlike
+    /// `isSurfaceBound` (Bool-only), this hands back the actual peer id so
+    /// callers can look up whether that peer is still alive in
+    /// `IPCStore`. Two call sites in `CalyxMCPServer` rely on this:
+    /// `handleJSONRPC`'s `initialize` case uses it to resolve a
+    /// reconnecting surface's ONE true peer identity — reporting the same
+    /// `peer_id` back instead of auto-registering a fresh one — and
+    /// `handleRegisterPeer` uses it to rename that peer in place instead
+    /// of minting a second identity for the same surface.
+    func boundPeerID(for surfaceID: UUID) -> UUID? {
+        surfaceToPeer[surfaceID]
+    }
+
     // MARK: - Unread Message Badges
 
     /// Every peer ID currently bound to a surface. `CalyxMCPServer`

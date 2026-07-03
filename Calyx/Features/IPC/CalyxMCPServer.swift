@@ -1055,14 +1055,15 @@ final class CalyxMCPServer {
     /// - Parameter surfaceID: The pane's `X-Calyx-Surface-ID` header, when
     ///   present and valid on the underlying HTTP request (Round 4),
     ///   parsed by `routeMCP`'s `parseSurfaceID(from:)`. When non-`nil`,
-    ///   the `initialize` case binds it to the auto-registered peer (only
-    ///   if the surface isn't already bound — see that call site), and
-    ///   `tools/call`'s `register_peer` unconditionally binds it to the
-    ///   newly created peer — both via `agentRegistry.bindSurface` — so a
-    ///   pane's row gets its unread badge lit even if it never calls a
-    ///   calyx-ipc tool itself (the pre-Round-4 hook-derived binding in
-    ///   `AgentRegistry.handleHookEvent` still runs independently, as a
-    ///   fallback that needs no `X-Calyx-Surface-ID` header at all).
+    ///   the `initialize` case reports (and, if needed, (re)binds) that
+    ///   surface's one true peer identity (Round 6 review — see that call
+    ///   site's own comment), and `tools/call`'s `register_peer`
+    ///   unconditionally binds it to whatever peer it resolves to — both
+    ///   via `agentRegistry.bindSurface` — so a pane's row gets its unread
+    ///   badge lit even if it never calls a calyx-ipc tool itself (the
+    ///   pre-Round-4 hook-derived binding in `AgentRegistry.handleHookEvent`
+    ///   still runs independently, as a fallback that needs no
+    ///   `X-Calyx-Surface-ID` header at all).
     func handleJSONRPC(data: Data, authToken: String?, surfaceID: UUID? = nil) async -> (statusCode: Int, body: Data?) {
 
         // 1. Authentication
@@ -1087,29 +1088,53 @@ final class CalyxMCPServer {
         // 4. Route by method
         switch request.method {
         case "initialize":
-            // Auto-register the connecting client as a peer
-            let clientName = extractClientName(from: request.params) ?? "claude-code"
-            let peer = await store.registerPeer(name: clientName, role: "claude-code")
-            // Round 4 review: only bind a surface that isn't already
-            // bound. `initialize` fires on every MCP connection/reconnect
-            // — each one minting a brand-new peer via `registerPeer`
-            // above — so binding unconditionally here would let a later,
-            // unrelated reconnect on the same surface (e.g. a nested
-            // `claude` invoked as a subprocess from within an
-            // already-bound pane, inheriting the same `CALYX_SURFACE_ID`
-            // env var) silently steal the surface's binding away from the
-            // peer the user's own pane actually messages through. This
-            // doesn't fully close that nested-`claude` gap (a `register_peer`
-            // tool call from the child still rebinds unconditionally,
-            // see below), but it does remove `initialize` itself as a
-            // firing point. `register_peer`'s own binding (`handleRegisterPeer`)
-            // stays unconditional by design: it's a deliberate,
-            // self-reported re-registration (e.g. after `/clear`), not an
-            // automatic connection-time side effect.
-            if let surfaceID, !agentRegistry.isSurfaceBound(surfaceID) {
-                agentRegistry.bindSurface(surfaceID, toPeer: peer.id)
+            // Round 6: auto-register a peer ONLY for a surface-bound
+            // connection (one carrying `X-Calyx-Surface-ID`). A
+            // surfaceless connection (e.g. an external MCP client like
+            // OpenCode) has no surface for a peer to ever be bound to —
+            // auto-registering one for it on every `initialize` just
+            // leaves an orphaned, unaddressable identity behind on every
+            // reconnect, with no way to rename it back onto whatever
+            // identity the client eventually self-registers via
+            // `register_peer`. Such a client keeps the pre-Round-6
+            // "self-register immediately" instructions (see
+            // `MCPRouter.instructions`) as its only path to a peer_id —
+            // that's the intended, unchanged contract for it, not a gap.
+            //
+            // Round 6 review: a surface-bound connection instead resolves
+            // to the surface's ONE peer identity, not a fresh one every
+            // time:
+            // - Bound to a peer that's still alive in `IPCStore`: report
+            //   that SAME peer_id, and do nothing else. This is what a
+            //   pane reconnecting mid-session (e.g. after a Claude Code
+            //   MCP client restart, or the deliberate re-init following
+            //   `/clear`) hits on every subsequent `initialize` — the
+            //   pane's identity and inbox carry over, by design (Calyx's
+            //   peer identity is pane-centric, not process-centric).
+            //   Skipping `registerPeer` here is what makes
+            //   `buildInitializeResponse`'s "already registered as X, and
+            //   register_peer returns the SAME X" promise actually hold
+            //   after a reconnect — minting a second peer here would
+            //   report a fresh X that `register_peer` could then never
+            //   reproduce.
+            // - Not bound, or bound to a peer that's since been
+            //   TTL-purged: register a fresh peer and (re)bind
+            //   unconditionally — the same self-heal `register_peer`
+            //   itself falls back to below when its own bound peer has
+            //   died (see `handleRegisterPeer`).
+            var peerID: UUID?
+            if let surfaceID {
+                if let boundPeerID = agentRegistry.boundPeerID(for: surfaceID),
+                   let alivePeer = await store.peerStatus(id: boundPeerID) {
+                    peerID = alivePeer.id
+                } else {
+                    let clientName = extractClientName(from: request.params) ?? "claude-code"
+                    let peer = await store.registerPeer(name: clientName, role: "claude-code")
+                    peerID = peer.id
+                    agentRegistry.bindSurface(surfaceID, toPeer: peer.id)
+                }
             }
-            let resp = MCPRouter.buildInitializeResponse(id: requestId, peerID: peer.id)
+            let resp = MCPRouter.buildInitializeResponse(id: requestId, peerID: peerID)
             return (200, encode(resp))
 
         case "tools/list":
@@ -1246,23 +1271,74 @@ final class CalyxMCPServer {
 
     // MARK: - Tool Handlers
 
+    /// Round 6: enforces "1 surface = 1 peer identity". Before this fix,
+    /// `register_peer` always minted a brand-new peer, while `initialize`
+    /// already auto-registers one for every surface-bound connection and
+    /// (contradictorily) the old instructions told clients to call
+    /// `register_peer` immediately after connecting anyway. A pane that
+    /// followed that instruction ended up with two disconnected
+    /// identities — the auto-registered one other peers actually message,
+    /// and an orphaned second one nobody addresses. Fix: a surface-bound
+    /// call whose already-bound peer is still alive in `IPCStore` gets
+    /// that peer RENAMED in place (same `peer_id` returned, binding
+    /// untouched) instead of a second identity being created. A stale
+    /// binding (peer TTL-purged) or a surfaceless caller (no binding to
+    /// rename onto) both fall through to the original
+    /// register-and-(re)bind behavior.
+    ///
+    /// Known accepted gap: a nested `claude` subprocess launched from
+    /// within an already-bound pane (inheriting the same
+    /// `CALYX_SURFACE_ID` env var) resolves to the SAME bound surface, so
+    /// its own `register_peer` call renames — and lastSeen-extends — the
+    /// parent pane's peer rather than getting an identity of its own.
+    /// This is a consequence of surface identity being inherited by
+    /// subprocess env vars, not something this fix introduces or closes.
     private func handleRegisterPeer(
         id: JSONRPCId,
         arguments: [String: Any]?,
         surfaceID: UUID?
     ) async -> (statusCode: Int, body: Data?) {
-        let name = (arguments?["name"] as? String) ?? ""
-        let role = (arguments?["role"] as? String) ?? ""
-        let peer = await store.registerPeer(name: name, role: role)
+        // `nil` (as opposed to `""`) is passed through to `updatePeer` for
+        // an omitted, empty, or whitespace-only argument, so the rename
+        // path below preserves the peer's existing name/role instead of
+        // blanking it out when a caller only supplies one of the two
+        // (e.g. a bare "give me a descriptive name" call that doesn't
+        // repeat the role `initialize` already set) — or supplies
+        // whitespace where a value was expected. Trimming before the
+        // emptiness check mirrors the header-parsing convention used
+        // elsewhere in this file (`parseSurfaceID`, the `X-Calyx-Agent-Kind`
+        // handling in `routeAgentEvent`).
+        let nameArg = (arguments?["name"] as? String)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let roleArg = (arguments?["role"] as? String)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+
+        if let surfaceID, let boundPeerID = agentRegistry.boundPeerID(for: surfaceID),
+           let renamed = await store.updatePeer(id: boundPeerID, name: nameArg, role: roleArg) {
+            return toolSuccess(id: id, text: registerPeerResultJSON(peerID: renamed.id))
+        }
+
+        // A brand-new registration has no existing name/role to preserve,
+        // so an omitted/empty argument here becomes "" exactly as before
+        // Round 6.
+        let peer = await store.registerPeer(name: nameArg ?? "", role: roleArg ?? "")
         // Bind the connection's own surface (Round 4) to the freshly
         // created peer — covers explicit re-registration (e.g. after
-        // `/clear`) the same way `initialize`'s auto-registration does in
-        // `handleJSONRPC`, not just the hook-derived binding path.
+        // `/clear`, or self-healing a stale binding above) the same way
+        // `initialize`'s auto-registration does in `handleJSONRPC`, not
+        // just the hook-derived binding path.
         if let surfaceID {
             agentRegistry.bindSurface(surfaceID, toPeer: peer.id)
         }
-        let json = "{\"peerId\":\"\(peer.id.uuidString)\"}"
-        return toolSuccess(id: id, text: json)
+        return toolSuccess(id: id, text: registerPeerResultJSON(peerID: peer.id))
+    }
+
+    /// The `register_peer` tool result body shared by both the rename and
+    /// fresh-registration paths in `handleRegisterPeer` above.
+    private func registerPeerResultJSON(peerID: UUID) -> String {
+        "{\"peerId\":\"\(peerID.uuidString)\"}"
     }
 
     private func handleListPeers(

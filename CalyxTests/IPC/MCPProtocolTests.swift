@@ -103,6 +103,98 @@ final class MCPProtocolTests: XCTestCase {
                      "nil instructions must remain nil after roundtrip")
     }
 
+    // ==================== Round 6: instructions branch on whether a ====================
+    // ==================== peer was already auto-registered ====================
+    //
+    // Bug: the old instructions told every connecting client "call
+    // register_peer once immediately after connecting", while `initialize`
+    // itself ALSO auto-registers a peer and announces its id in the same
+    // response — a contradiction. An agent that dutifully followed the
+    // instruction ended up minting a second, disconnected identity for the
+    // same pane (two rows in list_peers; senders addressing the
+    // auto-registered id never reached the pane's own inbox).
+    //
+    // Fix (Round 6 review): `initialize`'s auto-registration itself is now
+    // limited to surface-bound connections (see
+    // CalyxMCPServerAgentEventTests' `test_initialize_withoutSurfaceHeader_
+    // doesNotAutoRegisterPeer`) — an external client with no
+    // X-Calyx-Surface-ID (e.g. OpenCode) has no surface for a renamed peer
+    // to be bound to, so it is never auto-registered at all. Instructions
+    // must therefore branch on whether `buildInitializeResponse` was
+    // called with a non-nil `peerID`:
+    // - peerID present (surface-bound, already auto-registered): state
+    //   that the client is already registered, and that register_peer is
+    //   now only for attaching a descriptive name — a call that renames
+    //   the existing registration and returns the SAME peer_id.
+    // - peerID nil (no surface binding, never auto-registered): retain the
+    //   original "call register_peer immediately" guidance — there is no
+    //   surface binding for rename semantics to attach to, so
+    //   self-registration remains the only path to a peer_id.
+
+    func test_instructions_withPeerID_doesNotInstructImmediateRegisterPeerCall() throws {
+        let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: UUID())
+        let resultData = try jsonEncoder.encode(response.result!)
+        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let instructions = try XCTUnwrap(initResult.instructions)
+
+        XCTAssertFalse(
+            instructions.contains("Immediately after connecting, call register_peer"),
+            "instructions for a connection WITH an auto-registered peerID must no longer " +
+            "unconditionally instruct the client to call register_peer immediately after connecting " +
+            "— this contradicted initialize's own auto-registration and caused a second, orphaned " +
+            "peer identity per pane"
+        )
+    }
+
+    func test_instructions_withPeerID_explainsAutoRegistrationAndRenameSemantics() throws {
+        let id = JSONRPCId.int(1)
+        let peerID = UUID()
+
+        let response = MCPRouter.buildInitializeResponse(id: id, peerID: peerID)
+        let resultData = try jsonEncoder.encode(response.result!)
+        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let instructions = try XCTUnwrap(initResult.instructions)
+
+        // "Your peer_id is: <uuid>" must still appear (existing contract, unchanged).
+        XCTAssertTrue(instructions.contains("Your peer_id is: \(peerID.uuidString)"),
+                      "instructions must still announce the auto-registered peer_id")
+
+        // The client must be told it is ALREADY registered, not that it
+        // must register.
+        XCTAssertNotNil(
+            instructions.range(of: "already registered", options: .caseInsensitive),
+            "instructions must state the client is already registered as a peer"
+        )
+
+        // register_peer must now be framed as returning the SAME peer_id
+        // (a rename) rather than a fresh one — the core Round 6 fix.
+        XCTAssertNotNil(
+            instructions.range(of: "same peer_id", options: .caseInsensitive),
+            "instructions must state that calling register_peer returns the SAME peer_id, not a new " +
+            "one — otherwise a client that calls it anyway still ends up with two identities"
+        )
+    }
+
+    func test_instructions_withoutPeerID_retainsImmediateRegisterPeerInstruction() throws {
+        let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
+        let resultData = try jsonEncoder.encode(response.result!)
+        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let instructions = try XCTUnwrap(initResult.instructions)
+
+        XCTAssertTrue(
+            instructions.contains("Immediately after connecting, call register_peer once"),
+            "instructions for a connection with no auto-registered peerID (no surface binding) must " +
+            "retain the original 'call register_peer immediately' guidance — without a surface " +
+            "binding there is no rename semantics to fall back on, so self-registration is still " +
+            "required"
+        )
+
+        XCTAssertNil(
+            instructions.range(of: "Your peer_id is:"),
+            "instructions with no peerID must not claim a peer_id was already assigned"
+        )
+    }
+
     // ==================== 2. Tools List — IPC + LSP Tool Surface ====================
 
     func test_toolsListResponse_containsAllTools() throws {
