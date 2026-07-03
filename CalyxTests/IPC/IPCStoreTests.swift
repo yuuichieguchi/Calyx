@@ -1136,4 +1136,106 @@ final class IPCStoreTests: XCTestCase {
         XCTAssertEqual(counts.count, 1)
         XCTAssertEqual(counts.values.first, 0)
     }
+
+    // ==================== Round 6: updatePeer (rename semantics) ====================
+    //
+    // register_peer's Round 6 fix (a surface with an already-bound, still-
+    // alive peer gets that peer RENAMED rather than a second identity
+    // minted) needs a way to update an existing peer's name/role in place
+    // while preserving its identity (id, registeredAt). This is that
+    // primitive.
+
+    func test_updatePeer_existingPeer_updatesNameAndRole_bumpsLastSeen_preservesIdentity() async throws {
+        // Arrange
+        let store = makeStore()
+        let peer = await store.registerPeer(name: "old-name", role: "old-role")
+        let oneMinuteAgo = Date().addingTimeInterval(-60)
+        await store._testSetPeerLastSeen(peerId: peer.id, date: oneMinuteAgo)
+
+        // Act
+        let updated = await store.updatePeer(id: peer.id, name: "my-task", role: "worker")
+
+        // Assert
+        let result = try XCTUnwrap(updated, "updatePeer must return the updated Peer for a known id")
+        XCTAssertEqual(result.id, peer.id,
+                       "updatePeer must preserve the peer's original id — this is a rename, not a re-registration")
+        XCTAssertEqual(result.name, "my-task", "updatePeer must apply the new name")
+        XCTAssertEqual(result.role, "worker", "updatePeer must apply the new role")
+        XCTAssertEqual(result.registeredAt, peer.registeredAt,
+                       "updatePeer must preserve the original registeredAt — it renames the existing " +
+                       "registration, it does not recreate it")
+        XCTAssertGreaterThan(result.lastSeen, oneMinuteAgo,
+                             "updatePeer must bump lastSeen like other liveness-touching operations")
+
+        // The store's own record must reflect the same update, not just the returned copy.
+        let statusOptional = await store.peerStatus(id: peer.id)
+        let status = try XCTUnwrap(statusOptional)
+        XCTAssertEqual(status.name, "my-task")
+        XCTAssertEqual(status.role, "worker")
+    }
+
+    func test_updatePeer_unknownID_returnsNil() async {
+        // Arrange
+        let store = makeStore()
+
+        // Act
+        let result = await store.updatePeer(id: UUID(), name: "whoever", role: "whatever")
+
+        // Assert
+        XCTAssertNil(result, "updatePeer must return nil for an id with no registered peer")
+    }
+
+    // Round 6 review: `nil` for `name`/`role` means "leave this field
+    // unchanged" — `CalyxMCPServer.handleRegisterPeer` relies on this so a
+    // `register_peer` call that only supplies one of the two arguments
+    // doesn't blank out the other.
+
+    func test_updatePeer_nilName_preservesExistingName() async throws {
+        // Arrange
+        let store = makeStore()
+        let peer = await store.registerPeer(name: "original-name", role: "original-role")
+
+        // Act
+        let updated = await store.updatePeer(id: peer.id, name: nil, role: "new-role")
+
+        // Assert
+        let result = try XCTUnwrap(updated)
+        XCTAssertEqual(result.name, "original-name",
+                       "a nil name must leave the existing name unchanged")
+        XCTAssertEqual(result.role, "new-role", "a non-nil role must still apply")
+    }
+
+    func test_updatePeer_nilRole_preservesExistingRole() async throws {
+        // Arrange
+        let store = makeStore()
+        let peer = await store.registerPeer(name: "original-name", role: "original-role")
+
+        // Act
+        let updated = await store.updatePeer(id: peer.id, name: "new-name", role: nil)
+
+        // Assert
+        let result = try XCTUnwrap(updated)
+        XCTAssertEqual(result.name, "new-name", "a non-nil name must still apply")
+        XCTAssertEqual(result.role, "original-role",
+                       "a nil role must leave the existing role unchanged")
+    }
+
+    func test_updatePeer_bothNil_preservesNameAndRole_stillBumpsLastSeen() async throws {
+        // Arrange
+        let store = makeStore()
+        let peer = await store.registerPeer(name: "original-name", role: "original-role")
+        let oneMinuteAgo = Date().addingTimeInterval(-60)
+        await store._testSetPeerLastSeen(peerId: peer.id, date: oneMinuteAgo)
+
+        // Act
+        let updated = await store.updatePeer(id: peer.id, name: nil, role: nil)
+
+        // Assert
+        let result = try XCTUnwrap(updated)
+        XCTAssertEqual(result.name, "original-name")
+        XCTAssertEqual(result.role, "original-role")
+        XCTAssertGreaterThan(result.lastSeen, oneMinuteAgo,
+                             "updatePeer must still bump lastSeen even when both fields are preserved " +
+                             "unchanged — it's still a liveness-touching operation")
+    }
 }

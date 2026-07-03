@@ -145,6 +145,31 @@ actor IPCStore {
         return aliveOrPurge(id)
     }
 
+    /// Updates an existing peer's `name`/`role` in place and bumps its
+    /// `lastSeen`, preserving `id` and `registeredAt` — a rename, not a
+    /// re-registration. `nil` for either parameter keeps that field's
+    /// current value unchanged (Round 6 review: `CalyxMCPServer.handleRegisterPeer`
+    /// passes `nil` for an omitted or empty `register_peer` argument so a
+    /// caller that only supplies a new `name` doesn't blank out the
+    /// existing `role`, or vice versa). Returns the updated `Peer`, or
+    /// `nil` if `id` has no registered (alive) peer. Round 6: backs
+    /// `handleRegisterPeer`'s rename semantics — a surface with an
+    /// already-bound, still-alive peer gets that peer renamed instead of
+    /// a second identity being minted, closing the "two peers per pane"
+    /// defect.
+    func updatePeer(id: UUID, name: String?, role: String?) -> Peer? {
+        guard let existing = aliveOrPurge(id) else { return nil }
+        let updated = Peer(
+            id: existing.id,
+            name: name ?? existing.name,
+            role: role ?? existing.role,
+            lastSeen: Date(),
+            registeredAt: existing.registeredAt
+        )
+        peers[updated.id] = updated
+        return updated
+    }
+
     // MARK: - Messaging
 
     /// Sends a message from one peer to another.
