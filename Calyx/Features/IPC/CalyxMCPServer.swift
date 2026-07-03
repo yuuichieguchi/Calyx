@@ -1182,13 +1182,13 @@ final class CalyxMCPServer {
     }
 
     /// The calyx-ipc tools whose effects can change a bound peer's unread
-    /// count (directly, by delivering/acking a message, or indirectly, by
-    /// being the kind of call after which a stale count is worth
+    /// count (directly, by delivering/receiving a message, or indirectly,
+    /// by being the kind of call after which a stale count is worth
     /// refreshing). `syncBoundPeerInboxCounts` only runs for these —
     /// see its own doc comment for why.
     private static let inboxSyncToolNames: Set<String> = [
         "register_peer", "list_peers", "send_message", "broadcast",
-        "receive_messages", "ack_messages", "get_peer_status"
+        "receive_messages", "get_peer_status"
     ]
 
     private func dispatchToolCall(
@@ -1224,9 +1224,6 @@ final class CalyxMCPServer {
         case "receive_messages":
             return await handleReceiveMessages(id: id, arguments: arguments)
 
-        case "ack_messages":
-            return await handleAckMessages(id: id, arguments: arguments)
-
         case "get_peer_status":
             return await handleGetPeerStatus(id: id, arguments: arguments)
 
@@ -1237,12 +1234,11 @@ final class CalyxMCPServer {
 
     /// Refreshes every currently peer-bound surface's unread-message
     /// badge in one batch: `IPCStore.inboxCounts(for:)` +
-    /// `AgentRegistry.syncInboxCounts`. Replaces four separate
+    /// `AgentRegistry.syncInboxCounts`. Replaces three separate
     /// per-recipient `inboxCount` round trips that used to live in
-    /// `handleSendMessage` / `handleReceiveMessages` / `handleAckMessages`
-    /// (one each) and `handleBroadcast` (one *per recipient* — K actor
-    /// round trips for a K-recipient broadcast) with exactly one batched
-    /// query.
+    /// `handleSendMessage` / `handleReceiveMessages` (one each) and
+    /// `handleBroadcast` (one *per recipient* — K actor round trips for a
+    /// K-recipient broadcast) with exactly one batched query.
     ///
     /// Gated by two checks, in cost order: `toolName` must be one of
     /// `inboxSyncToolNames` (a plain `Set` lookup, no actor hop), and only
@@ -1419,31 +1415,21 @@ final class CalyxMCPServer {
         // This peer's unread badge is refreshed once, after this handler
         // returns, by `handleToolCall`'s `syncBoundPeerInboxCounts` — it
         // will read 0 for `peerUUID` immediately, since `receiveMessages`
-        // just marked every one of these messages delivered.
+        // just deleted every one of these messages from the inbox
+        // (delete-on-read).
         let messageDicts: [[String: Any]] = messages.map { messageToDict($0) }
         let result: [String: Any] = ["messages": messageDicts]
         guard let jsonData = try? JSONSerialization.data(withJSONObject: result),
               let json = String(data: jsonData, encoding: .utf8) else {
+            // Serialization failed AFTER receiveMessages already deleted
+            // these messages from the store — without requeuing them
+            // here, they'd be lost outright rather than merely returned
+            // as an error the caller can retry. Put them back at the
+            // front of the inbox so the next receive_messages call gets
+            // another chance to return (and serialize) them.
+            await store.requeue(messages, for: peerUUID)
             return toolError(id: id, text: "Failed to serialize messages")
         }
-        return toolSuccess(id: id, text: json)
-    }
-
-    private func handleAckMessages(
-        id: JSONRPCId,
-        arguments: [String: Any]?
-    ) async -> (statusCode: Int, body: Data?) {
-        guard let peerStr = arguments?["peer_id"] as? String,
-              let peerUUID = UUID(uuidString: peerStr),
-              let messageIdStrings = arguments?["message_ids"] as? [String] else {
-            return toolError(id: id, text: "Missing or invalid peer_id/message_ids")
-        }
-
-        let messageUUIDs = messageIdStrings.compactMap { UUID(uuidString: $0) }
-        await store.ackMessages(ids: messageUUIDs, for: peerUUID)
-        // This peer's unread badge is refreshed once, after this handler
-        // returns, by `handleToolCall`'s `syncBoundPeerInboxCounts`.
-        let json = "{\"acknowledged\":\(messageUUIDs.count)}"
         return toolSuccess(id: id, text: json)
     }
 

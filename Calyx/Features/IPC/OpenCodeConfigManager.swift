@@ -63,7 +63,11 @@ struct OpenCodeConfigManager: Sendable {
     /// minus the browser-automation paragraph, formatted as Markdown.
     ///
     /// Note: kept as a stable constant so the canary substring
-    /// `"call register_peer once"` remains present.
+    /// `"call register_peer once"` remains present. The receive_messages
+    /// once-only sentence is interpolated from `MCPRouter.
+    /// receiveMessagesOnceNotice` rather than duplicated here verbatim,
+    /// so this block and `MCPRouter`'s own instructions text can't drift
+    /// out of sync (Round 7 review).
     private static let managedBlockBody = """
     ## Calyx IPC
 
@@ -71,7 +75,7 @@ struct OpenCodeConfigManager: Sendable {
 
     Immediately after connecting, call register_peer once with a descriptive name based on your current task or working directory, and a role describing your function. Do not call register_peer again in the same session.
 
-    After completing any significant task, call receive_messages to check for messages from other peers. When you receive messages, process them and respond via send_message.
+    After completing any significant task, call receive_messages to check for messages from other peers. \(MCPRouter.receiveMessagesOnceNotice) — process and respond via send_message as soon as you receive it.
 
     Use list_peers to discover other connected instances. Use broadcast for announcements relevant to all peers.
     """

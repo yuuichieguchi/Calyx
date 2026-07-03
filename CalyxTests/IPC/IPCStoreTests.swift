@@ -3,7 +3,7 @@
 //  CalyxTests
 //
 //  Tests for IPCStore actor: peer registration, message delivery,
-//  broadcast, ack/receive, TTL expiration, and cleanup.
+//  broadcast, delete-on-read receive, TTL expiration, and cleanup.
 //
 //  Coverage:
 //  - Peer registration (name, role, timestamps)
@@ -11,7 +11,6 @@
 //  - Peer removal (peer + inbox)
 //  - Message send/receive (happy path, unregistered sender, unknown recipient)
 //  - Broadcast to all other peers
-//  - Message ack (partial removal)
 //  - Message limit (101 → keeps newest 100)
 //  - Peer TTL (11 min → excluded from list)
 //  - Message TTL (6 min → excluded from receive)
@@ -225,7 +224,15 @@ final class IPCStoreTests: XCTestCase {
 
     // ==================== 8. Receive Messages ====================
 
-    func test_receiveMessages_returnsUnackedMessages() async throws {
+    func test_receiveMessages_returnsSentMessages() async throws {
+        // Contract updated for Round 7 (delete-on-read): a receiveMessages
+        // call returns every message currently in the peer's inbox, and
+        // deletes them from the inbox in the same call — a message it
+        // returns will not be returned again by a later call. That
+        // second half of the contract (and the sibling-peer/later-message
+        // isolation it implies) has its own dedicated tests below, under
+        // "Round 7: delete-on-read (at-most-once)"; this test only covers
+        // the first receive returning what was sent.
         // Arrange
         let store = makeStore()
         let peerA = await store.registerPeer(name: "A", role: "terminal")
@@ -243,54 +250,12 @@ final class IPCStoreTests: XCTestCase {
 
         // Assert
         XCTAssertEqual(inbox.count, 2,
-                       "Should return both unacked messages")
+                       "Should return both sent messages")
         let messageIDs = Set(inbox.map(\.id))
         XCTAssertTrue(messageIDs.contains(msg1.id),
                       "Should contain first message")
         XCTAssertTrue(messageIDs.contains(msg2.id),
                       "Should contain second message")
-
-        // Contract updated post-review: "unacked" no longer means
-        // "unread" — receiveMessages marks every message it returns
-        // delivered without removing it (only ackMessages removes), so a
-        // second receiveMessages call for the same peer still returns
-        // both messages again (unread badge is about delivery, not
-        // presence).
-        let secondInbox = await store.receiveMessages(for: peerB.id)
-        XCTAssertEqual(secondInbox.count, 2,
-                       "receiveMessages must not remove messages from the inbox — only ackMessages does")
-    }
-
-    // ==================== 9. Ack Messages ====================
-
-    func test_ackMessages_removesAckedMessages() async throws {
-        // Arrange
-        let store = makeStore()
-        let peerA = await store.registerPeer(name: "A", role: "terminal")
-        let peerB = await store.registerPeer(name: "B", role: "terminal")
-
-        let msg1 = try await store.sendMessage(
-            from: peerA.id, to: peerB.id, content: "keep me"
-        )
-        let msg2 = try await store.sendMessage(
-            from: peerA.id, to: peerB.id, content: "ack me"
-        )
-
-        // Act — ack only msg2, without ever having received (delivered)
-        // it first. Contract updated post-review: ackMessages removes by
-        // ID regardless of whether the message was ever delivered — ack
-        // and delivery are independent (a peer polling get_peer_status
-        // for message IDs it already knows about, say) — so this must
-        // work exactly the same as it did when "unread" meant "present".
-        await store.ackMessages(ids: [msg2.id], for: peerB.id)
-
-        // Assert
-        let inbox = await store.receiveMessages(for: peerB.id)
-        XCTAssertEqual(inbox.count, 1,
-                       "Only the un-acked message should remain")
-        XCTAssertEqual(inbox.first?.id, msg1.id,
-                       "The remaining message should be msg1")
-        XCTAssertEqual(inbox.first?.content, "keep me")
     }
 
     // ==================== 10. Message Limit ====================
@@ -593,32 +558,6 @@ final class IPCStoreTests: XCTestCase {
                       "Sender C's lastSeen should bump when B receives C's message")
     }
 
-    // Test 4
-    func test_ackMessages_bumpsRecipientLastSeen() async throws {
-        // Contract: ackMessages(for: B) bumps B's lastSeen because ack is an
-        // explicit liveness signal.
-        // Arrange
-        let store = makeStore()
-        let peerA = await store.registerPeer(name: "A", role: "terminal")
-        let peerB = await store.registerPeer(name: "B", role: "terminal")
-
-        let msg = try await store.sendMessage(
-            from: peerA.id, to: peerB.id, content: "ack me"
-        )
-
-        let oneSecondAgo = Date().addingTimeInterval(-1)
-        await store._testSetPeerLastSeen(peerId: peerB.id, date: oneSecondAgo)
-
-        // Act
-        await store.ackMessages(ids: [msg.id], for: peerB.id)
-
-        // Assert
-        let updatedB = await store.peerStatus(id: peerB.id)
-        XCTAssertNotNil(updatedB)
-        XCTAssertTrue(updatedB!.lastSeen > oneSecondAgo,
-                      "Recipient's lastSeen should bump on ackMessages")
-    }
-
     // ==================== Change 2: Unread Message Pinning ====================
 
     // Test 5
@@ -700,24 +639,25 @@ final class IPCStoreTests: XCTestCase {
     }
 
     // Test 8
-    func test_pinLifts_afterAck_recipientThenPurged() async throws {
-        // Contract: Once the unread message is ack'd, the pin is lifted.
-        // After the pin is lifted, the recipient's stale lastSeen makes it
-        // purgeable on the next listPeers call.
+    func test_pinLifts_afterReceive_recipientThenPurged() async throws {
+        // Contract: Once the unread message is received (Round 7:
+        // receiveMessages deletes it from the inbox as it returns it), the
+        // pin is lifted. After the pin is lifted, the recipient's stale
+        // lastSeen makes it purgeable on the next listPeers call.
         // Arrange
         let store = makeStore()
         let peerA = await store.registerPeer(name: "A", role: "terminal")
         let peerB = await store.registerPeer(name: "B", role: "terminal")
 
-        let msg = try await store.sendMessage(
+        _ = try await store.sendMessage(
             from: peerA.id, to: peerB.id, content: "hi"
         )
 
-        // B acks the message → pin lifts
-        await store.ackMessages(ids: [msg.id], for: peerB.id)
+        // B receives the message → it's deleted from B's inbox, pin lifts
+        _ = await store.receiveMessages(for: peerB.id)
 
-        // Now age B's lastSeen to 11 min ago (note: ack also bumps B, so we
-        // override that here)
+        // Now age B's lastSeen to 11 min ago (note: receive also bumps B,
+        // so we override that here)
         let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
         await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
 
@@ -731,7 +671,7 @@ final class IPCStoreTests: XCTestCase {
     }
 
     // Test 9
-    func test_pinLifts_afterAck_senderThenPurged() async throws {
+    func test_pinLifts_afterReceive_senderThenPurged() async throws {
         // Contract (mirror of test 8): once the unread message is gone, the
         // sender is no longer pinned and its stale lastSeen makes it purgeable.
         // Arrange
@@ -739,12 +679,13 @@ final class IPCStoreTests: XCTestCase {
         let peerA = await store.registerPeer(name: "A", role: "terminal")
         let peerB = await store.registerPeer(name: "B", role: "terminal")
 
-        let msg = try await store.sendMessage(
+        _ = try await store.sendMessage(
             from: peerA.id, to: peerB.id, content: "hi"
         )
 
-        // B acks → no in-flight messages remain
-        await store.ackMessages(ids: [msg.id], for: peerB.id)
+        // B receives → the message is deleted from the inbox, no in-flight
+        // messages remain
+        _ = await store.receiveMessages(for: peerB.id)
 
         // Age A's lastSeen to 11 min ago
         let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
@@ -771,7 +712,7 @@ final class IPCStoreTests: XCTestCase {
 
         _ = try await store.broadcast(from: peerA.id, content: "broadcast")
 
-        // Age A's lastSeen to 11 min ago. Neither B nor C has acked.
+        // Age A's lastSeen to 11 min ago. Neither B nor C has received yet.
         let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
         await store._testSetPeerLastSeen(peerId: peerA.id, date: elevenMinutesAgo)
 
@@ -785,7 +726,7 @@ final class IPCStoreTests: XCTestCase {
     }
 
     // Test 11
-    func test_broadcast_partialAck_keepsSenderPinned() async throws {
+    func test_broadcast_partialReceive_keepsSenderPinned() async throws {
         // Contract: Pin holds while at least ONE recipient still has the
         // broadcast unread.
         // Arrange
@@ -794,14 +735,10 @@ final class IPCStoreTests: XCTestCase {
         let peerB = await store.registerPeer(name: "B", role: "terminal")
         let peerC = await store.registerPeer(name: "C", role: "plugin")
 
-        let messages = try await store.broadcast(from: peerA.id, content: "broadcast")
+        _ = try await store.broadcast(from: peerA.id, content: "broadcast")
 
-        // B acks its copy; C has not.
-        guard let msgForB = messages.first(where: { $0.to == peerB.id }) else {
-            XCTFail("Expected broadcast message for B")
-            return
-        }
-        await store.ackMessages(ids: [msgForB.id], for: peerB.id)
+        // B receives its copy (deleting it from B's inbox); C has not.
+        _ = await store.receiveMessages(for: peerB.id)
 
         // Age A's lastSeen to 11 min ago
         let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
@@ -817,21 +754,21 @@ final class IPCStoreTests: XCTestCase {
     }
 
     // Test 12
-    func test_broadcast_fullAck_unpinsSender() async throws {
-        // Contract: Once ALL recipients have acked, the pin lifts and A's stale
-        // lastSeen makes it purgeable.
+    func test_broadcast_fullReceive_unpinsSender() async throws {
+        // Contract: Once ALL recipients have received (and thereby
+        // deleted) their copy, the pin lifts and A's stale lastSeen makes
+        // it purgeable.
         // Arrange
         let store = makeStore()
         let peerA = await store.registerPeer(name: "A", role: "terminal")
         let peerB = await store.registerPeer(name: "B", role: "terminal")
         let peerC = await store.registerPeer(name: "C", role: "plugin")
 
-        let messages = try await store.broadcast(from: peerA.id, content: "broadcast")
+        _ = try await store.broadcast(from: peerA.id, content: "broadcast")
 
-        // B and C both ack
-        for msg in messages {
-            await store.ackMessages(ids: [msg.id], for: msg.to)
-        }
+        // B and C both receive
+        _ = await store.receiveMessages(for: peerB.id)
+        _ = await store.receiveMessages(for: peerC.id)
 
         // Age A's lastSeen to 11 min ago
         let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
@@ -843,7 +780,7 @@ final class IPCStoreTests: XCTestCase {
         // Assert
         let peerIDs = Set(peers.map(\.id))
         XCTAssertFalse(peerIDs.contains(peerA.id),
-                       "A should be purged once all recipients have acked")
+                       "A should be purged once all recipients have received their copy")
     }
 
     // ==================== Change 3: No Time-Based Drop ====================
@@ -933,27 +870,6 @@ final class IPCStoreTests: XCTestCase {
                        "Expired peer must be purged on receiveMessages, not silently bumped")
     }
 
-    // Test 17
-    func test_expiredPeer_noUnread_cannotAckMessages() async {
-        // Contract: An expired peer with no in-flight message must NOT be able
-        // to revive via ackMessages. ack is no-op and the peer is purged.
-        // Arrange
-        let store = makeStore()
-        let peerB = await store.registerPeer(name: "B", role: "terminal")
-
-        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
-        await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
-
-        // Act — call ack with arbitrary ID
-        await store.ackMessages(ids: [UUID()], for: peerB.id)
-
-        // Assert
-        let peers = await store.listPeers()
-        let peerIDs = Set(peers.map(\.id))
-        XCTAssertFalse(peerIDs.contains(peerB.id),
-                       "Expired peer must be purged on ackMessages, not silently bumped")
-    }
-
     // Test 18
     func test_expiredRecipient_noUnread_sendThrowsPeerNotFound() async throws {
         // Contract: An alive sender targeting an expired recipient (with no pin)
@@ -1022,7 +938,7 @@ final class IPCStoreTests: XCTestCase {
 
     // Unlike receiveMessages, inboxCount is a read-only query used to
     // refresh AgentRegistry's unread-message badge after a
-    // send/broadcast/ack — it must report the real count without the
+    // send/broadcast/receive — it must report the real count without the
     // liveness side effect (bumping lastSeen) receiveMessages has.
     func test_inboxCount_returnsMessageCountWithoutMutatingLastSeen() async throws {
         // Arrange
@@ -1053,18 +969,17 @@ final class IPCStoreTests: XCTestCase {
                        "inboxCount must be read-only: unlike receiveMessages, it must not bump lastSeen")
     }
 
-    // ==================== Round 3 fix: undelivered-based inboxCount ====================
+    // ==================== Round 3 fix (Round 7: simplified further) — inboxCount reflects current inbox size ====================
 
-    // Fixes a defect where the sidebar's unread badge stayed lit even
-    // after the agent had genuinely read its inbox: previously
-    // inboxCount reported total inbox *presence*, which receiveMessages
-    // never changes (only ackMessages removes a message) — so an agent
-    // that calls receive_messages but never separately acks (a common,
-    // valid usage pattern) saw its badge stuck non-zero forever.
-    // inboxCount now reports the UNDELIVERED count instead, and
-    // receiveMessages marks every message it returns delivered.
+    // Round 3 fixed a defect where the sidebar's unread badge stayed lit
+    // even after the agent had genuinely read its inbox. Round 7's
+    // delete-on-read change to receiveMessages made the original
+    // undelivered/delivered distinction this fix introduced moot:
+    // inboxCount now simply reports how many messages are currently
+    // sitting in the inbox, since receiveMessages removes every message
+    // it returns instead of merely marking it delivered.
 
-    func test_receiveMessages_immediatelyClearsInboxCount_withoutRequiringAck() async throws {
+    func test_receiveMessages_immediatelyClearsInboxCount() async throws {
         // Arrange
         let store = makeStore()
         let sender = await store.registerPeer(name: "sender", role: "terminal")
@@ -1073,45 +988,46 @@ final class IPCStoreTests: XCTestCase {
         _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
 
         let countBefore = await store.inboxCount(for: recipient.id)
-        XCTAssertEqual(countBefore, 2, "Precondition: both freshly-sent messages are undelivered")
+        XCTAssertEqual(countBefore, 2, "Precondition: both freshly-sent messages are in the inbox")
 
-        // Act — receive, but deliberately never ack.
+        // Act
         _ = await store.receiveMessages(for: recipient.id)
 
         // Assert
         let countAfter = await store.inboxCount(for: recipient.id)
         XCTAssertEqual(countAfter, 0,
-                       "receiveMessages alone (no ack) must immediately clear the undelivered count")
+                       "receiveMessages must immediately clear inboxCount — it deletes every " +
+                       "message it returns")
 
-        // The messages are still present, just no longer undelivered —
-        // ackMessages, not receiveMessages, is what removes them.
+        // The messages are gone, not merely hidden from the count — a
+        // second receiveMessages call returns nothing (delete-on-read).
         let inbox = await store.receiveMessages(for: recipient.id)
-        XCTAssertEqual(inbox.count, 2, "Delivered messages must remain in the inbox until ack'd")
+        XCTAssertEqual(inbox.count, 0, "Received messages must not remain in the inbox")
     }
 
-    func test_inboxCount_newMessageAfterDelivery_countsOnlyTheNewOne() async throws {
-        // A message sent (and therefore undelivered) AFTER a prior
-        // receiveMessages call must still be counted — delivery is
-        // per-message, not a peer-wide "caught up" flag.
+    func test_inboxCount_newMessageAfterReceive_countsOnlyTheNewOne() async throws {
+        // A message sent AFTER a prior receiveMessages call must still be
+        // counted — the earlier receive only cleared what was in the
+        // inbox at that time, not some peer-wide "caught up" flag.
         let store = makeStore()
         let sender = await store.registerPeer(name: "sender", role: "terminal")
         let recipient = await store.registerPeer(name: "recipient", role: "terminal")
         _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "one")
         _ = await store.receiveMessages(for: recipient.id)
-        let countAfterDelivery = await store.inboxCount(for: recipient.id)
-        XCTAssertEqual(countAfterDelivery, 0, "Precondition: delivered, so 0")
+        let countAfterReceive = await store.inboxCount(for: recipient.id)
+        XCTAssertEqual(countAfterReceive, 0, "Precondition: received (and therefore deleted), so 0")
 
         _ = try await store.sendMessage(from: sender.id, to: recipient.id, content: "two")
 
         let countAfterNewMessage = await store.inboxCount(for: recipient.id)
         XCTAssertEqual(countAfterNewMessage, 1,
-                       "A newly-sent message must count as undelivered even though an earlier " +
-                       "message to the same peer was already delivered")
+                       "A newly-sent message must count even though an earlier message to the " +
+                       "same peer was already received")
     }
 
     // ==================== Round 3: inboxCounts(for:) batch ====================
 
-    func test_inboxCounts_returnsUndeliveredCountPerPeer() async throws {
+    func test_inboxCounts_returnsCurrentCountPerPeer() async throws {
         let store = makeStore()
         let sender = await store.registerPeer(name: "sender", role: "terminal")
         let peerA = await store.registerPeer(name: "A", role: "terminal")
@@ -1237,5 +1153,215 @@ final class IPCStoreTests: XCTestCase {
         XCTAssertGreaterThan(result.lastSeen, oneMinuteAgo,
                              "updatePeer must still bump lastSeen even when both fields are preserved " +
                              "unchanged — it's still a liveness-touching operation")
+    }
+
+    // ==================== Round 7: delete-on-read (at-most-once) ====================
+    //
+    // Message.delivered and ackMessages are gone entirely: a message is
+    // now removed from the recipient's inbox by the SAME receiveMessages
+    // call that returns it, instead of staying present (merely marked
+    // "delivered") until a separate ackMessages call. These describe that
+    // contract directly; test_receiveMessages_returnsSentMessages above
+    // (formerly test_receiveMessages_returnsUnackedMessages, which
+    // asserted the opposite — that a second receiveMessages call still
+    // returned both messages) was rewritten to stop asserting the
+    // now-contradicted at-least-once behavior.
+
+    func test_receiveMessages_deletesReturnedMessages_secondReceiveIsEmpty() async throws {
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        _ = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "only once")
+
+        // Act — the first receive returns the message.
+        let firstInbox = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(firstInbox.count, 1,
+                       "Precondition: the first receiveMessages call must return the sent message")
+
+        // Act — a second receive for the same peer, with no new message sent.
+        let secondInbox = await store.receiveMessages(for: peerB.id)
+
+        // Assert
+        XCTAssertTrue(secondInbox.isEmpty,
+                      "receiveMessages must delete-on-read: a message already returned by an earlier " +
+                      "call must not be returned again, with no separate ackMessages step required " +
+                      "to remove it")
+    }
+
+    func test_receiveMessages_deleteOnRead_doesNotAffectOtherPeersOrLaterMessages() async throws {
+        // Contract: delete-on-read removes exactly the messages THIS call
+        // returned for THIS peer — a sibling peer's inbox, and a message
+        // sent to the same peer afterward, must be unaffected.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        let peerC = await store.registerPeer(name: "C", role: "terminal")
+
+        _ = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "for B")
+        _ = try await store.sendMessage(from: peerA.id, to: peerC.id, content: "for C")
+
+        // Act — B receives (and, under delete-on-read, deletes its own message).
+        let inboxB = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(inboxB.count, 1)
+
+        // A new message arrives for B after the delete-on-read receive above.
+        _ = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "after the first receive")
+
+        // Assert — C's inbox (untouched by B's receive) is still intact.
+        let inboxC = await store.receiveMessages(for: peerC.id)
+        XCTAssertEqual(inboxC.count, 1,
+                       "Receiving B's inbox must not delete C's unrelated message")
+
+        // Assert — the message sent to B after its receive is still delivered.
+        let inboxBAgain = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(inboxBAgain.count, 1,
+                       "A message sent after a delete-on-read receive must still be returned on the " +
+                       "next receive — deletion is per-message, not a peer-wide flag")
+        XCTAssertEqual(inboxBAgain.first?.content, "after the first receive")
+    }
+
+    // test_receiveMessages_deletedMessages_inboxCountIsZero removed
+    // (review): duplicated test_receiveMessages_immediatelyClearsInboxCount
+    // above, which already covers the same "inboxCount reads 0 right
+    // after receiveMessages" contract — including the stale delivered-flag
+    // comment this test had carried over from before the rewrite.
+
+    // ==================== Round 7 review: requeue (undo a downstream failure) ====================
+    //
+    // requeue exists solely so CalyxMCPServer.handleReceiveMessages can
+    // put messages back if it fails to serialize receiveMessages' result
+    // — receiveMessages already deleted them from the store by that
+    // point, so without requeue they'd be lost outright rather than
+    // merely returned as a retryable error.
+
+    func test_requeue_restoresMessagesToFrontInOriginalOrder() async throws {
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        let msg1 = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "first")
+        let msg2 = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "second")
+
+        let received = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(received.count, 2, "Precondition: both messages were received (and deleted)")
+
+        // Act — simulate the serialization-failure recovery path.
+        await store.requeue(received, for: peerB.id)
+
+        // Assert
+        let redelivered = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(redelivered.map(\.id), [msg1.id, msg2.id],
+                       "requeue must restore messages to the inbox in their original order")
+    }
+
+    func test_requeue_placesMessagesAheadOfArrivalsDuringTheGap() async throws {
+        // Contract: a message that arrived in the window between the
+        // failed receiveMessages call and the requeue call must not jump
+        // ahead of the requeued (earlier-sent) messages.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        let msg1 = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "first")
+        let received = await store.receiveMessages(for: peerB.id)
+
+        // A new message arrives during the gap before requeue runs.
+        let msg2 = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "arrived during the gap")
+
+        // Act
+        await store.requeue(received, for: peerB.id)
+
+        // Assert
+        let redelivered = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(redelivered.map(\.id), [msg1.id, msg2.id],
+                       "requeued messages must be returned before anything that arrived after the " +
+                       "failed receive")
+    }
+
+    func test_requeue_emptyMessages_isNoOp() async throws {
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        _ = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "untouched")
+
+        await store.requeue([], for: peerB.id)
+
+        let inbox = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(inbox.count, 1, "requeue([]) must not disturb the existing inbox")
+    }
+
+    func test_requeue_expiredPeer_isNoOp() async throws {
+        // Contract: requeue must not revive a peer that expired in the
+        // gap between the failed receiveMessages call and the requeue
+        // call — same revive-prevention rule every other IPCStore API
+        // follows.
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+        let msg = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "hi")
+        let received = await store.receiveMessages(for: peerB.id)
+
+        let elevenMinutesAgo = Date().addingTimeInterval(-11 * 60)
+        await store._testSetPeerLastSeen(peerId: peerB.id, date: elevenMinutesAgo)
+
+        await store.requeue(received, for: peerB.id)
+
+        let peers = await store.listPeers()
+        XCTAssertFalse(peers.map(\.id).contains(peerB.id),
+                       "requeue on an expired peer must not revive it")
+    }
+
+    func test_requeue_capsCombinedTotal_dropsOldestOfTheRequeuedMessagesFirst() async throws {
+        // Contract: if requeuing would push the peer's inbox over
+        // maxMessagesPerPeer (100), requeue must trim from the FRONT of
+        // the combined array — same drop-oldest-first policy as
+        // appendCapped — so the oldest of the requeued (earlier-sent)
+        // messages are dropped before any message that arrived during
+        // the gap.
+        // Arrange
+        let store = makeStore()
+        let peerA = await store.registerPeer(name: "A", role: "terminal")
+        let peerB = await store.registerPeer(name: "B", role: "terminal")
+
+        // 60 messages, all received (and thereby deleted) in one call.
+        for i in 0..<60 {
+            _ = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "requeued-\(i)")
+        }
+        let received = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(received.count, 60, "Precondition: all 60 messages were received in one call")
+
+        // 50 more arrive during the gap before requeue runs — 60 + 50 = 110, over the 100 cap.
+        for i in 0..<50 {
+            _ = try await store.sendMessage(from: peerA.id, to: peerB.id, content: "gap-\(i)")
+        }
+
+        // Act
+        await store.requeue(received, for: peerB.id)
+
+        // Assert
+        let redelivered = await store.receiveMessages(for: peerB.id)
+        XCTAssertEqual(redelivered.count, 100,
+                       "Combined total must be trimmed to maxMessagesPerPeer (100)")
+
+        let contents = redelivered.map(\.content)
+        for i in 0..<10 {
+            XCTAssertFalse(contents.contains("requeued-\(i)"),
+                           "The oldest 10 of the requeued messages must be dropped to make room")
+        }
+        for i in 10..<60 {
+            XCTAssertTrue(contents.contains("requeued-\(i)"),
+                          "Requeued messages after the dropped oldest 10 must survive the trim")
+        }
+        for i in 0..<50 {
+            XCTAssertTrue(contents.contains("gap-\(i)"),
+                          "Messages that arrived during the gap must all survive the trim")
+        }
+        XCTAssertEqual(contents.first, "requeued-10",
+                       "The oldest surviving requeued message must still be returned first")
     }
 }

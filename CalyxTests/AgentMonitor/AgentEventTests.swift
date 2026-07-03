@@ -291,24 +291,10 @@ final class AgentEventTests: XCTestCase {
                        "PreToolUse for receive_messages must extract this surface's own peer ID from tool_input.peer_id")
     }
 
-    func test_decode_preToolUse_ackMessages_extractsIpcSelfPeerIDFromPeerID() throws {
-        let data = json("""
-        {
-            "session_id": "abc-123",
-            "hook_event_name": "PreToolUse",
-            "tool_name": "mcp__calyx-ipc__ack_messages",
-            "tool_input": {
-                "peer_id": "55555555-5555-5555-5555-555555555555",
-                "message_ids": ["m1", "m2"]
-            }
-        }
-        """)
-
-        let event = try XCTUnwrap(AgentEvent.decode(from: data))
-
-        XCTAssertEqual(event.ipcSelfPeerID, "55555555-5555-5555-5555-555555555555",
-                       "PreToolUse for ack_messages must extract this surface's own peer ID from tool_input.peer_id")
-    }
+    // test_decode_preToolUse_ackMessages_extractsIpcSelfPeerIDFromPeerID
+    // removed: ack_messages was removed as an MCP tool in Round 7, so it's
+    // no longer one of the tool names AgentEvent extracts a self peer ID
+    // for either.
 
     func test_decode_preToolUse_nonCalyxIPCToolAndMissingToolInput_ipcSelfPeerIDIsNil() throws {
         // Sanity: a calyx-ipc send_message PreToolUse must actually

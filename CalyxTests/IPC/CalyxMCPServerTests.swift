@@ -9,7 +9,7 @@
 //  - Authentication: no token, wrong token, correct token
 //  - JSON-RPC routing: initialize, tools/list, unknown method, invalid JSON, notification
 //  - Tool calls: register_peer, list_peers, send_message (success + errors),
-//    receive_messages, ack_messages, broadcast, get_peer_status
+//    receive_messages, broadcast, get_peer_status
 //  - Lifecycle: start/stop, rapid toggle
 //
 //  NOTE: All handleJSONRPC tests exercise the method directly with Data,
@@ -240,7 +240,7 @@ final class CalyxMCPServerTests: XCTestCase {
                        "instructions must not be empty")
     }
 
-    // 5. "tools/list" → result with the IPC + LSP tool surface (7 + 70 = 77)
+    // 5. "tools/list" → result with the IPC + LSP tool surface (6 + 70 = 76)
     func test_handleJSONRPC_toolsList_returnsAllTools() async throws {
         // Arrange
         let data = makeRequest(method: "tools/list")
@@ -254,13 +254,14 @@ final class CalyxMCPServerTests: XCTestCase {
 
         let tools = try XCTUnwrap(result["tools"] as? [[String: Any]],
                                   "tools/list result must contain 'tools' array")
-        XCTAssertEqual(tools.count, 77,
-                       "tools/list must return 7 IPC + 70 LSP = 77 tools")
+        XCTAssertEqual(tools.count, 76,
+                       "tools/list must return 6 IPC + 70 LSP = 76 tools " +
+                       "(Round 7 removed ack_messages)")
 
         let toolNames = Set(tools.compactMap { $0["name"] as? String })
         let expectedIPCNames: Set<String> = [
             "register_peer", "list_peers", "send_message",
-            "broadcast", "receive_messages", "ack_messages", "get_peer_status",
+            "broadcast", "receive_messages", "get_peer_status",
         ]
         XCTAssertTrue(expectedIPCNames.isSubset(of: toolNames),
                       "tools/list must surface every IPC tool; got: \(toolNames)")
@@ -467,46 +468,6 @@ final class CalyxMCPServerTests: XCTestCase {
                        "Receiver should have exactly 1 message")
         XCTAssertEqual(messages[0]["content"] as? String, "test message",
                        "Message content should match what was sent")
-    }
-
-    // 15. ack_messages → receive again returns empty
-    func test_handleJSONRPC_ackMessages_removesMessages() async throws {
-        // Arrange — register, send, receive to get the message ID
-        let peerIdA = try await registerPeer(name: "sender")
-        let peerIdB = try await registerPeer(name: "receiver")
-
-        let sendData = makeToolCallRequest(toolName: "send_message", arguments: [
-            "from": peerIdA,
-            "to": peerIdB,
-            "content": "ack me",
-        ])
-        let (_, sendBody) = await server.handleJSONRPC(data: sendData, authToken: testToken)
-        let (sendJSON, _) = try toolCallJSON(sendBody)
-        let messageId = try XCTUnwrap(sendJSON["messageId"] as? String,
-                                      "send_message must return messageId")
-
-        // Act — ack the message
-        let ackData = makeToolCallRequest(toolName: "ack_messages", arguments: [
-            "peer_id": peerIdB,
-            "message_ids": [messageId],
-        ])
-        let (ackStatus, ackBody) = await server.handleJSONRPC(data: ackData, authToken: testToken)
-        XCTAssertEqual(ackStatus, 200)
-        let (_, ackIsError) = try toolCallText(ackBody)
-        XCTAssertFalse(ackIsError, "ack_messages should not be an error")
-
-        // Assert — receive again returns empty
-        let recvData = makeToolCallRequest(toolName: "receive_messages", arguments: [
-            "peer_id": peerIdB,
-        ])
-        let (recvStatus, recvBody) = await server.handleJSONRPC(data: recvData, authToken: testToken)
-        XCTAssertEqual(recvStatus, 200)
-        let (recvJSON, recvIsError) = try toolCallJSON(recvBody)
-        XCTAssertFalse(recvIsError)
-
-        let messages = recvJSON["messages"] as? [[String: Any]] ?? []
-        XCTAssertTrue(messages.isEmpty,
-                      "After ack, receive_messages should return empty")
     }
 
     // 16. broadcast → B and C receive, A does not
