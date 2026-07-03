@@ -22,12 +22,24 @@ struct ClaudeConfigManager: Sendable {
         // Ensure mcpServers key exists
         var mcpServers = config[mcpServersKey] as? [String: Any] ?? [:]
 
-        // Add/update calyx-ipc entry
+        // Add/update calyx-ipc entry.
+        //
+        // `X-Calyx-Surface-ID` (Round 4) carries the pane's surface ID via
+        // Claude Code's own `${VAR}` header env-expansion, so
+        // `CalyxMCPServer` can bind surface -> peer at MCP `initialize`
+        // time even for a passive recipient that never calls a calyx-ipc
+        // tool. Must be the `${CALYX_SURFACE_ID:-}` empty-default form: an
+        // undefined variable with no default fails Claude Code's config
+        // parse entirely, which would break every *other* terminal (one
+        // with no `CALYX_SURFACE_ID` env, e.g. outside Calyx) too. An
+        // empty header value is treated as "no binding" server-side, so
+        // the empty default is always safe.
         let calyxEntry: [String: Any] = [
             "type": "http",
             "url": "http://127.0.0.1:\(port)/mcp",
             "headers": [
-                "Authorization": "Bearer \(token)"
+                "Authorization": "Bearer \(token)",
+                "X-Calyx-Surface-ID": "${CALYX_SURFACE_ID:-}"
             ]
         ]
         mcpServers[calyxIPCKey] = calyxEntry

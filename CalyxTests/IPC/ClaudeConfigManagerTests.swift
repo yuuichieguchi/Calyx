@@ -218,6 +218,66 @@ final class ClaudeConfigManagerTests: XCTestCase {
                        "Authorization header should be 'Bearer {token}'")
     }
 
+    // Round 4: the MCP connection itself must carry the pane's surface ID,
+    // via Claude Code's documented `${VAR}` header env-expansion, so the
+    // server can bind surface -> peer at `initialize` time even for a
+    // passive recipient that never calls a calyx-ipc tool (and so never
+    // fires the PreToolUse/PostToolUse hook the old binding path relied
+    // on). Must be the `${CALYX_SURFACE_ID:-}` empty-default form — an
+    // undefined var with no default fails Claude Code's config parse
+    // entirely, which would break every *other* terminal too.
+    func test_enableIPC_headers_includeSurfaceIDPlaceholderWithEmptyDefault() throws {
+        // Given/When
+        try ClaudeConfigManager.enableIPC(port: 41830, token: "abc123", configPath: configPath)
+
+        // Then: headers contain exactly Authorization and X-Calyx-Surface-ID,
+        // the latter as the literal `${CALYX_SURFACE_ID:-}` expansion string.
+        let dict = try readConfigDict()
+        let mcpServers = dict["mcpServers"] as? [String: Any]
+        let calyxIPC = mcpServers?["calyx-ipc"] as? [String: Any]
+        let headers = calyxIPC?["headers"] as? [String: String]
+
+        XCTAssertEqual(headers?["Authorization"], "Bearer abc123")
+        XCTAssertEqual(headers?["X-Calyx-Surface-ID"], "${CALYX_SURFACE_ID:-}",
+                       "X-Calyx-Surface-ID must be the literal ${CALYX_SURFACE_ID:-} placeholder " +
+                       "(empty default) so Claude Code's own env expansion fills it per-pane, and an " +
+                       "external terminal with no CALYX_SURFACE_ID env still parses the config")
+        XCTAssertEqual(headers?.count, 2,
+                       "headers must contain exactly Authorization and X-Calyx-Surface-ID, no more")
+    }
+
+    func test_enableIPC_updatesExistingEntry_headersIncludeSurfaceIDPlaceholder() throws {
+        // Given: calyx-ipc already exists from a pre-Round-4 config (single header)
+        let existingJSON = """
+        {
+            "mcpServers": {
+                "calyx-ipc": {
+                    "type": "http",
+                    "url": "http://localhost:40000/mcp",
+                    "headers": {
+                        "Authorization": "Bearer old-token"
+                    }
+                }
+            }
+        }
+        """
+        writeConfig(existingJSON)
+
+        // When: enableIPC is called again (e.g. re-running "Enable AI Agent IPC")
+        try ClaudeConfigManager.enableIPC(port: 55555, token: "new-token", configPath: configPath)
+
+        // Then: the regenerated entry gains the X-Calyx-Surface-ID header too
+        let dict = try readConfigDict()
+        let mcpServers = dict["mcpServers"] as? [String: Any]
+        let calyxIPC = mcpServers?["calyx-ipc"] as? [String: Any]
+        let headers = calyxIPC?["headers"] as? [String: String]
+
+        XCTAssertEqual(headers?["Authorization"], "Bearer new-token")
+        XCTAssertEqual(headers?["X-Calyx-Surface-ID"], "${CALYX_SURFACE_ID:-}",
+                       "Re-running enableIPC on a pre-Round-4 entry must add X-Calyx-Surface-ID, " +
+                       "not just refresh Authorization")
+    }
+
     // MARK: - disableIPC
 
     func test_disableIPC_removesCalyxEntry() throws {

@@ -10,9 +10,22 @@ import Foundation
 
 struct ClaudeHooksConfigManager: Sendable {
 
-    /// The 7 hook events Calyx installs a command entry for, and the
+    /// The 8 hook events Calyx installs a command entry for, and the
     /// `matcher` each uses (`nil` means no `"matcher"` key is written —
     /// Claude Code treats an absent matcher as "always run").
+    ///
+    /// `PermissionRequest` (Round 4) is a tool-approval-prompt hook,
+    /// subscribed here with matcher `"*"` — unified with `PreToolUse`/
+    /// `PostToolUse` rather than left without a matcher — and installed
+    /// alongside `Notification`("permission_prompt") rather than in place
+    /// of it: `Notification`'s firing can lag the actual on-screen dialog
+    /// by several seconds, while `PermissionRequest` fires in sync with
+    /// the dialog appearing, so subscribing to it lets the Agents sidebar
+    /// flip a row to `.blocked` immediately instead of waiting out that
+    /// delay. `AgentRegistry`'s server-side mapping of `PermissionRequest`
+    /// to `.blocked` (unconditional, no message-substring check — unlike
+    /// `Notification`) is already implemented; this only wires up
+    /// `calyx-agent-hook`'s subscription so the hook actually fires.
     private static let targetEvents: [(name: String, matcher: String?)] = [
         ("SessionStart", nil),
         ("UserPromptSubmit", nil),
@@ -21,11 +34,12 @@ struct ClaudeHooksConfigManager: Sendable {
         ("Notification", "permission_prompt"),
         ("Stop", nil),
         ("SessionEnd", nil),
+        ("PermissionRequest", "*"),
     ]
 
     // MARK: - Public API
 
-    /// Merges Calyx's 7 hook entries into `configPath`'s `"hooks"` section,
+    /// Merges Calyx's 8 hook entries into `configPath`'s `"hooks"` section,
     /// preserving the user's own existing hook entries and unrelated
     /// top-level keys. Idempotent: re-running replaces Calyx's own prior
     /// entries rather than duplicating them.
@@ -104,7 +118,7 @@ struct ClaudeHooksConfigManager: Sendable {
     }
 
     /// Whether Calyx's own command entry is present for at least one of the
-    /// 7 target events. Returns `false` (rather than throwing) when
+    /// 8 target events. Returns `false` (rather than throwing) when
     /// `configPath`'s symlink chain can't be resolved — this is a
     /// read-only status check, and every other unreadable/invalid-file
     /// case here already resolves to `false` the same way.
