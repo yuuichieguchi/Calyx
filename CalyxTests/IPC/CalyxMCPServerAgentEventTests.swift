@@ -308,9 +308,9 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
     // MARK: - Round 3: unread-badge wiring (route() binding + real tool calls)
     //
     // No mocking: drives the real PreToolUse-binding path through route(),
-    // then the real send_message/receive_messages/ack_messages tool
-    // handlers through handleJSONRPC, and asserts on the same injected
-    // AgentRegistry both paths share.
+    // then the real send_message/receive_messages tool handlers through
+    // handleJSONRPC, and asserts on the same injected AgentRegistry both
+    // paths share.
 
     private func rpcToolCallRequest(id: Int, toolName: String, arguments: [String: Any]) -> Data {
         let dict: [String: Any] = [
@@ -345,63 +345,6 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
         let json = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
         let messages = try XCTUnwrap(json["messages"] as? [[String: Any]])
         return messages.compactMap { $0["id"] as? String }
-    }
-
-    func test_agentEventBinding_sendMessageIncrementsUnreadCount_ackMessagesClearsIt() async throws {
-        let registry = AgentRegistry()
-        server.agentRegistry = registry
-
-        let p1 = try await registerPeerID(name: "P1")
-        let p2 = try await registerPeerID(name: "P2")
-
-        // P1's pane reports a PreToolUse for its own send_message call —
-        // this is how the registry learns the surface -> peer binding.
-        let boundSurface = UUID()
-        let bindingRequest = agentEventRequest(
-            token: testToken,
-            surfaceIDHeader: boundSurface.uuidString,
-            body: Data("""
-            {"hook_event_name":"PreToolUse","session_id":"s1",
-             "tool_name":"mcp__calyx-ipc__send_message",
-             "tool_input":{"from":"\(p1)","to":"\(p2)","content":"hi"}}
-            """.utf8)
-        )
-        let bindingResponse = await server.route(request: bindingRequest)
-        XCTAssertEqual(bindingResponse.statusCode, 204)
-
-        // P2 now actually sends a message to P1 via the real MCP tool-call
-        // path — this must update the bound surface's unreadCount through
-        // the injected registry (no mocking of IPCStore or the registry).
-        let sendRequest = rpcToolCallRequest(id: 2, toolName: "send_message", arguments: [
-            "from": p2, "to": p1, "content": "hello from P2",
-        ])
-        let (sendStatus, _) = await server.handleJSONRPC(data: sendRequest, authToken: testToken)
-        XCTAssertEqual(sendStatus, 200)
-
-        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 1,
-                       "Sending a message to the bound peer must increment the surface row's unreadCount")
-
-        // Contract updated post-review: receive_messages alone (no ack)
-        // must already clear unreadCount to 0 — the fix for a defect
-        // where the badge stayed lit even after the agent had genuinely
-        // read its inbox, only clearing once it was separately ack'd.
-        let receiveRequest = rpcToolCallRequest(id: 3, toolName: "receive_messages", arguments: ["peer_id": p1])
-        let (_, receiveBody) = await server.handleJSONRPC(data: receiveRequest, authToken: testToken)
-        let messageIDs = try extractMessageIDs(fromReceiveResultText: try toolResultText(receiveBody))
-
-        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 0,
-                       "receive_messages alone (no ack yet) must already clear the bound surface's " +
-                       "unreadCount, since it marks the retrieved messages delivered")
-
-        // ack_messages (message removal) must not resurrect the badge.
-        let ackRequest = rpcToolCallRequest(id: 4, toolName: "ack_messages", arguments: [
-            "peer_id": p1, "message_ids": messageIDs,
-        ])
-        let (ackStatus, _) = await server.handleJSONRPC(data: ackRequest, authToken: testToken)
-        XCTAssertEqual(ackStatus, 200)
-
-        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 0,
-                       "unreadCount must remain 0 after ack_messages too")
     }
 
     func test_agentEventBinding_postToolUseRegisterPeerResponse_bindsSurface_firstMessageLightsUpBadge() async throws {
@@ -1299,5 +1242,87 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
                        "a whitespace-only name argument to register_peer must preserve the existing " +
                        "name, not overwrite it with whitespace")
         XCTAssertEqual(renamed["role"] as? String, "worker", "the supplied role must apply")
+    }
+
+    // MARK: - Round 7: messages are deleted on receive (at-most-once);
+    // ack_messages is removed entirely.
+
+    func test_agentEventBinding_sendMessageIncrementsUnreadCount_receiveClearsIt_secondReceiveReturnsEmpty() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+
+        let p1 = try await registerPeerID(name: "P1")
+        let p2 = try await registerPeerID(name: "P2")
+
+        // P1's pane reports a PreToolUse for its own send_message call —
+        // this is how the registry learns the surface -> peer binding.
+        let boundSurface = UUID()
+        let bindingRequest = agentEventRequest(
+            token: testToken,
+            surfaceIDHeader: boundSurface.uuidString,
+            body: Data("""
+            {"hook_event_name":"PreToolUse","session_id":"s1",
+             "tool_name":"mcp__calyx-ipc__send_message",
+             "tool_input":{"from":"\(p1)","to":"\(p2)","content":"hi"}}
+            """.utf8)
+        )
+        let bindingResponse = await server.route(request: bindingRequest)
+        XCTAssertEqual(bindingResponse.statusCode, 204)
+
+        // P2 sends a message to P1 via the real MCP tool-call path.
+        let sendRequest = rpcToolCallRequest(id: 2, toolName: "send_message", arguments: [
+            "from": p2, "to": p1, "content": "hello from P2",
+        ])
+        let (sendStatus, _) = await server.handleJSONRPC(data: sendRequest, authToken: testToken)
+        XCTAssertEqual(sendStatus, 200)
+
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 1,
+                       "Sending a message to the bound peer must increment the surface row's unreadCount")
+
+        // The FIRST receive_messages call returns the message and clears
+        // unreadCount — unchanged from the pre-Round-7 contract.
+        let firstReceiveRequest = rpcToolCallRequest(id: 3, toolName: "receive_messages", arguments: ["peer_id": p1])
+        let (firstReceiveStatus, firstReceiveBody) = await server.handleJSONRPC(data: firstReceiveRequest, authToken: testToken)
+        XCTAssertEqual(firstReceiveStatus, 200)
+        let firstMessageIDs = try extractMessageIDs(fromReceiveResultText: try toolResultText(firstReceiveBody))
+        XCTAssertEqual(firstMessageIDs.count, 1,
+                       "the first receive_messages call must return the one message that was sent")
+
+        XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 0,
+                       "receive_messages must clear the bound surface's unreadCount")
+
+        // Round 7 core contract: a SECOND receive_messages call for the
+        // same peer, with nothing new sent in between, must now return
+        // an empty array — the message was already deleted from the
+        // inbox by the first call (at-most-once delivery), with no
+        // separate ack_messages step needed to remove it.
+        let secondReceiveRequest = rpcToolCallRequest(id: 4, toolName: "receive_messages", arguments: ["peer_id": p1])
+        let (secondReceiveStatus, secondReceiveBody) = await server.handleJSONRPC(data: secondReceiveRequest, authToken: testToken)
+        XCTAssertEqual(secondReceiveStatus, 200)
+        let secondMessageIDs = try extractMessageIDs(fromReceiveResultText: try toolResultText(secondReceiveBody))
+        XCTAssertEqual(secondMessageIDs.count, 0,
+                       "a second receive_messages call for the same peer must return no messages — " +
+                       "receive_messages deletes on read, so a message is never returned twice")
+    }
+
+    func test_ackMessagesToolCall_returnsUnknownToolError() async throws {
+        // Round 7: ack_messages is removed entirely — messages are
+        // deleted on receive (at-most-once), so there is no longer a
+        // separate ack step. A client still holding onto stale
+        // instructions/tool list that calls ack_messages anyway must get
+        // the same "unknown tool" error any other unrecognized tool name
+        // gets, not a working handler.
+        let p1 = try await registerPeerID(name: "P1")
+
+        let ackRequest = rpcToolCallRequest(id: 1, toolName: "ack_messages", arguments: [
+            "peer_id": p1, "message_ids": [] as [String],
+        ])
+        let (status, body) = await server.handleJSONRPC(data: ackRequest, authToken: testToken)
+        XCTAssertEqual(status, 200, "an unknown-tool error is a 200 with isError:true, not an HTTP failure")
+
+        let text = try toolResultText(body)
+        XCTAssertTrue(text.contains("Unknown tool"),
+                      "ack_messages must return the same 'Unknown tool: ack_messages' error any other " +
+                      "unrecognized tool name gets — got: \(text)")
     }
 }

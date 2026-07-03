@@ -135,23 +135,12 @@ struct MCPRouter: Sendable {
             ),
             MCPTool(
                 name: "receive_messages",
-                description: "Receive pending messages for this peer",
+                description: "Receive pending messages for this peer. Each returned message is removed from the inbox as part of this call, so it will not be returned again by a later call.",
                 inputSchema: schema(
                     properties: [
                         "peer_id": prop("string", "Your peer ID"),
                     ],
                     required: ["peer_id"]
-                )
-            ),
-            MCPTool(
-                name: "ack_messages",
-                description: "Acknowledge and delete received messages",
-                inputSchema: schema(
-                    properties: [
-                        "peer_id": prop("string", "Peer ID"),
-                        "message_ids": arrayProp("string", "Message IDs to acknowledge"),
-                    ],
-                    required: ["peer_id", "message_ids"]
                 )
             ),
             MCPTool(
@@ -217,12 +206,23 @@ struct MCPRouter: Sendable {
         ]
     }
 
+    /// The delete-on-read (at-most-once) semantics of `receive_messages`:
+    /// a message is removed from the inbox as it's returned, so it will
+    /// not be returned again by a later call. Not `private` — shared
+    /// verbatim between `commonSuffixParagraphs` below and
+    /// `OpenCodeConfigManager`'s managed AGENTS.md block (Round 7 review:
+    /// the two used to carry independently-authored copies of this
+    /// sentence, which could silently drift out of sync), so there's
+    /// exactly one place this wording lives.
+    static let receiveMessagesOnceNotice =
+        "receive_messages removes each message from your inbox as it returns it, so a message will not be returned again on a later call"
+
     /// Paragraphs shared by both instructions variants, following
     /// whichever register-peer guidance applies. Factored out (Round 6
     /// review) so the browser/LSP tool surface descriptions aren't
     /// duplicated (and liable to drift) between the two variants.
     private static let commonSuffixParagraphs: [String] = [
-        "After completing any significant task, call receive_messages to check for messages from other peers. When you receive messages, process them and respond via send_message.",
+        "After completing any significant task, call receive_messages to check for messages from other peers. \(receiveMessagesOnceNotice) — process and respond via send_message as soon as you receive it.",
         "Use list_peers to discover other connected instances. Use broadcast for announcements relevant to all peers.",
         "Browser automation tools (browser_*) are available when browser scripting is enabled via the Command Palette. Use browser_snapshot to inspect pages and browser_click/browser_fill to interact with elements. Element refs (@e1, @e2) from snapshots can be used as selectors.",
         "LSP language tools (lsp_*) are available when the LSP bridge is started. Use lsp_hover to inspect type information and documentation at a position in a file. Use lsp_definition / lsp_declaration / lsp_type_definition / lsp_implementation for navigation. Use lsp_references for finding usages. Use lsp_completion for autocomplete and lsp_workspace_symbol for cross-file symbol search. All LSP tools require workspace_root, language_id, and (most of them) file/line/column arguments.",

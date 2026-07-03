@@ -199,12 +199,13 @@ final class MCPProtocolTests: XCTestCase {
 
     func test_toolsListResponse_containsAllTools() throws {
         // Arrange — `tools/list` advertises the combined IPC + LSP surface
-        // (7 IPC + 70 LSP = 77 tools). Each IPC name must be present and the
-        // LSP catalogue must be surfaced alongside.
+        // (6 IPC + 70 LSP = 76 tools; Round 7 removed ack_messages). Each
+        // IPC name must be present and the LSP catalogue must be surfaced
+        // alongside.
         let id = JSONRPCId.int(2)
         let expectedIPCTools: Set<String> = [
             "register_peer", "list_peers", "send_message",
-            "broadcast", "receive_messages", "ack_messages", "get_peer_status",
+            "broadcast", "receive_messages", "get_peer_status",
         ]
 
         // Act
@@ -225,8 +226,86 @@ final class MCPProtocolTests: XCTestCase {
                       "Tools list must contain every IPC tool; got: \(actualNames)")
         XCTAssertTrue(actualNames.contains("lsp_hover"),
                       "Tools list must surface the LSP tool catalogue alongside IPC tools")
-        XCTAssertEqual(toolsResult.tools.count, 77,
-                       "Tools list must contain 7 IPC + 70 LSP = 77 tools")
+        XCTAssertEqual(toolsResult.tools.count, 76,
+                       "Tools list must contain 6 IPC + 70 LSP = 76 tools")
+    }
+
+    // ==================== Round 7: ack_messages removed; receive is ====================
+    // ==================== delete-on-read (at-most-once) ====================
+    //
+    // Messages are now removed from the recipient's inbox by the same
+    // receive_messages call that returns them, instead of staying
+    // present until a separate ack_messages call. ack_messages is
+    // therefore removed entirely, not just deprecated.
+
+    func test_toolsListResponse_doesNotContainAckMessages() throws {
+        let response = MCPRouter.buildToolsListResponse(id: .int(2))
+        let resultData = try jsonEncoder.encode(response.result!)
+        let toolsResult = try jsonDecoder.decode(MCPToolsListResult.self, from: resultData)
+        let actualNames = Set(toolsResult.tools.map(\.name))
+
+        XCTAssertFalse(actualNames.contains("ack_messages"),
+                       "ack_messages must be removed from the tool catalogue — receive_messages now " +
+                       "deletes on read, so there is no longer a separate ack step for a client to call")
+    }
+
+    func test_instructions_withoutPeerID_doesNotMentionAck() throws {
+        let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
+        let resultData = try jsonEncoder.encode(response.result!)
+        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let instructions = try XCTUnwrap(initResult.instructions)
+
+        XCTAssertNil(
+            instructions.range(of: "ack", options: .caseInsensitive),
+            "instructions for a connection with no auto-registered peerID must not mention " +
+            "ack/ack_messages anywhere — the tool no longer exists"
+        )
+    }
+
+    func test_instructions_withPeerID_doesNotMentionAck() throws {
+        let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: UUID())
+        let resultData = try jsonEncoder.encode(response.result!)
+        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let instructions = try XCTUnwrap(initResult.instructions)
+
+        XCTAssertNil(
+            instructions.range(of: "ack", options: .caseInsensitive),
+            "instructions for a connection with an auto-registered peerID must not mention " +
+            "ack/ack_messages anywhere — the tool no longer exists"
+        )
+    }
+
+    func test_instructions_describesReceiveMessagesAsDeleteOnRead() throws {
+        // The receive_messages guidance paragraph must explain the new
+        // at-most-once contract — that retrieving a message removes it
+        // from the inbox in the same call, so it will not be returned
+        // again — so an agent doesn't try to re-poll for (or expect a
+        // reply flow around re-reading) a message it already retrieved.
+        let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
+        let resultData = try jsonEncoder.encode(response.result!)
+        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let instructions = try XCTUnwrap(initResult.instructions)
+
+        XCTAssertTrue(instructions.contains("receive_messages"),
+                      "instructions must still mention receive_messages")
+
+        let mentionsRemoval = instructions.range(of: "remov", options: .caseInsensitive) != nil
+        let mentionsNotReturnedAgain =
+            instructions.range(of: "only once", options: .caseInsensitive) != nil ||
+            instructions.range(
+                of: "will not.*again", options: [.regularExpression, .caseInsensitive]
+            ) != nil ||
+            instructions.range(
+                of: "not be returned again", options: .caseInsensitive
+            ) != nil
+
+        XCTAssertTrue(
+            mentionsRemoval && mentionsNotReturnedAgain,
+            "instructions must explain that receive_messages removes messages from the inbox as it " +
+            "returns them, and that a message will not be returned again on a later call — the " +
+            "at-most-once contract ack_messages' removal step used to provide. instructions was: " +
+            "\(instructions)"
+        )
     }
 
     // ==================== 3. register_peer Schema ====================
@@ -485,13 +564,14 @@ final class MCPProtocolTests: XCTestCase {
 
     // ==================== Supplementary: MCPRouter.tools Static Property ====================
 
-    func test_router_tools_staticProperty_returns7Tools() {
+    func test_router_tools_staticProperty_returns6Tools() {
         // Act
         let tools = MCPRouter.tools
 
         // Assert
-        XCTAssertEqual(tools.count, 7,
-                       "MCPRouter.tools must expose exactly 7 tool definitions")
+        XCTAssertEqual(tools.count, 6,
+                       "MCPRouter.tools must expose exactly 6 tool definitions " +
+                       "(Round 7 removed ack_messages)")
 
         let names = tools.map(\.name)
         // IPC tools
@@ -500,7 +580,6 @@ final class MCPProtocolTests: XCTestCase {
         XCTAssertTrue(names.contains("send_message"))
         XCTAssertTrue(names.contains("broadcast"))
         XCTAssertTrue(names.contains("receive_messages"))
-        XCTAssertTrue(names.contains("ack_messages"))
         XCTAssertTrue(names.contains("get_peer_status"))
     }
 

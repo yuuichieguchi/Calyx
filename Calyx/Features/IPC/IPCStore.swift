@@ -22,14 +22,6 @@ struct Message: Sendable, Codable {
     let to: UUID
     let content: String
     var timestamp: Date
-    /// Whether this message has been returned by a `receiveMessages` call
-    /// for its recipient. Set by `receiveMessages`, never cleared. Unlike
-    /// removal (only `ackMessages` does that), delivery alone doesn't
-    /// drop the message from the inbox — it only stops the message from
-    /// counting toward `inboxCount`'s undelivered total, so a peer's
-    /// unread badge clears as soon as it actually retrieves its inbox
-    /// rather than requiring a separate explicit ack.
-    var delivered: Bool = false
 }
 
 // MARK: - Errors
@@ -67,7 +59,8 @@ actor IPCStore {
     // MARK: - Liveness
 
     /// A peer is alive if its `lastSeen` is within `peerTTL` OR it is pinned by
-    /// being the sender or recipient of any in-flight (un-acked) message.
+    /// being the sender or recipient of any in-flight (not yet received)
+    /// message.
     private func isAlive(_ peer: Peer) -> Bool {
         let now = Date()
         if now.timeIntervalSince(peer.lastSeen) <= peerTTL { return true }
@@ -241,15 +234,33 @@ actor IPCStore {
         return messages
     }
 
-    /// Returns all messages currently in the peer's inbox. Message retention is
-    /// governed solely by recipient peer liveness (no time-based drop). Bumps
-    /// the recipient's `lastSeen` and the `lastSeen` of every distinct sender
-    /// of returned messages. If the peer is not alive, returns [] and purges.
+    /// Returns all messages currently in the peer's inbox, deleting them
+    /// from the inbox in the same call (delete-on-read, at-most-once
+    /// delivery) — a message a `receiveMessages` call returns will never
+    /// be returned again. Bumps the recipient's `lastSeen` and the
+    /// `lastSeen` of every distinct sender of returned messages. If the
+    /// peer is not alive, returns [] and purges.
+    ///
+    /// Round 7: replaces the earlier at-least-once contract (a message
+    /// stayed in the inbox, merely marked delivered, until a separate
+    /// `ackMessages` call removed it). In practice `ackMessages` was
+    /// rarely called — MCP instructions never told a client it needed
+    /// to — so inboxes only grew, and an agent could stumble onto a
+    /// stale message from a call it had already processed. A pull-based
+    /// inbox reads more naturally as "read it, it's gone" than as a
+    /// two-step read-then-acknowledge protocol, so delete-on-read is now
+    /// the only contract; there is no ack step to skip. This deletion is
+    /// final except for the one narrow case `requeue` undoes (see its
+    /// doc comment for exactly which failure that is, and which ones it
+    /// deliberately does not cover) — under the at-most-once contract, a
+    /// caller-side failure to actually deliver the returned messages is
+    /// accepted, permanent loss, not something this store recovers from.
     func receiveMessages(for peerID: UUID) -> [Message] {
         guard aliveOrPurge(peerID) != nil else { return [] }
 
         let now = Date()
-        var messages = inbox[peerID] ?? []
+        let messages = inbox[peerID] ?? []
+        inbox[peerID] = []
         peers[peerID]?.lastSeen = now
 
         // Bump every distinct sender (no-op if a sender has since been purged).
@@ -260,54 +271,75 @@ actor IPCStore {
             }
         }
 
-        // Mark every message this call returns as delivered — in the
-        // stored inbox, not just the returned copies — so `inboxCount`'s
-        // undelivered total (and therefore the unread badge) reflects
-        // that this peer has now retrieved them. Delivery doesn't remove
-        // anything from the inbox; only `ackMessages` does that.
-        for index in messages.indices {
-            messages[index].delivered = true
-        }
-        inbox[peerID] = messages
-
         return messages
     }
 
-    /// Removes messages with the given IDs from a peer's inbox. Acks are an
-    /// explicit liveness signal: bumps the peer's `lastSeen`. If the peer is
-    /// not alive, this is a no-op and the peer is purged.
-    func ackMessages(ids: [UUID], for peerID: UUID) {
+    /// Restores `messages` to the FRONT of `peerID`'s inbox, ahead of
+    /// anything already present, preserving their original relative
+    /// order. Exists solely to undo a `receiveMessages` call's deletion
+    /// when a later step fails after the fact — `CalyxMCPServer.
+    /// handleReceiveMessages` calls this if it can't serialize the
+    /// result, so a serialization failure doesn't silently lose messages
+    /// `receiveMessages` already committed to removing from the store.
+    /// `messages` are placed ahead of whatever is already in the inbox
+    /// (e.g. a message that arrived during the gap between the failed
+    /// `receiveMessages` call and this one) so the next `receiveMessages`
+    /// call returns them first, in the order they were originally sent —
+    /// same drop-oldest-first capping as `appendCapped` if the combined
+    /// total exceeds `maxMessagesPerPeer`. If the peer is no longer
+    /// alive, this is a no-op: there is no inbox left to requeue into,
+    /// and a peer that expired in that same gap should not be revived by
+    /// a requeue. A no-op for an empty `messages` too, since there is
+    /// nothing to restore.
+    ///
+    /// Scope: this only covers the synchronous `JSONSerialization`
+    /// failure inside `handleReceiveMessages` that calls it directly. It
+    /// does NOT cover, and cannot recover from, a failure at either of
+    /// the two later points on that same response path — the JSON-RPC
+    /// envelope's own re-encode in `toolSuccess`, or a network-layer
+    /// failure writing the HTTP response — both of which lose the
+    /// already-deleted messages permanently. That's the accepted
+    /// boundary of the at-most-once contract this round establishes, not
+    /// a gap `requeue` is meant to close.
+    ///
+    /// Unlike `sendMessage`, `broadcast`, and `receiveMessages`, this
+    /// does not bump `peerID`'s `lastSeen` — it's a server-internal
+    /// recovery step undoing this store's own prior deletion, not a
+    /// client-initiated liveness signal.
+    func requeue(_ messages: [Message], for peerID: UUID) {
         guard aliveOrPurge(peerID) != nil else { return }
+        guard !messages.isEmpty else { return }
 
-        let idSet = Set(ids)
-        inbox[peerID]?.removeAll { idSet.contains($0.id) }
-
-        peers[peerID]?.lastSeen = Date()
+        var combined = messages + (inbox[peerID] ?? [])
+        if combined.count > maxMessagesPerPeer {
+            combined.removeFirst(combined.count - maxMessagesPerPeer)
+        }
+        inbox[peerID] = combined
     }
 
-    /// Number of currently UNDELIVERED messages waiting in `peerID`'s
-    /// inbox (sent but not yet returned by a `receiveMessages` call) —
-    /// what `AgentRegistry`'s unread-message badge reflects. A delivered
-    /// message stays in the inbox (only `ackMessages` removes it) but no
-    /// longer counts here, so retrieving a peer's inbox immediately
-    /// clears its badge rather than requiring a separate explicit ack.
-    /// Without the side effects `receiveMessages` has (bumping
-    /// `lastSeen` on the recipient and every distinct sender) — and
-    /// without `aliveOrPurge`'s purge-on-expiry either, since this is a
-    /// pure read used to refresh the badge after a
-    /// send/broadcast/receive/ack, not a liveness-gated API. An unknown
-    /// `peerID` simply has no inbox entry, reading as `0`.
+    /// Number of messages currently waiting in `peerID`'s inbox — what
+    /// `AgentRegistry`'s unread-message badge reflects. Since
+    /// `receiveMessages` deletes every message it returns, this is
+    /// simply the inbox's current size; there is no separate
+    /// delivered/undelivered distinction to track. Without the side
+    /// effects `receiveMessages` has (bumping `lastSeen` on the
+    /// recipient and every distinct sender) — and without
+    /// `aliveOrPurge`'s purge-on-expiry either, since this is a pure
+    /// read used to refresh the badge after a send/broadcast/receive,
+    /// not a liveness-gated API. An unknown `peerID` simply has no
+    /// inbox entry, reading as `0`.
     func inboxCount(for peerID: UUID) -> Int {
-        (inbox[peerID] ?? []).filter { !$0.delivered }.count
+        (inbox[peerID] ?? []).count
     }
 
-    /// Batch form of `inboxCount(for:)`: the undelivered count for every
-    /// `peerID` in `peerIDs`, in one call. Used by `CalyxMCPServer` to
-    /// refresh every bound peer's badge once per `tools/call` request
-    /// instead of one `inboxCount` round trip per affected peer — see
-    /// the call site's doc comment. Same read-only, no-side-effect,
-    /// non-liveness-gated contract as `inboxCount(for:)`; an unknown
-    /// `peerID` in `peerIDs` simply reads as `0`.
+    /// Batch form of `inboxCount(for:)`: the current inbox count for
+    /// every `peerID` in `peerIDs`, in one call. Used by
+    /// `CalyxMCPServer` to refresh every bound peer's badge once per
+    /// `tools/call` request instead of one `inboxCount` round trip per
+    /// affected peer — see the call site's doc comment. Same read-only,
+    /// no-side-effect, non-liveness-gated contract as
+    /// `inboxCount(for:)`; an unknown `peerID` in `peerIDs` simply reads
+    /// as `0`.
     func inboxCounts(for peerIDs: [UUID]) -> [UUID: Int] {
         var result: [UUID: Int] = [:]
         result.reserveCapacity(peerIDs.count)

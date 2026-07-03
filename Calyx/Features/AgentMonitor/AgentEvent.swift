@@ -35,7 +35,7 @@ struct AgentEntry: Identifiable, Sendable, Equatable {
     var lastEventAt: Date
     /// Count of unread IPC messages waiting for the peer bound to this
     /// surface, kept in sync by `AgentRegistry.updateInbox` /
-    /// `syncInboxCounts` from `IPCStore`'s undelivered-message count.
+    /// `syncInboxCounts` from `IPCStore`'s current inbox count.
     var unreadCount: Int = 0
 }
 
@@ -79,7 +79,7 @@ struct AgentEvent: Sendable, Equatable {
     /// For a `PreToolUse` event whose `tool_name` is one of Calyx's own
     /// `mcp__calyx-ipc__*` tools, this surface's own peer ID (extracted
     /// from `tool_input.from` for `send_message`/`broadcast`, or
-    /// `tool_input.peer_id` for `receive_messages`/`ack_messages`) — or,
+    /// `tool_input.peer_id` for `receive_messages`) — or,
     /// for a `PostToolUse` event whose `tool_name` is
     /// `mcp__calyx-ipc__register_peer`, the peer ID the server just
     /// generated for this surface (`tool_response.peerId`) — used by
@@ -122,9 +122,9 @@ struct AgentEvent: Sendable, Equatable {
     ]
 
     /// `tool_name`s whose self peer ID is carried in `tool_input.peer_id`
-    /// (the caller identifies itself when reading/acking its own inbox).
+    /// (the caller identifies itself when reading its own inbox).
     private static let peerIDKeyToolNames: Set<String> = [
-        "mcp__calyx-ipc__receive_messages", "mcp__calyx-ipc__ack_messages",
+        "mcp__calyx-ipc__receive_messages",
     ]
 
     /// The one `tool_name` whose self peer ID is learned from its
