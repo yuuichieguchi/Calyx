@@ -109,8 +109,45 @@ final class CalyxMCPServer {
         guard let body = request.body else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
-        let (statusCode, responseBody) = await handleJSONRPC(data: body, authToken: authToken)
+        // A missing, empty, or non-UUID value means "no surface binding
+        // for this connection" here — unlike `/agent-event`'s required
+        // header below, `/mcp` predates `X-Calyx-Surface-ID`, and every
+        // existing MCP client that doesn't send it (or an older Claude
+        // Code build whose `${VAR:-default}` expansion isn't supported,
+        // leaving the literal placeholder string in place) must keep
+        // working exactly as before — so `nil` here is not a request
+        // error, just "not bound".
+        let surfaceID = parseSurfaceID(from: request.headers)
+        let (statusCode, responseBody) = await handleJSONRPC(data: body, authToken: authToken, surfaceID: surfaceID)
         return HTTPParser.response(statusCode: statusCode, body: responseBody)
+    }
+
+    /// Trims whitespace from `X-Calyx-Surface-ID` and parses it as a
+    /// `UUID`, returning `nil` for a missing, empty, or non-UUID value.
+    /// Shared (Round 4 review) by both `/mcp` (`routeMCP`) and
+    /// `/agent-event` (`routeAgentEvent`) so the same header — sent by an
+    /// actual Claude Code MCP client on one route and by
+    /// `calyx-agent-hook`'s own hook POST on the other — is parsed
+    /// identically on both: e.g. a value padded with incidental
+    /// whitespace parses the same way regardless of which route received
+    /// it, rather than one route trimming and the other not. What differs
+    /// per route is only what a `nil` result *means*: `routeMCP` treats it
+    /// as "no binding for this connection" (see its own comment),
+    /// `routeAgentEvent` treats it as a 400 request error (the header is
+    /// required there).
+    ///
+    /// The `trimmingCharacters` call below is defensive duplication:
+    /// `HTTPParser` already trims every header value while parsing the
+    /// raw request, so in practice `headers` never contains untrimmed
+    /// whitespace by the time it reaches here. Kept anyway as a
+    /// self-contained guarantee against a future `HTTPParser` change (or
+    /// a header dictionary built directly in a test) that stops trimming.
+    private func parseSurfaceID(from headers: [String: String]) -> UUID? {
+        guard let trimmed = header(named: "X-Calyx-Surface-ID", in: headers)?
+            .trimmingCharacters(in: .whitespaces), !trimmed.isEmpty else {
+            return nil
+        }
+        return UUID(uuidString: trimmed)
     }
 
     private func routeAgentEvent(request: HTTPRequest) async -> HTTPResponse {
@@ -118,8 +155,7 @@ final class CalyxMCPServer {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
-        guard let surfaceIDHeader = header(named: "X-Calyx-Surface-ID", in: request.headers),
-              let surfaceID = UUID(uuidString: surfaceIDHeader) else {
+        guard let surfaceID = parseSurfaceID(from: request.headers) else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
 
@@ -713,7 +749,19 @@ final class CalyxMCPServer {
 
     /// Process a single JSON-RPC request.
     /// Returns an HTTP-like status code and optional response body.
-    func handleJSONRPC(data: Data, authToken: String?) async -> (statusCode: Int, body: Data?) {
+    ///
+    /// - Parameter surfaceID: The pane's `X-Calyx-Surface-ID` header, when
+    ///   present and valid on the underlying HTTP request (Round 4),
+    ///   parsed by `routeMCP`'s `parseSurfaceID(from:)`. When non-`nil`,
+    ///   the `initialize` case binds it to the auto-registered peer (only
+    ///   if the surface isn't already bound — see that call site), and
+    ///   `tools/call`'s `register_peer` unconditionally binds it to the
+    ///   newly created peer — both via `agentRegistry.bindSurface` — so a
+    ///   pane's row gets its unread badge lit even if it never calls a
+    ///   calyx-ipc tool itself (the pre-Round-4 hook-derived binding in
+    ///   `AgentRegistry.handleHookEvent` still runs independently, as a
+    ///   fallback that needs no `X-Calyx-Surface-ID` header at all).
+    func handleJSONRPC(data: Data, authToken: String?, surfaceID: UUID? = nil) async -> (statusCode: Int, body: Data?) {
 
         // 1. Authentication
         guard let authToken, authToken == token else {
@@ -740,6 +788,25 @@ final class CalyxMCPServer {
             // Auto-register the connecting client as a peer
             let clientName = extractClientName(from: request.params) ?? "claude-code"
             let peer = await store.registerPeer(name: clientName, role: "claude-code")
+            // Round 4 review: only bind a surface that isn't already
+            // bound. `initialize` fires on every MCP connection/reconnect
+            // — each one minting a brand-new peer via `registerPeer`
+            // above — so binding unconditionally here would let a later,
+            // unrelated reconnect on the same surface (e.g. a nested
+            // `claude` invoked as a subprocess from within an
+            // already-bound pane, inheriting the same `CALYX_SURFACE_ID`
+            // env var) silently steal the surface's binding away from the
+            // peer the user's own pane actually messages through. This
+            // doesn't fully close that nested-`claude` gap (a `register_peer`
+            // tool call from the child still rebinds unconditionally,
+            // see below), but it does remove `initialize` itself as a
+            // firing point. `register_peer`'s own binding (`handleRegisterPeer`)
+            // stays unconditional by design: it's a deliberate,
+            // self-reported re-registration (e.g. after `/clear`), not an
+            // automatic connection-time side effect.
+            if let surfaceID, !agentRegistry.isSurfaceBound(surfaceID) {
+                agentRegistry.bindSurface(surfaceID, toPeer: peer.id)
+            }
             let resp = MCPRouter.buildInitializeResponse(id: requestId, peerID: peer.id)
             return (200, encode(resp))
 
@@ -751,7 +818,7 @@ final class CalyxMCPServer {
             return (204, nil)
 
         case "tools/call":
-            return await handleToolCall(id: requestId, params: request.params)
+            return await handleToolCall(id: requestId, params: request.params, surfaceID: surfaceID)
 
         default:
             let resp = MCPRouter.buildErrorResponse(id: requestId, code: -32601, message: "Method not found")
@@ -763,7 +830,8 @@ final class CalyxMCPServer {
 
     private func handleToolCall(
         id: JSONRPCId,
-        params: [String: AnyCodable]?
+        params: [String: AnyCodable]?,
+        surfaceID: UUID?
     ) async -> (statusCode: Int, body: Data?) {
 
         guard let params else {
@@ -774,7 +842,7 @@ final class CalyxMCPServer {
             return toolError(id: id, text: "Missing tool name")
         }
 
-        let response = await dispatchToolCall(id: id, toolName: toolName, params: params)
+        let response = await dispatchToolCall(id: id, toolName: toolName, params: params, surfaceID: surfaceID)
 
         // Refresh every bound peer's unread badge once, at the end of
         // every calyx-ipc messaging tools/call request, rather than each
@@ -799,7 +867,8 @@ final class CalyxMCPServer {
     private func dispatchToolCall(
         id: JSONRPCId,
         toolName: String,
-        params: [String: AnyCodable]
+        params: [String: AnyCodable],
+        surfaceID: UUID?
     ) async -> (statusCode: Int, body: Data?) {
         // LSP route — `lsp_*` tools are dispatched through `MCPLSPBridge`.
         if MCPRouter.isLSPTool(name: toolName) {
@@ -814,7 +883,7 @@ final class CalyxMCPServer {
 
         switch toolName {
         case "register_peer":
-            return await handleRegisterPeer(id: id, arguments: arguments)
+            return await handleRegisterPeer(id: id, arguments: arguments, surfaceID: surfaceID)
 
         case "list_peers":
             return await handleListPeers(id: id)
@@ -877,11 +946,19 @@ final class CalyxMCPServer {
 
     private func handleRegisterPeer(
         id: JSONRPCId,
-        arguments: [String: Any]?
+        arguments: [String: Any]?,
+        surfaceID: UUID?
     ) async -> (statusCode: Int, body: Data?) {
         let name = (arguments?["name"] as? String) ?? ""
         let role = (arguments?["role"] as? String) ?? ""
         let peer = await store.registerPeer(name: name, role: role)
+        // Bind the connection's own surface (Round 4) to the freshly
+        // created peer — covers explicit re-registration (e.g. after
+        // `/clear`) the same way `initialize`'s auto-registration does in
+        // `handleJSONRPC`, not just the hook-derived binding path.
+        if let surfaceID {
+            agentRegistry.bindSurface(surfaceID, toPeer: peer.id)
+        }
         let json = "{\"peerId\":\"\(peer.id.uuidString)\"}"
         return toolSuccess(id: id, text: json)
     }

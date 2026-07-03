@@ -1274,4 +1274,170 @@ final class AgentRegistryTests: XCTestCase {
         XCTAssertEqual(registry.entries[surfaceID]?.lastEventAt, firstEventAt,
                        "Writing the same state again must not refresh lastEventAt (no-op write)")
     }
+
+    // MARK: - Round 4 review: async-delivery race guard for a just-blocked entry
+
+    func test_handleHookEvent_lateArrivingPreToolUseWithin1_5sOfBlocked_doesNotOverwriteBlocked() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let base = Date()
+
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID, now: base)
+        registry.handleHookEvent(
+            event("Notification", message: "needs your permission"), surfaceID: surfaceID, now: base
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        // A PreToolUse arriving 1.0s later (inside the 1.5s race window)
+        // must not clobber the blocked state — see handleHookEvent's own
+        // comment on the async-delivery race this guards against.
+        registry.handleHookEvent(event("PreToolUse"), surfaceID: surfaceID, now: base.addingTimeInterval(1.0))
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked,
+                       "A PreToolUse landing within 1.5s of the blocked transition must be treated as " +
+                       "a stale async-delivery race, not genuine progress")
+    }
+
+    // Round 4 review follow-up: pins down the *accepted trade-off* this
+    // guard makes — not just that it correctly ignores a genuinely stale,
+    // out-of-order `PreToolUse`, but that it also drops a *legitimate*,
+    // unrelated tool call's `PreToolUse` landing in the same window, since
+    // `AgentRegistry` has no `tool_name`/call-identity field to tell the
+    // two apart at this layer. Mechanically identical to the "late
+    // arriving" race test above; kept separate because it documents a
+    // deliberately different property (an accepted false-drop, not just a
+    // true-positive stale drop) — see handleHookEvent's own comment on
+    // this trade-off.
+    func test_handleHookEvent_legitimateDifferentToolPreToolUseWithin1_5sOfBlocked_isAlsoDropped() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let base = Date()
+
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID, now: base)
+        registry.handleHookEvent(
+            event("Notification", message: "needs your permission"), surfaceID: surfaceID, now: base
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        // A different, genuinely-new tool call's PreToolUse, indistinguishable
+        // from a stale one at this layer, arriving 0.2s after the rejection.
+        registry.handleHookEvent(event("PreToolUse"), surfaceID: surfaceID, now: base.addingTimeInterval(0.2))
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked,
+                       "A legitimate different tool call's PreToolUse within the 1.5s window is also " +
+                       "dropped — an accepted trade-off, not a bug — since the row self-corrects on " +
+                       "the very next PostToolUse/Stop/UserPromptSubmit regardless")
+    }
+
+    // Round 4 review follow-up: pins the window's exact boundary contract
+    // (`<`, not `<=`) — a PreToolUse arriving at *exactly* 1.5s must clear
+    // blocked, not be dropped.
+    func test_handleHookEvent_preToolUseAtExactly1_5sBoundary_clearsBlocked() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let base = Date()
+
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID, now: base)
+        registry.handleHookEvent(
+            event("Notification", message: "needs your permission"), surfaceID: surfaceID, now: base
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        registry.handleHookEvent(event("PreToolUse"), surfaceID: surfaceID, now: base.addingTimeInterval(1.5))
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .working,
+                       "The guard's window is a strict `<` — a PreToolUse landing at exactly 1.5s is " +
+                       "already outside it and must clear blocked, not be dropped")
+    }
+
+    func test_handleHookEvent_preToolUseAfter1_5sOfBlocked_clearsBlockedNormally() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let base = Date()
+
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID, now: base)
+        registry.handleHookEvent(
+            event("Notification", message: "needs your permission"), surfaceID: surfaceID, now: base
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        // Outside the 1.5s window — a genuine post-approval PreToolUse
+        // must clear blocked exactly as before this guard existed.
+        registry.handleHookEvent(event("PreToolUse"), surfaceID: surfaceID, now: base.addingTimeInterval(2.0))
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .working,
+                       "A PreToolUse arriving well after the race window must clear blocked as before")
+    }
+
+    func test_handleHookEvent_postToolUseWithin1_5sOfBlocked_stillClearsBlockedImmediately() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let base = Date()
+
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID, now: base)
+        registry.handleHookEvent(
+            event("Notification", message: "needs your permission"), surfaceID: surfaceID, now: base
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        // PostToolUse is not covered by the PreToolUse-only race guard:
+        // it only fires once a tool has actually run, so it must keep
+        // clearing .blocked immediately, even within the 1.5s window.
+        registry.handleHookEvent(event("PostToolUse"), surfaceID: surfaceID, now: base.addingTimeInterval(0.5))
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .working,
+                       "PostToolUse must still clear blocked immediately, unlike PreToolUse")
+    }
+
+    func test_handleHookEvent_userPromptSubmitWithin1_5sOfBlocked_stillClearsBlockedImmediately() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let base = Date()
+
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID, now: base)
+        registry.handleHookEvent(
+            event("Notification", message: "needs your permission"), surfaceID: surfaceID, now: base
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        registry.handleHookEvent(event("UserPromptSubmit"), surfaceID: surfaceID, now: base.addingTimeInterval(0.5))
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .working,
+                       "UserPromptSubmit must still clear blocked immediately, unlike PreToolUse")
+    }
+
+    func test_handleHookEvent_stopWithin1_5sOfBlocked_stillClearsToIdleImmediately() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let base = Date()
+
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID, now: base)
+        registry.handleHookEvent(
+            event("Notification", message: "needs your permission"), surfaceID: surfaceID, now: base
+        )
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .blocked)
+
+        registry.handleHookEvent(event("Stop"), surfaceID: surfaceID, now: base.addingTimeInterval(0.5))
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .idle,
+                       "Stop must still clear blocked to idle immediately, unlike PreToolUse")
+    }
+
+    // MARK: - Round 4 review: isSurfaceBound
+
+    func test_isSurfaceBound_reflectsBindingState() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+
+        XCTAssertFalse(registry.isSurfaceBound(surfaceID), "An unbound surface must report false")
+
+        registry.handleHookEvent(
+            AgentEvent(hookEventName: "PreToolUse", sessionID: "session-1", cwd: nil, message: nil,
+                       ipcSelfPeerID: UUID().uuidString),
+            surfaceID: surfaceID
+        )
+
+        XCTAssertTrue(registry.isSurfaceBound(surfaceID),
+                      "A surface bound via a hook-derived ipcSelfPeerID must report true")
+    }
 }

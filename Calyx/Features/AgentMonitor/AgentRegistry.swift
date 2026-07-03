@@ -223,9 +223,15 @@ final class AgentRegistry {
     ///   `SessionStart` re-send branch, and the "same session" update path
     ///   at the bottom of this method) never overwrites an existing
     ///   entry's `kind` with this parameter's default.
-    func handleHookEvent(_ event: AgentEvent, surfaceID: UUID, kind: String = AgentEntry.claudeCodeKind) {
-        let now = Date()
-
+    /// - Parameter now: Injectable for tests (defaults to `Date()`).
+    ///   Notably used by the same-session update path's PreToolUse race
+    ///   guard below, which compares `now` against `existing.lastEventAt`.
+    func handleHookEvent(
+        _ event: AgentEvent,
+        surfaceID: UUID,
+        kind: String = AgentEntry.claudeCodeKind,
+        now: Date = Date()
+    ) {
         // A hook event is real self-reported evidence the pane is a live
         // agent session — any leftover heuristic miss-streak bookkeeping
         // (relevant only to `.titleHeuristic` rows) for this surface is
@@ -285,6 +291,40 @@ final class AgentRegistry {
             return
         }
 
+        // Round 4 review: `calyx-agent-hook`'s command entries all run
+        // `"async": true`, so the script's POST to the server never blocks
+        // Claude Code — two hooks fired moments apart in the real event
+        // order (a tool call's own `PreToolUse`, then almost immediately
+        // after, a *different* tool call's permission dialog appearing)
+        // can land at the server out of that order. A `PreToolUse`
+        // arriving within 1.5s of the moment this entry became `.blocked`
+        // is treated as exactly that stale async-delivery race rather than
+        // genuine forward progress, and is dropped here — otherwise it
+        // would flash the row back to `.working` for a beat even though
+        // the permission dialog the user actually sees is still up.
+        // `PostToolUse` / `Stop` / `UserPromptSubmit` are deliberately not
+        // covered by this guard: each of those only fires once the prompt
+        // has *actually* been resolved (the tool ran, or the user typed a
+        // new message), so they must keep clearing `.blocked` immediately,
+        // exactly as before. 1.5s is comfortably longer than realistic
+        // same-session hook delivery jitter and comfortably shorter than
+        // the time an actual human takes to click through a dialog.
+        //
+        // Accepted trade-off: this guard cannot distinguish the stale race
+        // above from a *genuinely new*, unrelated tool call's `PreToolUse`
+        // landing in the same 1.5s window right after a rejection — that
+        // legitimate event is dropped too, same as the stale one. The row
+        // stays visibly stale for at most 1.5s either way, and the very
+        // next `PostToolUse`/`Stop`/`UserPromptSubmit` (none of which this
+        // guard touches) corrects it immediately, so this was judged an
+        // acceptable cost for closing the more common stale-`.blocked`
+        // flash.
+        if existing.state == .blocked,
+           event.hookEventName == "PreToolUse",
+           now.timeIntervalSince(existing.lastEventAt) < 1.5 {
+            return
+        }
+
         // `cwd` is not re-derived here: `SessionStart` already established
         // it for the session's lifetime, and a Claude Code session's
         // working directory doesn't change mid-session.
@@ -310,14 +350,19 @@ final class AgentRegistry {
     /// only to guard against an older Claude Code build that ignores the
     /// matcher and fires `Notification` for unrelated messages too.
     ///
-    /// `PermissionRequest` (Codex's hook, Phase 2) always resolves to
-    /// `.blocked`, unconditionally — unlike `Notification` there's no
-    /// message-substring backstop to apply, since Codex's hook payload for
-    /// this event carries no equivalent field: `calyx-agent-hook` exiting
-    /// 0 with no output already guarantees the hook never influences
-    /// Codex's own approval decision, so firing it at all is a reliable
-    /// signal that Codex is waiting on the user. It's deliberately absent
-    /// from `forwardMovingEventNames`: see that property's doc comment.
+    /// `PermissionRequest` always resolves to `.blocked`, unconditionally —
+    /// unlike `Notification` there's no message-substring backstop to
+    /// apply, since this event's hook payload carries no equivalent field:
+    /// `calyx-agent-hook` exiting 0 with no output already guarantees the
+    /// hook never influences the CLI's own approval decision, so firing it
+    /// at all is a reliable signal the agent is waiting on the user.
+    /// Originally Codex-only (Phase 2); Round 4 also subscribes Claude
+    /// Code to it (`ClaudeHooksConfigManager`), alongside
+    /// `Notification`("permission_prompt"), because `PermissionRequest`
+    /// fires in sync with the permission dialog appearing while
+    /// `Notification` can lag it by several seconds. It's deliberately
+    /// absent from `forwardMovingEventNames`: see that property's doc
+    /// comment.
     private static func resultingState(for event: AgentEvent) -> AgentState? {
         switch event.hookEventName {
         case "UserPromptSubmit", "PreToolUse", "PostToolUse":
@@ -501,7 +546,17 @@ final class AgentRegistry {
     ///   too — a peer only ever legitimately self-reports from one pane,
     ///   so a rebind means its owning pane changed (e.g. IPC
     ///   re-registration after a restart), not that it's now shared.
-    private func bindSurface(_ surfaceID: UUID, toPeer peerID: UUID) {
+    ///
+    /// Not `private` (Round 4): `handleHookEvent` below still calls this
+    /// for the `PreToolUse`/`PostToolUse` hook-derived binding it has
+    /// always used, but `CalyxMCPServer` also calls it directly now, to
+    /// bind a surface the moment its MCP connection's `initialize` (or an
+    /// explicit `register_peer` tool call) carries an `X-Calyx-Surface-ID`
+    /// header — covering a passive recipient that never calls a
+    /// calyx-ipc tool itself and so never fires the hook path at all.
+    /// Both call sites share the same "1 peer = 1 surface" invariant this
+    /// method enforces.
+    func bindSurface(_ surfaceID: UUID, toPeer peerID: UUID) {
         if let oldPeerID = surfaceToPeer[surfaceID], oldPeerID != peerID {
             peerToSurface.removeValue(forKey: oldPeerID)
         }
@@ -516,6 +571,17 @@ final class AgentRegistry {
     private func unbindSurface(_ surfaceID: UUID) {
         guard let peerID = surfaceToPeer.removeValue(forKey: surfaceID) else { return }
         peerToSurface.removeValue(forKey: peerID)
+    }
+
+    /// Whether `surfaceID` currently has a peer bound to it via
+    /// `bindSurface`. Read-only query (Round 4 review): `CalyxMCPServer`'s
+    /// `initialize` handler uses this to only auto-bind a surface that
+    /// isn't already bound, rather than unconditionally rebinding on every
+    /// MCP `initialize` — see that call site's own comment for why an
+    /// unconditional bind there is unsafe. `register_peer`'s own binding
+    /// remains unconditional and does not consult this.
+    func isSurfaceBound(_ surfaceID: UUID) -> Bool {
+        surfaceToPeer[surfaceID] != nil
     }
 
     // MARK: - Unread Message Badges

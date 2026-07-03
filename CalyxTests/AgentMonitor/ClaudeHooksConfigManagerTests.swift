@@ -9,10 +9,10 @@
 //  preservation of unrelated content.
 //
 //  Coverage:
-//  - installHooks on an empty/new file writes all 7 target events, each
+//  - installHooks on an empty/new file writes all 8 target events, each
 //    with a command entry (type=command, timeout, async=true)
-//  - PreToolUse / PostToolUse use matcher "*"; Notification uses matcher
-//    "permission_prompt"
+//  - PreToolUse / PostToolUse / PermissionRequest (Round 4) use matcher
+//    "*"; Notification uses matcher "permission_prompt"
 //  - installHooks preserves the user's own existing hook entries and
 //    unrelated top-level keys
 //  - Re-installing is idempotent (no duplicate command entries)
@@ -33,14 +33,23 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
     private var configPath: String!
     private var scriptPath: String!
 
+    // Round 4: PermissionRequest fires in sync with the permission dialog
+    // appearing, unlike Notification(permission_prompt) which can lag
+    // behind it by several seconds — subscribing to it too lets the
+    // sidebar flip to blocked immediately instead of waiting for the
+    // delayed Notification hook.
     private static let expectedEvents = [
         "SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse",
-        "Notification", "Stop", "SessionEnd",
+        "Notification", "Stop", "SessionEnd", "PermissionRequest",
     ]
 
+    // Round 4 review: PermissionRequest's matcher was unified with
+    // PreToolUse/PostToolUse's "*" (previously omitted entirely) — see
+    // ClaudeHooksConfigManager.targetEvents' doc comment.
     private static let expectedMatcherByEvent: [String: String] = [
         "PreToolUse": "*",
         "PostToolUse": "*",
+        "PermissionRequest": "*",
         "Notification": "permission_prompt",
     ]
 
@@ -92,7 +101,10 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
 
     // MARK: - installHooks: fresh file
 
-    func test_installHooks_newFile_writesAllSevenEventsWithCommandEntry() throws {
+    // Round 4: renamed from ...writesAllSevenEventsWithCommandEntry — the
+    // contract is now 8 events (PermissionRequest added, see
+    // `expectedEvents`'s doc comment).
+    func test_installHooks_newFile_writesAllEightEventsWithCommandEntry() throws {
         try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
 
         let dict = try readConfigDict()
@@ -113,6 +125,32 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
             XCTAssertNotNil(entry["timeout"], "\(eventName) command entry must specify a timeout")
             XCTAssertEqual(entry["async"] as? Bool, true, "\(eventName) command entry must be async")
         }
+    }
+
+    // Round 4 review: PermissionRequest's matcher contract changed from
+    // "no matcher key at all" to `"*"` (unified with PreToolUse/
+    // PostToolUse — see targetEvents' doc comment), so this test — pre-review
+    // named ...hasCommandEntryAndNoMatcherKey and asserting `XCTAssertNil`
+    // — is renamed and its assertion flipped accordingly. The loop above
+    // already covers the same matcher value via `expectedMatcherByEvent`;
+    // this test additionally pins down PermissionRequest's command-entry
+    // shape (type/timeout/async) on its own.
+    func test_installHooks_permissionRequest_hasCommandEntryAndWildcardMatcher() throws {
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+
+        let dict = try readConfigDict()
+        let groups = hookGroups(dict, event: "PermissionRequest")
+
+        XCTAssertFalse(groups.isEmpty, "PermissionRequest hook group must be present")
+        XCTAssertEqual(groups.first?["matcher"] as? String, "*",
+                       "PermissionRequest's matcher must be \"*\", unified with PreToolUse/PostToolUse")
+
+        let commands = commandEntries(groups)
+        XCTAssertEqual(commands.count, 1, "PermissionRequest must contain exactly one command entry")
+        let entry = commands.first ?? [:]
+        XCTAssertEqual(entry["type"] as? String, "command")
+        XCTAssertNotNil(entry["timeout"], "PermissionRequest command entry must specify a timeout")
+        XCTAssertEqual(entry["async"] as? Bool, true, "PermissionRequest command entry must be async")
     }
 
     // MARK: - installHooks: preserves existing content
@@ -200,8 +238,44 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
         XCTAssertEqual(permissions?["allow"] as? [String], ["read"], "Unrelated top-level keys must be preserved")
     }
 
+    // Round 4: covers the full installHooks -> removeHooks round trip for
+    // PermissionRequest specifically, alongside a co-located third-party
+    // hook (e.g. claude-remote-approver) the user installed themselves —
+    // installHooks must add Calyx's own entry without disturbing it, and
+    // removeHooks must take only Calyx's entry back out.
+    func test_installThenRemove_permissionRequest_preservesUserOwnHookAndRemovesOnlyCalyxEntry() throws {
+        let existingConfig: [String: Any] = [
+            "hooks": [
+                "PermissionRequest": [
+                    ["hooks": [
+                        ["type": "command", "command": "/usr/local/bin/claude-remote-approver", "timeout": 3],
+                    ]],
+                ],
+            ],
+        ]
+        try writeConfigDict(existingConfig)
+
+        try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+
+        let afterInstall = try readConfigDict()
+        let installedCommands = commandEntries(hookGroups(afterInstall, event: "PermissionRequest"))
+        XCTAssertEqual(installedCommands.count, 2,
+                       "installHooks must add Calyx's own PermissionRequest entry alongside the " +
+                       "user's pre-existing one, not replace or skip it")
+
+        try ClaudeHooksConfigManager.removeHooks(configPath: configPath)
+
+        let afterRemove = try readConfigDict()
+        let remainingCommands = commandEntries(hookGroups(afterRemove, event: "PermissionRequest"))
+        XCTAssertEqual(remainingCommands.count, 1,
+                       "removeHooks must remove only Calyx's own PermissionRequest entry")
+        XCTAssertEqual(remainingCommands.first?["command"] as? String, "/usr/local/bin/claude-remote-approver",
+                       "The user's own PermissionRequest hook (e.g. claude-remote-approver) must " +
+                       "survive removeHooks")
+    }
+
     func test_removeHooks_dropsEmptyEventKeysAndHooksKeyWhenAllEmpty() throws {
-        // The 7 events installHooks writes only ever contain Calyx's own
+        // The 8 events installHooks writes only ever contain Calyx's own
         // entry in a fresh install, so removing them should leave neither
         // a dangling "EventName": [] nor an empty "hooks": {} behind.
         try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
@@ -403,7 +477,7 @@ final class ClaudeHooksConfigManagerTests: XCTestCase {
 
         try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: homeSettingsPath)
 
-        // The real dotfiles-managed file received Calyx's 7 events...
+        // The real dotfiles-managed file received Calyx's 8 events...
         let realData = try Data(contentsOf: URL(fileURLWithPath: dotfilesSettingsPath))
         let realDict = try XCTUnwrap(try JSONSerialization.jsonObject(with: realData) as? [String: Any])
         for eventName in Self.expectedEvents {

@@ -330,14 +330,15 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
         return try XCTUnwrap(content.first?["text"] as? String)
     }
 
+    // Round 4 review: previously duplicated the same
+    // `JSONSerialization`/`peerId` extraction inline; now delegates to
+    // `peerID(fromToolResultBody:)` below, the single place that logic
+    // lives.
     private func registerPeerID(name: String) async throws -> String {
         let request = rpcToolCallRequest(id: 1, toolName: "register_peer", arguments: ["name": name, "role": "terminal"])
         let (status, body) = await server.handleJSONRPC(data: request, authToken: testToken)
         XCTAssertEqual(status, 200)
-        let json = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: Data(try toolResultText(body).utf8)) as? [String: Any]
-        )
-        return try XCTUnwrap(json["peerId"] as? String)
+        return try peerID(fromToolResultBody: body)
     }
 
     private func extractMessageIDs(fromReceiveResultText text: String) throws -> [String] {
@@ -484,5 +485,339 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
         XCTAssertEqual(registry.entries[boundSurface]?.unreadCount, 1,
                        "A calyx-ipc messaging tools/call (get_peer_status here) must still trigger " +
                        "syncBoundPeerInboxCounts and pick up the count left stale by the earlier lsp_* call")
+    }
+
+    // MARK: - Round 4: MCP-connection surface binding (X-Calyx-Surface-ID
+    // on /mcp itself), so a passive recipient that never calls a
+    // calyx-ipc tool still gets its unread badge lit.
+    //
+    // All three tests below drive `initialize`/`register_peer` through
+    // `route(request:)` with an `HTTPRequest` carrying the
+    // `X-Calyx-Surface-ID` header, exactly as Claude Code's own MCP
+    // client would send it once `ClaudeConfigManager` starts emitting the
+    // header (see ClaudeConfigManagerTests). `routeMCP` does not yet read
+    // that header at all, so every one of these is expected to fail red:
+    // the binding never happens, and the surface's `unreadCount` never
+    // moves off its initial value.
+
+    /// Builds a `POST /mcp` request carrying the given bearer token and
+    /// (optionally) an `X-Calyx-Surface-ID` header, mirroring
+    /// `agentEventRequest`'s shape for `/agent-event`.
+    private func mcpRequest(token: String?, surfaceIDHeader: String?, body: Data) -> HTTPRequest {
+        var headers: [String: String] = [:]
+        if let token { headers["Authorization"] = "Bearer \(token)" }
+        if let surfaceIDHeader { headers["X-Calyx-Surface-ID"] = surfaceIDHeader }
+        return HTTPRequest(method: "POST", path: "/mcp", headers: headers, body: body)
+    }
+
+    private func initializeRequestBody(id: Int) -> Data {
+        let dict: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": [
+                "protocolVersion": "2024-11-05",
+                "capabilities": [:] as [String: Any],
+                "clientInfo": ["name": "test", "version": "1.0"],
+            ],
+        ]
+        return try! JSONSerialization.data(withJSONObject: dict)
+    }
+
+    /// `initialize`'s response carries the auto-registered peer ID only
+    /// inside the `instructions` prose (`MCPRouter.buildInitializeResponse`),
+    /// not as a separate JSON field the way `register_peer`'s tool result
+    /// does — so extraction here parses that sentence with a regex, rather
+    /// than reusing `registerPeerID`'s `json["peerId"]` lookup.
+    private func peerID(fromInitializeResponseBody body: Data?) throws -> String {
+        let data = try XCTUnwrap(body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let result = try XCTUnwrap(json["result"] as? [String: Any])
+        let instructions = try XCTUnwrap(result["instructions"] as? String)
+
+        let regex = try NSRegularExpression(pattern: #"Your peer_id is: ([0-9A-Fa-f-]+)\."#)
+        let fullRange = NSRange(instructions.startIndex..<instructions.endIndex, in: instructions)
+        let match = try XCTUnwrap(
+            regex.firstMatch(in: instructions, range: fullRange),
+            "initialize response instructions must contain a 'Your peer_id is: <uuid>.' sentence"
+        )
+        let peerIDRange = try XCTUnwrap(Range(match.range(at: 1), in: instructions))
+        return String(instructions[peerIDRange])
+    }
+
+    /// `register_peer`'s tool result carries `peerId` as a JSON field
+    /// directly (unlike `initialize`'s prose-embedded form above).
+    private func peerID(fromToolResultBody body: Data?) throws -> String {
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(try toolResultText(body).utf8)) as? [String: Any]
+        )
+        return try XCTUnwrap(json["peerId"] as? String)
+    }
+
+    // MARK: - User-scenario reproduction
+
+    func test_userScenario_bothPanesInitializeWithSurfaceHeader_passiveRecipientGetsBadgeWithoutCallingAnyTool() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+
+        let surfaceA = UUID()
+        let surfaceB = UUID()
+
+        // Pane A and Pane B each connect with their own surface header —
+        // exactly what two Ghostty panes' `claude` processes do once
+        // ClaudeConfigManager emits `X-Calyx-Surface-ID` on the calyx-ipc
+        // MCP entry.
+        let initA = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(initA.statusCode, 200)
+        let peerA = try peerID(fromInitializeResponseBody: initA.body)
+
+        let initB = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceB.uuidString, body: initializeRequestBody(id: 2)
+        ))
+        XCTAssertEqual(initB.statusCode, 200)
+        let peerB = try peerID(fromInitializeResponseBody: initB.body)
+
+        // Both panes' sessions start — this creates the sidebar rows via
+        // the existing hook path, independent of the surface -> peer
+        // binding under test.
+        let sessionStartA = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceA.uuidString,
+            body: validAgentEventBody(sessionID: "session-a", cwd: "/Users/dev/repo-a")
+        ))
+        XCTAssertEqual(sessionStartA.statusCode, 204)
+
+        let sessionStartB = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceB.uuidString,
+            body: validAgentEventBody(sessionID: "session-b", cwd: "/Users/dev/repo-b")
+        ))
+        XCTAssertEqual(sessionStartB.statusCode, 204)
+
+        // A sends to B via the real send_message tool — B never calls any
+        // calyx-ipc tool itself, so the pre-Round-4 PreToolUse/
+        // PostToolUse-only binding path never learns B's surface.
+        let sendResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 3, toolName: "send_message", arguments: [
+                "from": peerA, "to": peerB, "content": "hello from A",
+            ])
+        ))
+        XCTAssertEqual(sendResponse.statusCode, 200)
+
+        XCTAssertEqual(registry.entries[surfaceB]?.unreadCount, 1,
+                       "B's surface -> peer binding must be learned from its own surface-tagged " +
+                       "initialize alone, so a message sent to B lights up its badge even though B " +
+                       "never called a calyx-ipc tool")
+
+        // B checks its inbox — the badge clears.
+        let receiveResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 4, toolName: "receive_messages", arguments: ["peer_id": peerB])
+        ))
+        XCTAssertEqual(receiveResponse.statusCode, 200)
+        XCTAssertEqual(registry.entries[surfaceB]?.unreadCount, 0,
+                       "receive_messages must clear the badge once B actually reads its inbox")
+    }
+
+    // MARK: - initialize header validation
+
+    func test_initializeHeaderBinding_onlyValidUUIDHeaderBinds() async throws {
+        let validSurfaceID = UUID()
+        let cases: [(label: String, header: String?, shouldBind: Bool)] = [
+            ("valid UUID", validSurfaceID.uuidString, true),
+            ("empty string", "", false),
+            ("missing", nil, false),
+            ("non-UUID", "not-a-uuid", false),
+        ]
+
+        for testCase in cases {
+            let registry = AgentRegistry()
+            server.agentRegistry = registry
+            let surfaceID = UUID(uuidString: testCase.header ?? "") ?? UUID()
+
+            let initResponse = await server.route(request: mcpRequest(
+                token: testToken, surfaceIDHeader: testCase.header, body: initializeRequestBody(id: 1)
+            ))
+            XCTAssertEqual(initResponse.statusCode, 200, "[\(testCase.label)] initialize must still succeed")
+            let recipientPeerID = try peerID(fromInitializeResponseBody: initResponse.body)
+
+            // The recipient's row must exist regardless of the initialize
+            // header's validity — created via the same real surface UUID
+            // used for the initialize call in the valid case, or a
+            // throwaway one otherwise (the row's own surface identity is
+            // not what's under test here).
+            let sessionStart = await server.route(request: agentEventRequest(
+                token: testToken, surfaceIDHeader: surfaceID.uuidString,
+                body: validAgentEventBody(sessionID: "session-\(testCase.label)", cwd: "/Users/dev/repo")
+            ))
+            XCTAssertEqual(sessionStart.statusCode, 204, "[\(testCase.label)] SessionStart must still succeed")
+
+            let senderPeerID = try await registerPeerID(name: "sender-\(testCase.label)")
+            let sendResponse = await server.route(request: mcpRequest(
+                token: testToken, surfaceIDHeader: nil,
+                body: rpcToolCallRequest(id: 2, toolName: "send_message", arguments: [
+                    "from": senderPeerID, "to": recipientPeerID, "content": "hi",
+                ])
+            ))
+            XCTAssertEqual(sendResponse.statusCode, 200, "[\(testCase.label)] send_message must still succeed")
+
+            let expectedCount = testCase.shouldBind ? 1 : 0
+            XCTAssertEqual(registry.entries[surfaceID]?.unreadCount ?? 0, expectedCount,
+                           "[\(testCase.label)] initialize's X-Calyx-Surface-ID header of " +
+                           "\(String(describing: testCase.header)) must " +
+                           "\(testCase.shouldBind ? "" : "not ")bind the auto-registered peer to the surface")
+        }
+    }
+
+    // MARK: - register_peer tool call surface binding
+
+    func test_registerPeerToolCall_surfaceHeader_bindsNewPeerToSurface() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceID = UUID()
+
+        // register_peer's own HTTP request carries the surface header —
+        // covers explicit re-registration (e.g. after `/clear`), distinct
+        // from initialize's automatic peer registration.
+        let registerResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString,
+            body: rpcToolCallRequest(id: 1, toolName: "register_peer", arguments: ["name": "B", "role": "terminal"])
+        ))
+        XCTAssertEqual(registerResponse.statusCode, 200)
+        let peerB = try peerID(fromToolResultBody: registerResponse.body)
+
+        let sessionStart = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo")
+        ))
+        XCTAssertEqual(sessionStart.statusCode, 204)
+
+        let peerA = try await registerPeerID(name: "A")
+        let sendResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 2, toolName: "send_message", arguments: [
+                "from": peerA, "to": peerB, "content": "hi",
+            ])
+        ))
+        XCTAssertEqual(sendResponse.statusCode, 200)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 1,
+                       "register_peer's own X-Calyx-Surface-ID header must bind the newly created " +
+                       "peer to that surface, the same way initialize's auto-registered peer does")
+    }
+
+    // MARK: - Round 4 review: initialize only binds an unbound surface
+
+    func test_initialize_surfaceAlreadyBound_doesNotRebindToNewAutoRegisteredPeer() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceID = UUID()
+
+        // First connection: initialize binds the surface to its
+        // auto-registered peer, exactly like every other test above.
+        let firstInit = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(firstInit.statusCode, 200)
+        let firstPeer = try peerID(fromInitializeResponseBody: firstInit.body)
+
+        // A second `initialize` on the SAME surface (e.g. a reconnect, or
+        // a nested `claude` invoked as a subprocess and inheriting the
+        // same CALYX_SURFACE_ID env var) mints a brand-new peer via its
+        // own auto-registration — this must NOT steal the surface's
+        // existing binding away from the first peer.
+        let secondInit = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString, body: initializeRequestBody(id: 2)
+        ))
+        XCTAssertEqual(secondInit.statusCode, 200)
+        let secondPeer = try peerID(fromInitializeResponseBody: secondInit.body)
+        XCTAssertNotEqual(firstPeer, secondPeer, "Precondition: each initialize mints a distinct peer")
+
+        let sessionStart = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo")
+        ))
+        XCTAssertEqual(sessionStart.statusCode, 204)
+
+        let senderPeerID = try await registerPeerID(name: "sender")
+
+        // A message to the FIRST (originally bound) peer must still light
+        // up the badge...
+        let sendToFirst = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 3, toolName: "send_message", arguments: [
+                "from": senderPeerID, "to": firstPeer, "content": "hi",
+            ])
+        ))
+        XCTAssertEqual(sendToFirst.statusCode, 200)
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 1,
+                       "The surface's original binding (from the first initialize) must still be the " +
+                       "one that lights up the badge")
+
+        let receiveFirst = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 4, toolName: "receive_messages", arguments: ["peer_id": firstPeer])
+        ))
+        XCTAssertEqual(receiveFirst.statusCode, 200)
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 0)
+
+        // ...while a message to the SECOND (later, would-be) peer must
+        // not, proving the second initialize never rebound the surface.
+        let sendToSecond = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 5, toolName: "send_message", arguments: [
+                "from": senderPeerID, "to": secondPeer, "content": "hi again",
+            ])
+        ))
+        XCTAssertEqual(sendToSecond.statusCode, 200)
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 0,
+                       "A message to the second initialize's peer must NOT light up the badge — the " +
+                       "surface's binding must still point at the first peer, not the second")
+    }
+
+    // MARK: - Round 4 review: shared surface-ID header parsing (trim)
+    // across /mcp and /agent-event
+
+    func test_surfaceIDHeader_leadingTrailingWhitespace_parsesIdenticallyOnMCPAndAgentEvent() async throws {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let surfaceID = UUID()
+        let paddedHeader = "  \(surfaceID.uuidString)  "
+
+        // /agent-event: a padded header must parse to the same UUID, not
+        // 400 — the trim now happens in the same shared helper /mcp uses.
+        let sessionStart = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: paddedHeader,
+            body: validAgentEventBody(sessionID: "session-1", cwd: "/Users/dev/repo")
+        ))
+        XCTAssertEqual(sessionStart.statusCode, 204,
+                       "A padded X-Calyx-Surface-ID must still parse on /agent-event, not 400")
+        XCTAssertEqual(registry.entries[surfaceID]?.sessionID, "session-1",
+                       "The trimmed UUID, not the padded string, must be the entry's key")
+
+        // /mcp: the same padded header on `initialize` must bind the same
+        // (trimmed) surface UUID, exactly as the unpadded form does
+        // elsewhere in this file. The surface isn't yet peer-bound at
+        // this point (SessionStart above never carries an
+        // ipcSelfPeerID), so Round 4 review fix #1's "only bind an
+        // unbound surface" gate doesn't block this.
+        let initResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: paddedHeader, body: initializeRequestBody(id: 1)
+        ))
+        XCTAssertEqual(initResponse.statusCode, 200)
+        let peer = try peerID(fromInitializeResponseBody: initResponse.body)
+
+        let senderPeerID = try await registerPeerID(name: "sender")
+        let sendResponse = await server.route(request: mcpRequest(
+            token: testToken, surfaceIDHeader: nil,
+            body: rpcToolCallRequest(id: 2, toolName: "send_message", arguments: [
+                "from": senderPeerID, "to": peer, "content": "hi",
+            ])
+        ))
+        XCTAssertEqual(sendResponse.statusCode, 200)
+        XCTAssertEqual(registry.entries[surfaceID]?.unreadCount, 1,
+                       "A padded X-Calyx-Surface-ID on /mcp's initialize must bind the trimmed UUID, " +
+                       "lighting up the same surface's badge")
     }
 }
