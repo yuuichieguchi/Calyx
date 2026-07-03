@@ -88,12 +88,57 @@ final class CalyxMCPServer {
     /// temp directory so `start()`/`stop()` never touch the real file.
     var agentEndpointDirectory: String = AgentEndpointFile.defaultDirectory
 
+    /// The slow-loris deadline `handleConnection` bounds *receiving* a
+    /// complete request to (not request processing — see
+    /// `handleConnection`'s doc comment). 10s in production;
+    /// test-overridable so tests can exercise both "receiving itself is
+    /// slow, hits the deadline" and "receiving is fast, `route(request:)`
+    /// alone taking a long time must not hit it" without either waiting
+    /// a full 10s or shrinking the production default.
+    var connectionReceiveDeadline: Duration = .seconds(10)
+
+    /// Test-only artificial delay injected at the top of
+    /// `route(request:)`, used to simulate a slow `tools/call` (e.g. a
+    /// long-running `lsp_*` tool, which can legitimately run for up to
+    /// an hour — see `LSPTimeouts`) without depending on a real slow
+    /// language server. `nil` (no delay) in production and by default
+    /// in every test that doesn't explicitly set it.
+    var _testRouteDelay: Duration?
+
+    /// Test-only counter of how many times `sendHTTPResponse` was
+    /// *entered* for any connection on this server instance —
+    /// incremented unconditionally, before its `accumulator.didRespond`
+    /// guard. Confirmed empirically (Round 5 final review) to reach `2`
+    /// for a single connection in the exact scenario the deadline
+    /// double-send bug describes — the guard makes the second entry a
+    /// harmless no-op, but does not prevent the entry itself, so this
+    /// counter alone is *not* the correctness signal a test should
+    /// assert `== 1` against. See `_testSendHTTPResponseSentCount` for
+    /// that, and `sendHTTPResponse`'s doc comment for why a wire-level
+    /// "did the client see two responses" check can't reliably
+    /// distinguish the fixed and unfixed behavior either (the
+    /// connection may already be torn down by the time a stale second
+    /// entry happens, silently dropping its `connection.send(...)`
+    /// bytes before they ever reach a test's socket).
+    private(set) var _testSendHTTPResponseAttemptCount = 0
+
+    /// Test-only counter of how many times `sendHTTPResponse` actually
+    /// proceeded past its `accumulator.didRespond` guard to call
+    /// `connection.send(...)` — i.e. the count that must stay at `1` per
+    /// connection for the Round 5 final review's Critical fix to hold.
+    /// See `_testSendHTTPResponseAttemptCount` for the (deliberately
+    /// unguarded) entry counter this complements.
+    private(set) var _testSendHTTPResponseSentCount = 0
+
     /// Routes an `HTTPRequest` by path. `POST /mcp` dispatches to the
     /// existing `handleJSONRPC`; `POST /agent-event` dispatches to
     /// `handleAgentEvent`. Everything else is 404. Extracted from
     /// `handleConnection` so tests can drive routing directly without a
     /// real `NWConnection`.
     func route(request: HTTPRequest) async -> HTTPResponse {
+        if let delay = _testRouteDelay {
+            try? await Task.sleep(for: delay)
+        }
         switch (request.method, request.path) {
         case ("POST", "/mcp"):
             return await routeMCP(request: request)
@@ -311,8 +356,14 @@ final class CalyxMCPServer {
         var lastError: Error?
 
         // Phase 1: canonical linear scan over `preferredPort..<preferredPort+10`.
-        // If a port in that window is free we bind it and publish that exact
-        // port — preserves the "well-known port" UX for the common case.
+        // If a port in that window is free we bind it and publish the port
+        // the listener actually resolved to (see `bindListener(onPort:)`) —
+        // which matches the requested port for the common non-zero case,
+        // preserving the "well-known port" UX, but can differ when
+        // `preferredPort` is `0` and the kernel silently assigns an
+        // ephemeral slot instead of literally binding port `0` (see
+        // `bindKernelAssignedListener`'s doc comment for why that can
+        // happen even on this, the canonical-scan, path).
         //
         // `NWListener(using:)` does NOT actually validate the bind — it only
         // checks parameter shape. The kernel-level bind happens later during
@@ -324,7 +375,7 @@ final class CalyxMCPServer {
         // never accepts connections.
         for portOffset in 0..<10 {
             let tryPort = preferredPort + portOffset
-            guard let nl = bindListener(onPort: tryPort) else {
+            guard let (nl, resolvedPort) = bindListener(onPort: tryPort) else {
                 lastError = NSError(
                     domain: "CalyxMCPServer",
                     code: 3,
@@ -335,7 +386,10 @@ final class CalyxMCPServer {
                 )
                 continue
             }
-            finishStart(listener: nl, boundPort: tryPort, priorTeardown: priorTeardown)
+            if resolvedPort != tryPort {
+                NSLog("[CalyxMCPServer] canonical scan requested port \(tryPort) but the listener resolved to \(resolvedPort); recording the resolved port")
+            }
+            finishStart(listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown)
             return
         }
 
@@ -362,8 +416,21 @@ final class CalyxMCPServer {
     }
 
     /// Attempt to bind an `NWListener` on `127.0.0.1:<port>`. Returns the
-    /// started listener once it reaches `.ready`, or `nil` if the bind
-    /// fails (e.g. EADDRINUSE) or does not become ready within 1s.
+    /// started listener together with the port it actually resolved to
+    /// once ready, or `nil` if the bind fails (e.g. EADDRINUSE), does not
+    /// become ready within 1s, or reaches `.ready` without a resolvable
+    /// non-zero port.
+    ///
+    /// The resolved port is read back from `nl.port?.rawValue` rather than
+    /// trusted to equal `tryPort` because `requiredLocalEndpoint` with a
+    /// literal port of `0` is not rejected by Network framework on every
+    /// host (Round 5 / task #47 — see `bindKernelAssignedListener`'s doc
+    /// comment): on hosts where it isn't rejected, this very function can
+    /// reach `.ready` with the kernel having silently picked an ephemeral
+    /// port for `tryPort == 0`, and the only way to learn which port that
+    /// is is to ask the listener itself. A `nil`/`0` readback here is
+    /// treated as a bind failure (cancel + `nil`) so a caller can never
+    /// record port `0` as if it were a successful bind.
     ///
     /// Note: the listener's queue is intentionally a dedicated background
     /// queue rather than `.main`. `start()` runs on the main thread and
@@ -371,7 +438,7 @@ final class CalyxMCPServer {
     /// callbacks on `.main` would deadlock. Once the listener is ready
     /// we reassign `newConnectionHandler` so connections route back into
     /// `@MainActor` via `Task { @MainActor in ... }`.
-    private func bindListener(onPort tryPort: Int) -> NWListener? {
+    private func bindListener(onPort tryPort: Int) -> (NWListener, Int)? {
         let params = NWParameters.tcp
         let nwPort = NWEndpoint.Port(integerLiteral: UInt16(tryPort))
         params.requiredLocalEndpoint = NWEndpoint.hostPort(
@@ -379,53 +446,89 @@ final class CalyxMCPServer {
             port: nwPort
         )
         guard let nl = try? NWListener(using: params) else { return nil }
-        return startListenerAndWaitForReady(nl)
+        guard let ready = startListenerAndWaitForReady(nl) else { return nil }
+        guard let resolvedPort = ready.port?.rawValue, resolvedPort != 0 else {
+            ready.cancel()
+            return nil
+        }
+        return (ready, Int(resolvedPort))
     }
 
-    /// Bind an `NWListener` with `NWEndpoint.Port(integerLiteral: 0)`
-    /// (the kernel-assigned ephemeral slot fallback). Returns the
+    /// Fallback bind path used when the canonical scan (Phase 1 in
+    /// `start()`) exhausts `preferredPort..<preferredPort+10` without
+    /// finding a free port. Asks the kernel for a free ephemeral loopback
+    /// port via a throwaway BSD socket, then binds an `NWListener` to
+    /// that resolved port with `requiredLocalEndpoint`. Returns the
     /// started listener and the port the kernel actually picked, or
-    /// `nil` if the bind fails.
+    /// `nil` if every attempt fails.
     ///
-    /// Implementation note: for the ephemeral case we use the
-    /// `NWListener(using:on:)` constructor with `.any` (i.e. port 0)
-    /// rather than `requiredLocalEndpoint`. Network framework rejects
-    /// `requiredLocalEndpoint` with `host: .ipv4(.loopback), port: 0`
-    /// at `start()` time with `nw_path_create_evaluator_for_listener
-    /// failed`, but the `on:` form correctly asks the kernel to pick
-    /// a free port. Loopback-only binding is then ensured by
-    /// `params.requiredInterfaceType = .loopback` (the test harness
-    /// connects to `127.0.0.1:<port>` from the same process so this
-    /// is consistent with the canonical-scan path's `.ipv4(.loopback)`
-    /// bind).
-    private func bindKernelAssignedListener() -> (NWListener, Int)? {
-        // Network framework rejects `requiredLocalEndpoint` with port 0
-        // (returns EINVAL during `nw_path_create_evaluator_for_listener`).
+    /// Implementation note: this path resolves a concrete port via a BSD
+    /// socket before ever touching `NWListener`, rather than binding
+    /// `requiredLocalEndpoint` with a literal port of `0` directly, on
+    /// the assumption that Network framework rejects a literal-`0`
+    /// `requiredLocalEndpoint` at `start()` time
+    /// (`nw_path_create_evaluator_for_listener failed`). Round 5 (task
+    /// #47) established that this rejection is environment-dependent,
+    /// not universal: on hosts where it does *not* reject the bind, a
+    /// literal-`0` `requiredLocalEndpoint` reaches `.ready` directly,
+    /// with the kernel silently choosing the ephemeral port during
+    /// Phase 1's canonical scan itself (`bindListener(onPort:)`) —
+    /// which is exactly why `bindListener(onPort:)` reads back
+    /// `nl.port?.rawValue` after `.ready` instead of trusting the
+    /// requested port. This fallback remains in place for hosts where
+    /// the literal-`0` bind genuinely is rejected and the canonical
+    /// scan's `tryPort == 0` iteration fails outright.
+    ///
+    /// `internal` (not `private`) so `CalyxMCPServerTests` can exercise
+    /// it directly via `@testable import` without needing to exhaust
+    /// the whole canonical scan range first just to reach this path.
+    func bindKernelAssignedListener() -> (NWListener, Int)? {
         // Strategy: use the BSD socket API to ask the kernel for a free
         // ephemeral port on 127.0.0.1, then probe that exact port via
-        // `requiredLocalEndpoint` with the resolved port number. The
-        // BSD socket is closed before NWListener binds; the race window
-        // is sub-millisecond and the test exercises a host where the
-        // pre-bound ports are deliberately outside this range.
+        // `requiredLocalEndpoint` with the resolved port number — see
+        // this function's doc comment for why a literal port `0` isn't
+        // handed to `NWListener` directly. The BSD socket is closed
+        // before NWListener binds; the race window is sub-millisecond
+        // and the test exercises a host where the pre-bound ports are
+        // deliberately outside this range.
         //
         // Try up to a handful of kernel-assigned ports — if one happens
         // to lose the close→bind race we ask the kernel for another.
         for attempt in 0..<5 {
-            guard let resolvedPort = askKernelForFreeLoopbackPort() else {
+            guard let probedPort = askKernelForFreeLoopbackPort() else {
                 NSLog("[CalyxMCPServer] BSD fallback attempt \(attempt): kernel did not return a port")
                 continue
             }
 
             let params = NWParameters.tcp
-            let nwPort = NWEndpoint.Port(integerLiteral: UInt16(resolvedPort))
+            let nwPort = NWEndpoint.Port(integerLiteral: UInt16(probedPort))
             params.requiredLocalEndpoint = NWEndpoint.hostPort(
                 host: .ipv4(.loopback),
                 port: nwPort
             )
             guard let nl = try? NWListener(using: params) else { continue }
-            if let ready = startListenerAndWaitForReady(nl) {
-                return (ready, resolvedPort)
+            guard let ready = startListenerAndWaitForReady(nl) else { continue }
+
+            // Symmetric with `bindListener(onPort:)`: read the port the
+            // listener itself actually resolved to, rather than
+            // trusting `probedPort` (the pre-bind BSD-socket probe) to
+            // still be accurate. No observed real-world divergence
+            // between the two today — the BSD socket is closed before
+            // `NWListener` binds, and the race window between them is
+            // sub-millisecond — but nothing structurally guarantees
+            // they can never differ, and recording an unverified
+            // pre-bind guess here would silently reopen the exact class
+            // of bug `bindListener(onPort:)` was fixed to close (Round
+            // 5 / task #47): a caller trusting a port number the
+            // listener never confirmed it actually bound.
+            guard let boundPort = ready.port?.rawValue, boundPort != 0 else {
+                ready.cancel()
+                continue
             }
+            if Int(boundPort) != probedPort {
+                NSLog("[CalyxMCPServer] BSD fallback probed port \(probedPort) but the listener resolved to \(boundPort); recording the resolved port")
+            }
+            return (ready, Int(boundPort))
         }
         return nil
     }
@@ -435,7 +538,11 @@ final class CalyxMCPServer {
     /// assigned port via `getsockname`, then closing the socket. The
     /// returned port is the kernel's choice from the ephemeral range —
     /// use it as the desired port for an `NWListener` bind.
-    private func askKernelForFreeLoopbackPort() -> Int? {
+    ///
+    /// `internal` (not `private`) so `CalyxMCPServerTests` can call this
+    /// directly via `@testable import` instead of maintaining its own
+    /// duplicate copy of the same BSD-socket probe.
+    func askKernelForFreeLoopbackPort() -> Int? {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = 0
@@ -710,35 +817,230 @@ final class CalyxMCPServer {
 
     // MARK: - Connection Handling
 
+    /// Reference-typed accumulation state for one connection's
+    /// `receiveUntilComplete` read loop, held for the lifetime of a
+    /// single `handleConnection` call. A plain `Data` value threaded
+    /// through the recursive `receive` calls as a parameter would force
+    /// a full copy of the bytes already accumulated on every chunk —
+    /// the recursive function's own parameter keeps the previous `Data`
+    /// alive as a second reference for the duration of each call, so
+    /// appending into a shadowed copy can never reuse its storage in
+    /// place (copy-on-write only elides the copy when there is exactly
+    /// one live reference). Holding the bytes in a single mutable `var`
+    /// on a class instead means every chunk's `append` mutates the one
+    /// and only reference in place, making accumulation amortized
+    /// O(total bytes) rather than O(total bytes²) for a request that
+    /// arrives in many small chunks.
+    ///
+    /// `requiredTotal`, once known (i.e. once `HTTPParser.completeness(of:)`
+    /// has found the header terminator), is cached here too, so a large
+    /// body doesn't pay for re-finding that terminator via a fresh
+    /// `Data.range(of:)` scan on every single chunk — once cached,
+    /// `receiveUntilComplete` compares `data.count` against it directly
+    /// instead of calling back into `HTTPParser.completeness(of:)`.
+    ///
+    /// `@MainActor`-isolated like the rest of this class (and therefore
+    /// implicitly `Sendable`, safe to capture across the `NWConnection`
+    /// completion-handler boundary) — every read and mutation happens
+    /// from within the `Task { @MainActor in ... }` hop `receiveUntilComplete`
+    /// already performs for every other reason.
+    ///
+    /// `didRespond` is this same isolation's other job: the single
+    /// source of truth `sendHTTPResponse` checks-and-sets to guarantee
+    /// at most one HTTP response ever goes out on the connection this
+    /// accumulator belongs to — see `sendHTTPResponse`'s doc comment
+    /// for the double-send this closes off (the receive-deadline `Task`
+    /// and `receiveUntilComplete`'s own terminal branches can otherwise
+    /// both end up calling it for the same connection).
+    @MainActor
+    private final class ReceiveAccumulator {
+        var data = Data()
+        var requiredTotal: Int?
+        var didRespond = false
+    }
+
     private func handleConnection(_ connection: NWConnection) {
         connection.start(queue: .main)
-        connection.receive(minimumIncompleteLength: 1, maximumLength: HTTPParser.maxHeaderSize + HTTPParser.maxBodySize) { [weak self] data, _, _, error in
+
+        // Constructed before `deadlineTask` (and captured by both it
+        // and `receiveUntilComplete` below) specifically so the two independent
+        // paths that can send a response for this connection share one
+        // `didRespond` flag — see `sendHTTPResponse`'s doc comment.
+        let accumulator = ReceiveAccumulator()
+
+        // Slow-loris guard, bounded to *receiving* a complete request
+        // only: a peer that opens the connection and never sends one
+        // (or trickles it in a byte at a time) would otherwise pin
+        // `receiveUntilComplete`'s accumulation loop below open
+        // indefinitely — that loop has no per-call timeout of its own.
+        // `receiveUntilComplete` cancels this Task the moment
+        // accumulation reaches a terminal outcome (complete, too-large,
+        // or peer-closed/error) — *before* handing off to
+        // `finishRequest`/`route(request:)` — so this deadline never
+        // covers request *processing* time. It deliberately must not:
+        // some `lsp_*` tool calls legitimately run for up to an hour
+        // (see `LSPTimeouts`), and a deadline spanning processing would
+        // cut those off with a spurious 408. `!Task.isCancelled` below
+        // is a cheap early-exit optimization, not the correctness
+        // guarantee against a double send — that's `sendHTTPResponse`'s
+        // `accumulator.didRespond` check.
+        let deadline = connectionReceiveDeadline
+        let deadlineTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: deadline)
+            guard let self, !Task.isCancelled else { return }
+            self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 408, body: nil), accumulator: accumulator)
+        }
+
+        receiveUntilComplete(connection: connection, accumulator: accumulator, deadlineTask: deadlineTask)
+    }
+
+    /// Recursively accumulates `NWConnection.receive` chunks into
+    /// `accumulator.data` until a complete HTTP request — or a
+    /// definitive terminal condition (buffer too large, peer closed, or
+    /// a receive error) — is reached, then hands off to `finishRequest`.
+    ///
+    /// Re-issuing `receive` here (rather than parsing whatever a single
+    /// call returned, as the previous implementation did) matters
+    /// because `minimumIncompleteLength: 1` only guarantees *at least
+    /// one* byte per callback: a request whose header block and
+    /// `Content-Length`-declared body arrive as separate TCP segments
+    /// (more likely under load — see `CalyxMCPServerTests`'s
+    /// `test_realHTTPRequest_headersAndBodySplitAcrossTCPSegments_stillParsesCompleteRequest`)
+    /// used to reach `HTTPParser.parse` with the body segment still
+    /// missing. `HTTPParser.parse` doesn't treat that as an error
+    /// either — with no body bytes yet present it silently returns
+    /// `HTTPRequest.body == nil` rather than raising an
+    /// `HTTPParseError` — so `routeMCP`'s `guard let body else { 400 }`
+    /// fired on a request that was actually well-formed, just not
+    /// fully arrived yet.
+    ///
+    /// `HTTPParser.completeness(of:)` only ever inspects `accumulator.data`
+    /// for completeness (and only until `accumulator.requiredTotal` is
+    /// known — see `ReceiveAccumulator`'s doc comment); `HTTPParser.parse`
+    /// itself is still invoked exactly once, in `finishRequest`, on a
+    /// buffer this function has already established is complete (or
+    /// terminal) — `HTTPParser`'s existing contract of "given a
+    /// complete buffer, parse it" is unchanged.
+    private func receiveUntilComplete(
+        connection: NWConnection,
+        accumulator: ReceiveAccumulator,
+        deadlineTask: Task<Void, Never>
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: HTTPParser.maxHeaderSize + HTTPParser.maxBodySize) { [weak self] data, _, isComplete, error in
             Task { @MainActor [weak self] in
-                guard let self, let data else {
+                guard let self else {
                     connection.cancel()
                     return
                 }
 
-                do {
-                    let httpRequest = try HTTPParser.parse(data)
-                    let httpResponse = await self.route(request: httpRequest)
-                    self.sendHTTPResponse(connection: connection, httpResponse: httpResponse)
-                } catch let error as HTTPParseError {
-                    let statusCode: Int
-                    switch error {
-                    case .headerTooLarge, .bodyTooLarge: statusCode = 413
-                    case .invalidContentLength, .malformedRequest: statusCode = 400
-                    case .timeout: statusCode = 408
+                if let data {
+                    accumulator.data.append(data)
+                }
+
+                let state: HTTPParser.Completeness
+                if let requiredTotal = accumulator.requiredTotal {
+                    // The header terminator (and, if present, a valid
+                    // Content-Length) were already resolved on an
+                    // earlier chunk — skip `HTTPParser.completeness(of:)`'s
+                    // header-terminator search entirely and just compare
+                    // against the byte count it already computed then.
+                    state = accumulator.data.count >= requiredTotal ? .complete : .incomplete
+                } else {
+                    let (resolvedState, resolvedTotal) = HTTPParser.completeness(of: accumulator.data)
+                    accumulator.requiredTotal = resolvedTotal
+                    state = resolvedState
+                }
+
+                switch state {
+                case .incomplete:
+                    if isComplete || error != nil {
+                        // The peer closed (or the read errored) before
+                        // a complete request arrived — OR (see
+                        // `sendHTTPResponse`'s doc comment) this is a
+                        // *stale* `receive()` call that only completed
+                        // because the receive-deadline `Task` already
+                        // sent a 408 and cancelled the connection out
+                        // from under it. Either way, hand whatever
+                        // bytes we do have to the same parse-and-respond
+                        // path a complete request goes through —
+                        // `sendHTTPResponse`'s `accumulator.didRespond`
+                        // guard is what actually decides whether this
+                        // particular call gets to respond.
+                        deadlineTask.cancel()
+                        await self.finishRequest(connection: connection, buffer: accumulator.data, accumulator: accumulator)
+                        return
                     }
-                    self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: statusCode, body: nil))
-                } catch {
-                    self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 500, body: nil))
+                    self.receiveUntilComplete(connection: connection, accumulator: accumulator, deadlineTask: deadlineTask)
+                case .complete:
+                    deadlineTask.cancel()
+                    await self.finishRequest(connection: connection, buffer: accumulator.data, accumulator: accumulator)
+                case .tooLarge:
+                    deadlineTask.cancel()
+                    self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 413, body: nil), accumulator: accumulator)
                 }
             }
         }
     }
 
-    private func sendHTTPResponse(connection: NWConnection, httpResponse: HTTPResponse) {
+    /// Parses a buffer already established as complete (or terminal) by
+    /// `receiveUntilComplete` and dispatches it through `route(request:)`
+    /// — the same parse-error-to-status-code mapping the pre-buffering
+    /// implementation always used. Called only after `receiveUntilComplete`
+    /// has already cancelled the receive-phase deadline, so however long
+    /// `route(request:)` takes is never bounded by it.
+    ///
+    /// Can be entered more than once for the same `accumulator` (see
+    /// `sendHTTPResponse`'s doc comment for how) — every exit path here
+    /// routes through `sendHTTPResponse`, which is what actually
+    /// guarantees only the first call gets to respond.
+    private func finishRequest(connection: NWConnection, buffer: Data, accumulator: ReceiveAccumulator) async {
+        do {
+            let httpRequest = try HTTPParser.parse(buffer)
+            let httpResponse = await self.route(request: httpRequest)
+            self.sendHTTPResponse(connection: connection, httpResponse: httpResponse, accumulator: accumulator)
+        } catch let error as HTTPParseError {
+            let statusCode: Int
+            switch error {
+            case .headerTooLarge, .bodyTooLarge: statusCode = 413
+            case .invalidContentLength, .malformedRequest: statusCode = 400
+            case .timeout: statusCode = 408
+            }
+            self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: statusCode, body: nil), accumulator: accumulator)
+        } catch {
+            self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 500, body: nil), accumulator: accumulator)
+        }
+    }
+
+    /// Sends `httpResponse` and cancels the connection once it's fully
+    /// written — but only the *first* time this is called for a given
+    /// `accumulator` (i.e. for a given connection). `accumulator.didRespond`
+    /// is the single source of truth "has a response already gone out
+    /// on this connection", checked and set atomically here (no `await`
+    /// between the check and the set, and this whole class is
+    /// `@MainActor`-isolated, so there is no interleaving window for a
+    /// second caller to slip in between them).
+    ///
+    /// This guard exists because the receive-deadline `Task` (started
+    /// in `handleConnection`) and `receiveUntilComplete`'s own terminal
+    /// branches can otherwise both end up calling this for the same
+    /// connection: when the deadline actually elapses (the slow-loris
+    /// case it exists to handle), its 408 send's own
+    /// `connection.cancel()` completes whatever `receive()` call was
+    /// still outstanding at that moment. That completion re-enters
+    /// `receiveUntilComplete`'s `isComplete || error != nil` branch —
+    /// indistinguishable there from a genuine peer close — which would,
+    /// without this guard, call `finishRequest` and send a second,
+    /// spurious response on a connection already cancelled by the
+    /// first. `deadlineTask.cancel()` at each of `receiveUntilComplete`'s
+    /// terminal branches narrows the same race in the other direction
+    /// but — being only a cooperative-cancellation flag — cannot fully
+    /// close it either: this `didRespond` check is the actual
+    /// correctness guarantee in both directions.
+    private func sendHTTPResponse(connection: NWConnection, httpResponse: HTTPResponse, accumulator: ReceiveAccumulator) {
+        _testSendHTTPResponseAttemptCount += 1
+        guard !accumulator.didRespond else { return }
+        accumulator.didRespond = true
+        _testSendHTTPResponseSentCount += 1
         let data = httpResponse.serialize()
         connection.send(content: data, completion: .contentProcessed { _ in
             connection.cancel()
