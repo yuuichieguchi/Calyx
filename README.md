@@ -25,6 +25,7 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **Diff Review Comments** -- click the gutter `+` button to add inline comments to diff lines, then Submit Review to send directly to a Claude Code, Codex, OpenCode, or Hermes terminal tab
 ([demo video](https://www.youtube.com/watch?v=_O2Lr4oFf4c))
 - **AI Agent IPC** -- MCP server for communication between AI agent instances (Claude Code, Codex CLI, OpenCode, Hermes) across tabs and panes ([demo video](https://www.youtube.com/watch?v=Xty0ad9gGcM))
+- **Agents Sidebar** -- live status view for connected AI agents (Claude Code, Codex, OpenCode, Hermes) with per-agent state (blocked/working/idle/done), unread message badge, last-seen timestamp, and click-to-focus pane
 - **LSP Proxy MCP** -- exposes language server features such as hover, definition, references, rename, and diagnostics to AI agents over the same MCP server as AI Agent IPC. Missing servers can be auto-installed via Settings.
 - **Scriptable Browser** -- 25 CLI commands for browser automation (like cmux): snapshot, click, fill, eval, screenshot, wait, get-attribute, get-links, get-inputs, is-visible, hover, scroll. No enable step needed. `calyx` CLI bundled in the app
 - **Ghostty config compatibility** -- reads `~/.config/ghostty/config` (most keys hot-reload on save; see Settings for Calyx-managed keys)
