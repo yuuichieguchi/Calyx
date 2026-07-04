@@ -86,6 +86,37 @@ final class SurfaceRegistry {
         return createSurface(app: app, config: config)
     }
 
+    /// Persistent-session variant: sets `config.command` (in addition to
+    /// `pwd`) so the surface's child process is a `calyx-session attach`
+    /// invocation (see `SessionCommandSynthesizer`) instead of the
+    /// user's plain shell. Setting a non-empty `command` also makes
+    /// ghostty force `wait-after-command` on internally (embedded.zig's
+    /// `Surface.init`), independent of anything this config sets, so a
+    /// persistent-session pane never auto-closes when the attach
+    /// process disconnects — `SessionReconnectCoordinator` decides
+    /// whether to reconnect or close instead. `command`'s C string only
+    /// needs to stay alive for the duration of `ghostty_surface_new`
+    /// inside `createSurface(app:config:)` (verified against
+    /// embedded.zig: the command slice is copied into the surface's own
+    /// config before `Options.command` goes out of scope), matching the
+    /// `pwd`-only variant's `withCString` nesting above.
+    func createSurface(app: ghostty_app_t, config: ghostty_surface_config_s, pwd: String?, command: String?) -> UUID? {
+        guard let command else {
+            return createSurface(app: app, config: config, pwd: pwd)
+        }
+        return command.withCString { cmdCStr in
+            var mutableConfig = config
+            mutableConfig.command = cmdCStr
+            guard let pwd else {
+                return createSurface(app: app, config: mutableConfig)
+            }
+            return pwd.withCString { pwdCStr in
+                mutableConfig.working_directory = pwdCStr
+                return createSurface(app: app, config: mutableConfig)
+            }
+        }
+    }
+
     func destroySurface(_ id: UUID) {
         guard var entry = entries[id] else { return }
         guard entry.state != .destroyed else { return }

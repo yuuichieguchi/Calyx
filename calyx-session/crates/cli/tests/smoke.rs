@@ -127,6 +127,151 @@ fn daemon_foreground_serves_new_ls_kill_over_scratch_dirs() {
     );
 }
 
+/// Regression test (P3 review): the Swift side currently approximates
+/// "absent from `ls` == exited(code: 0)", since the CLI has no way to
+/// read a session's *real* exit code from the ledger (the `ListAll`
+/// protocol message exists in the daemon since P2, but no CLI flag
+/// reaches it). `ls --all --json` should report the full ledger view
+/// (running *and* exited sessions, the latter with their real exit
+/// code), matching `ListAllOk`'s `SessionInfo` serialization — the same
+/// shape `ls --json` already uses for `ListOk`.
+///
+/// `--all` doesn't exist on the current CLI, so this fails at clap's
+/// argument parsing before ever reaching the daemon.
+#[test]
+fn ls_all_reports_exited_sessions_with_their_real_exit_code() {
+    let tempdir = tempfile::tempdir().expect("create scratch tempdir");
+    let runtime_dir = tempdir.path().join("run");
+    let state_dir = tempdir.path().join("state");
+    let _guard = spawn_foreground_daemon(&runtime_dir, &state_dir);
+
+    let run_cli = |args: &[&str]| {
+        Command::new(bin())
+            .args(["--runtime-dir", runtime_dir.to_str().unwrap()])
+            .args(["--state-dir", state_dir.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("run `calyx-session {}`: {e}", args.join(" ")))
+    };
+
+    let new_result = run_cli(&[
+        "new", "--argv", "/bin/sh", "--argv", "-c", "--argv", "exit 7",
+    ]);
+    assert!(
+        new_result.status.success(),
+        "new should succeed, got {new_result:?}"
+    );
+    let id = String::from_utf8_lossy(&new_result.stdout)
+        .trim()
+        .to_string();
+    assert!(!id.is_empty(), "new should print the created session's id");
+
+    // Deterministic wait for exit: poll the *existing* `ls --json`
+    // (unaffected by this test's --all addition) until the session's
+    // exit removes it from the live registry view.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let ls_live = run_cli(&["ls", "--json"]);
+        assert!(
+            ls_live.status.success(),
+            "ls --json should succeed, got {ls_live:?}"
+        );
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_slice(&ls_live.stdout).expect("ls --json output should be valid JSON");
+        let still_live = sessions
+            .iter()
+            .any(|s| s.get("id").and_then(|v| v.as_str()) == Some(id.as_str()));
+        if !still_live {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session {id} should exit within 5s, still in ls --json: {sessions:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let ls_live_after = run_cli(&["ls", "--json"]);
+    let live_sessions: Vec<serde_json::Value> = serde_json::from_slice(&ls_live_after.stdout)
+        .expect("ls --json output should be valid JSON");
+    assert!(
+        !live_sessions
+            .iter()
+            .any(|s| s.get("id").and_then(|v| v.as_str()) == Some(id.as_str())),
+        "an exited session should not appear in plain `ls --json`, got {live_sessions:?}"
+    );
+
+    let ls_all = run_cli(&["ls", "--all", "--json"]);
+    assert!(
+        ls_all.status.success(),
+        "ls --all --json should succeed, got {ls_all:?}"
+    );
+    let all_sessions: Vec<serde_json::Value> = serde_json::from_slice(&ls_all.stdout)
+        .expect("ls --all --json output should be valid JSON");
+    let entry = all_sessions
+        .iter()
+        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        .unwrap_or_else(|| {
+            panic!("ls --all --json should include the exited session {id}, got {all_sessions:?}")
+        });
+    assert_eq!(
+        entry.get("state"),
+        Some(&serde_json::json!({"Exited": {"code": 7}})),
+        "exited session should report state Exited with its real code (7), got {entry:?}"
+    );
+}
+
+/// `ls --all --json` must report *running* sessions too (a full ledger
+/// view, not exited-only).
+#[test]
+fn ls_all_includes_running_sessions_too() {
+    let tempdir = tempfile::tempdir().expect("create scratch tempdir");
+    let runtime_dir = tempdir.path().join("run");
+    let state_dir = tempdir.path().join("state");
+    let _guard = spawn_foreground_daemon(&runtime_dir, &state_dir);
+
+    let run_cli = |args: &[&str]| {
+        Command::new(bin())
+            .args(["--runtime-dir", runtime_dir.to_str().unwrap()])
+            .args(["--state-dir", state_dir.to_str().unwrap()])
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("run `calyx-session {}`: {e}", args.join(" ")))
+    };
+
+    // /bin/cat never exits on its own within this test.
+    let new_result = run_cli(&["new", "--argv", "/bin/cat"]);
+    assert!(
+        new_result.status.success(),
+        "new should succeed, got {new_result:?}"
+    );
+    let id = String::from_utf8_lossy(&new_result.stdout)
+        .trim()
+        .to_string();
+
+    let ls_all = run_cli(&["ls", "--all", "--json"]);
+    assert!(
+        ls_all.status.success(),
+        "ls --all --json should succeed, got {ls_all:?}"
+    );
+    let all_sessions: Vec<serde_json::Value> = serde_json::from_slice(&ls_all.stdout)
+        .expect("ls --all --json output should be valid JSON");
+    let entry = all_sessions
+        .iter()
+        .find(|s| s.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))
+        .unwrap_or_else(|| {
+            panic!(
+                "ls --all --json should include the still-running session {id}, \
+                 got {all_sessions:?}"
+            )
+        });
+    assert_eq!(
+        entry.get("state"),
+        Some(&serde_json::json!("Running")),
+        "running session should report state Running, got {entry:?}"
+    );
+}
+
 #[test]
 fn attach_to_an_immediately_exiting_session_returns_exit_code_0() {
     let tempdir = tempfile::tempdir().expect("create scratch tempdir");

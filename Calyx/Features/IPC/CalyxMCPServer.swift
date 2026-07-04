@@ -81,6 +81,16 @@ final class CalyxMCPServer {
     /// leak state across cases.
     var agentRegistry: AgentRegistry = .shared
 
+    /// Resolves a calyx-session ID to the surface UUID currently
+    /// attached to it, for `/mcp` and `/agent-event` requests whose
+    /// `X-Calyx-Surface-ID` header carries a session ID rather than a
+    /// raw surface UUID (persistent-session panes, see
+    /// `AgentHookScript`'s `CALYX_SESSION_ID` precedence). Defaults to
+    /// the shared singleton; tests inject an isolated instance.
+    /// Consulted by `resolveSurfaceID(from:)` as the fallback once
+    /// `parseSurfaceID` fails to parse the header as a raw UUID.
+    var sessionSurfaceMap: SessionSurfaceMap = .shared
+
     /// Directory `agent-endpoint.json` is written to (by `finishStart`)
     /// and removed from (by `stop()`). Defaults to
     /// `AgentEndpointFile.defaultDirectory`
@@ -154,15 +164,19 @@ final class CalyxMCPServer {
         guard let body = request.body else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
-        // A missing, empty, or non-UUID value means "no surface binding
-        // for this connection" here — unlike `/agent-event`'s required
-        // header below, `/mcp` predates `X-Calyx-Surface-ID`, and every
-        // existing MCP client that doesn't send it (or an older Claude
-        // Code build whose `${VAR:-default}` expansion isn't supported,
-        // leaving the literal placeholder string in place) must keep
-        // working exactly as before — so `nil` here is not a request
-        // error, just "not bound".
-        let surfaceID = parseSurfaceID(from: request.headers)
+        // A missing, empty, or unresolvable value means "no surface
+        // binding for this connection" here — unlike `/agent-event`'s
+        // required header below, `/mcp` predates `X-Calyx-Surface-ID`,
+        // and every existing MCP client that doesn't send it (or an
+        // older Claude Code build whose `${VAR:-default}` expansion
+        // isn't supported, leaving the literal placeholder string in
+        // place) must keep working exactly as before — so `nil` here is
+        // not a request error, just "not bound". `resolveSurfaceID`
+        // also resolves a calyx-session ID via `sessionSurfaceMap` (the
+        // same two-stage fallback `/agent-event` uses) so an MCP client
+        // running inside a persistent-session pane keeps its surface
+        // binding across a reconnect too.
+        let surfaceID = resolveSurfaceID(from: request.headers)
         let (statusCode, responseBody) = await handleJSONRPC(data: body, authToken: authToken, surfaceID: surfaceID)
         return HTTPParser.response(statusCode: statusCode, body: responseBody)
     }
@@ -195,12 +209,39 @@ final class CalyxMCPServer {
         return UUID(uuidString: trimmed)
     }
 
+    /// Two-stage resolution of `X-Calyx-Surface-ID`, shared by both
+    /// `/mcp` (`routeMCP`) and `/agent-event` (`routeAgentEvent`): first
+    /// as a raw surface UUID (`parseSurfaceID`, the pre-existing and
+    /// still-primary contract on both routes), then — only when that
+    /// parse fails — as a calyx-session ID looked up in
+    /// `sessionSurfaceMap`. A persistent-session pane's hook sends its
+    /// stable calyx-session ID in this same header instead of a surface
+    /// UUID whenever `CALYX_SESSION_ID` is set (see
+    /// `AgentHookScript.scriptBody`'s
+    /// `${CALYX_SESSION_ID:-$CALYX_SURFACE_ID}` fallback), and an MCP
+    /// client running inside such a pane (e.g. Claude Code's own MCP
+    /// connection, which reads the same precedence) sends the same
+    /// value — since a surface UUID does not survive reconnect, only
+    /// the calyx-session ID does. `nil` if neither resolves; what a
+    /// `nil` result *means* still differs per route (see each route's
+    /// own comment).
+    private func resolveSurfaceID(from headers: [String: String]) -> UUID? {
+        if let surfaceID = parseSurfaceID(from: headers) {
+            return surfaceID
+        }
+        guard let raw = header(named: "X-Calyx-Surface-ID", in: headers)?
+            .trimmingCharacters(in: .whitespaces), !raw.isEmpty else {
+            return nil
+        }
+        return sessionSurfaceMap.surfaceID(for: raw)
+    }
+
     private func routeAgentEvent(request: HTTPRequest) async -> HTTPResponse {
         guard let authToken = bearerToken(from: request.headers), authToken == token else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
-        guard let surfaceID = parseSurfaceID(from: request.headers) else {
+        guard let surfaceID = resolveSurfaceID(from: request.headers) else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
 

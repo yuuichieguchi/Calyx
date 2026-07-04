@@ -19,6 +19,17 @@ echo "Generating Xcode project..."
 xcodegen generate
 echo "Xcode project generated."
 
+# TODO(P5): this script does not yet build/bundle calyx-session before
+# the Release build below. project.yml's "Bundle Session Daemon"
+# postBuildScript hard-fails a non-Debug build when
+# build/session/calyx-session is missing, so a Release build here
+# currently requires `scripts/build-session.sh` to have been run
+# manually first. P5 (remote sessions, cross-compilation) should wire
+# that build in here directly, and decide whether calyx-session needs
+# its own explicit codesign step alongside the CalyxCLI/Sparkle
+# handling below rather than relying solely on the outer app's
+# (non-`--deep`) signature.
+
 # 3. Build
 echo "Building Calyx (Release)..."
 xcodebuild \

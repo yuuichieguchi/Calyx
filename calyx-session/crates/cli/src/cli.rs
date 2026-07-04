@@ -81,6 +81,9 @@ pub struct NewArgs {
 pub struct LsArgs {
     #[arg(long)]
     pub json: bool,
+    /// Include exited sessions (full ledger view via `ListAll`).
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Args, Debug)]
