@@ -9,6 +9,9 @@
 
 const std = @import("std");
 const vt = @import("ghostty-vt");
+// Second alias for scopes where `vt` is shadowed by the stream
+// handler's mandatory `vt` method name.
+const ghostty = vt;
 
 /// Controlled abort for panics inside the shim or ghostty-vt. Unwinding
 /// across the C boundary into Rust would be undefined behavior, so the
@@ -40,14 +43,18 @@ const err_nomem: i32 = -12;
 /// crates/vt/src/error.rs.
 const err_stream: i32 = -71;
 
+/// The stream type every GvtTerminal feeds through: ghostty's generic
+/// VT stream dispatching into `RespondingHandler` below.
+const GvtStream = vt.Stream(RespondingHandler);
+
 /// Opaque handle backing `void*` on the C side.
 const GvtTerminal = struct {
     terminal: vt.Terminal,
 
-    /// Owns the VT parser state. Its handler holds a pointer to
-    /// `terminal` above, so a GvtTerminal must stay at its heap address
-    /// for its whole lifetime (never copied by value).
-    stream: vt.ReadonlyStream,
+    /// Owns the VT parser state. Its handler holds pointers to this
+    /// struct and to `terminal` above, so a GvtTerminal must stay at
+    /// its heap address for its whole lifetime (never copied by value).
+    stream: GvtStream,
 
     /// The caller's scrollback byte budget. ghostty-vt receives the
     /// same value but only prunes at whole-page granularity, and one
@@ -55,8 +62,8 @@ const GvtTerminal = struct {
     /// shim enforces the budget row-wise via `enforceScrollbackBudget`.
     max_scrollback_bytes: u32,
 
-    /// Responder registration for detached-mode queries (P2). Stored
-    /// but never invoked in P1: ReadonlyStream ignores query actions.
+    /// Responder for detached-mode query replies (DSR/DA1/DECRQM).
+    /// When unset, queries are silently ignored, matching P1 behavior.
     responder_ctx: ?*anyopaque = null,
     responder: ?gvt_responder_fn = null,
 
@@ -82,6 +89,194 @@ const GvtTerminal = struct {
 fn fromHandle(t: ?*anyopaque) ?*GvtTerminal {
     return @ptrCast(@alignCast(t orelse return null));
 }
+
+/// Stream handler that answers query-class actions (which need a write
+/// path back to the application) through the registered responder, and
+/// delegates every state-modifying action to ghostty's ReadonlyHandler
+/// unchanged. Response strings mirror ghostty's own StreamHandler
+/// (src/termio/stream_handler.zig) so a detached session sees the same
+/// terminal identity it would when attached.
+const RespondingHandler = struct {
+    inner: ghostty.ReadonlyHandler,
+    owner: *GvtTerminal,
+
+    pub fn deinit(self: *RespondingHandler) void {
+        self.inner.deinit();
+    }
+
+    pub fn vt(
+        self: *RespondingHandler,
+        comptime action: ghostty.StreamAction.Tag,
+        value: ghostty.StreamAction.Value(action),
+    ) !void {
+        switch (action) {
+            .device_status => self.deviceStatus(value.request),
+            .device_attributes => self.deviceAttributes(value),
+            .request_mode => self.requestMode(value.mode),
+            .request_mode_unknown => self.requestModeUnknown(value),
+            .kitty_keyboard_query => self.kittyKeyboardQuery(),
+            .xtversion => self.xtversion(),
+            .size_report => self.sizeReport(value),
+            // Color operations both mutate state (set/reset -> inner)
+            // and answer queries (-> responder); intercept for the
+            // queries, then delegate the whole action unchanged.
+            .color_operation => {
+                self.colorQueries(&value);
+                try self.inner.vt(action, value);
+            },
+            else => try self.inner.vt(action, value),
+        }
+    }
+
+    fn respond(self: *RespondingHandler, bytes: []const u8) void {
+        const responder = self.owner.responder orelse return;
+        responder(self.owner.responder_ctx, bytes.ptr, bytes.len);
+    }
+
+    fn deviceStatus(self: *RespondingHandler, req: ghostty.device_status.Request) void {
+        switch (req) {
+            .operating_status => self.respond("\x1b[0n"),
+            .cursor_position => {
+                const term = self.inner.terminal;
+                const cursor = &term.screens.active.cursor;
+                // With origin mode set, CPR reports region-relative
+                // coordinates, mirroring ghostty's own handler.
+                const pos: struct { x: usize, y: usize } = if (term.modes.get(.origin)) .{
+                    .x = cursor.x -| term.scrolling_region.left,
+                    .y = cursor.y -| term.scrolling_region.top,
+                } else .{ .x = cursor.x, .y = cursor.y };
+                var buf: [32]u8 = undefined;
+                const resp = std.fmt.bufPrint(
+                    &buf,
+                    "\x1b[{d};{d}R",
+                    .{ pos.y + 1, pos.x + 1 },
+                ) catch return;
+                self.respond(resp);
+            },
+            // Requires host theme knowledge the shim doesn't have.
+            .color_scheme => {},
+        }
+    }
+
+    fn deviceAttributes(self: *RespondingHandler, req: ghostty.DeviceAttributeReq) void {
+        switch (req) {
+            // VT220 with color, like ghostty (clipboard access omitted:
+            // the shim has no clipboard).
+            .primary => self.respond("\x1b[?62;22c"),
+            .secondary => self.respond("\x1b[>1;10;0c"),
+            else => {},
+        }
+    }
+
+    fn requestMode(self: *RespondingHandler, mode: ghostty.Mode) void {
+        const tag: ghostty.modes.ModeTag = @bitCast(@intFromEnum(mode));
+        const prefix: []const u8 = if (tag.ansi) "" else "?";
+        const code: u8 = if (self.inner.terminal.modes.get(mode)) 1 else 2;
+        var buf: [32]u8 = undefined;
+        const resp = std.fmt.bufPrint(
+            &buf,
+            "\x1b[{s}{d};{d}$y",
+            .{ prefix, tag.value, code },
+        ) catch return;
+        self.respond(resp);
+    }
+
+    fn kittyKeyboardQuery(self: *RespondingHandler) void {
+        var buf: [32]u8 = undefined;
+        const resp = std.fmt.bufPrint(&buf, "\x1b[?{d}u", .{
+            self.inner.terminal.screens.active.kitty_keyboard.current().int(),
+        }) catch return;
+        self.respond(resp);
+    }
+
+    fn xtversion(self: *RespondingHandler) void {
+        self.respond("\x1bP>|calyx-session (ghostty-vt)\x1b\\");
+    }
+
+    fn sizeReport(self: *RespondingHandler, style: ghostty.SizeReportStyle) void {
+        switch (style) {
+            // Text-area size in characters is the only variant the
+            // shim can answer truthfully; pixel-based reports would
+            // require a display it doesn't have.
+            .csi_18_t => {
+                const term = self.inner.terminal;
+                var buf: [32]u8 = undefined;
+                const resp = std.fmt.bufPrint(
+                    &buf,
+                    "\x1b[8;{d};{d}t",
+                    .{ term.rows, term.cols },
+                ) catch return;
+                self.respond(resp);
+            },
+            .csi_14_t, .csi_16_t, .csi_21_t => {},
+        }
+    }
+
+    fn colorQueries(
+        self: *RespondingHandler,
+        value: *const ghostty.StreamAction.ColorOperation,
+    ) void {
+        var it = value.requests.constIterator(0);
+        while (it.next()) |req| switch (req.*) {
+            .query => |target| self.respondColorQuery(target, value.terminator),
+            else => {},
+        };
+    }
+
+    fn respondColorQuery(
+        self: *RespondingHandler,
+        target: ghostty.osc.color.Target,
+        terminator: ghostty.osc.Terminator,
+    ) void {
+        const term = self.inner.terminal;
+        var buf: [64]u8 = undefined;
+        switch (target) {
+            .palette => |idx| {
+                const rgb = term.colors.palette.current[idx];
+                const resp = std.fmt.bufPrint(
+                    &buf,
+                    "\x1b]4;{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}{s}",
+                    .{ idx, scale16(rgb.r), scale16(rgb.g), scale16(rgb.b), terminator.string() },
+                ) catch return;
+                self.respond(resp);
+            },
+            .dynamic => |dynamic| {
+                // A headless terminal has no configured theme; when no
+                // OSC 10/11/12 override was ever set, report a plain
+                // white-on-black scheme rather than staying silent
+                // (querying apps block on the answer). The cursor
+                // falls back to the foreground color first, like
+                // ghostty's own handler.
+                const fg_fallback: ghostty.color.RGB = .{ .r = 0xff, .g = 0xff, .b = 0xff };
+                const code: u8, const rgb: ghostty.color.RGB = switch (dynamic) {
+                    .foreground => .{ 10, term.colors.foreground.get() orelse fg_fallback },
+                    .background => .{ 11, term.colors.background.get() orelse .{ .r = 0, .g = 0, .b = 0 } },
+                    .cursor => .{ 12, term.colors.cursor.get() orelse
+                        term.colors.foreground.get() orelse fg_fallback },
+                    else => return,
+                };
+                const resp = std.fmt.bufPrint(
+                    &buf,
+                    "\x1b]{d};rgb:{x:0>4}/{x:0>4}/{x:0>4}{s}",
+                    .{ code, scale16(rgb.r), scale16(rgb.g), scale16(rgb.b), terminator.string() },
+                ) catch return;
+                self.respond(resp);
+            },
+            .special => {},
+        }
+    }
+
+    fn requestModeUnknown(self: *RespondingHandler, raw: ghostty.StreamAction.RawMode) void {
+        const prefix: []const u8 = if (raw.ansi) "" else "?";
+        var buf: [32]u8 = undefined;
+        const resp = std.fmt.bufPrint(
+            &buf,
+            "\x1b[{s}{d};0$y",
+            .{ prefix, raw.mode },
+        ) catch return;
+        self.respond(resp);
+    }
+};
 
 /// Caller-provided out-buffer pair, validated and zeroed up front so
 /// every error path leaves it in a defined empty state.
@@ -128,7 +323,10 @@ pub export fn gvt_terminal_new(
         .stream = undefined,
         .max_scrollback_bytes = max_scrollback_bytes,
     };
-    self.stream = self.terminal.vtStream();
+    self.stream = .initAlloc(alloc, .{
+        .inner = .init(&self.terminal),
+        .owner = self,
+    });
     return self;
 }
 
@@ -518,4 +716,10 @@ test "total rows of a fresh terminal equals its height" {
     var total: u32 = 0;
     try std.testing.expectEqual(@as(i32, 0), gvt_total_rows(handle, &total));
     try std.testing.expectEqual(@as(u32, 24), total);
+}
+
+/// Helper for `scale16` doc: OSC color replies use 16-bit-per-channel
+/// `rgb:` syntax; widen an 8-bit channel by bit replication.
+fn scale16(channel: u8) u16 {
+    return @as(u16, channel) * 0x101;
 }
