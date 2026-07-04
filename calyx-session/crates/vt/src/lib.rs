@@ -9,15 +9,20 @@ use std::ptr;
 
 pub use error::VtError;
 
+/// The boxed form a registered responder closure is stored in. Double
+/// boxing turns the fat `dyn` pointer into a thin, stable heap address
+/// usable as the C callback's `ctx`.
+type ResponderClosure = Box<dyn FnMut(&[u8])>;
+
 /// A single ghostty-vt terminal instance, owned via an opaque libgvt
 /// handle.
 ///
 /// Deliberately neither `Send` nor `Sync`: whether the underlying Zig
 /// `Terminal` tolerates being moved across threads has not been
 /// verified against ghostty's internals. Revisit for the daemon (P2).
-#[derive(Debug)]
 pub struct Terminal {
     handle: *mut c_void,
+    responder: Option<Box<ResponderClosure>>,
 }
 
 impl Terminal {
@@ -28,7 +33,10 @@ impl Terminal {
         if handle.is_null() {
             return Err(VtError::TerminalCreationFailed);
         }
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            responder: None,
+        })
     }
 
     /// Feeds raw bytes (text and/or escape sequences) into the
@@ -88,6 +96,56 @@ impl Terminal {
         VtError::from_code(rc, "Terminal::total_rows")?;
         Ok(total)
     }
+
+    /// Registers `responder` to be invoked with the raw bytes of any
+    /// query-class response (DSR 6 cursor-position report, DA1,
+    /// DECRQM) this terminal would emit while `feed`ing input in
+    /// detached mode, i.e. with no real PTY/application on the other
+    /// end to answer such queries itself (P2 daemon use case).
+    ///
+    /// Wraps `vt_sys::gvt_terminal_set_responder`; see
+    /// `calyx-session/shim/src/gvt.zig` for the C ABI contract. The
+    /// closure is invoked synchronously from within `feed`, and a
+    /// second `set_responder` call replaces the first.
+    pub fn set_responder<F>(&mut self, responder: F)
+    where
+        F: FnMut(&[u8]) + 'static,
+    {
+        let mut boxed: Box<ResponderClosure> = Box::new(Box::new(responder));
+        let ctx = (&mut *boxed) as *mut ResponderClosure as *mut c_void;
+        unsafe { vt_sys::gvt_terminal_set_responder(self.handle, ctx, Some(responder_trampoline)) };
+        // Replace only after the shim points at the new box: the old
+        // box must stay alive for as long as the shim could still call
+        // into it.
+        self.responder = Some(boxed);
+    }
+
+    /// Unregisters a previously set responder; subsequent queries are
+    /// silently ignored again.
+    pub fn clear_responder(&mut self) {
+        unsafe { vt_sys::gvt_terminal_set_responder(self.handle, ptr::null_mut(), None) };
+        self.responder = None;
+    }
+}
+
+/// C-side entry point for responder callbacks.
+///
+/// # Safety (contract with `set_responder`)
+/// `ctx` is the address of a live `ResponderClosure` owned by the
+/// `Terminal` whose feed triggered this call; the shim only invokes it
+/// synchronously during `gvt_terminal_feed`, while that borrow is
+/// unique.
+extern "C" fn responder_trampoline(ctx: *mut c_void, bytes: *const u8, len: usize) {
+    if ctx.is_null() {
+        return;
+    }
+    let closure = unsafe { &mut *(ctx as *mut ResponderClosure) };
+    let slice = if len == 0 || bytes.is_null() {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(bytes, len) }
+    };
+    closure(slice);
 }
 
 /// Copies a shim-owned buffer into a Rust-owned `Vec<u8>` and releases
@@ -110,5 +168,18 @@ impl Drop for Terminal {
         if !self.handle.is_null() {
             unsafe { vt_sys::gvt_terminal_free(self.handle) };
         }
+        // `responder` (if any) drops after the handle is freed, so the
+        // shim can no longer call into the closure it pointed at.
+    }
+}
+
+// Manual impl because the responder closure has no `Debug`; `derive`
+// would otherwise be preferred.
+impl std::fmt::Debug for Terminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Terminal")
+            .field("handle", &self.handle)
+            .field("responder", &self.responder.is_some())
+            .finish()
     }
 }
