@@ -6,14 +6,23 @@ use crate::cli::LsArgs;
 use crate::commands::client::{server_err, unexpected, DaemonClient};
 use crate::commands::{socket_path, CommandError};
 
-/// Lists sessions (via `ControlMsg::List`), printed as JSON with
-/// `--json` or as a human-readable table otherwise.
+/// Lists sessions (via `ControlMsg::List`, or `ControlMsg::ListAll`
+/// with `--all` to include exited sessions from the ledger), printed
+/// as JSON with `--json` or as a human-readable table otherwise.
 pub fn run(runtime_dir: &Option<PathBuf>, args: LsArgs) -> Result<u8, CommandError> {
     let client = DaemonClient::connect(&socket_path(runtime_dir))?;
-    let sessions = match client.request(&ControlMsg::List)? {
-        ControlMsg::ListOk { sessions } => sessions,
-        ControlMsg::Err { code, msg } => return Err(server_err(code, msg)),
-        other => return Err(unexpected(&other)),
+    let sessions = if args.all {
+        match client.request(&ControlMsg::ListAll)? {
+            ControlMsg::ListAllOk { sessions } => sessions,
+            ControlMsg::Err { code, msg } => return Err(server_err(code, msg)),
+            other => return Err(unexpected(&other)),
+        }
+    } else {
+        match client.request(&ControlMsg::List)? {
+            ControlMsg::ListOk { sessions } => sessions,
+            ControlMsg::Err { code, msg } => return Err(server_err(code, msg)),
+            other => return Err(unexpected(&other)),
+        }
     };
 
     if args.json {

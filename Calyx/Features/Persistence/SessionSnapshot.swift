@@ -6,7 +6,7 @@
 import Foundation
 
 struct SessionSnapshot: Codable, Equatable {
-    static let currentSchemaVersion = 5
+    static let currentSchemaVersion = 6
 
     let schemaVersion: Int
     let windows: [WindowSnapshot]
@@ -124,14 +124,44 @@ struct TabSnapshot: Codable, Equatable {
     let pwd: String?
     let splitTree: SplitTree
     let browserURL: URL?
+    /// Schema v6: calyx-session references keyed by leaf surface UUID
+    /// (a subset of `splitTree`'s leaf IDs). `nil` for a v5-and-earlier
+    /// snapshot or a tab with no persistent sessions — synthesized
+    /// Codable already decodes a missing/absent key as `nil` for an
+    /// Optional stored property, so no custom `init(from:)` is needed
+    /// for backward compatibility here (contrast `WindowSnapshot` /
+    /// `TabGroupSnapshot`, whose custom inits exist only because their
+    /// added fields default to non-nil values).
+    let sessionRefs: [UUID: SessionRef]?
 
-    init(id: UUID = UUID(), title: String = "Terminal", titleOverride: String? = nil, pwd: String? = nil, splitTree: SplitTree = SplitTree(), browserURL: URL? = nil) {
+    init(id: UUID = UUID(), title: String = "Terminal", titleOverride: String? = nil, pwd: String? = nil, splitTree: SplitTree = SplitTree(), browserURL: URL? = nil, sessionRefs: [UUID: SessionRef]? = nil) {
         self.id = id
         self.title = title
         self.titleOverride = titleOverride
         self.pwd = pwd
         self.splitTree = splitTree
         self.browserURL = browserURL
+        self.sessionRefs = sessionRefs
+    }
+}
+
+extension Dictionary where Key == UUID, Value == SessionRef {
+    /// Re-keys leaf-UUID-keyed `SessionRef`s the same way
+    /// `SplitTree.remapLeafIDs(_:)` re-keys leaves: a key present in
+    /// `mapping` moves to its mapped value; a key absent from `mapping`
+    /// is left exactly as it was. Used directly on the runtime
+    /// `Tab.sessionRefs` dictionary by both `AppDelegate
+    /// .restoreTabSurfaces` (full-restore success) and
+    /// `CalyxWindowController.performReconnect` (surface swap) — there
+    /// is no `TabSnapshot`-level equivalent; restore/reconnect always
+    /// operate on the live `Tab`, never reconstruct a whole
+    /// `TabSnapshot` mid-flight.
+    func remappingKeys(_ mapping: [UUID: UUID]) -> [UUID: SessionRef] {
+        var result: [UUID: SessionRef] = [:]
+        for (leafID, ref) in self {
+            result[mapping[leafID] ?? leafID] = ref
+        }
+        return result
     }
 }
 
@@ -173,13 +203,14 @@ extension TabGroup {
 
 extension Tab {
     func snapshot() -> TabSnapshot? {
+        let refs = sessionRefs.isEmpty ? nil : sessionRefs
         switch content {
         case .diff:
             return nil  // Diff tabs are not persisted
         case .terminal:
-            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: nil)
+            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: nil, sessionRefs: refs)
         case .browser(let url):
-            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: url)
+            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: url, sessionRefs: refs)
         }
     }
 
@@ -195,7 +226,8 @@ extension Tab {
             titleOverride: snapshot.titleOverride,
             pwd: snapshot.pwd,
             splitTree: snapshot.splitTree,
-            content: content
+            content: content,
+            sessionRefs: snapshot.sessionRefs ?? [:]
         )
     }
 }
