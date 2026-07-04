@@ -1,0 +1,3 @@
+/target/
+/shim/zig-out/
+/shim/.zig-cache/
