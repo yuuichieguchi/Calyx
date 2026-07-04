@@ -1,0 +1,9 @@
+[package]
+name = "vt-sys"
+version = "0.1.0"
+edition.workspace = true
+build = "build.rs"
+links = "gvt"
+description = "Raw FFI bindings to libgvt, a C ABI shim over ghostty-vt's Terminal."
+
+[dependencies]

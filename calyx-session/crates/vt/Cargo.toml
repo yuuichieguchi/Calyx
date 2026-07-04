@@ -1,0 +1,8 @@
+[package]
+name = "vt"
+version = "0.1.0"
+edition.workspace = true
+description = "Safe wrapper around vt-sys / libgvt for terminal state capture and replay."
+
+[dependencies]
+vt-sys = { path = "../vt-sys" }

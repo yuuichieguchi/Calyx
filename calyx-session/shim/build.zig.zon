@@ -1,0 +1,16 @@
+.{
+    .name = .gvt_shim,
+    .version = "0.0.0",
+    .fingerprint = 0xa236dcf6fca7454b,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        // Path dependency onto the ghostty submodule checked out at the
+        // repo root. No hash is required for path dependencies.
+        .ghostty = .{ .path = "../../ghostty" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
