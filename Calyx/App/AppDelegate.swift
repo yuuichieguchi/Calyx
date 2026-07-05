@@ -111,6 +111,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Give any kill(id:) calls dispatched by an explicit pane/tab
+        // close that raced with this quit a short, bounded window to
+        // actually finish (see SessionKillTracker's header comment) —
+        // otherwise a kill's Task could be torn down mid-Process-spawn,
+        // silently leaving the calyx-session running as an orphan even
+        // though the user asked to end it. Runs regardless of
+        // windowControllers/appSession state below, since kills can be
+        // in flight even after every window has already closed.
+        var killsDrained = false
+        Task {
+            await SessionKillTracker.drain(timeoutSeconds: 2.0)
+            killsDrained = true
+        }
+        let killDrainDeadline = Date().addingTimeInterval(2.5)
+        while !killsDrained, Date() < killDrainDeadline {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+
         // Last-window close path already persists synchronously in windowWillClose.
         // Avoid overwriting with an empty snapshot during app teardown.
         if windowControllers.isEmpty || appSession.windows.isEmpty {
@@ -771,23 +789,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let oldLeafIDs = tab.splitTree.allLeafIDs()
         guard !oldLeafIDs.isEmpty else { return false }
 
+        // Reject any persisted SessionRef whose sessionID isn't shaped
+        // like a genuine ULID before it ever reaches calyx-session
+        // attach — a corrupted/malicious sessions.json value must not
+        // run arbitrary daemon-side lookups. The rejected leaf simply
+        // restores as an ordinary passthrough shell below
+        // (createSurfaceWithPwd only synthesizes an attach command when
+        // tab.sessionRefs still has an entry for that leaf).
+        for (leafID, sessionRef) in tab.sessionRefs where !SessionRef.isValidULID(sessionRef.sessionID) {
+            tab.sessionRefs.removeValue(forKey: leafID)
+        }
+
         var mapping: [UUID: UUID] = [:]
 
         for oldID in oldLeafIDs {
-            guard let newID = createSurfaceWithPwd(tab: tab, app: app, window: window) else {
+            guard let newID = createSurfaceWithPwd(tab: tab, app: app, window: window, oldLeafID: oldID) else {
                 continue
             }
             mapping[oldID] = newID
+            if let sessionRef = tab.sessionRefs[oldID] {
+                SessionSurfaceMap.shared.register(sessionID: sessionRef.sessionID, surfaceID: newID)
+            }
         }
 
         // All leaves must be restored for split integrity
         if mapping.count == oldLeafIDs.count {
             tab.splitTree = tab.splitTree.remapLeafIDs(mapping)
+            tab.sessionRefs = tab.sessionRefs.remappingKeys(mapping)
             return true
         }
 
-        // Partial failure: destroy any surfaces we created and return false
-        for newID in mapping.values {
+        // Partial failure: destroy any surfaces we created (undoing
+        // their SessionSurfaceMap registration too) and return false
+        for (oldID, newID) in mapping {
+            if let sessionRef = tab.sessionRefs[oldID] {
+                SessionSurfaceMap.shared.unregister(sessionID: sessionRef.sessionID)
+            }
             tab.registry.destroySurface(newID)
         }
         return false
@@ -798,12 +835,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         tab.splitTree = SplitTree(leafID: newID)
+        // The whole original tree failed to restore, so none of the
+        // old leaf UUIDs survive into this brand-new single-leaf tree —
+        // drop every now-orphaned SessionRef rather than let it linger
+        // (and get written back out by the next snapshot) pointing at a
+        // leaf that no longer exists.
+        tab.pruneSessionRefs()
         return true
     }
 
-    private func createSurfaceWithPwd(tab: Tab, app: ghostty_app_t, window: NSWindow) -> UUID? {
+    /// Creates one surface for `tab` during restore. When `oldLeafID`
+    /// names a leaf that had a `SessionRef` in the snapshot
+    /// (`tab.sessionRefs`, carried over by `Tab.init(snapshot:)`
+    /// regardless of the current `SessionSettings
+    /// .persistentSessionsEnabled` toggle — a session that already
+    /// exists in the daemon must not be orphaned just because the user
+    /// has since turned the feature off), creates the surface with an
+    /// attach command instead of a plain shell so `restoreTabSurfaces`
+    /// can reconnect it. `fallbackCreateSurface`'s single-surface,
+    /// whole-tree-failed path calls this with the default `oldLeafID:
+    /// nil`, so it always falls back to a plain passthrough surface —
+    /// matching this method's pre-feature behavior exactly for that
+    /// rare failure case.
+    private func createSurfaceWithPwd(tab: Tab, app: ghostty_app_t, window: NSWindow, oldLeafID: UUID? = nil) -> UUID? {
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
+
+        if let oldLeafID, let sessionRef = tab.sessionRefs[oldLeafID],
+           let command = SessionCommandSynthesizer.reattachCommand(sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()) {
+            return tab.registry.createSurface(app: app, config: config, pwd: tab.pwd, command: command)
+        }
         return tab.registry.createSurface(app: app, config: config, pwd: tab.pwd)
     }
 

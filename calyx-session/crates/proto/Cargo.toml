@@ -1,0 +1,11 @@
+[package]
+name = "proto"
+version = "0.1.0"
+edition.workspace = true
+description = "Wire protocol (length-prefixed framing + CBOR control messages) shared by the calyx-session daemon and CLI."
+
+[dependencies]
+serde = { workspace = true }
+ciborium = { workspace = true }
+
+[dev-dependencies]

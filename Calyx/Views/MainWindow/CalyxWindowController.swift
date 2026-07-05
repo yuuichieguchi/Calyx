@@ -36,6 +36,29 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
     private var composeOverlayTargetSurfaceID: UUID?
+    /// Decides reconnect vs. close for this window's persistent-session
+    /// surfaces on `GHOSTTY_ACTION_SHOW_CHILD_EXITED` (wired in
+    /// `handleShowChildExitedNotification`). One instance per window
+    /// controller is enough — decisions are keyed by surface UUID, and
+    /// each surface only ever belongs to one window.
+    private lazy var sessionReconnectCoordinator = SessionReconnectCoordinator(
+        daemonClient: SessionDaemonClient.shared,
+        surfaceMap: .shared,
+        onDecision: { [weak self] surfaceID, decision in
+            self?.handleSessionReconnectDecision(surfaceID: surfaceID, decision: decision)
+        }
+    )
+    /// Surface UUIDs currently being destroyed as part of
+    /// `performReconnect`'s surface swap (populated right before, and
+    /// cleared right after, its `destroySurface` call). Consulted by
+    /// `killSessionIfPersistent` via `SessionCloseKillPolicy` — defense
+    /// in depth on top of `performReconnect`'s own ordering (re-pointing
+    /// `SessionSurfaceMap` before destroying the old surface) — so a
+    /// `destroySurface` call that synchronously re-enters
+    /// `handleCloseSurfaceNotification` (ghostty's `close_surface`
+    /// callback fires from inside `requestClose()`) can never self-kill
+    /// the very session `performReconnect` is reconnecting to.
+    private var reconnectingSurfaceIDs: Set<UUID> = []
 
     // MARK: - Computed Properties
 
@@ -323,7 +346,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
 
-        guard let surfaceID = tab.registry.createSurface(app: app, config: config, pwd: tab.pwd) else {
+        guard let surfaceID = createManagedSurface(
+            tab: tab, app: app, config: config,
+            passthroughPwd: tab.pwd, spawnCwd: tab.pwd ?? NSHomeDirectory(), origin: .tab
+        ) else {
             logger.error("Failed to create initial surface")
             return
         }
@@ -336,6 +362,91 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         if let surfaceView = tab.registry.view(for: surfaceID) {
             window.makeFirstResponder(surfaceView)
+        }
+    }
+
+    // MARK: - Session Persistence
+
+    /// Applies `SessionSpawnPlanner`'s decision for a freshly-created
+    /// terminal surface. `.passthrough` (the default — feature off, or
+    /// `origin == .quickTerminal`) creates the surface exactly as
+    /// before this feature existed, via `passthroughPwd` — every
+    /// existing call site's pre-feature `pwd` argument, unchanged, so
+    /// the OFF path has zero observable difference. `.persistent`
+    /// creates it with the synthesized attach command instead, and
+    /// records the new session in `tab.sessionRefs` (persisted into
+    /// `TabSnapshot.sessionRefs` at save time) and
+    /// `SessionSurfaceMap.shared` (so `/agent-event` routing, the
+    /// close=kill path below, and `SessionReconnectCoordinator` can all
+    /// find it later). `spawnCwd`/`inheritedCwd` are only read when a
+    /// plan actually turns out `.persistent`; they have no effect while
+    /// the feature is off. `inheritedCwd` (only ever non-nil from
+    /// `handleNewSplitNotification`) takes priority — see
+    /// `SessionSpawnContext`'s doc comment — since ghostty has no
+    /// surface-level pwd getter (only the async `GHOSTTY_ACTION_PWD` ->
+    /// `.ghosttySetPwd` report this codebase already tracks into
+    /// `tab.pwd`), so `tab.pwd` is the best available approximation of
+    /// the split's specific origin surface, not necessarily its exact
+    /// live cwd if the tab has multiple panes in different directories.
+    private func createManagedSurface(
+        tab: Tab,
+        app: ghostty_app_t,
+        config: ghostty_surface_config_s,
+        passthroughPwd: String?,
+        spawnCwd: String,
+        inheritedCwd: String? = nil,
+        origin: SessionSpawnOrigin
+    ) -> UUID? {
+        let context = SessionSpawnContext(cwd: spawnCwd, inheritedCwd: inheritedCwd, origin: origin)
+        switch SessionSpawnPlanner.plan(for: context) {
+        case .passthrough:
+            return tab.registry.createSurface(app: app, config: config, pwd: passthroughPwd)
+        case .persistent(let sessionID, let command):
+            let ghosttyPwd = inheritedCwd ?? spawnCwd
+            guard let surfaceID = tab.registry.createSurface(app: app, config: config, pwd: ghosttyPwd, command: command) else {
+                return nil
+            }
+            tab.sessionRefs[surfaceID] = SessionRef(sessionID: sessionID)
+            SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: surfaceID)
+            return surfaceID
+        }
+    }
+
+    /// Explicit-close half of the close=kill / quit=detach contract: a
+    /// user-initiated pane/tab close ends the underlying calyx-session
+    /// too (rather than leaving it running headless forever), and drops
+    /// its now-stale `SessionSurfaceMap` entry and `tab.sessionRefs`
+    /// entry so neither routing nor the next snapshot still reference a
+    /// leaf that no longer exists. Called from `closeTab(id:)`,
+    /// `closeActiveGroup()`, `closeAllTabsInGroup(id:)`, and
+    /// `handleCloseSurfaceNotification` right before/alongside
+    /// `SurfaceRegistry.destroySurface(_:)` — including reentrant calls
+    /// `destroySurface` triggers synchronously via ghostty's
+    /// `close_surface` callback, which is exactly why the actual kill
+    /// decision is delegated to `SessionCloseKillPolicy` rather than
+    /// just checking `hasSession`: a review found this method reachable,
+    /// unconditionally, from two unsafe reentrant paths —
+    /// `performReconnect` (which destroys the OLD surface to make room
+    /// for the reconnected one — must not self-kill) and
+    /// `windowWillClose`/quit teardown (must detach, not kill, so the
+    /// session survives to be reattached on next launch; `isTerminating`
+    /// reuses `isClosingForShutdown`, which `AppDelegate
+    /// .markAllControllersClosingForShutdown()` / `windowShouldClose`
+    /// both set before any surface is destroyed).
+    private func killSessionIfPersistent(tab: Tab, surfaceID: UUID) {
+        let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID)
+        guard SessionCloseKillPolicy.shouldKill(
+            hasSession: sessionID != nil,
+            isTerminating: isClosingForShutdown,
+            isReconnectSwap: reconnectingSurfaceIDs.contains(surfaceID)
+        ), let sessionID else {
+            return
+        }
+        SessionSurfaceMap.shared.unregister(sessionID: sessionID)
+        tab.sessionRefs[surfaceID] = nil
+        sessionReconnectCoordinator.markClosed(sessionID: sessionID)
+        SessionKillTracker.track {
+            await SessionDaemonClient.shared.kill(id: sessionID)
         }
     }
 
@@ -532,7 +643,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
         config.scale_factor = Double(window.backingScaleFactor)
 
-        guard let surfaceID = tab.registry.createSurface(app: app, config: config) else {
+        guard let surfaceID = createManagedSurface(
+            tab: tab, app: app, config: config,
+            passthroughPwd: nil, spawnCwd: activeTab?.pwd ?? NSHomeDirectory(), origin: .tab
+        ) else {
             logger.error("Failed to create surface for new tab")
             return
         }
@@ -657,8 +771,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         diffStates.removeValue(forKey: tabID)
         reviewStores.removeValue(forKey: tabID)
 
-        // Destroy all surfaces in the tab
+        // Destroy all surfaces in the tab (killing any persistent
+        // session each was attached to — an explicit tab close, unlike
+        // quitting the app, ends the session rather than detaching it)
         for surfaceID in tab.registry.allIDs {
+            killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
             tab.registry.destroySurface(surfaceID)
         }
 
@@ -720,7 +837,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
 
-        guard let surfaceID = tab.registry.createSurface(app: app, config: config) else {
+        guard let surfaceID = createManagedSurface(
+            tab: tab, app: app, config: config,
+            passthroughPwd: nil, spawnCwd: activeTab?.pwd ?? NSHomeDirectory(), origin: .tab
+        ) else {
             logger.error("Failed to create surface for new group")
             return
         }
@@ -788,9 +908,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             reviewStores.removeValue(forKey: tabID)
         }
 
-        // Destroy all surfaces in all tabs of this group
+        // Destroy all surfaces in all tabs of this group (killing any
+        // persistent sessions — see closeTab(id:)'s equivalent comment)
         for tab in group.tabs {
             for surfaceID in tab.registry.allIDs {
+                killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
                 tab.registry.destroySurface(surfaceID)
             }
         }
@@ -854,6 +976,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         for tab in group.tabs {
             for surfaceID in tab.registry.allIDs {
+                killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
                 tab.registry.destroySurface(surfaceID)
             }
         }
@@ -1136,6 +1259,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .calyxFocusSurface, object: nil)
         center.addObserver(self, selector: #selector(handleSurfaceDestroyedForAgentMonitor(_:)),
                            name: .calyxSurfaceDestroyed, object: nil)
+        center.addObserver(self, selector: #selector(handleShowChildExitedNotification(_:)),
+                           name: .ghosttyShowChildExited, object: nil)
     }
 
     // MARK: - Screen State Polling (Herdr Layer 2)
@@ -1226,7 +1351,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             config.scale_factor = Double(window.backingScaleFactor)
         }
 
-        guard let newSurfaceID = tab.registry.createSurface(app: app, config: config) else {
+        guard let newSurfaceID = createManagedSurface(
+            tab: tab, app: app, config: config,
+            passthroughPwd: nil, spawnCwd: tab.pwd ?? NSHomeDirectory(), inheritedCwd: tab.pwd, origin: .tab
+        ) else {
             logger.error("Failed to create split surface")
             return
         }
@@ -1248,20 +1376,44 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard let (owningTab, owningGroup) = findTab(for: surfaceView) else { return }
         guard let surfaceID = owningTab.registry.id(for: surfaceView) else { return }
 
-        // Surface-level cleanup: update split tree and destroy surface
-        let (newTree, focusTarget) = owningTab.splitTree.remove(surfaceID)
-        owningTab.registry.destroySurface(surfaceID)
-        owningTab.splitTree = newTree
+        // This notification fires for every ghostty-driven surface
+        // close, including a persistent-session pane whose user, having
+        // seen SessionReconnectCoordinator give up (or having decided
+        // not to wait), presses a key on the dead pane — ghostty's own
+        // close_surface callback then fires with process_alive=false
+        // (see SessionReconnectCoordinator.swift's header comment). In
+        // every case this notification fires, the pane is being
+        // explicitly torn down, so `closeSurfaceAndCleanUp` kills the
+        // underlying session the same as
+        // closeTab(id:)/closeActiveGroup()/closeAllTabsInGroup(id:) do.
+        closeSurfaceAndCleanUp(tab: owningTab, group: owningGroup, surfaceID: surfaceID)
+    }
+
+    /// Shared surface-teardown sequence: kill any persistent session
+    /// attached to `surfaceID`, remove the leaf from `tab`'s split
+    /// tree, destroy the surface, and — if that leaves the tab with no
+    /// leaves at all — remove the tab (closing the window if it was the
+    /// last one). Used by both `handleCloseSurfaceNotification` (a
+    /// ghostty-driven close, e.g. `exit` in a plain pane, or a key press
+    /// acknowledging a dead persistent-session pane) and
+    /// `closeDeadPersistentSessionSurface` (`SessionReconnectCoordinator`
+    /// confirming, via the daemon, that a persistent session's process
+    /// really did exit).
+    private func closeSurfaceAndCleanUp(tab: Tab, group: TabGroup, surfaceID: UUID) {
+        killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
+        let (newTree, focusTarget) = tab.splitTree.remove(surfaceID)
+        tab.registry.destroySurface(surfaceID)
+        tab.splitTree = newTree
 
         // If closeTab is handling this tab, skip tab removal (closeTab will do it)
-        if closingTabIDs.contains(owningTab.id) {
+        if closingTabIDs.contains(tab.id) {
             return
         }
 
         // Below runs only for process-initiated closes (e.g. `exit` command)
-        if owningTab.splitTree.isEmpty {
-            let wasActiveTab = (owningTab.id == activeTab?.id)
-            let result = windowSession.removeTab(id: owningTab.id, fromGroup: owningGroup.id)
+        if tab.splitTree.isEmpty {
+            let wasActiveTab = (tab.id == activeTab?.id)
+            let result = windowSession.removeTab(id: tab.id, fromGroup: group.id)
             if wasActiveTab {
                 switch result {
                 case .switchedTab, .switchedGroup:
@@ -1276,13 +1428,141 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             return
         }
 
-        if owningTab.id == activeTab?.id {
-            splitContainerView?.updateLayout(tree: owningTab.splitTree)
-            if let focusID = focusTarget, let focusView = owningTab.registry.view(for: focusID) {
+        if tab.id == activeTab?.id {
+            splitContainerView?.updateLayout(tree: tab.splitTree)
+            if let focusID = focusTarget, let focusView = tab.registry.view(for: focusID) {
                 window?.makeFirstResponder(focusView)
             }
             requestSave()
         }
+    }
+
+    // MARK: - Session Reconnect
+
+    /// `GHOSTTY_ACTION_SHOW_CHILD_EXITED` for a persistent-session
+    /// surface: hand off to `sessionReconnectCoordinator`, which queries
+    /// the daemon (macOS never reports a trustworthy exit code for this
+    /// action — see `SessionDaemonClient.swift`'s header comment) and
+    /// decides reconnect vs. close via `handleSessionReconnectDecision`.
+    /// A no-op for an ordinary (non-persistent-session) surface, since
+    /// the coordinator's own `surfaceMap.sessionID(for:)` lookup finds
+    /// nothing for one.
+    @objc private func handleShowChildExitedNotification(_ notification: Notification) {
+        guard let surfaceView = notification.object as? SurfaceView else { return }
+        guard belongsToThisWindow(surfaceView) else { return }
+        guard let surfaceID = findTab(for: surfaceView)?.0.registry.id(for: surfaceView) else { return }
+
+        Task { [weak self] in
+            await self?.sessionReconnectCoordinator.childExited(surfaceID: surfaceID)
+        }
+    }
+
+    private func handleSessionReconnectDecision(surfaceID: UUID, decision: SessionReconnectDecision) {
+        switch decision {
+        case .closePane:
+            closeDeadPersistentSessionSurface(surfaceID: surfaceID)
+        case .reconnect(let sessionID, let attempt):
+            scheduleReconnect(surfaceID: surfaceID, sessionID: sessionID, attempt: attempt)
+        }
+    }
+
+    /// The daemon confirmed the session's child process actually
+    /// exited — close the pane exactly as an ordinary ghostty-driven
+    /// close would (see `closeSurfaceAndCleanUp`'s doc comment).
+    private func closeDeadPersistentSessionSurface(surfaceID: UUID) {
+        guard let (tab, group) = findTabAndGroup(surfaceID: surfaceID) else { return }
+        closeSurfaceAndCleanUp(tab: tab, group: group, surfaceID: surfaceID)
+    }
+
+    /// Waits out `attempt`'s backoff delay, then re-attaches. A stale
+    /// `surfaceID` (the pane was closed by the user in the meantime) is
+    /// handled by `performReconnect`'s own `findTab` lookup coming back
+    /// `nil`.
+    private func scheduleReconnect(surfaceID: UUID, sessionID: String, attempt: Int) {
+        let delaySeconds = Self.reconnectBackoffSeconds(forAttempt: attempt)
+        Task { [weak self] in
+            if delaySeconds > 0 {
+                try? await Task.sleep(for: .seconds(delaySeconds))
+            }
+            self?.performReconnect(oldSurfaceID: surfaceID, sessionID: sessionID)
+        }
+    }
+
+    /// Re-runs `calyx-session attach --create` for `sessionID` in a
+    /// fresh surface, then swaps it in for `oldSurfaceID` everywhere
+    /// that referenced it: the split tree (`SplitTree.remapLeafIDs`,
+    /// the same contract `AppDelegate.restoreTabSurfaces` uses),
+    /// `tab.sessionRefs` (`remappingKeys`, so the next snapshot points
+    /// at the live leaf), and `SessionSurfaceMap` (`replaceSurface`).
+    /// `attach --create`'s idempotency is what makes this safe to retry
+    /// on a daemon that turned out to be merely unreachable rather than
+    /// truly gone.
+    ///
+    /// CRITICAL ordering (review finding): `SurfaceRegistry
+    /// .destroySurface(_:)` synchronously re-enters ghostty's
+    /// `close_surface` callback (`handleCloseSurfaceNotification` ->
+    /// `closeSurfaceAndCleanUp`) from inside `requestClose()`, *before*
+    /// this method returns. The remap/replace calls below run BEFORE
+    /// `destroySurface(oldSurfaceID)` specifically so that reentrant
+    /// call observes state that already points at `newSurfaceID`:
+    /// `SessionSurfaceMap.shared.sessionID(for: oldSurfaceID)` is
+    /// already `nil` (so `killSessionIfPersistent` naturally does not
+    /// kill), and `oldSurfaceID` is already absent from `tab.splitTree`
+    /// (so `SplitTree.remove(_:)` — verified by inspection — treats a
+    /// leaf ID it can't find as a no-op and returns an unchanged tree
+    /// with `focusTarget == nil`, so the reentrant `closeSurfaceAndCleanUp`
+    /// tail becomes a harmless redundant layout refresh, not tree
+    /// corruption). `reconnectingSurfaceIDs` adds a second, independent
+    /// layer of defense in `killSessionIfPersistent` regardless of this
+    /// ordering.
+    private func performReconnect(oldSurfaceID: UUID, sessionID: String) {
+        guard let tab = findTab(surfaceID: oldSurfaceID) else { return }
+        guard let app = GhosttyAppController.shared.app, let window = self.window else { return }
+        guard let command = SessionCommandSynthesizer.reattachCommand(sessionID: sessionID, cwd: tab.pwd ?? NSHomeDirectory()) else {
+            logger.error("No calyx-session binary resolvable; cannot reconnect session \(sessionID, privacy: .public)")
+            return
+        }
+
+        var config = GhosttyFFI.surfaceConfigNew()
+        config.scale_factor = Double(window.backingScaleFactor)
+
+        guard let newSurfaceID = tab.registry.createSurface(app: app, config: config, pwd: tab.pwd, command: command) else {
+            logger.error("Failed to create reconnect surface for session \(sessionID, privacy: .public)")
+            return
+        }
+
+        let mapping = [oldSurfaceID: newSurfaceID]
+        tab.splitTree = tab.splitTree.remapLeafIDs(mapping)
+        tab.sessionRefs = tab.sessionRefs.remappingKeys(mapping)
+        SessionSurfaceMap.shared.replaceSurface(old: oldSurfaceID, new: newSurfaceID)
+
+        reconnectingSurfaceIDs.insert(oldSurfaceID)
+        tab.registry.destroySurface(oldSurfaceID)
+        reconnectingSurfaceIDs.remove(oldSurfaceID)
+
+        // This session's attempt counter must reset now that the
+        // reconnect succeeded, so a later, unrelated disconnect on the
+        // new surface starts backing off from attempt 1 again.
+        sessionReconnectCoordinator.markEstablished(sessionID: sessionID)
+
+        if tab.id == activeTab?.id {
+            splitContainerView?.updateLayout(tree: tab.splitTree)
+            if let newView = tab.registry.view(for: newSurfaceID) {
+                window.makeFirstResponder(newView)
+            }
+        }
+        requestSave()
+    }
+
+    /// Exponential backoff for reconnect attempts, capped at 30s:
+    /// attempt 1 reconnects immediately (0s); attempts 2-6 wait
+    /// 1/2/4/8/16s; attempt 7+ waits the 30s cap. Keeps a persistently
+    /// unreachable daemon from spinning the pane in a tight retry loop
+    /// while still reconnecting instantly for the common case (the
+    /// attach process merely disconnected once).
+    private static func reconnectBackoffSeconds(forAttempt attempt: Int) -> Double {
+        guard attempt > 1 else { return 0 }
+        return min(30.0, pow(2.0, Double(attempt - 2)))
     }
 
     @objc private func handleGotoSplitNotification(_ notification: Notification) {
@@ -1765,6 +2045,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         for group in windowSession.groups {
             for tab in group.tabs where tab.registry.contains(surfaceID) {
                 return tab
+            }
+        }
+        return nil
+    }
+
+    /// Like `findTab(surfaceID:)`, but also returns the owning group —
+    /// needed by `closeDeadPersistentSessionSurface` to remove the tab
+    /// via `WindowSession.removeTab(id:fromGroup:)` when a persistent
+    /// session's pane closes and empties the tab's split tree.
+    private func findTabAndGroup(surfaceID: UUID) -> (Tab, TabGroup)? {
+        for group in windowSession.groups {
+            for tab in group.tabs where tab.registry.contains(surfaceID) {
+                return (tab, group)
             }
         }
         return nil

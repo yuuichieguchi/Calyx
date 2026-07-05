@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vt-sys",
+    "crates/vt",
+    "crates/proto",
+    "crates/daemon",
+    "crates/cli",
+]
+
+[workspace.package]
+edition = "2021"
+
+# Shared across the P2 session-daemon crates (proto/daemon/cli). Pinned
+# once here so all three resolve the same version.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+nix = { version = "0.31", features = ["fs", "term", "process", "signal", "socket", "ioctl", "user", "poll"] }
+ulid = { version = "1", features = ["serde"] }
+libc = "0.2"
+tempfile = "3"
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }

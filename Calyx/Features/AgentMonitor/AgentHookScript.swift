@@ -18,13 +18,14 @@ enum AgentHookScript {
         (AgentEndpointFile.defaultDirectory as NSString).appendingPathComponent("bin")
     }
 
-    /// `CALYX_SURFACE_ID` unset means this pane wasn't launched by Calyx
-    /// (e.g. a plain Terminal.app tab running `claude`) — exit
-    /// immediately so those instances are unaffected. `agent-endpoint.json`
-    /// is re-read on every invocation (rather than baked in at install
-    /// time) so a server restart or token rotation never leaves the hook
-    /// posting to a stale port/token. Every exit path is `exit 0`: a
-    /// failed or unreachable POST must never break the user's hook chain.
+    /// Both `CALYX_SURFACE_ID` and `CALYX_SESSION_ID` unset means this
+    /// pane wasn't launched by Calyx at all (e.g. a plain Terminal.app
+    /// tab running `claude`) — exit immediately so those instances are
+    /// unaffected. `agent-endpoint.json` is re-read on every invocation
+    /// (rather than baked in at install time) so a server restart or
+    /// token rotation never leaves the hook posting to a stale
+    /// port/token. Every exit path is `exit 0`: a failed or unreachable
+    /// POST must never break the user's hook chain.
     ///
     /// `$1` is the agent kind, forwarded as the `X-Calyx-Agent-Kind`
     /// header so the server can attribute the event to the right CLI.
@@ -33,6 +34,19 @@ enum AgentHookScript {
     /// by `ClaudeHooksConfigManager`), which invoke it with no arguments;
     /// `CodexHooksConfigManager` installs Codex's entries as
     /// `"<scriptPath>" codex` to pass `codex` explicitly.
+    ///
+    /// The `X-Calyx-Surface-ID` header value itself is
+    /// `${CALYX_SESSION_ID:-$CALYX_SURFACE_ID}`: a persistent-session
+    /// pane's calyx-session ID survives ghostty surface re-creation
+    /// (reconnect) while `CALYX_SURFACE_ID` does not, so `CALYX_SESSION_ID`
+    /// is preferred whenever set, falling back to the ordinary
+    /// `CALYX_SURFACE_ID` otherwise. The fail-open guard above checks
+    /// both variables (not just `CALYX_SURFACE_ID`) so a hypothetical
+    /// future caller that sets only `CALYX_SESSION_ID` still gets its
+    /// event forwarded, rather than the guard silently depending on an
+    /// invariant ("`CALYX_SESSION_ID` is only ever set alongside
+    /// `CALYX_SURFACE_ID`") that happens to hold today but isn't
+    /// enforced anywhere.
     static let scriptBody: String = """
     #!/bin/sh
     #
@@ -40,7 +54,7 @@ enum AgentHookScript {
     # Calyx's local Agent Monitor IPC endpoint. Installed and removed by
     # ClaudeHooksConfigManager / CodexHooksConfigManager.
 
-    if [ -z "$CALYX_SURFACE_ID" ]; then
+    if [ -z "$CALYX_SURFACE_ID" ] && [ -z "$CALYX_SESSION_ID" ]; then
         exit 0
     fi
 
@@ -61,7 +75,7 @@ enum AgentHookScript {
     curl -s -m 2 \\
         -X POST \\
         -H "Authorization: Bearer $token" \\
-        -H "X-Calyx-Surface-ID: $CALYX_SURFACE_ID" \\
+        -H "X-Calyx-Surface-ID: ${CALYX_SESSION_ID:-$CALYX_SURFACE_ID}" \\
         -H "X-Calyx-Agent-Kind: $kind" \\
         -H "Content-Type: application/json" \\
         --data-binary @- \\

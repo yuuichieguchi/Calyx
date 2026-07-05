@@ -51,6 +51,20 @@ targets:
           mkdir -p "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin"
           cp "${BUILT_PRODUCTS_DIR}/calyx" "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx"
         name: Bundle CalyxCLI
+      - script: |
+          set -e
+          SESSION_BIN="${PROJECT_DIR}/build/session/calyx-session"
+          if [ -f "$SESSION_BIN" ]; then
+            mkdir -p "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin"
+            cp "$SESSION_BIN" "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
+            chmod 0755 "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
+          elif [ "${CONFIGURATION}" = "Debug" ]; then
+            echo "warning: build/session/calyx-session not found — run scripts/build-session.sh to enable persistent sessions in this Debug build. Skipping (feature stays gated off)."
+          else
+            echo "error: build/session/calyx-session not found for a ${CONFIGURATION} build. Run scripts/build-session.sh before building Release."
+            exit 1
+          fi
+        name: Bundle Session Daemon
     info:
       path: Calyx/Info.plist
       properties:

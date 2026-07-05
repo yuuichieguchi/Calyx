@@ -1,0 +1,21 @@
+[package]
+name = "cli"
+version = "0.1.0"
+edition.workspace = true
+description = "calyx-session: thin CLI over the session daemon (daemon control, attach, and session management)."
+
+[[bin]]
+name = "calyx-session"
+path = "src/main.rs"
+
+[dependencies]
+proto = { path = "../proto" }
+daemon = { path = "../daemon" }
+clap = { workspace = true }
+ulid = { workspace = true }
+libc = { workspace = true }
+nix = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -645,10 +645,12 @@ final class SessionPersistenceTests: XCTestCase {
 
     // MARK: - Schema v5 — WindowSnapshot gains isFullScreen
 
-    /// currentSchemaVersion should be 5 for the v5 schema that introduces isFullScreen.
-    func test_v5_schema_version_is_5() {
-        XCTAssertEqual(SessionSnapshot.currentSchemaVersion, 5,
-                       "Schema version should be 5 after isFullScreen addition")
+    /// currentSchemaVersion should be 6 for the v6 schema that adds
+    /// TabSnapshot.sessionRefs (see SessionSnapshotV6Tests for the
+    /// field-level coverage) on top of v5's isFullScreen.
+    func test_v6_schema_version_is_6() {
+        XCTAssertEqual(SessionSnapshot.currentSchemaVersion, 6,
+                       "Schema version should be 6 after the sessionRefs addition")
     }
 
     /// WindowSnapshot should expose an isFullScreen property that stores the
