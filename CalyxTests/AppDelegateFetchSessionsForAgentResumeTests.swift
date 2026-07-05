@@ -69,10 +69,13 @@ final class AppDelegateFetchSessionsForAgentResumeTests: XCTestCase {
             await withCheckedContinuation { (_: CheckedContinuation<[SessionInfo], Never>) in
                 // Deliberately never resumed: this Task hangs for the
                 // rest of the process's life. Harmless here because
-                // `fetchSessionsForAgentResume`'s own spin loop is
-                // bounded by its own 2.0s deadline and gives up on it
-                // regardless (that bounded give-up is exactly the
-                // blocking behavior this test measures).
+                // `fetchSessionsForAgentResume` no longer spins
+                // synchronously waiting on it at all (R6-C); the shared
+                // `agentResumeSessionsTask` it starts is itself bounded
+                // (R8-D, r8-fix-spec.md: `listAllSessionsBounded`'s own
+                // ~5s deadline), so even a real caller awaiting that
+                // task's value still gets a terminal `[:]` result rather
+                // than hanging forever.
             }
         }
     }
@@ -92,7 +95,7 @@ final class AppDelegateFetchSessionsForAgentResumeTests: XCTestCase {
         appDelegate._sessionDaemonClientForTesting = NeverRespondingDaemonClient()
 
         let start = Date()
-        let result = appDelegate.fetchSessionsForAgentResume()
+        appDelegate.fetchSessionsForAgentResume()
         let elapsed = Date().timeIntervalSince(start)
 
         XCTAssertLessThan(elapsed, 0.5,
@@ -100,8 +103,11 @@ final class AppDelegateFetchSessionsForAgentResumeTests: XCTestCase {
                           "daemon round-trip, it took \(elapsed)s against an unresponsive fake daemon, " +
                           "which only happens if it is still synchronously spinning the run loop waiting " +
                           "for a result it should instead be awaiting asynchronously")
-        XCTAssertEqual(result, [:],
-                       "With no daemon response available synchronously, the immediate return value must " +
-                       "be empty, this method must not fabricate session info")
+        // G5 (r8-fix-spec.md): fetchSessionsForAgentResume returns Void
+        // now (its old return value was always [:], never meaningful);
+        // observe the shared task itself instead.
+        XCTAssertNotNil(appDelegate.agentResumeSessionsTask,
+                        "fetchSessionsForAgentResume must still start the shared fetch task even though it " +
+                        "no longer returns a synchronous result, callers await the task itself")
     }
 }

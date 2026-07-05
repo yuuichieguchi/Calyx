@@ -54,59 +54,42 @@ final class CalyxWindowControllerNonLastWindowCloseTests: XCTestCase {
 
     // MARK: - Fixture
 
-    private struct WindowCloseFixture {
-        let controller: CalyxWindowController
-        let tab: Tab
-        let trackedLeafID: UUID
-        let siblingLeafID: UUID
-        let sessionID: String
+    /// sessionIDs registered with `SessionSurfaceMap.shared` by
+    /// `makeFixture()`, unregistered in `tearDown` (R8-G item G2,
+    /// r8-fix-spec.md: the single cleanup pattern this file now shares
+    /// with `SessionReconnectGiveUpTests`, whose original discipline
+    /// this mirrors).
+    private var registeredSessionIDs: [String] = []
+
+    override func tearDown() {
+        for sessionID in registeredSessionIDs {
+            SessionSurfaceMap.shared.unregister(sessionID: sessionID)
+        }
+        registeredSessionIDs.removeAll()
+        super.tearDown()
     }
 
-    /// Two-pane, single-tab, single-group window: `trackedLeafID` carries
-    /// a `SessionRef` (registered in both `tab.sessionRefs` and
+    /// Two-pane, single-tab, single-group window (R8-G item G2,
+    /// r8-fix-spec.md: shared with `SessionReconnectGiveUpTests`, see
+    /// `TwoPaneSessionFixture`'s own header comment): `trackedLeafID`
+    /// carries a `SessionRef` (registered in both `tab.sessionRefs` and
     /// `SessionSurfaceMap.shared`); `siblingLeafID` is an ordinary,
     /// untracked pane, present only so the fixture isn't a degenerate
-    /// single-surface case. Mirrors `SessionReconnectGiveUpTests
-    /// .makeFixture()`.
-    private func makeFixture() -> WindowCloseFixture {
-        let registry = SurfaceRegistry()
-        let trackedLeafID = UUID()
-        let siblingLeafID = UUID()
-        registry._testInsert(view: SurfaceView(frame: .zero), id: trackedLeafID)
-        registry._testInsert(view: SurfaceView(frame: .zero), id: siblingLeafID)
-
-        let root = SplitNode.split(SplitData(
-            direction: .horizontal,
-            ratio: 0.5,
-            first: .leaf(id: trackedLeafID),
-            second: .leaf(id: siblingLeafID)
-        ))
-        let sessionID = "test-session-\(UUID().uuidString)"
-        let tab = Tab(
-            splitTree: SplitTree(root: root, focusedLeafID: trackedLeafID),
-            registry: registry,
-            sessionRefs: [trackedLeafID: SessionRef(sessionID: sessionID)]
-        )
-        SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: trackedLeafID)
-
-        let group = TabGroup(name: "Default", tabs: [tab], activeTabID: tab.id)
-        let session = WindowSession(groups: [group], activeGroupID: group.id)
-        let window = CalyxWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        let controller = CalyxWindowController(window: window, windowSession: session, restoring: true)
-        return WindowCloseFixture(
-            controller: controller, tab: tab,
-            trackedLeafID: trackedLeafID, siblingLeafID: siblingLeafID, sessionID: sessionID
-        )
+    /// single-surface case.
+    private func makeFixture() -> TwoPaneSessionFixture {
+        let fixture = makeTwoPaneSessionFixture()
+        registeredSessionIDs.append(fixture.sessionID)
+        return fixture
     }
 
-    private final class NoTerminateAppDelegate: AppDelegate {
-        override func removeWindowController(_ controller: CalyxWindowController) {}
-    }
+    /// R8-G item G3 (r8-fix-spec.md; verified behavior-neutral):
+    /// subclasses `ConfirmQuitMockAppDelegate` (R6-J) instead of
+    /// `AppDelegate` directly, consolidating this file's mock with the
+    /// rest of the suite's shared base. `ConfirmQuitMockAppDelegate`'s
+    /// `closingWouldTerminate` override (always `true`) is inert for
+    /// every test in this file: none of them drive `windowShouldClose`,
+    /// only `windowWillClose` directly, which never calls it.
+    private final class NoTerminateAppDelegate: ConfirmQuitMockAppDelegate {}
 
     private func withMockAppDelegate(_ mock: NoTerminateAppDelegate, _ body: () -> Void) {
         let original = NSApp.delegate
@@ -131,7 +114,6 @@ final class CalyxWindowControllerNonLastWindowCloseTests: XCTestCase {
     func test_windowWillClose_nonTerminatingClose_unregistersAndClearsPersistentSession() {
         let fixture = makeFixture()
         let mock = NoTerminateAppDelegate()
-        defer { SessionSurfaceMap.shared.unregister(sessionID: fixture.sessionID) }
 
         XCTAssertFalse(fixture.controller.isClosingForShutdown,
                       "Precondition: a plain, non-last-window red-button close never sets isClosingForShutdown " +
@@ -170,7 +152,6 @@ final class CalyxWindowControllerNonLastWindowCloseTests: XCTestCase {
         let mock = NoTerminateAppDelegate()
         mock._setApplicationTerminatingForTesting(true)
         fixture.controller.isClosingForShutdown = true
-        defer { SessionSurfaceMap.shared.unregister(sessionID: fixture.sessionID) }
 
         withMockAppDelegate(mock) {
             fixture.controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
@@ -181,5 +162,45 @@ final class CalyxWindowControllerNonLastWindowCloseTests: XCTestCase {
                       "the SessionSurfaceMap entry into the shutdown snapshot, not tear it down")
         XCTAssertNotNil(fixture.tab.sessionRefs[fixture.trackedLeafID],
                         "...and must preserve tab.sessionRefs too, so the next launch can restore/reattach it")
+    }
+
+    // MARK: - R8-C: one canonical termination discriminator
+
+    /// R8-C (r8-fix-spec.md; consolidates r7-verdicts.md's I1/A2/C2
+    /// dormant discriminator-mismatch finding): windowWillClose's outer
+    /// loop gates on isAppActuallyTerminating (app-level:
+    /// AppDelegate.isApplicationTerminating || isTerminationConfirmed),
+    /// but killSessionIfPersistent's inner SessionCloseKillPolicy call
+    /// passes isTerminating: isClosingForShutdown, this window's own,
+    /// narrower flag. No production call path sets isClosingForShutdown
+    /// true while the app is genuinely not terminating today (see
+    /// r7-verdicts.md R7-V2, REFUTED for that reason), but the mismatch
+    /// itself is real: with isClosingForShutdown true and the app NOT
+    /// terminating, the outer gate correctly decides to run the close
+    /// policy, but the inner policy independently reads its own
+    /// isClosingForShutdown (true) as "terminating" and refuses to
+    /// kill, leaving the persistent session's mapping in place even
+    /// though the outer gate already decided otherwise. This test locks
+    /// the invariant that both layers must read the SAME discriminator,
+    /// so this mismatch cannot silently resurface on a future call path.
+    func test_windowWillClose_isClosingForShutdownTrueButAppNotTerminating_stillKillsPersistentSession() {
+        let fixture = makeFixture()
+        let mock = NoTerminateAppDelegate()
+        fixture.controller.isClosingForShutdown = true
+
+        XCTAssertFalse(mock.isApplicationTerminating, "Precondition: the app is not terminating in this scenario")
+        XCTAssertFalse(mock.isTerminationConfirmed, "Precondition: termination has not been confirmed either")
+
+        withMockAppDelegate(mock) {
+            fixture.controller.windowWillClose(Notification(name: NSWindow.willCloseNotification))
+        }
+
+        XCTAssertNil(SessionSurfaceMap.shared.sessionID(for: fixture.trackedLeafID),
+                    "windowWillClose's outer 'is the app actually terminating' gate and the inner kill " +
+                    "policy must read the SAME discriminator: with isClosingForShutdown true but the app " +
+                    "genuinely not terminating, the outer gate already decided to run the close policy, the " +
+                    "inner policy must not independently refuse and leave this mapping in place")
+        XCTAssertNil(fixture.tab.sessionRefs[fixture.trackedLeafID],
+                    "...and must clear tab.sessionRefs too, matching the outer gate's kill decision")
     }
 }

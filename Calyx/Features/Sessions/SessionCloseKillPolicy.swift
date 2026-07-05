@@ -54,7 +54,7 @@ enum SessionCloseKillPolicy {
     }
 
     /// F9 (V10, WARNING, r4-fix-spec.md): detach semantics for the
-    /// detach-instead-of-kill paths (`session.detach`, `.giveUp`) —
+    /// detach-instead-of-kill paths (`session.detach`, `.giveUp`):
     /// the session keeps running headless, reattachable later, instead
     /// of being killed. Detach's own call site
     /// (`detachSessionIfPersistent`) previously checked only

@@ -119,11 +119,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     /// R6-D (r6-fix-spec.md): true once the app is genuinely quitting,
-    /// not just this window closing. Folds in
-    /// `AppDelegate.isTerminationConfirmed` (set by `windowShouldClose`'s
-    /// own last-window success path BEFORE `applicationShouldTerminate`
-    /// ever runs) together with `AppDelegate.isApplicationTerminating`
-    /// itself, since round-5 review (I2) found the per-window
+    /// not just this window closing. A thin forward (R8-C, r8-fix-
+    /// spec.md) to `AppDelegate.isTerminating`, the one canonical query
+    /// (see its own doc comment for why both of its component flags
+    /// participate): round-5 review (I2) found the per-window
     /// `isClosingForShutdown` flag alone is not a safe "app terminating"
     /// discriminator (`closeLastWindow` sets it even for a non-
     /// terminating close, see that flag's own doc comment). Used by
@@ -132,8 +131,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// tracking state into the snapshot exactly as before (app
     /// terminating).
     private var isAppActuallyTerminating: Bool {
-        guard let appDelegate = NSApp.delegate as? AppDelegate else { return false }
-        return appDelegate.isApplicationTerminating || appDelegate.isTerminationConfirmed
+        (NSApp.delegate as? AppDelegate)?.isTerminating ?? false
     }
 
     // MARK: - Computed Properties
@@ -542,11 +540,22 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// reuses `isClosingForShutdown`, which `AppDelegate
     /// .markAllControllersClosingForShutdown()` / `windowShouldClose`
     /// both set before any surface is destroyed).
-    private func killSessionIfPersistent(tab: Tab, surfaceID: UUID) {
+    ///
+    /// `isTerminating` (R8-C, r8-fix-spec.md; consolidates r7-
+    /// verdicts.md's I1/A2/C2 dormant discriminator-mismatch finding):
+    /// `nil` (every caller except `windowWillClose`'s teardown loop)
+    /// reads this window's own `isClosingForShutdown`, exactly as
+    /// before. `windowWillClose` passes its own already-computed
+    /// discriminator explicitly instead, so the outer "is the app
+    /// actually terminating" gate and this policy call always agree,
+    /// even in cases (a future call path, or a test) where
+    /// `isClosingForShutdown` and the app-level state happen to
+    /// disagree.
+    private func killSessionIfPersistent(tab: Tab, surfaceID: UUID, isTerminating: Bool? = nil) {
         let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID)
         guard SessionCloseKillPolicy.shouldKill(
             hasSession: sessionID != nil,
-            isTerminating: isClosingForShutdown,
+            isTerminating: isTerminating ?? isClosingForShutdown,
             isReconnectSwap: reconnectingSurfaceIDs.contains(surfaceID)
         ), let sessionID else {
             return
@@ -578,11 +587,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// teardown racing Cmd+Q could clear `SessionRef` before that
     /// snapshot is built, permanently losing this session's tracking
     /// even though it survives in the daemon.
-    private func detachSessionIfPersistent(tab: Tab, surfaceID: UUID) {
+    ///
+    /// `isTerminating`: see `killSessionIfPersistent`'s identical
+    /// parameter doc comment (R8-C, r8-fix-spec.md).
+    private func detachSessionIfPersistent(tab: Tab, surfaceID: UUID, isTerminating: Bool? = nil) {
         let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID)
         guard SessionCloseKillPolicy.shouldDetach(
             hasSession: sessionID != nil,
-            isTerminating: isClosingForShutdown,
+            isTerminating: isTerminating ?? isClosingForShutdown,
             isReconnectSwap: reconnectingSurfaceIDs.contains(surfaceID)
         ), let sessionID else {
             return
@@ -590,6 +602,24 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         SessionSurfaceMap.shared.unregister(sessionID: sessionID)
         tab.sessionRefs[surfaceID] = nil
         sessionReconnectCoordinator.markClosed(sessionID: sessionID)
+    }
+
+    /// R8-F (r8-fix-spec.md, item F1): shared per-tab teardown loop for
+    /// `closeTab`/`closeActiveGroup`/`closeAllTabsInGroup`/`windowWillClose`,
+    /// which used to each run their own copy of "kill every persistent
+    /// surface, then destroy it". `isTerminating` is passed straight
+    /// through to `killSessionIfPersistent` (R8-C): an explicit tab/
+    /// group close always passes `false` (never mid-quit at this point,
+    /// `isClosingForShutdown` is still unset here even for the last-
+    /// window case, see `closeLastWindow`'s own doc comment for when it
+    /// gets set); `windowWillClose` passes its own already-computed
+    /// `isAppActuallyTerminating`, so its outer gate and this loop's
+    /// inner kill decision always read the same value.
+    private func tearDownSurfaces(in tab: Tab, isTerminating: Bool) {
+        for surfaceID in tab.registry.allIDs {
+            killSessionIfPersistent(tab: tab, surfaceID: surfaceID, isTerminating: isTerminating)
+            tab.registry.destroySurface(surfaceID)
+        }
     }
 
     /// Pre-teardown quit-confirmation gate shared by every close path
@@ -1033,14 +1063,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         reviewStores.removeValue(forKey: tabID)
 
         // Destroy all surfaces in the tab, killing any persistent
-        // session each was attached to — an explicit tab close, unlike
-        // quitting the app, ends the session rather than detaching it.
-        // (`session.detach`/`session.kill` no longer route through this
-        // method — see `closeFocusedSessionSurface`.)
-        for surfaceID in tab.registry.allIDs {
-            killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
-            tab.registry.destroySurface(surfaceID)
-        }
+        // session each was attached to (R8-F, tearDownSurfaces): an
+        // explicit tab close, unlike quitting the app, ends the session
+        // rather than detaching it. (`session.detach`/`session.kill` no
+        // longer route through this method, see `closeFocusedSessionSurface`.)
+        tearDownSurfaces(in: tab, isTerminating: false)
 
         let result = windowSession.removeTab(id: tabID, fromGroup: group.id)
 
@@ -1164,12 +1191,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
 
         // Destroy all surfaces in all tabs of this group (killing any
-        // persistent sessions — see closeTab(id:)'s equivalent comment)
+        // persistent sessions, see closeTab(id:)'s equivalent comment,
+        // R8-F tearDownSurfaces)
         for tab in group.tabs {
-            for surfaceID in tab.registry.allIDs {
-                killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
-                tab.registry.destroySurface(surfaceID)
-            }
+            tearDownSurfaces(in: tab, isTerminating: false)
         }
 
         let result = windowSession.removeGroup(id: group.id)
@@ -1227,10 +1252,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
 
         for tab in group.tabs {
-            for surfaceID in tab.registry.allIDs {
-                killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
-                tab.registry.destroySurface(surfaceID)
-            }
+            tearDownSurfaces(in: tab, isTerminating: false)
         }
 
         let result = windowSession.removeGroup(id: groupID)
@@ -1711,7 +1733,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// caller that passes `true` without having actually inserted first
     /// would otherwise silently no-op (this method's own guard would
     /// never fire, but neither would the reentrancy protection it
-    /// exists for) — both current callers were verified correctly
+    /// exists for); both current callers were verified correctly
     /// paired (see round 5's I1 finding).
     private func closeSurfaceAndCleanUp(
         tab: Tab,
@@ -1871,15 +1893,31 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     /// R6-A (r6-fix-spec.md item 3): bails out entirely, without
     /// touching the queue, while this window or the app itself is
-    /// shutting down (`isShuttingDown`) — replaying on top of quit
+    /// shutting down (`isShuttingDown`): replaying on top of quit
     /// teardown that already preserved tracking state into the snapshot
-    /// is both unnecessary and dangerous (r5-verdicts.md V5). Otherwise
-    /// replays each event through the same `deferOrRun` primitive (for
-    /// `.childExited`/`.closeSurface`) or by re-entering the public
-    /// `handleSessionReconnectDecision` handler (for `.decision`, whose
-    /// own guards give re-deferral "for free"), so a replay landing
-    /// during a second, already-active modal re-defers instead of
-    /// applying early (item 4).
+    /// is both unnecessary and dangerous (r5-verdicts.md V5).
+    ///
+    /// R8-G item G4 (r8-fix-spec.md): all three cases below follow the
+    /// SAME single pattern, replaying exactly what a live, real-time
+    /// occurrence of that event would have done, with the SAME gating.
+    /// For `.decision`, that means calling the public
+    /// `handleSessionReconnectDecision` handler directly: its own
+    /// `isShuttingDown` guard re-applies "for free" before it re-enters
+    /// `deferOrRun`. For `.childExited`/`.closeSurface`, it means
+    /// calling their PRIVATE processing function
+    /// (`processChildExited`/`processCloseSurface`) wrapped in
+    /// `deferOrRun` here, rather than their `@objc` public handler
+    /// (`handleShowChildExitedNotification`/`handleCloseSurfaceNotification`),
+    /// since those need an actual `Notification` to unwrap and this
+    /// call site already has the unwrapped `SurfaceView`; that
+    /// difference is purely mechanical, NOT a gating difference, since
+    /// each public handler's own gating lives in the exact function this
+    /// replays: `processChildExited` re-checks `isShuttingDown` itself
+    /// (so it's exactly as gated as `handleShowChildExitedNotification`,
+    /// which calls nothing else first), and `handleCloseSurfaceNotification`
+    /// deliberately has NO `isShuttingDown` gate of its own (see its own
+    /// doc comment), so `processCloseSurface` having none either is the
+    /// SAME behavior, not a missing one.
     private func drainDeferredReconnectEvents() {
         guard !isShuttingDown else { return }
         guard !deferredReconnectEvents.isEmpty else { return }
@@ -1907,7 +1945,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     func handleSessionReconnectDecision(surfaceID: UUID, decision: SessionReconnectDecision) {
         // R6-A (r6-fix-spec.md item 3, r5-verdicts.md V5): bail out
         // entirely while this window or the app itself is shutting
-        // down, BEFORE even considering deferral — a decision arriving
+        // down, BEFORE even considering deferral: a decision arriving
         // (or replaying) once the app is genuinely terminating must
         // never be queued either, since windowWillClose's teardown
         // already preserved tracking state into the snapshot.
@@ -2007,7 +2045,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     ///
     /// R6-B (r6-fix-spec.md): the kept-pane (last-pane-everywhere)
     /// branch now also shows a persistent in-pane overlay (see
-    /// `showReconnectGiveUpOverlay`'s doc comment) — the macOS
+    /// `showReconnectGiveUpOverlay`'s doc comment): the macOS
     /// notification alone can silently vanish (permission not granted),
     /// and ghostty's own child-exited text is suppressed for this
     /// surface, leaving no other in-app signal.
@@ -2775,7 +2813,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             return false
         }
 
-        appDelegate.isTerminationConfirmed = true
+        // R8-A (r8-fix-spec.md; r7-verdicts.md R7-V1): re-checks
+        // closingWouldTerminate instead of trusting this method's own
+        // entry-time result above, a global event tap can toggle the
+        // quick terminal mid-modal (confirmQuitIfNeeded just ran one),
+        // making this close no longer terminating by the time control
+        // returns here. A no-op when it no longer would (see
+        // markTerminationConfirmedIfWouldTerminate's own doc comment);
+        // the window still closes either way (isClosingForShutdown/
+        // return true below are unaffected), only whether a LATER
+        // Cmd+Q silently skips its own confirm-quit prompt changes.
+        markTerminationConfirmedIfWouldTerminate()
         isClosingForShutdown = true
         return true
     }
@@ -2825,16 +2873,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // without kill/detach, so tracking state survives into the
         // snapshot for the next launch. `isAppActuallyTerminating`, not
         // the per-window `isClosingForShutdown`, is the discriminator
-        // (see each flag's own doc comment for why).
+        // (see each flag's own doc comment for why). R8-F
+        // (tearDownSurfaces) shares this loop's body with closeTab/
+        // closeActiveGroup/closeAllTabsInGroup; R8-C passes
+        // `appIsTerminating` straight through to it (rather than gating
+        // the call outside and letting the policy re-derive its own
+        // notion of "terminating" from `isClosingForShutdown` inside),
+        // so this outer gate and the inner kill decision always read
+        // the exact same value.
         let appIsTerminating = isAppActuallyTerminating
         for group in windowSession.groups {
             for tab in group.tabs {
-                for id in tab.registry.allIDs {
-                    if !appIsTerminating {
-                        killSessionIfPersistent(tab: tab, surfaceID: id)
-                    }
-                    tab.registry.destroySurface(id)
-                }
+                tearDownSurfaces(in: tab, isTerminating: appIsTerminating)
             }
         }
 

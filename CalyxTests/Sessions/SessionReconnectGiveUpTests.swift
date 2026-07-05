@@ -115,59 +115,20 @@ final class SessionReconnectGiveUpTests: XCTestCase {
         super.tearDown()
     }
 
-    /// Two-pane fixture: `trackedLeafID` carries a `SessionRef` (both in
-    /// `tab.sessionRefs` and `SessionSurfaceMap.shared`); `siblingLeafID`
-    /// is an ordinary, untracked pane. Two panes (rather than a single-
-    /// leaf tab) keep `closeSurfaceAndCleanUp`'s tab/window-removal
-    /// branch out of play — that cascade is normal, pre-existing
-    /// behavior exercised elsewhere, not this test's concern, and it
-    /// would otherwise invoke `window.close()`.
-    private struct Fixture {
-        let controller: CalyxWindowController
-        let tab: Tab
-        let trackedLeafID: UUID
-        let siblingLeafID: UUID
-        let sessionID: String
-    }
-
-    private func makeFixture() -> Fixture {
-        let registry = SurfaceRegistry()
-        let trackedLeafID = UUID()
-        let siblingLeafID = UUID()
-        registry._testInsert(view: SurfaceView(frame: .zero), id: trackedLeafID)
-        registry._testInsert(view: SurfaceView(frame: .zero), id: siblingLeafID)
-
-        let root = SplitNode.split(SplitData(
-            direction: .horizontal,
-            ratio: 0.5,
-            first: .leaf(id: trackedLeafID),
-            second: .leaf(id: siblingLeafID)
-        ))
-        let sessionID = "test-session-\(UUID().uuidString)"
-        let tab = Tab(
-            splitTree: SplitTree(root: root, focusedLeafID: trackedLeafID),
-            registry: registry,
-            sessionRefs: [trackedLeafID: SessionRef(sessionID: sessionID)]
-        )
-        SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: trackedLeafID)
-        registeredSessionIDs.append(sessionID)
-
-        let group = TabGroup(name: "Default", tabs: [tab], activeTabID: tab.id)
-        let session = WindowSession(groups: [group], activeGroupID: group.id)
-        let window = CalyxWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        let controller = CalyxWindowController(window: window, windowSession: session, restoring: true)
-        return Fixture(
-            controller: controller,
-            tab: tab,
-            trackedLeafID: trackedLeafID,
-            siblingLeafID: siblingLeafID,
-            sessionID: sessionID
-        )
+    /// Two-pane fixture (R8-G item G2, r8-fix-spec.md: shared with
+    /// `CalyxWindowControllerNonLastWindowCloseTests`, see
+    /// `TwoPaneSessionFixture`'s own header comment): `trackedLeafID`
+    /// carries a `SessionRef` (both in `tab.sessionRefs` and
+    /// `SessionSurfaceMap.shared`); `siblingLeafID` is an ordinary,
+    /// untracked pane. Two panes (rather than a single-leaf tab) keep
+    /// `closeSurfaceAndCleanUp`'s tab/window-removal branch out of play,
+    /// that cascade is normal, pre-existing behavior exercised
+    /// elsewhere, not this test's concern, and it would otherwise invoke
+    /// `window.close()`.
+    private func makeFixture() -> TwoPaneSessionFixture {
+        let fixture = makeTwoPaneSessionFixture()
+        registeredSessionIDs.append(fixture.sessionID)
+        return fixture
     }
 
     func test_giveUp_closesPaneDeterministically_leavesSiblingPaneIntact() {

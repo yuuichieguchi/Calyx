@@ -40,6 +40,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// life.
     private(set) var isApplicationTerminating = false
 
+    /// R8-C (r8-fix-spec.md; consolidates r7-verdicts.md's I1/A2/C2
+    /// dormant discriminator-mismatch finding): the ONE canonical "is
+    /// the app actually terminating" query, folding in both
+    /// `isApplicationTerminating` (set once `applicationShouldTerminate`
+    /// itself has decided to terminate) and `isTerminationConfirmed`
+    /// (set earlier, by `windowShouldClose`'s last-window success path,
+    /// for the whole window between that decision and
+    /// `applicationShouldTerminate` actually running, see that flag's
+    /// own doc comment for why `isClosingForShutdown` alone cannot
+    /// stand in for this: round-5 review (I2) found it set even for a
+    /// non-terminating close). Every reader that used to consult one or
+    /// the other ad hoc (`CalyxWindowController.isAppActuallyTerminating`,
+    /// `killSessionIfPersistent`/`detachSessionIfPersistent`'s
+    /// `isTerminating` parameter) must read THIS query instead, so the
+    /// outer "should this teardown preserve or tear down" gate and any
+    /// inner policy it drives always agree.
+    var isTerminating: Bool {
+        isApplicationTerminating || isTerminationConfirmed
+    }
+
     #if DEBUG
     /// Test seam (P4 round-6 fix RED phase): mirrors
     /// `_setConfirmingQuitForTesting`'s convention for `isApplicationTerminating`.
@@ -410,7 +430,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// F6: brings the window already hosting `sessionID`'s live surface
     /// to the front, instead of `attachWindow` creating a second one for
     /// the same session. Returns `true` once a live controller was found
-    /// and focused, `false` when the mapping was stale (see below) — the
+    /// and focused, `false` when the mapping was stale (see below); the
     /// caller (`attachWindow`) falls through to a fresh attach on `false`.
     ///
     /// R6-D (r6-fix-spec.md, sweep finding): when NO controller contains
@@ -1098,7 +1118,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var activate: (() -> Void)?
     }
 
-    private func restoreTabSurfaces(tab: Tab, app: ghostty_app_t, window: NSWindow) -> Bool {
+    /// Not `private` (P4 round-8 fix RED phase, T-B):
+    /// `AppDelegateRestoreTabSurfacesOwnershipTests`/
+    /// `AppDelegateOfferAgentResumePipelineBoundTests` call this directly
+    /// (with `_createSurfaceWithPwdHookForTesting` set, see that seam's
+    /// own doc comment on `createSurfaceWithPwd`) to drive its
+    /// partial-failure cleanup and per-surface agent-resume dispatch
+    /// deterministically, without a real, live ghostty surface, mirroring
+    /// `fetchSessionsForAgentResume`'s identical round-6 RED phase
+    /// precedent.
+    func restoreTabSurfaces(tab: Tab, app: ghostty_app_t, window: NSWindow) -> Bool {
         let oldLeafIDs = tab.splitTree.allLeafIDs()
         guard !oldLeafIDs.isEmpty else { return false }
 
@@ -1114,11 +1143,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         var mapping: [UUID: UUID] = [:]
+        // R8-D item 3 (H2, r8-fix-spec.md): collected here, fanned out
+        // through a single shared Task below instead of
+        // `createSurfaceWithPwd` spawning its own per-surface Task (see
+        // its own doc comment).
+        var agentResumeCandidates: [(tab: Tab, surfaceID: UUID, sessionID: String)] = []
 
         for oldID in oldLeafIDs {
-            guard let newID = createSurfaceWithPwd(tab: tab, app: app, window: window, oldLeafID: oldID) else {
+            guard let created = createSurfaceWithPwd(tab: tab, app: app, window: window, oldLeafID: oldID) else {
                 continue
             }
+            let newID = created.surfaceID
             mapping[oldID] = newID
             if let sessionRef = tab.sessionRefs[oldID] {
                 // R6-C (V4 constraint, r6-fix-spec.md): re-checked
@@ -1127,11 +1162,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // register call (this whole loop stays fully synchronous
                 // today, with no `await` in between, so no other
                 // MainActor call can interleave here, see
-                // fetchSessionsForAgentResume's doc comment) — abort
+                // fetchSessionsForAgentResume's doc comment); abort
                 // registering over an entry that appeared meanwhile
                 // rather than clobber it.
                 if SessionSurfaceMap.shared.surfaceID(for: sessionRef.sessionID) == nil {
                     SessionSurfaceMap.shared.register(sessionID: sessionRef.sessionID, surfaceID: newID)
+                }
+            }
+            if let agentResumeSessionID = created.agentResumeSessionID {
+                agentResumeCandidates.append((tab, newID, agentResumeSessionID))
+            }
+        }
+
+        // R8-D item 3 (H2): one shared Task awaits the shared fetch
+        // once and calls `offerAgentResume` for every reattached leaf
+        // from this single restore pass, an O(1) Task count regardless
+        // of how many persistent-session leaves this tab has.
+        if !agentResumeCandidates.isEmpty {
+            let candidates = agentResumeCandidates
+            let fetchTask = agentResumeSessionsTask
+            Task { [weak self] in
+                let sessions = await fetchTask?.value ?? [:]
+                for candidate in candidates {
+                    self?.offerAgentResume(
+                        tab: candidate.tab, surfaceID: candidate.surfaceID,
+                        sessionID: candidate.sessionID, sessions: sessions
+                    )
+                    #if DEBUG
+                    self?._createSurfaceWithPwdOfferAgentResumeCompletedHookForTesting?()
+                    #endif
                 }
             }
         }
@@ -1144,9 +1203,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // Partial failure: destroy any surfaces we created (undoing
-        // their SessionSurfaceMap registration too) and return false
+        // their SessionSurfaceMap registration too) and return false.
+        // R8-B (r8-fix-spec.md; r7-verdicts.md R7-V3): unregisters only
+        // when the mapping still actually points at THIS (failed)
+        // restore's own surface. A duplicate sessionID across two tabs
+        // (a corrupted/hand-edited sessions.json, explicitly in this
+        // function's own threat model, see the doc comment above)
+        // registers the FIRST tab's surface and skips the SECOND (the
+        // `== nil` guard above); without this check, the second tab's
+        // partial-failure cleanup would unregister the sessionID
+        // unconditionally, ripping the FIRST tab's still-live,
+        // already-succeeded mapping out from under it.
         for (oldID, newID) in mapping {
-            if let sessionRef = tab.sessionRefs[oldID] {
+            if let sessionRef = tab.sessionRefs[oldID],
+               SessionSurfaceMap.shared.surfaceID(for: sessionRef.sessionID) == newID {
                 SessionSurfaceMap.shared.unregister(sessionID: sessionRef.sessionID)
             }
             tab.registry.destroySurface(newID)
@@ -1155,9 +1225,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func fallbackCreateSurface(tab: Tab, app: ghostty_app_t, window: NSWindow) -> Bool {
-        guard let newID = createSurfaceWithPwd(tab: tab, app: app, window: window) else {
+        guard let created = createSurfaceWithPwd(tab: tab, app: app, window: window) else {
             return false
         }
+        let newID = created.surfaceID
         tab.splitTree = SplitTree(leafID: newID)
         // The whole original tree failed to restore, so none of the
         // old leaf UUIDs survive into this brand-new single-leaf tree —
@@ -1172,42 +1243,92 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// names a leaf that had a `SessionRef` in the snapshot
     /// (`tab.sessionRefs`, carried over by `Tab.init(snapshot:)`
     /// regardless of the current `SessionSettings
-    /// .persistentSessionsEnabled` toggle — a session that already
+    /// .persistentSessionsEnabled` toggle, a session that already
     /// exists in the daemon must not be orphaned just because the user
     /// has since turned the feature off), creates the surface with an
     /// attach command instead of a plain shell so `restoreTabSurfaces`
-    /// can reconnect it. `fallbackCreateSurface`'s single-surface,
-    /// whole-tree-failed path calls this with the default `oldLeafID:
-    /// nil`, so it always falls back to a plain passthrough surface —
-    /// matching this method's pre-feature behavior exactly for that
-    /// rare failure case (and never reaches `offerAgentResume` below,
-    /// since that needs a `sessionRefs` entry keyed by `oldLeafID`).
+    /// can reconnect it, returning the sessionID it reattached
+    /// alongside the new surfaceID so the caller can offer agent resume
+    /// for it (see `agentResumeSessionID`'s own doc comment).
+    /// `fallbackCreateSurface`'s single-surface, whole-tree-failed path
+    /// calls this with the default `oldLeafID: nil`, so it always falls
+    /// back to a plain passthrough surface (`agentResumeSessionID` is
+    /// always `nil` for that call, matching this method's pre-feature
+    /// behavior exactly for that rare failure case).
     ///
     /// R6-C (r6-fix-spec.md): no longer takes a `sessions` parameter.
-    /// The surface is created immediately, synchronously; `offerAgentResume`
-    /// runs inside its own fire-and-forget `Task` that awaits
-    /// `agentResumeSessionsTask`'s result first, so this method (and
-    /// its caller, `restoreTabSurfaces`) never waits on the daemon.
+    /// The surface is created immediately, synchronously; a caller that
+    /// gets a non-nil `agentResumeSessionID` back awaits
+    /// `agentResumeSessionsTask`'s result itself before calling
+    /// `offerAgentResume` (see `restoreTabSurfaces`'s R8-D/H2 fan-out),
+    /// so this method never waits on the daemon.
     private func createSurfaceWithPwd(
         tab: Tab, app: ghostty_app_t, window: NSWindow, oldLeafID: UUID? = nil
-    ) -> UUID? {
+    ) -> (surfaceID: UUID, agentResumeSessionID: String?)? {
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
 
         if let oldLeafID, let sessionRef = tab.sessionRefs[oldLeafID],
            let command = SessionCommandSynthesizer.reattachCommand(sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()) {
-            guard let surfaceID = tab.registry.createSurface(app: app, config: config, pwd: tab.pwd, command: command) else {
+            guard let surfaceID = createRegistrySurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: command, oldLeafID: oldLeafID) else {
                 return nil
             }
-            let sessionID = sessionRef.sessionID
-            let fetchTask = agentResumeSessionsTask
-            Task { [weak self] in
-                let sessions = await fetchTask?.value ?? [:]
-                self?.offerAgentResume(tab: tab, surfaceID: surfaceID, sessionID: sessionID, sessions: sessions)
-            }
-            return surfaceID
+            return (surfaceID, sessionRef.sessionID)
         }
-        return tab.registry.createSurface(app: app, config: config, pwd: tab.pwd)
+        guard let surfaceID = createRegistrySurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: nil, oldLeafID: oldLeafID) else {
+            return nil
+        }
+        return (surfaceID, nil)
+    }
+
+    #if DEBUG
+    /// Test seam (P4 round-8 fix RED phase, T-B/T-D): when non-nil,
+    /// called INSTEAD of the real `tab.registry.createSurface(...)` FFI
+    /// call inside `createRegistrySurface`, keyed by `oldLeafID` (`nil`
+    /// for the no-old-leaf/fallback path). Returns the UUID to report as
+    /// the newly created surface (simulating success), or `nil` to
+    /// simulate surface-creation failure for that one leaf, letting
+    /// `restoreTabSurfaces`'s partial-failure bookkeeping (and, R8-D/H2,
+    /// its shared agent-resume fan-out `Task`) be driven deterministically
+    /// without a real, live ghostty surface (confirmed unsafe from this
+    /// test host, see `_attachWindowCreationHookForTesting`'s doc comment
+    /// for the confirmed hang). Placed as the narrowest possible wrapper
+    /// around only the actually-unsafe call: everything around it (the
+    /// attach-command detection, the `offerAgentResume` dispatch) stays
+    /// real, unmodified production code. `nil` (the default) leaves
+    /// production behavior unchanged. DO NOT use from production code.
+    var _createSurfaceWithPwdHookForTesting: ((UUID?) -> UUID?)?
+
+    /// Test seam (P4 round-8 fix RED phase, T-D): when non-nil, called
+    /// once `restoreTabSurfaces`'s shared agent-resume fan-out `Task`
+    /// (R8-D/H2, r8-fix-spec.md; formerly a per-surface `Task` spawned
+    /// directly inside `createSurfaceWithPwd`, before that fan-out
+    /// consolidated it) has awaited `agentResumeSessionsTask`'s result
+    /// and called `offerAgentResume` for ONE reattached leaf, i.e. once
+    /// that leaf's pipeline reaches a terminal state, regardless of
+    /// whether `offerAgentResume` actually found a resumable session to
+    /// act on. Fires once per candidate leaf in the fan-out, not once
+    /// per restore pass. No such observable existed before this seam:
+    /// the fan-out `Task` is otherwise fire-and-forget, with nothing to
+    /// await from a test. `nil` (the default) leaves production
+    /// behavior unchanged. DO NOT use from production code.
+    var _createSurfaceWithPwdOfferAgentResumeCompletedHookForTesting: (() -> Void)?
+    #endif
+
+    /// Thin wrapper around the one actually-unsafe-to-test call
+    /// `createSurfaceWithPwd` makes (`tab.registry.createSurface`, a
+    /// real ghostty FFI surface), so `_createSurfaceWithPwdHookForTesting`
+    /// (see its own doc comment) can intercept exactly that call and
+    /// nothing else.
+    private func createRegistrySurface(
+        tab: Tab, app: ghostty_app_t, config: ghostty_surface_config_s, pwd: String?, command: String?, oldLeafID: UUID?
+    ) -> UUID? {
+        #if DEBUG
+        if let hook = _createSurfaceWithPwdHookForTesting {
+            return hook(oldLeafID)
+        }
+        #endif
+        return tab.registry.createSurface(app: app, config: config, pwd: pwd, command: command)
     }
 
     #if DEBUG
@@ -1229,17 +1350,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// R6-C (r6-fix-spec.md, r5-verdicts.md R5-blocking): the async
     /// fetch task `fetchSessionsForAgentResume()` starts, shared by
     /// every surface created during the SAME restore/attach pass so
-    /// `createSurfaceWithPwd` can await its result (inside its own
-    /// fire-and-forget `Task`, right before calling `offerAgentResume`)
-    /// instead of blocking on it. Overwritten by each new
-    /// `fetchSessionsForAgentResume()` call: `restoreSession`/`attachWindow`
-    /// each make exactly one call per pass (matching F10's original
-    /// "one `listAll()` per pass" intent), and
-    /// `restoreWindow`/`restoreTabSurfaces`/`createSurfaceWithPwd` read
-    /// this property synchronously afterward, within that same call
-    /// stack, before any later `fetchSessionsForAgentResume()` call
-    /// could replace it.
-    private var agentResumeSessionsTask: Task<[String: SessionInfo], Never>?
+    /// `restoreTabSurfaces`'s fan-out `Task` (R8-D/H2) can await its
+    /// result, right before calling `offerAgentResume`, instead of
+    /// blocking on it. `restoreSession`/`attachWindow` each make exactly
+    /// one call per pass (matching F10's original "one `listAll()` per
+    /// pass" intent); `restoreWindow`/`restoreTabSurfaces` read this
+    /// property synchronously afterward, within that same call stack.
+    ///
+    /// R8-D item 2 (H1, r8-fix-spec.md): no longer unconditionally
+    /// overwritten. `fetchSessionsForAgentResume()` reuses an already
+    /// in-flight task instead of starting a second daemon subprocess
+    /// for the same purpose (a `listAll()` round-trip reflects the
+    /// whole daemon-wide ledger regardless of which pass triggered it,
+    /// so an overlapping pass reusing a still-in-flight fetch from a
+    /// previous one is exactly as correct as waiting for a fresh one).
+    /// Not `private` (P4 round-8 fix RED phase, G5): exposed read-only
+    /// so `AppDelegateFetchSessionsForAgentResumeTests` can observe that
+    /// a task was actually started, now that
+    /// `fetchSessionsForAgentResume()` itself no longer returns a
+    /// meaningful synchronous result.
+    private(set) var agentResumeSessionsTask: Task<[String: SessionInfo], Never>?
+
+    /// R8-D item 1 (r8-fix-spec.md; r7-verdicts.md's "Unbounded await
+    /// (D1)" finding): the deadline `listAllSessionsBounded()` races the
+    /// real daemon round-trip against, so `agentResumeSessionsTask`
+    /// always reaches a terminal state even if the daemon never
+    /// responds at all. `AppDelegateOfferAgentResumePipelineBoundTests`'s
+    /// 8s `XCTWaiter` bound comfortably exceeds this.
+    private static let agentResumeFetchTimeoutSeconds: UInt64 = 5
 
     /// F10 (V11, WARNING, r4-fix-spec.md): starts (but does not wait
     /// for) the daemon's session list fetch, keyed by session ID, gated
@@ -1260,28 +1398,76 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// the opposite of this method's stated purpose. Now it only starts
     /// `agentResumeSessionsTask` and returns immediately; window/tab
     /// restoration proceeds without ever waiting on the daemon, and
-    /// `createSurfaceWithPwd` awaits `agentResumeSessionsTask` itself,
-    /// only where the result is actually needed. Always returns `[:]`
-    /// (no daemon response is available synchronously any more, this
-    /// method must not fabricate session info). Not `private` (round-6
-    /// RED phase): `AppDelegateFetchSessionsForAgentResumeTests` calls
-    /// this directly to measure that it no longer blocks, matching this
-    /// file's `offerAgentResume`/`attachWindow` direct-drive precedent.
-    @discardableResult
-    func fetchSessionsForAgentResume() -> [String: SessionInfo] {
+    /// `restoreTabSurfaces`'s fan-out `Task` (R8-D/H2) awaits
+    /// `agentResumeSessionsTask` itself, only where the result is
+    /// actually needed.
+    ///
+    /// G5 (r8-fix-spec.md): returns `Void`, not a dictionary. The old
+    /// return value was always `[:]` (no daemon response is ever
+    /// available synchronously), never a meaningful result to report;
+    /// `agentResumeSessionsTask` itself (see its own doc comment) is
+    /// what callers actually need. Not `private` (round-6 RED phase):
+    /// `AppDelegateFetchSessionsForAgentResumeTests` calls this directly
+    /// to measure that it no longer blocks, matching this file's
+    /// `offerAgentResume`/`attachWindow` direct-drive precedent.
+    func fetchSessionsForAgentResume() {
         guard SessionSettings.agentResumeEnabled else {
             agentResumeSessionsTask = nil
-            return [:]
+            return
         }
+        // R8-D item 2 (H1): reuse whatever fetch is already in flight
+        // rather than starting a second daemon subprocess for the
+        // identical purpose.
+        guard agentResumeSessionsTask == nil else { return }
+        #if DEBUG
+        let client = _sessionDaemonClientForTesting ?? SessionDaemonClient.shared
+        #else
+        let client = SessionDaemonClient.shared
+        #endif
         agentResumeSessionsTask = Task {
-            #if DEBUG
-            let sessions = await (_sessionDaemonClientForTesting ?? SessionDaemonClient.shared).listAll()
-            #else
-            let sessions = await SessionDaemonClient.shared.listAll()
-            #endif
-            return Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+            await AppDelegate.listAllSessionsBounded(client: client)
         }
-        return [:]
+    }
+
+    /// R8-D item 1 (r8-fix-spec.md; r7-verdicts.md's "Unbounded await
+    /// (D1)" finding): bounds the daemon round-trip to
+    /// `agentResumeFetchTimeoutSeconds`, completing with `[:]` if it
+    /// hasn't responded by then, so `agentResumeSessionsTask` always
+    /// reaches a terminal state.
+    ///
+    /// Deliberately NOT a `TaskGroup` race: `withTaskGroup` always
+    /// awaits every child task to completion before returning, even
+    /// after `cancelAll()` (cancellation is cooperative; an
+    /// unresponsive daemon's `listAll()`, awaiting a `CheckedContinuation`
+    /// nobody ever resumes, never observes it), which would make the
+    /// whole race hang exactly as long as the call it exists to bound.
+    /// Instead, two independent, unstructured `Task`s race to resume
+    /// `continuation` first, guarded by `resumed`; both closures run on
+    /// the MainActor (inherited from this `static` method's caller,
+    /// itself always called from `agentResumeSessionsTask`'s own
+    /// MainActor-isolated `Task`), so they can never execute
+    /// concurrently with each other, mirroring `applicationWillTerminate`'s
+    /// identical `killsDrained` pattern above, no lock needed. The loser
+    /// (almost always the real daemon call, on timeout) is abandoned,
+    /// not awaited: this function returns as soon as the winner resumes.
+    @MainActor
+    private static func listAllSessionsBounded(client: SessionDaemonClientProtocol) async -> [String: SessionInfo] {
+        let sessions = await withCheckedContinuation { (continuation: CheckedContinuation<[SessionInfo], Never>) in
+            var resumed = false
+            Task {
+                let result = await client.listAll()
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: result)
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: agentResumeFetchTimeoutSeconds * 1_000_000_000)
+                guard !resumed else { return }
+                resumed = true
+                continuation.resume(returning: [])
+            }
+        }
+        return Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
     }
 
     /// P4: once a reattached persistent-session surface exists, checks
