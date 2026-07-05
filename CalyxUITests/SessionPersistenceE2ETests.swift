@@ -44,6 +44,7 @@
 // spawning. That assumption needs empirical confirmation the first
 // time this test actually runs.
 
+import AppKit
 import XCTest
 
 final class SessionPersistenceE2ETests: CalyxUITestCase {
@@ -55,6 +56,15 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         ["-calyx.session.persistentSessionsEnabled", "YES"]
     }
 
+    /// Bundle identifier set ONLY on the `DebugUITesting` config used by
+    /// the `CalyxUITests` scheme's test action (see project.yml) —
+    /// deliberately distinct from production's `com.calyx.terminal` so
+    /// LaunchServices can never conflate a locally-installed production
+    /// Calyx.app with the app-under-test. Used below to independently
+    /// confirm the frontmost app is actually this test's own
+    /// app-under-test before any keystroke is sent.
+    private static let testAppBundleIdentifier = "com.calyx.terminal.e2e"
+
     /// Does NOT call `super.setUp()`: the base class's `setUp()`
     /// launches `app` immediately with its own environment, before a
     /// subclass would have any chance to set `HOME`/`CALYX_SESSION_BIN`
@@ -63,6 +73,19 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     /// suite needs.
     override func setUp() {
         continueAfterFailure = false
+
+        do {
+            guard try Self.isDeveloperModeEnabled() else {
+                XCTFail("Developer mode is not enabled; run `sudo DevToolsSecurity -enable` first, " +
+                         "then re-run this test. (Without it, XCUITest hangs waiting for an " +
+                         "automation-permission dialog instead of failing visibly.)")
+                return
+            }
+        } catch {
+            XCTFail("Could not check developer-mode status via `DevToolsSecurity -status`: \(error)")
+            return
+        }
+
         homeDir = NSTemporaryDirectory() + "CalyxSessionE2E-Home-\(UUID().uuidString)"
         sessionDir = NSTemporaryDirectory() + "CalyxSessionE2E-Session-\(UUID().uuidString)"
         try? FileManager.default.createDirectory(atPath: homeDir, withIntermediateDirectories: true)
@@ -77,7 +100,17 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     }
 
     override func tearDown() {
-        app.terminate()
+        // `app` may still be nil if setUp() bailed out early (developer
+        // mode disabled) before reaching `app = XCUIApplication()`.
+        if let app, app.state == .runningForeground {
+            XCTAssertEqual(
+                NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                Self.testAppBundleIdentifier,
+                "The app-under-test was no longer frontmost immediately before termination " +
+                "— investigate before trusting that this run's keystrokes stayed isolated."
+            )
+        }
+        app?.terminate()
         if let homeDir {
             try? FileManager.default.removeItem(atPath: homeDir)
         }
@@ -85,6 +118,24 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
             try? FileManager.default.removeItem(atPath: sessionDir)
         }
         super.tearDown()
+    }
+
+    /// Checks `DevToolsSecurity -status` so a missing automation
+    /// authorization fails this test immediately with a clear message
+    /// instead of hanging on an unattended permission dialog. Verified
+    /// output strings: "Developer mode is currently enabled." /
+    /// "...disabled." — the disabled string never contains "enabled" as
+    /// a substring, so this check is unambiguous either way.
+    private static func isDeveloperModeEnabled() throws -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/DevToolsSecurity")
+        process.arguments = ["-status"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        try process.run()
+        process.waitUntilExit()
+        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return output.contains("enabled")
     }
 
     /// Path to a pre-built `calyx-session` binary this test points
@@ -108,6 +159,64 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         app.launch()
     }
 
+    // MARK: - Keystroke-leak guards
+    //
+    // Layer-2 defense (see incident writeup in this file's header
+    // comment): even with bundle-ID isolation (project.yml's
+    // `DebugUITesting` config), these guards independently re-verify
+    // the app-under-test is actually frontmost immediately before any
+    // keystroke is sent, and fail the test rather than type blindly.
+
+    /// Activates `app` and fails the test immediately if it cannot be
+    /// confirmed as the actual frontmost app. Call before any action
+    /// that will send keyboard events.
+    private func ensureAppIsFrontmost(file: StaticString = #filePath, line: UInt = #line) {
+        app.activate()
+        let isFrontmost = NSPredicate { _, _ in
+            NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.testAppBundleIdentifier
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: isFrontmost, object: nil)
+        let result = XCTWaiter().wait(for: [expectation], timeout: 5)
+        guard result == .completed, app.state == .runningForeground else {
+            XCTFail(
+                "Refusing to proceed: could not confirm the app-under-test as frontmost " +
+                "(frontmost bundle ID: \(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "nil"), " +
+                "expected: \(Self.testAppBundleIdentifier), app.state: \(app.state)). " +
+                "Aborting to avoid leaking keystrokes to another app.",
+                file: file,
+                line: line
+            )
+            return
+        }
+    }
+
+    /// Sends `text` via `app.typeText` only after re-confirming,
+    /// immediately beforehand, that `app` is both running in the
+    /// foreground and the actual frontmost app system-wide. If either
+    /// check fails, fails the test instead of typing.
+    private func typeTextSafely(_ text: String, file: StaticString = #filePath, line: UInt = #line) {
+        guard app.state == .runningForeground else {
+            XCTFail(
+                "Refusing to type: app-under-test is not running in the foreground " +
+                "(state: \(app.state)). Aborting to avoid leaking keystrokes.",
+                file: file,
+                line: line
+            )
+            return
+        }
+        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.testAppBundleIdentifier else {
+            XCTFail(
+                "Refusing to type: frontmost app is " +
+                "\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "nil"), " +
+                "expected \(Self.testAppBundleIdentifier). Aborting to avoid leaking keystrokes.",
+                file: file,
+                line: line
+            )
+            return
+        }
+        app.typeText(text)
+    }
+
     // MARK: - Restart replay
 
     /// Full round trip: type a unique marker into a persistent-session
@@ -120,8 +229,9 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
 
         createNewTabViaMenu()
         waitFor(app.windows.firstMatch)
+        ensureAppIsFrontmost()
 
-        app.typeText("echo \(marker)\n")
+        typeTextSafely("echo \(marker)\n")
 
         let markerText = app.staticTexts.containing(NSPredicate(format: "value CONTAINS %@", marker)).firstMatch
         XCTAssertTrue(waitFor(markerText, timeout: 10), "The marker must appear in the pane after being echoed")

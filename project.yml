@@ -7,6 +7,20 @@ options:
   createIntermediateGroups: true
   generateEmptyDirectories: true
 
+# DebugUITesting is a debug-type config used ONLY by the CalyxUITests
+# scheme's test action (see schemes.CalyxUITests.test.config below), so
+# the Calyx.app built for UI testing gets an isolated
+# PRODUCT_BUNDLE_IDENTIFIER (com.calyx.terminal.e2e, set below on the
+# Calyx target) distinct from the production com.calyx.terminal used by
+# every other config. This prevents LaunchServices from ever conflating
+# a locally-installed production Calyx.app with the UI-test-built one,
+# which previously let XCUITest keystrokes leak into whichever app
+# LaunchServices considered the "real" com.calyx.terminal.
+configs:
+  Debug: debug
+  Release: release
+  DebugUITesting: debug
+
 settings:
   base:
     SWIFT_VERSION: "6.2"
@@ -106,6 +120,10 @@ targets:
         release:
           CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
           OTHER_CODE_SIGN_FLAGS: "--timestamp"
+        debuguitesting:
+          # Exact-match key (case-insensitive) against the "DebugUITesting"
+          # config name — applies ONLY to that config, not to Debug/Release.
+          PRODUCT_BUNDLE_IDENTIFIER: com.calyx.terminal.e2e
     dependencies:
       - framework: GhosttyKit.xcframework
         embed: false
@@ -171,8 +189,15 @@ schemes:
     test:
       config: Debug
       targets:
+        # CalyxUITests is deliberately excluded here: this scheme's test
+        # action only has one shared `config` for all listed targets, and
+        # that config (Debug) builds the app-under-test with the
+        # production PRODUCT_BUNDLE_IDENTIFIER. Running UI tests through
+        # this scheme would silently reintroduce the bundle-ID collision
+        # that the isolated `CalyxUITests` scheme (test.config:
+        # DebugUITesting) exists to prevent. Use the CalyxUITests scheme
+        # directly for UI tests.
         - CalyxTests
-        - CalyxUITests
   CalyxTests:
     build:
       targets:
@@ -188,7 +213,10 @@ schemes:
         Calyx: [run, test]
         CalyxUITests: test
     test:
-      config: Debug
+      # Builds the Calyx app-under-test with PRODUCT_BUNDLE_IDENTIFIER
+      # com.calyx.terminal.e2e (see the DebugUITesting config above),
+      # isolating it from the production com.calyx.terminal bundle ID.
+      config: DebugUITesting
       targets:
         - CalyxUITests
 
