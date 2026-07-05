@@ -313,59 +313,6 @@ struct SystemCommandRunner: LSPCommandRunner {
         )
     }
 
-    /// Thread-safe bridge between `withTaskCancellationHandler`'s
-    /// `onCancel` closure (which may run before the `Process` even
-    /// exists yet, concurrently with, or after it starts) and the
-    /// dispatch-queue block that actually launches it. Whichever side
-    /// observes the other's write first under `lock` is responsible for
-    /// calling `terminate()`: `cancel()` terminates directly if
-    /// `register(_:)` already ran; otherwise `register(_:)`'s return
-    /// value tells the launching side the task was already cancelled by
-    /// the time the process came into being, so it must terminate it
-    /// itself right after `process.run()` succeeds (calling
-    /// `terminate()` on an unlaunched `Process` is unsafe, so `cancel()`
-    /// alone must never do so). R14-D (r14-fix-spec.md): `terminate()`
-    /// below is also the watchdog timer's own termination path, so
-    /// `cancel()` and a natural timeout can never race each other
-    /// calling `Process.terminate()` unsynchronized.
-    private final class CancellationBridge: @unchecked Sendable {
-        private let lock = NSLock()
-        private var isCancelled = false
-        private var terminated = false
-        private var process: Process?
-
-        /// Called once, immediately after `process.run()` succeeds.
-        /// Returns whether the task was already cancelled by this
-        /// point.
-        func register(_ process: Process) -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            self.process = process
-            return isCancelled
-        }
-
-        func cancel() {
-            lock.lock()
-            isCancelled = true
-            lock.unlock()
-            terminate()
-        }
-
-        /// R14-D (r14-fix-spec.md): single terminate-once path shared
-        /// by both `cancel()` (Task cancellation) and the watchdog
-        /// timer (natural timeout) below, replacing the previous
-        /// unsynchronized two-thread `process.terminate()` call sites --
-        /// Foundation does not document `Process.terminate()` as safe
-        /// to call concurrently from two threads, so this removes that
-        /// unverified assumption entirely rather than relying on it.
-        func terminate() {
-            lock.lock()
-            guard !terminated, let proc = process else { lock.unlock(); return }
-            terminated = true
-            lock.unlock()
-            proc.terminate()
-        }
-    }
-
     /// Shared `Process`-spawning core for `run(...)` and `installRun(...)`.
     /// The only behavioural difference between the two public entry
     /// points is the `timeoutSeconds` value passed in here, so we keep a
@@ -377,7 +324,7 @@ struct SystemCommandRunner: LSPCommandRunner {
         environment: [String: String]?,
         timeoutSeconds: TimeInterval
     ) async throws -> CommandResult {
-        let cancellationBridge = CancellationBridge()
+        let cancellationBridge = ProcessCancellationBridge()
         // R12-A item 1 (r12-fix-spec.md): a plain `withCheckedThrowingContinuation`
         // never observes Swift Task cancellation, so `task.cancel()` on a
         // caller awaiting `run(...)` used to reach nothing -- the spawned
@@ -430,8 +377,10 @@ struct SystemCommandRunner: LSPCommandRunner {
                         // The task was already cancelled by the time
                         // this process launched; `cancel()` found
                         // nothing registered yet, so terminate it here
-                        // instead.
-                        process.terminate()
+                        // instead, through the same terminate-once lock
+                        // (R16-1, r16-fix-spec.md) rather than a second,
+                        // unsynchronized `process.terminate()` call site.
+                        cancellationBridge.terminate()
                     }
 
                     // Watchdog: terminate runaway children at `timeoutSeconds`,

@@ -1399,9 +1399,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// if the daemon never responds at all.
     /// `AppDelegateOfferAgentResumePipelineBoundTests`'s 15s `XCTWaiter`
     /// bound comfortably exceeds this (R10-C item 2/5, r10-fix-spec.md:
-    /// shared with `SessionBrowserModel.refresh()` as
-    /// `SessionDaemonClientProtocol.listAllBoundTimeoutSeconds`, one
-    /// constant instead of two ad hoc bounds).
+    /// shared with `SessionBrowserModel.refresh()` via `listAllBounded()`'s
+    /// `daemonQueryBoundTimeoutSeconds`. R14-B (r14-fix-spec.md) later gave
+    /// `sessionStateBounded(id:)`'s reconnect-decision path its own,
+    /// longer `sessionStateBoundTimeoutSeconds` instead of reusing this
+    /// one, so the low- and high-consequence callers now deliberately use
+    /// two separate bounds, not the single shared constant this comment
+    /// used to describe).
 
     /// F10 (V11, WARNING, r4-fix-spec.md): starts (but does not wait
     /// for) the daemon's session list fetch, keyed by session ID, gated

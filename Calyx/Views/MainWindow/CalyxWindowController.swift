@@ -66,6 +66,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// (R14-B's longer 15s `sessionStateBoundTimeoutSeconds` bound
     /// triples how long an orphaned one could linger).
     private var childExitedTasks: [UUID: Task<Void, Never>] = [:]
+    #if DEBUG
+    /// Test seam (P4 round-16 fix RED phase): read-only observability
+    /// into `childExitedTasks`, mirroring `_closingTabIDsForTesting`'s
+    /// naming/gating convention, so tests can await a tracked Task's
+    /// `.value` and then confirm it removed its own entry. DO NOT use
+    /// from production code.
+    var _childExitedTasksForTesting: [UUID: Task<Void, Never>] { childExitedTasks }
+    #endif
     private var hasMoreCommits = true
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
@@ -1890,7 +1898,16 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// intentionally preserves tracking state into the snapshot, so
     /// kicking off a fresh reconnect decision on top of that is both
     /// unnecessary and dangerous (r5-verdicts.md V5).
-    private func processChildExited(surfaceView: SurfaceView) {
+    ///
+    /// Not `private` (P4 round-16 fix RED phase, mirroring
+    /// `handleSessionReconnectDecision`'s own "Not `private`" doc
+    /// comment): `CalyxWindowControllerChildExitedTasksTests` calls
+    /// this directly to drive `childExitedTasks`'s insert without
+    /// needing a real `GHOSTTY_ACTION_SHOW_CHILD_EXITED` notification
+    /// and a `SurfaceView` actually attached to the window (which
+    /// `handleShowChildExitedNotification`'s `belongsToThisWindow`
+    /// guard would otherwise require).
+    func processChildExited(surfaceView: SurfaceView) {
         guard !isShuttingDown else { return }
         guard let surfaceID = findTab(for: surfaceView)?.0.registry.id(for: surfaceView) else { return }
 
@@ -1898,8 +1915,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // `childExitedTasks`, cancelled alongside its `diffTasks`/
         // `expandTasks` siblings in `windowWillClose`, instead of being
         // left as an untracked fire-and-forget `Task`.
+        //
+        // R16-2 (r16-fix-spec.md): cancel-before-replace guards against
+        // a same-key re-insert leaking the previous Task (cheap
+        // insurance even though surfaceIDs are one-shot in practice);
+        // the Task itself removes its own entry once it completes,
+        // mirroring `expandTasks[hash]`'s self-removing Task
+        // (`expandCommit(hash:)`) -- otherwise a completed entry is
+        // retained forever.
+        childExitedTasks[surfaceID]?.cancel()
         childExitedTasks[surfaceID] = Task { [weak self] in
-            await self?.sessionReconnectCoordinator.childExited(surfaceID: surfaceID)
+            guard let self else { return }
+            await self.sessionReconnectCoordinator.childExited(surfaceID: surfaceID)
+            self.childExitedTasks.removeValue(forKey: surfaceID)
         }
     }
 

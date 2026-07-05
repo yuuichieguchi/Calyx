@@ -159,44 +159,6 @@ enum GitService {
 
     // MARK: - Process Execution
 
-    /// Thread-safe bridge between `withTaskCancellationHandler`'s
-    /// `onCancel` closure and the dispatch-queue block that actually
-    /// spawns `git`, mirroring `SystemCommandRunner`'s own
-    /// `CancellationBridge` (R14-E, r14-fix-spec.md) -- including
-    /// routing the 10s watchdog's termination through the same
-    /// terminate-once lock below, not a second, unsynchronized
-    /// `process.terminate()` call site.
-    private final class CancellationBridge: @unchecked Sendable {
-        private let lock = NSLock()
-        private var isCancelled = false
-        private var terminated = false
-        private var process: Process?
-
-        /// Called once, immediately after `process.run()` succeeds.
-        /// Returns whether the task was already cancelled by this
-        /// point.
-        func register(_ process: Process) -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            self.process = process
-            return isCancelled
-        }
-
-        func cancel() {
-            lock.lock()
-            isCancelled = true
-            lock.unlock()
-            terminate()
-        }
-
-        func terminate() {
-            lock.lock()
-            guard !terminated, let proc = process else { lock.unlock(); return }
-            terminated = true
-            lock.unlock()
-            proc.terminate()
-        }
-    }
-
     /// Every public entry point above (`repoRoot`, `gitStatus`,
     /// `commitLog`, `commitFiles`, `fileDiff`) drives this with a
     /// read-only git subcommand (`status`, `log`, `diff-tree`, `diff`,
@@ -209,7 +171,7 @@ enum GitService {
             throw GitError.gitNotFound
         }
 
-        let cancellationBridge = CancellationBridge()
+        let cancellationBridge = ProcessCancellationBridge()
         // R14-E (r14-fix-spec.md): mirrors SystemCommandRunner
         // .runInternal's R12-A fix -- withTaskCancellationHandler makes
         // a caller's Task cancellation SIGTERM the spawned `git`
@@ -245,9 +207,11 @@ enum GitService {
                     if cancellationBridge.register(process) {
                         // Already cancelled by the time this process
                         // launched; `cancel()` found nothing registered
-                        // yet, so terminate it here instead (mirrors
-                        // SystemCommandRunner.runInternal).
-                        process.terminate()
+                        // yet, so terminate it here instead, through the
+                        // same terminate-once lock (R16-1,
+                        // r16-fix-spec.md) rather than a second,
+                        // unsynchronized `process.terminate()` call site.
+                        cancellationBridge.terminate()
                     }
 
                     var didTimeout = false

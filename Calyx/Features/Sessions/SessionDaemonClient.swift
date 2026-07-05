@@ -108,9 +108,20 @@ private final class SessionDaemonBoundedRaceBridge<T: Sendable>: @unchecked Send
         isCancelled = true
         let opTask = operationTask
         let toTask = timeoutTask
+        // R16-3 (r16-fix-spec.md): `register(...)` hasn't run yet when
+        // `continuation` is still nil, so its own already-cancelled
+        // branch (see `bounded(...)` below) is the one that will call
+        // `onTimeout()`, not this method -- calling it here too would
+        // invoke it twice (only the second call's result would actually
+        // resume anything, since `resume(with:)` alone is exactly-once,
+        // but `onTimeout()` itself is not idempotent to call). This
+        // lock is the sole arbiter of which side runs first, making the
+        // single call exactly-once by construction rather than documented.
+        let hasRegistered = continuation != nil
         lock.unlock()
         opTask?.cancel()
         toTask?.cancel()
+        guard hasRegistered else { return }
         resume(with: onTimeout())
     }
 }
@@ -242,7 +253,12 @@ extension SessionDaemonClientProtocol {
                     // Already cancelled by the time both arms were
                     // created and registered; cancel them and resume
                     // right away instead of waiting for either to
-                    // notice on its own.
+                    // notice on its own. R16-3 (r16-fix-spec.md): this
+                    // branch is the sole `onTimeout()` caller for this
+                    // race -- `bridge.cancel(onTimeout:)` skips its own
+                    // call when it ran before `register(...)` did (see
+                    // that method's own comment), so `onTimeout()` fires
+                    // exactly once, not twice.
                     opTask.cancel()
                     toTask.cancel()
                     bridge.resume(with: onTimeout())
