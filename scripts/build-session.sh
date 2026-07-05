@@ -56,6 +56,8 @@ echo "GVT_ZIG=$GVT_ZIG"
 )
 
 mkdir -p "$OUT_DIR"
+# rm before cp: same stale-code-signature-cache SIGKILL risk as the Bundle Session Daemon script in project.yml.
+rm -f "$OUT_DIR/calyx-session"
 cp "$SESSION_DIR/target/release/calyx-session" "$OUT_DIR/calyx-session"
 chmod 0755 "$OUT_DIR/calyx-session"
 

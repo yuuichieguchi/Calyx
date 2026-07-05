@@ -22,7 +22,12 @@ actor SessionPersistenceActor {
         if let testDir = ProcessInfo.processInfo.environment["CALYX_UITEST_SESSION_DIR"] {
             calyxDir = URL(fileURLWithPath: testDir, isDirectory: true)
         } else {
-            let homeDir = FileManager.default.homeDirectoryForCurrentUser
+            // SessionRootResolver is the single definition of the session
+            // root (see SessionRootResolver.swift); for a normal launch
+            // this resolves to the same real home as before. Custom-HOME
+            // launches now store snapshots under the resolved root
+            // instead (no migration; intentional).
+            let homeDir = URL(fileURLWithPath: SessionRootResolver().resolve(), isDirectory: true)
             calyxDir = homeDir.appendingPathComponent(".calyx", isDirectory: true)
         }
 

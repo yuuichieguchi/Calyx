@@ -63,6 +63,8 @@ targets:
         name: Copy Ghostty Resources
       - script: |
           mkdir -p "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin"
+          # rm before cp: same stale-code-signature-cache SIGKILL risk as the Bundle Session Daemon script below.
+          rm -f "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx"
           cp "${BUILT_PRODUCTS_DIR}/calyx" "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx"
         name: Bundle CalyxCLI
       - script: |

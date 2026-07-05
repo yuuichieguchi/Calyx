@@ -2361,14 +2361,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // later, unrelated disconnect still starts backing off from
         // attempt 1 again (`markEstablished`'s original purpose).
         //
-        // Cancel-before-replace mirrors `childExitedTasks`'s discipline
-        // above, keyed by newSurfaceID so two different reconnects never
-        // share a key. Re-checks `SessionSurfaceMap.shared.surfaceID(for:)`
-        // once the wait elapses: if this replacement was itself already
-        // swapped out again by a second reconnect within the grace
-        // window, that second attempt now owns the attempt count, and
-        // this stale confirmation must not wrongly reset it out from
-        // under an unrelated, still-in-progress retry.
+        // The `.cancel()` below is cheap insurance, not the real
+        // mechanism: newSurfaceID is a fresh UUID on every call, so this
+        // key was never registered before and the cancel never actually
+        // matches an in-flight task. Superseded grace tasks are not
+        // proactively cancelled; they are outlived and neutralized by
+        // the SessionSurfaceMap re-check once the wait elapses: if this
+        // replacement was itself already swapped out again by a second
+        // reconnect within the grace window,
+        // `SessionSurfaceMap.shared.surfaceID(for:)` no longer equals
+        // newSurfaceID, so that second attempt now owns the attempt
+        // count, and this stale confirmation must not wrongly reset it
+        // out from under an unrelated, still-in-progress retry.
         reconnectEstablishGraceTasks[newSurfaceID]?.cancel()
         reconnectEstablishGraceTasks[newSurfaceID] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(Self.reconnectEstablishGraceMilliseconds))

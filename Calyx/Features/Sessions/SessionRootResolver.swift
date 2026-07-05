@@ -4,15 +4,15 @@
 // Resolves the on-disk session root ($HOME/.calyx: run/sessiond.sock,
 // state/) that the Rust calyx-session daemon/CLI derives from the
 // literal HOME env var at process start (see
-// calyx-session/crates/daemon/src/session.rs's default_home_subdir).
-// This is THE single definition of that root on the Swift side —
+// calyx-session/crates/cli/src/commands/mod.rs:74's default_home_subdir).
+// This is THE single definition of that root on the Swift side --
 // mirroring SessionBinaryResolver's own role of being the one place
 // SessionSpawnPlanner and SessionDaemonClient agree on the
-// calyx-session binary path — so every consumer must receive its
+// calyx-session binary path -- so every consumer must receive its
 // resolved value explicitly (SessionCommandSynthesizer's synthesized
 // attach command, SessionDaemonClient's query environment) rather than
 // re-deriving home independently. In particular, never substitute
-// FileManager.homeDirectoryForCurrentUser here — that API ignores HOME
+// FileManager.homeDirectoryForCurrentUser here -- that API ignores HOME
 // entirely, which is exactly the mismatch this type exists to close.
 
 import Foundation

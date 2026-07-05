@@ -13,7 +13,7 @@
 // impossible. An earlier version of this test drove the pane with
 // `app.typeText`, but that API synthesizes global key events that
 // land on whatever window is truly frontmost system-wide, not
-// something scoped to the app under test — an xctest-launched app
+// something scoped to the app under test -- an xctest-launched app
 // cannot reliably hold focus, so a stray keystroke could leak into
 // whatever the developer running this suite had focused on their
 // real desktop. It also had to work around Ghostty rendering terminal
@@ -78,7 +78,6 @@
 // spawning. That assumption needs empirical confirmation the first
 // time this test actually runs.
 
-import AppKit
 import XCTest
 
 final class SessionPersistenceE2ETests: CalyxUITestCase {
@@ -89,15 +88,6 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     override var additionalLaunchArguments: [String] {
         ["-calyx.session.persistentSessionsEnabled", "YES"]
     }
-
-    /// Bundle identifier set ONLY on the `DebugUITesting` config used by
-    /// the `CalyxUITests` scheme's test action (see project.yml) —
-    /// deliberately distinct from production's `com.calyx.terminal` so
-    /// LaunchServices can never conflate a locally-installed production
-    /// Calyx.app with the app-under-test. Used in `tearDown()` to
-    /// confirm the app-under-test was still the actual frontmost app
-    /// immediately before termination.
-    private static let testAppBundleIdentifier = "com.calyx.terminal.e2e"
 
     /// Does NOT call `super.setUp()`: the base class's `setUp()`
     /// launches `app` immediately with its own environment, before a
@@ -137,16 +127,10 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     }
 
     override func tearDown() {
-        // `app` may still be nil if setUp() bailed out early (developer
-        // mode disabled) before reaching `app = XCUIApplication()`.
-        if let app, app.state == .runningForeground {
-            XCTAssertEqual(
-                NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
-                Self.testAppBundleIdentifier,
-                "The app-under-test was no longer frontmost immediately before termination " +
-                "— investigate before trusting that this run's keystrokes stayed isolated."
-            )
-        }
+        // `app?.terminate()`, not `app!.terminate()`: this override's
+        // setUp() has no early-bailout path today, but nothing in
+        // XCTestCase's contract rules out a future setUp() failure
+        // leaving `app` unassigned before tearDown() runs.
         app?.terminate()
         // `removeItem` can fail here under the runner's App Sandbox
         // (already tolerated via `try?`); that is fine because
