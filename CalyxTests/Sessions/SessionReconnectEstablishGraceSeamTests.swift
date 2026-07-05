@@ -179,6 +179,18 @@ final class SessionReconnectEstablishGraceSeamTests: XCTestCase {
         let newSurfaceID = UUID()
         fixture.tab.registry._testInsert(view: SurfaceView(frame: .zero), id: newSurfaceID)
         fixture.controller._performReconnectSurfaceCreationHookForTesting = { newSurfaceID }
+        // Round-18 G6: establishment now also requires
+        // `reconnectGraceProbe(sessionID:)` to report `.established`. This
+        // test drives a real `performReconnect` against `/usr/bin/true`
+        // and never registers `sessionID` with any real or fake daemon
+        // ledger, so the real, un-hooked probe fallback would find no
+        // matching session and report `.notEstablished` under fail-closed
+        // semantics, breaking this test's expectation that the count
+        // eventually resets. Stub the probe to isolate this test's actual
+        // subject (the grace-period wait/surface-identity check) from G6's
+        // separate probe contract, which `SessionReconnectGracePositiveSignalSeamTests`
+        // covers directly.
+        fixture.controller._reconnectGraceProbeForTesting = { .established }
 
         fixture.controller.handleSessionReconnectDecision(
             surfaceID: fixture.trackedLeafID,

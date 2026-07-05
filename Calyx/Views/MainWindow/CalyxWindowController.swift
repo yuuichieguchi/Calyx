@@ -24,6 +24,20 @@ enum CalyxWindowControllerReconnectGraceOverrides {
 }
 #endif
 
+/// Round-18 finding G6: what `performReconnect`'s grace `Task` learns from
+/// `reconnectGraceProbe(sessionID:)` before calling `markEstablished`. Time
+/// alone (the grace-period wait) plus surface identity alone is not
+/// positive evidence the replacement is actually connected -- an attach
+/// process that dies SLOWER than the grace window keeps resetting the
+/// attempt count every cycle without ever advancing it, so `.giveUp` never
+/// fires. `.established` requires the daemon to report the session
+/// `Running` with at least one attached client; anything else, including a
+/// probe failure, is `.notEstablished`.
+enum ReconnectGraceProbeResult: Sendable, Equatable {
+    case established
+    case notEstablished
+}
+
 @MainActor
 class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private(set) var windowSession: WindowSession
@@ -130,6 +144,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// timing under test, remains real, unmodified production code. DO
     /// NOT use from production code.
     var _performReconnectSurfaceCreationHookForTesting: (() -> UUID?)?
+
+    /// Test seam (round-18 G6 RED phase): when non-nil, called INSTEAD of
+    /// the real `SessionDaemonClient.shared.listAllBounded()` daemon query
+    /// inside `reconnectGraceProbe(sessionID:)`, mirroring
+    /// `_performReconnectSurfaceCreationHookForTesting`'s exact
+    /// hook-first/real-fallback style. A throwing hook is fail-closed by
+    /// construction: `reconnectGraceProbe(sessionID:)` treats it exactly
+    /// like an explicit `.notEstablished` answer. `nil` (the default)
+    /// leaves production behavior unchanged. DO NOT use from production
+    /// code.
+    var _reconnectGraceProbeForTesting: (() async throws -> ReconnectGraceProbeResult)?
 
     /// Test seam: read-only access to `sessionReconnectCoordinator`,
     /// mirroring `_childExitedTasksForTesting`'s/`_closingTabIDsForTesting`'s
@@ -2319,6 +2344,38 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         return tab.registry.createSurface(app: app, config: config, pwd: pwd, command: command)
     }
 
+    /// Round-18 G6: positive-evidence check `performReconnect`'s grace
+    /// `Task` consults immediately before `markEstablished`, alongside
+    /// (not instead of) the existing surface-identity check -- see that
+    /// call site's doc comment for why time and surface identity alone
+    /// are insufficient. Mirrors `createReconnectSurface`'s
+    /// hook-first/real-fallback shape: under `#if DEBUG`, a set
+    /// `_reconnectGraceProbeForTesting` hook is consulted first, with a
+    /// throwing hook collapsed to `.notEstablished` (fail-closed) rather
+    /// than propagated. The real fallback reuses the existing bounded
+    /// `listAllBounded()` race (already used by
+    /// `SessionBrowserModel.refresh()`/`AppDelegate
+    /// .fetchSessionsForAgentResume()`) against the same
+    /// `SessionDaemonClient.shared` singleton `sessionReconnectCoordinator`
+    /// already wires in, rather than adding a second daemon-query
+    /// primitive. `.established` requires a matching `SessionInfo` whose
+    /// `state == .running` AND `attachedClients >= 1`; a missing match,
+    /// `.exited`, zero attached clients, or `listAllBounded()`'s own
+    /// already-bounded degrade-to-`[]` all fall through to
+    /// `.notEstablished` for free.
+    private func reconnectGraceProbe(sessionID: String) async -> ReconnectGraceProbeResult {
+        #if DEBUG
+        if let hook = _reconnectGraceProbeForTesting {
+            return (try? await hook()) ?? .notEstablished
+        }
+        #endif
+        let sessions = await SessionDaemonClient.shared.listAllBounded()
+        guard let match = sessions.first(where: { $0.id == sessionID }) else {
+            return .notEstablished
+        }
+        return (match.state == .running && match.attachedClients >= 1) ? .established : .notEstablished
+    }
+
     private func performReconnect(oldSurfaceID: UUID, sessionID: String) {
         guard let tab = findTab(surfaceID: oldSurfaceID) else { return }
         guard let app = GhosttyAppController.shared.app, let window = self.window else { return }
@@ -2361,6 +2418,21 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // later, unrelated disconnect still starts backing off from
         // attempt 1 again (`markEstablished`'s original purpose).
         //
+        // Round-18 finding G6: time alone still proved insufficient -- an
+        // attach process that dies SLOWER than the grace window (e.g. a
+        // ~2.5s die/respawn cycle against a daemon that keeps answering
+        // `.running`/`.unreachable`) got its attempt count reset every
+        // single cycle by the surface-identity check alone, since the
+        // surface itself was never swapped out again in that scenario.
+        // The count never advanced past 1, so `.giveUp` never fired: an
+        // unbounded reconnect loop at roughly the grace window's own
+        // cadence. Establishment now also requires
+        // `reconnectGraceProbe(sessionID:)` to report the daemon sees the
+        // session running with at least one attached client. A probe
+        // failure is fail-closed: skipping a legitimate reset only delays
+        // backoff recovery, while wrongly resetting reopens the unbounded
+        // loop.
+        //
         // The `.cancel()` below is cheap insurance, not the real
         // mechanism: newSurfaceID is a fresh UUID on every call, so this
         // key was never registered before and the cancel never actually
@@ -2377,7 +2449,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         reconnectEstablishGraceTasks[newSurfaceID] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(Self.reconnectEstablishGraceMilliseconds))
             guard let self else { return }
-            if !Task.isCancelled, SessionSurfaceMap.shared.surfaceID(for: sessionID) == newSurfaceID {
+            if !Task.isCancelled, SessionSurfaceMap.shared.surfaceID(for: sessionID) == newSurfaceID,
+               await self.reconnectGraceProbe(sessionID: sessionID) == .established {
                 self.sessionReconnectCoordinator.markEstablished(sessionID: sessionID)
             }
             self.reconnectEstablishGraceTasks.removeValue(forKey: newSurfaceID)
