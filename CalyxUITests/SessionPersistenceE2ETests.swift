@@ -74,24 +74,23 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     override func setUp() {
         continueAfterFailure = false
 
-        if !Self.isManualAuthMode {
-            do {
-                guard try Self.isDeveloperModeEnabled() else {
-                    XCTFail("Developer mode is not enabled; run `sudo DevToolsSecurity -enable` first, " +
-                             "then re-run this test. (Without it, XCUITest hangs waiting for an " +
-                             "automation-permission dialog instead of failing visibly.) Alternatively, " +
-                             "for an attended run where you will manually approve the automation " +
-                             "dialog yourself, set CALYX_E2E_MANUAL_AUTH=1.")
-                    return
-                }
-            } catch {
-                XCTFail("Could not check developer-mode status via `DevToolsSecurity -status`: \(error)")
-                return
-            }
-        }
-
-        homeDir = NSTemporaryDirectory() + "CalyxSessionE2E-Home-\(UUID().uuidString)"
-        sessionDir = NSTemporaryDirectory() + "CalyxSessionE2E-Session-\(UUID().uuidString)"
+        // Short root REQUIRED: the daemon's socket lives at
+        // $HOME/.calyx/run/sessiond.sock (see
+        // `calyx-session/crates/cli/src/commands/mod.rs`'s
+        // `default_home_subdir`, which joins the literal `HOME` env var
+        // with no canonicalization), and macOS's sockaddr_un limits
+        // `sun_path` to 104 bytes (SUN_LEN). NSTemporaryDirectory()
+        // (`/var/folders/.../T/...`) is long enough on its own to blow
+        // past that limit once `.calyx/run/sessiond.sock` is appended.
+        // Do NOT move this back to NSTemporaryDirectory(). Worst case
+        // here: "/tmp/cxe2e-" (11 bytes) + 8-char UUID prefix (8 bytes)
+        // + "-h" (2 bytes) = 21 bytes for homeDir, plus
+        // "/.calyx/run/sessiond.sock" (25 bytes) = 46 bytes total,
+        // comfortably under the 104-byte SUN_LEN limit.
+        let homeSuffix = String(UUID().uuidString.prefix(8))
+        let sessionSuffix = String(UUID().uuidString.prefix(8))
+        homeDir = "/tmp/cxe2e-\(homeSuffix)-h"
+        sessionDir = "/tmp/cxe2e-\(sessionSuffix)-s"
         try? FileManager.default.createDirectory(atPath: homeDir, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(atPath: sessionDir, withIntermediateDirectories: true)
 
@@ -122,41 +121,6 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
             try? FileManager.default.removeItem(atPath: sessionDir)
         }
         super.tearDown()
-    }
-
-    /// When set to `"1"` in the test runner process's environment (via
-    /// `ProcessInfo.processInfo.environment`, the same mechanism
-    /// `CALYX_SESSION_BIN` uses above), skips the developer-mode
-    /// fail-fast entirely (`isDeveloperModeEnabled()` is not called)
-    /// and proceeds straight to launching `app`.
-    ///
-    /// This is for ATTENDED runs only: a human sitting at the machine
-    /// who will manually approve the automation-permission dialog
-    /// XCUITest triggers on first keystroke/query. Unattended/CI runs
-    /// must NOT set this: without developer mode enabled, such a run
-    /// would hang indefinitely waiting for a dialog nobody is present
-    /// to approve.
-    private static var isManualAuthMode: Bool {
-        ProcessInfo.processInfo.environment["CALYX_E2E_MANUAL_AUTH"] == "1"
-    }
-
-    /// Checks `DevToolsSecurity -status` so a missing automation
-    /// authorization fails this test immediately with a clear message
-    /// instead of hanging on an unattended permission dialog. Verified
-    /// output strings: "Developer mode is currently enabled." /
-    /// "...disabled." — the disabled string never contains "enabled" as
-    /// a substring, so this check is unambiguous either way. Not called
-    /// at all when `isManualAuthMode` is true (see above).
-    private static func isDeveloperModeEnabled() throws -> Bool {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/sbin/DevToolsSecurity")
-        process.arguments = ["-status"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        try process.run()
-        process.waitUntilExit()
-        let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        return output.contains("enabled")
     }
 
     /// Path to a pre-built `calyx-session` binary this test points
