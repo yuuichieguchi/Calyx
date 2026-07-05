@@ -125,8 +125,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         BrowserServer.shared.start()
         NSApp.servicesProvider = self
 
-        let isUITesting = ProcessInfo.processInfo.arguments.contains("--uitesting")
-        if isUITesting || !restoreSession() {
+        // No `--uitesting` bypass here: `restoreSession()` returns false
+        // whenever there is no snapshot to restore (see its guard against
+        // a nil or empty-`windows` snapshot), and every UI test launches
+        // with a fresh, never-before-used `CALYX_UITEST_SESSION_DIR`
+        // (`CalyxUITestCase.setUp`), so this always falls through to
+        // `createNewWindow()` exactly as before for every existing test.
+        // Only a test that relaunches with the SAME session dir (the
+        // persistence E2E suite) can find a snapshot and take the
+        // restore path, which is required for the restored pane to
+        // reattach to its pre-restart session instead of a fresh one
+        // being created.
+        if !restoreSession() {
             if pendingURLs.isEmpty {
                 createNewWindow()
             }
