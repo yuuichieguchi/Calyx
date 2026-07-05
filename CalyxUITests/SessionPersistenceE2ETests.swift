@@ -2,10 +2,26 @@
 // CalyxUITests
 //
 // End-to-end coverage for the persistent-session pipeline: a shell
-// command run in a persistent-session pane must survive an app
+// process running in a persistent-session pane must survive an app
 // restart (calyx-session's daemon keeps the child process running
-// independent of Calyx.app's lifetime) and replay its output into the
-// restored pane.
+// independent of Calyx.app's lifetime), and the pane restored after
+// relaunch must reattach to that SAME shell with working I/O, rather
+// than a fresh replacement shell being spawned.
+//
+// Verification method: Ghostty renders terminal content on the GPU,
+// so anything echoed into a pane is never exposed through the
+// accessibility tree; `app.staticTexts` can never observe it, no
+// matter how the persistent-session pipeline actually behaves.
+// `BrowserScriptingUITests.terminalExec` already establishes the
+// precedent for working around this: it redirects a command's output
+// to a file and reads that file back from disk, instead of reading
+// `app.staticTexts`. This test follows the same precedent: each phase
+// has the shell write its own PID (`echo $$`) to a file under this
+// test's session temp dir, and the file is read back from disk. The
+// two PIDs matching before and after restart is the strongest proof
+// available to XCUITest that calyx-session's daemon kept the exact
+// same shell process alive across Calyx.app's termination, and that
+// the restored pane reattached to it with working I/O.
 //
 // RED phase note (P4): this test is written to compile against
 // `CalyxUITestCase` and the app's existing `--uitesting` /
@@ -202,31 +218,90 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         app.typeText(text)
     }
 
+    // MARK: - PID-file polling
+
+    /// Polls `path` until its contents parse as a bare integer PID, or
+    /// `timeout` elapses, returning the parsed PID or nil on timeout.
+    /// The shell's `echo $$ > path` redirection is not synchronous with
+    /// respect to XCUITest's `typeText`, so the file may not exist yet
+    /// (or may still be mid-write) for a short while after the
+    /// keystrokes are sent.
+    private func waitForPID(atPath path: String, timeout: TimeInterval) -> Int? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
+                let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let pid = Int(trimmed) {
+                    return pid
+                }
+            }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return nil
+    }
+
     // MARK: - Restart replay
 
-    /// Full round trip: type a unique marker into a persistent-session
-    /// pane, terminate the app, relaunch with the same
-    /// HOME/session-dir, and confirm the marker reappears (the daemon
-    /// kept the shell alive and replayed its scrollback into the
-    /// reattached pane).
-    func test_persistentSession_survivesRestart_replaysOutput() {
-        let marker = "CALYX_E2E_MARKER_\(UUID().uuidString)"
+    /// Full round trip: confirm a persistent-session pane hosts a live,
+    /// input-accepting shell by reading that shell's own PID back from
+    /// a file; terminate the app; relaunch with the same
+    /// HOME/session-dir; and confirm the restored pane's shell reports
+    /// the SAME PID (see file header for why PID identity, not
+    /// `app.staticTexts`, is the verification method here).
+    func test_persistentSession_survivesRestart_sameShellStaysAlive() {
+        let pidFile1 = "\(sessionDir!)/pid1.txt"
+        let pidFile2 = "\(sessionDir!)/pid2.txt"
 
         createNewTabViaMenu()
         waitFor(app.windows.firstMatch)
         ensureAppIsFrontmost()
 
-        typeTextSafely("echo \(marker)\n")
-
-        let markerText = app.staticTexts.containing(NSPredicate(format: "value CONTAINS %@", marker)).firstMatch
-        XCTAssertTrue(waitFor(markerText, timeout: 10), "The marker must appear in the pane after being echoed")
+        typeTextSafely("echo $$ > \(pidFile1)\n")
+        guard let pid1 = waitForPID(atPath: pidFile1, timeout: 10) else {
+            XCTFail(
+                "The pane's shell never wrote its PID to \(pidFile1) within 10s, " +
+                "meaning the persistent-session pane never became an interactive " +
+                "shell that accepts input, so there is nothing to compare after restart."
+            )
+            return
+        }
 
         app.terminate()
         relaunchWithSameEnvironment()
+        waitFor(app.windows.firstMatch)
 
-        let replayedMarkerText = app.staticTexts.containing(NSPredicate(format: "value CONTAINS %@", marker)).firstMatch
-        XCTAssertTrue(waitFor(replayedMarkerText, timeout: 10),
-                     "After restart, the restored pane must replay the same marker via calyx-session's " +
-                     "reattach + Replay frame — proving the shell survived Calyx.app's termination")
+        // The restored pane's reattach to the daemon-held shell completes
+        // asynchronously after the window appears, with no XCUITest-visible
+        // signal for "reattach done." Keystrokes sent immediately after
+        // relaunch can land before the reattach completes and be dropped,
+        // so retry the echo up to 3 times over ~15s rather than relying on
+        // a single fixed sleep before the first attempt.
+        var pid2: Int?
+        for _ in 1...3 {
+            ensureAppIsFrontmost()
+            typeTextSafely("echo $$ > \(pidFile2)\n")
+            if let pid = waitForPID(atPath: pidFile2, timeout: 5) {
+                pid2 = pid
+                break
+            }
+        }
+
+        guard let confirmedPID2 = pid2 else {
+            XCTFail(
+                "The restored pane never wrote its PID to \(pidFile2) after 3 attempts " +
+                "over ~15s, meaning the restored pane never reattached to a working, " +
+                "input-accepting shell after restart."
+            )
+            return
+        }
+
+        XCTAssertEqual(
+            confirmedPID2, pid1,
+            "The restored pane's shell PID (\(confirmedPID2)) must equal the original " +
+            "pane's shell PID (\(pid1)); this proves calyx-session's daemon kept the " +
+            "SAME shell process alive across Calyx.app's termination and the restored " +
+            "pane reattached to it with working I/O, rather than a fresh replacement " +
+            "shell being spawned."
+        )
     }
 }
