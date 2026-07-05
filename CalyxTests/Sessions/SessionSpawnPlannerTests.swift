@@ -152,15 +152,23 @@ final class SessionSpawnPlannerTests: XCTestCase {
         }
 
         XCTAssertTrue(isValidULID(sessionID), "sessionID must be a 26-character Crockford base32 ULID, got \(sessionID)")
-        // Since the session-root-resolution fix round, the command
-        // gained a leading `HOME=<root>` env-assignment word ahead of
-        // `exec` (see SessionCommandSynthesizerHomeStampTests), so the
-        // direct-exec invariant this test protects is now checked as
-        // "starts with the env-assignment word, immediately followed by
-        // exec" rather than a bare `hasPrefix("exec ")`.
-        XCTAssertTrue(command.hasPrefix("HOME=") && command.contains(" exec "),
-                     "The synthesized command must stamp a leading HOME= env-assignment word, then exec into " +
-                     "calyx-session directly (SessionCommandSynthesizer's contract)")
+        // Ghostty resolves a pane's `command` config by treating the
+        // FIRST WHITESPACE-DELIMITED WORD as the literal program to
+        // exec directly (resolving a non-absolute first word against
+        // the pane's cwd), rather than handing the whole string to
+        // `/bin/sh -c` itself -- a leading `HOME=<root>` env-assignment
+        // word (an earlier round's shape) becomes that first word, so
+        // ghostty tries to execute a nonexistent file literally named
+        // "HOME=<root>" and the pane dies instantly (see
+        // SessionCommandSynthesizerHomeStampTests for the verbatim
+        // field failure and the full ghostty-compatibility contract).
+        // The fix keeps `exec` as the first word and moves the env
+        // assignment after it, into `/usr/bin/env`.
+        XCTAssertTrue(command.hasPrefix("exec /usr/bin/env HOME="),
+                     "The synthesized command's first word must stay exactly \"exec\" -- ghostty execs the " +
+                     "pane command's first word directly rather than via /bin/sh -c, so the HOME stamp must " +
+                     "be applied via a trailing `/usr/bin/env HOME=...` word rather than a leading " +
+                     "env-assignment word")
         XCTAssertEqual(argv, ["attach", sessionID, "--create", "--cwd", "/Users/dev/repo"],
                        "The synthesized command must attach/create the exact sessionID returned alongside " +
                        "it, positionally (matching the P2 CLI's AttachArgs, not a --id flag), and carry the " +

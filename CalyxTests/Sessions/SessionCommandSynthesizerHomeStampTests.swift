@@ -51,20 +51,38 @@
 //  (this fix's actual target) changes the exec'd process's observed
 //  $HOME.
 //
-//  KNOWN CONSEQUENCE FOR GREEN (flagged, not fixed here): once Green
-//  lands, the synthesized command's TEXT will start with "HOME=..."
-//  rather than "exec ", which will break the literal
-//  `command.hasPrefix("exec ")` assertions in
-//  SessionCommandSynthesizerTests.test_attachCommand_basicForm_includesExecCreateIdCwdInOrder
+//  KNOWN CONSEQUENCE FOR GREEN (flagged, not fixed here -- and since
+//  overtaken by ROUND 2 below): once Green landed for ROUND 1, the
+//  synthesized command's TEXT started with "HOME=..." rather than
+//  "exec ". SessionCommandSynthesizerTests.test_attachCommand_basicForm_includesExecCreateIdCwdInOrder
 //  and SessionSpawnPlannerTests.test_plan_enabledTabOrigin_returnsPersistentWithULIDSessionIDAndMatchingCommand
-//  (both currently green, pre-existing, and deliberately left untouched
-//  by this RED phase per this round's rules). Green must update those
-//  two assertions to a check that tolerates a leading `HOME=... `
-//  env-assignment word while still verifying the underlying invariant
-//  they protect (direct exec, not a surviving shell wrapper) --
-//  e.g. asserting `" exec "` appears in the command, or asserting the
-//  first word after any leading `KEY=value` assignment tokens is
-//  `exec`. Not this file's job to weaken pre-existing tests during RED.
+//  were updated at the time to tolerate that leading `HOME=... ` word
+//  (`command.hasPrefix("HOME=") && command.contains(" exec ")`). ROUND
+//  2 below now tightens those same two assertions further, since a
+//  leading `HOME=` word turns out to be unusable in production.
+//
+//  ROUND 2 (ghostty first-word-exec compatibility fix): proven live in
+//  a real pane that the ROUND 1 shape above (`HOME=<root> exec <bin>
+//  ...`) breaks ghostty itself, independent of daemon/env correctness.
+//  Ghostty resolves a pane's `command` config by treating the FIRST
+//  WHITESPACE-DELIMITED WORD as the literal program to exec directly
+//  (resolving a non-absolute first word against the pane's cwd), NOT
+//  by handing the whole string to `/bin/sh -c` the way this file's own
+//  `runShC` helper does. A leading `HOME=<root>` env-assignment word
+//  becomes that first word, so ghostty tries (and fails) to execute a
+//  nonexistent file literally named "HOME=<root>". Verbatim field
+//  failure from a real pane:
+//
+//    bash: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: No such file or directory
+//    bash: line 0: exec: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: cannot execute: No such file or directory
+//
+//  The fix keeps `exec` as the unconditional first word and moves the
+//  env assignment after it, into `/usr/bin/env`: `exec /usr/bin/env
+//  HOME=<root> <binaryPath> attach ...`. This file's two execution
+//  tests below now ALSO assert (via `assertFirstWordIsExec`) that the
+//  command's first word is exactly `exec` -- RED against the ROUND 1
+//  `HOME=<root> exec ...` shape still in production code as of this
+//  RED phase.
 //
 //  Coverage:
 //  - reattachCommand stamps HOME=<resolver's root> ahead of exec, and
@@ -72,6 +90,8 @@
 //  - attachCommand (SessionSpawnPlanner's create-variant) does the same
 //  - reattachCommand with no binary resolvable still returns nil,
 //    unaffected by the new rootResolver parameter's presence/default
+//  - (ROUND 2) both commands' first whitespace-delimited word is
+//    exactly `exec` -- the ghostty compatibility constraint above
 //
 
 import XCTest
@@ -129,6 +149,39 @@ final class SessionCommandSynthesizerHomeStampTests: XCTestCase {
         process.waitUntilExit()
     }
 
+    /// ROUND 2 (ghostty first-word-exec compatibility): asserts the
+    /// command's first whitespace-delimited word is exactly `exec`.
+    ///
+    /// Verbatim field failure from a real pane, with the pre-fix
+    /// `HOME=<root> exec <bin> ...` shape (what both attachCommand and
+    /// reattachCommand emit as of this RED phase):
+    ///
+    ///   bash: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: No such file or directory
+    ///   bash: line 0: exec: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: cannot execute: No such file or directory
+    ///
+    /// Ghostty resolves a pane's `command` config by treating the
+    /// FIRST WHITESPACE-DELIMITED WORD as the literal program to exec
+    /// directly, resolving a non-absolute first word against the
+    /// pane's cwd -- NOT by handing the whole string to `/bin/sh -c`
+    /// (that's this file's own `runShC` helper, used only to verify
+    /// the env-stamp/argv side of the contract in a real shell). A
+    /// leading `HOME=<root>` env-assignment word becomes that first
+    /// word, so ghostty tries to execute a nonexistent file literally
+    /// named "HOME=<root>" and the pane dies instantly. First-word-exec
+    /// is therefore load-bearing for ghostty independent of whether the
+    /// HOME stamp itself takes effect when run through a real shell.
+    private func assertFirstWordIsExec(
+        _ command: String, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let firstWord = command.split(separator: " ", maxSplits: 1).first.map(String.init)
+        XCTAssertEqual(firstWord, "exec",
+                       "The command's first whitespace-delimited word must be exactly \"exec\" -- ghostty " +
+                       "execs the pane command's first word directly (not via /bin/sh -c), so any other " +
+                       "first word (e.g. a leading HOME=... env-assignment) makes ghostty try to execute a " +
+                       "nonexistent file and the pane dies instantly",
+                       file: file, line: line)
+    }
+
     // MARK: - reattachCommand
 
     func test_reattachCommand_stampsResolverRootAsHOME_execdProcessObservesIt() throws {
@@ -150,6 +203,8 @@ final class SessionCommandSynthesizerHomeStampTests: XCTestCase {
             XCTFail("With a resolvable binary path, reattachCommand must not return nil")
             return
         }
+
+        assertFirstWordIsExec(command)
 
         try runShC(command)
         let lines = readCapturedLines(at: outputPath)
@@ -194,6 +249,8 @@ final class SessionCommandSynthesizerHomeStampTests: XCTestCase {
             cwd: "/Users/dev/repo",
             rootResolver: FakeRootResolver(root: "/opt/calyx-fixture/spawn-home")
         )
+
+        assertFirstWordIsExec(command)
 
         try runShC(command)
         let lines = readCapturedLines(at: outputPath)

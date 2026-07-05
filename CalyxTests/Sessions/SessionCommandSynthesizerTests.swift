@@ -101,15 +101,23 @@ final class SessionCommandSynthesizerTests: XCTestCase {
         let command = SessionCommandSynthesizer.attachCommand(
             binaryPath: binaryPath, sessionID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", cwd: "/Users/dev/repo"
         )
-        // Since the session-root-resolution fix round, the command
-        // gained a leading `HOME=<root>` env-assignment word ahead of
-        // `exec` (see SessionCommandSynthesizerHomeStampTests), so the
-        // direct-exec invariant this test protects is now checked as
-        // "starts with the env-assignment word, immediately followed by
-        // exec" rather than a bare `hasPrefix("exec ")`.
-        XCTAssertTrue(command.hasPrefix("HOME=") && command.contains(" exec "),
-                     "The command must stamp a leading HOME= env-assignment word, then exec into " +
-                     "calyx-session directly, not run it as a plain subcommand")
+        // Ghostty resolves a pane's `command` config by treating the
+        // FIRST WHITESPACE-DELIMITED WORD as the literal program to
+        // exec directly (resolving a non-absolute first word against
+        // the pane's cwd), rather than handing the whole string to
+        // `/bin/sh -c` itself -- a leading `HOME=<root>` env-assignment
+        // word (an earlier round's shape) becomes that first word, so
+        // ghostty tries to execute a nonexistent file literally named
+        // "HOME=<root>" and the pane dies instantly (see
+        // SessionCommandSynthesizerHomeStampTests for the verbatim
+        // field failure and the full ghostty-compatibility contract).
+        // The fix keeps `exec` as the first word and moves the env
+        // assignment after it, into `/usr/bin/env`.
+        XCTAssertTrue(command.hasPrefix("exec /usr/bin/env HOME="),
+                     "The command's first word must stay exactly \"exec\" -- ghostty execs the pane " +
+                     "command's first word directly rather than via /bin/sh -c, so the HOME stamp must be " +
+                     "applied via a trailing `/usr/bin/env HOME=...` word rather than a leading " +
+                     "env-assignment word")
 
         let argv = try runAndCaptureArgv(command, outputPath: outputPath)
         XCTAssertEqual(argv, ["attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", "/Users/dev/repo"],
