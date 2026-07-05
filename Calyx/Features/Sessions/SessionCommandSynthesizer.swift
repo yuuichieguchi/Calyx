@@ -63,29 +63,50 @@ enum SessionCommandSynthesizer {
         return String(decoding: bytes, as: UTF8.self)
     }
 
-    /// Builds `exec /usr/bin/env HOME=<root> <binaryPath> attach
-    /// <sessionID> --create --cwd <cwd> [--name <name>]`. `sessionID` is
+    /// Builds `/usr/bin/env HOME=<root> <binaryPath> attach <sessionID>
+    /// --create --cwd <cwd> [--name <name>]`. `sessionID` is
     /// positional, matching the P2 CLI's `AttachArgs`
     /// (`calyx-session/crates/cli/src/cli.rs`), which has no `--id` flag.
     ///
-    /// `exec` must stay the command's first whitespace-delimited word.
-    /// Ghostty resolves a pane's `command` config by treating that first
-    /// word as the literal program to exec directly (resolving a
-    /// non-absolute first word against the pane's cwd), not by handing
-    /// the whole string to `/bin/sh -c`. An earlier shape of this
-    /// function put the `HOME=<root>` env-assignment word first instead,
-    /// which became that literal first word, so ghostty tried to exec a
-    /// nonexistent file named after it and the pane died instantly.
-    /// Verbatim field failure from a real pane:
+    /// The command's first whitespace-delimited word must be exactly
+    /// `/usr/bin/env` -- never a leading `exec` of our own, and never a
+    /// bare env-assignment word. Ghostty does not hand this string to a
+    /// shell unmodified; it wraps whatever `command` we configure
+    /// itself, as `/bin/bash --noprofile --norc -c "exec -l <command>"`
+    /// (see `ghostty/src/termio/Exec.zig`'s `execCommand`, for the
+    /// default `.shell`-variant command that Calyx always produces,
+    /// since it never adds a `direct:` prefix). Ghostty's own wrapping
+    /// already supplies the leading `exec`, so within that shell
+    /// invocation ordinary POSIX word semantics apply to exec's target
+    /// word: a word containing no `/` is PATH-searched; a word
+    /// containing a `/` is instead resolved as a path, relative to the
+    /// pane's cwd if not already absolute. Two earlier shapes of this
+    /// function were each field-verified broken against that rule:
     ///
-    ///     bash: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: No such file or directory
-    ///     bash: line 0: exec: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: cannot execute: No such file or directory
+    /// - A bare `HOME=<root>` env-assignment word first. That word
+    ///   contains a `/` (from its own value), so it was resolved as a
+    ///   cwd-relative path instead of exec'd. Verbatim field failure
+    ///   from a real pane:
     ///
-    /// The fix keeps `exec` first and routes the HOME stamp through
-    /// `/usr/bin/env` instead of a leading env-assignment word: `env`'s
-    /// `NAME=value... command args...` form sets `HOME` in the
-    /// environment it hands to `command`, then execs `command` itself,
-    /// so `env` never lingers as a surviving parent either.
+    ///       bash: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: No such file or directory
+    ///       bash: line 0: exec: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: cannot execute: No such file or directory
+    ///
+    /// - The HOME stamp routed through `/usr/bin/env`, but with our own
+    ///   `exec` kept first -- stacking on top of ghostty's own
+    ///   already-supplied `exec`. A bare `exec` word (no `/`) is
+    ///   PATH-searched as a literal program named "exec", which does
+    ///   not exist. Verbatim field failure from a real pane:
+    ///
+    ///       bash: line 0: exec: exec: not found
+    ///
+    /// The fix drops our own leading `exec` entirely and routes the
+    /// HOME stamp through `/usr/bin/env` as the first word instead:
+    /// `/usr/bin/env` is already absolute (no cwd-relative ambiguity)
+    /// and is not a second `exec` word, so ghostty's own single `exec`
+    /// finds and execs it directly. `env`'s `NAME=value... command
+    /// args...` form sets `HOME` in the environment it hands to
+    /// `command`, then execs `command` itself, so `env` never lingers
+    /// as a surviving parent either.
     ///
     /// The `HOME=<root>` argument passed to `/usr/bin/env` stamps
     /// `rootResolver`'s resolved session root explicitly as the exec'd
@@ -94,13 +115,14 @@ enum SessionCommandSynthesizer {
     /// `default_home_subdir`, which reads the literal `HOME` env var)
     /// can never disagree with whatever `SessionDaemonClient` resolved
     /// for the same `rootResolver`, regardless of whatever ambient env
-    /// ghostty chooses to pass its `/bin/sh -c` invocation.
+    /// ghostty's own wrapping passes into the pane.
     /// `shSafeToken(_:)` applies here exactly like every other
     /// user/attacker-influenced token below.
     ///
-    /// The leading `exec` replaces the intermediate `/bin/sh` process
-    /// with `/usr/bin/env`, which in turn execs and replaces itself with
-    /// `calyx-session` (rather than leaving `sh` or `env` as a surviving
+    /// Ghostty's own `exec -l <command>` wrapping replaces its
+    /// intermediate `bash` process with whatever this command execs
+    /// (`/usr/bin/env`, which in turn execs and replaces itself with
+    /// `calyx-session`, rather than leaving `env` as a surviving
     /// parent), so the ghostty surface's child process *is*
     /// `calyx-session attach`, not a shell or `env` wrapping it. This is
     /// required for correct SIGWINCH/SIGTERM delivery and for
@@ -124,7 +146,7 @@ enum SessionCommandSynthesizer {
         name: String? = nil,
         rootResolver: SessionRootResolverProtocol = SessionRootResolver()
     ) -> String {
-        var command = "exec /usr/bin/env HOME=\(shSafeToken(rootResolver.resolve())) \(shSafeToken(binaryPath)) attach \(shSafeToken(sessionID)) --create --cwd \(shSafeToken(cwd))"
+        var command = "/usr/bin/env HOME=\(shSafeToken(rootResolver.resolve())) \(shSafeToken(binaryPath)) attach \(shSafeToken(sessionID)) --create --cwd \(shSafeToken(cwd))"
         if let name {
             command += " --name \(shSafeToken(name))"
         }

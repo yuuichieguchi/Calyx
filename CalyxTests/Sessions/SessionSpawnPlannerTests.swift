@@ -152,23 +152,24 @@ final class SessionSpawnPlannerTests: XCTestCase {
         }
 
         XCTAssertTrue(isValidULID(sessionID), "sessionID must be a 26-character Crockford base32 ULID, got \(sessionID)")
-        // Ghostty resolves a pane's `command` config by treating the
-        // FIRST WHITESPACE-DELIMITED WORD as the literal program to
-        // exec directly (resolving a non-absolute first word against
-        // the pane's cwd), rather than handing the whole string to
-        // `/bin/sh -c` itself -- a leading `HOME=<root>` env-assignment
-        // word (an earlier round's shape) becomes that first word, so
-        // ghostty tries to execute a nonexistent file literally named
-        // "HOME=<root>" and the pane dies instantly (see
-        // SessionCommandSynthesizerHomeStampTests for the verbatim
-        // field failure and the full ghostty-compatibility contract).
-        // The fix keeps `exec` as the first word and moves the env
-        // assignment after it, into `/usr/bin/env`.
-        XCTAssertTrue(command.hasPrefix("exec /usr/bin/env HOME="),
-                     "The synthesized command's first word must stay exactly \"exec\" -- ghostty execs the " +
-                     "pane command's first word directly rather than via /bin/sh -c, so the HOME stamp must " +
-                     "be applied via a trailing `/usr/bin/env HOME=...` word rather than a leading " +
-                     "env-assignment word")
+        // Ghostty wraps whatever `command` string we configure ITSELF
+        // as `<shell> -c "exec <command>"` -- it supplies its own
+        // leading `exec`, so our OWN synthesized command must never
+        // start with a second `exec` of its own (PATH-searched as a
+        // literal nonexistent program, producing "exec: exec: not
+        // found" in a real pane) nor a bare non-absolute word like a
+        // leading `HOME=<root>` env-assignment (resolved against the
+        // pane's cwd instead of exec'd, producing "No such file or
+        // directory" in a real pane) -- see
+        // SessionCommandSynthesizerHomeStampTests for both verbatim
+        // field failures and the full ghostty-compatibility contract.
+        // `/usr/bin/env` is immune to both: it is already absolute and
+        // it is not a second `exec` word.
+        XCTAssertTrue(command.hasPrefix("/usr/bin/env HOME="),
+                     "The synthesized command's first word must be exactly \"/usr/bin/env\" -- ghostty " +
+                     "already wraps our command as `<shell> -c \"exec <command>\"` itself, so our own " +
+                     "command must not add a second `exec` of its own nor start with a bare env-assignment " +
+                     "word")
         XCTAssertEqual(argv, ["attach", sessionID, "--create", "--cwd", "/Users/dev/repo"],
                        "The synthesized command must attach/create the exact sessionID returned alongside " +
                        "it, positionally (matching the P2 CLI's AttachArgs, not a --id flag), and carry the " +

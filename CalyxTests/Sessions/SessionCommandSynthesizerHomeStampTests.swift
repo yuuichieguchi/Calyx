@@ -78,20 +78,70 @@
 //
 //  The fix keeps `exec` as the unconditional first word and moves the
 //  env assignment after it, into `/usr/bin/env`: `exec /usr/bin/env
-//  HOME=<root> <binaryPath> attach ...`. This file's two execution
-//  tests below now ALSO assert (via `assertFirstWordIsExec`) that the
-//  command's first word is exactly `exec` -- RED against the ROUND 1
-//  `HOME=<root> exec ...` shape still in production code as of this
-//  RED phase.
+//  HOME=<root> <binaryPath> attach ...`.
+//
+//  ROUND 3 (ghostty exec-wrapping compatibility fix -- supersedes
+//  ROUND 2's own fix): proven live in a real pane, AFTER the ROUND 2
+//  shape above shipped, that ghostty does not hand our configured
+//  `command` string to a shell unmodified at all -- it wraps whatever
+//  we configure ITSELF as `<shell> -c "exec <command>"` (ghostty
+//  supplies its own leading `exec`; verified directly against
+//  `ghostty/src/termio/Exec.zig`'s `execCommand`, which for any
+//  `.shell`-variant command -- the default when Calyx's synthesized
+//  string carries no `direct:` prefix, see
+//  `ghostty/src/config/Command.zig` -- builds
+//  `/bin/bash --noprofile --norc -c "exec -l <command>"`, itself
+//  further wrapped in `/usr/bin/login -flp <username> ...` on macOS).
+//  This also retroactively explains ROUND 2's field failure above: a
+//  word is only PATH-searched by the shell if it contains NO `/`; a
+//  word containing a `/` is instead resolved as a path, relative to
+//  the pane's cwd if not already absolute -- ordinary POSIX shell
+//  semantics, nothing ghostty-specific. ROUND 2's own first word,
+//  `HOME=/tmp/cxpane`, contains a `/` from its own value, so THAT is
+//  what got resolved against the pane's cwd, not some ghostty-specific
+//  "first word" rule. Because ROUND 2's fix additionally kept `exec`
+//  as our OWN first word on top of ghostty's already-supplied one, the
+//  actual full invocation became `exec exec /usr/bin/env ...`, and a
+//  bare `exec` (no `/`) IS PATH-searched as a literal program named
+//  "exec", which does not exist. Verbatim field failure from a real
+//  pane, with the ROUND 2 `exec /usr/bin/env HOME=<root> ...` shape
+//  (what both attachCommand and reattachCommand still emit as of this
+//  RED phase):
+//
+//    bash: line 0: exec: exec: not found
+//
+//  The fix drops our own leading `exec` entirely -- ghostty already
+//  supplies it via its own wrapping -- so the synthesized command
+//  itself must start with `/usr/bin/env` instead: `/usr/bin/env
+//  HOME=<root> <binaryPath> attach ...`. `/usr/bin/env` is immune to
+//  both failure modes above: it is already absolute (no cwd-relative
+//  ambiguity) and it is not a second `exec` word (so ghostty's own
+//  single `exec` finds and execs it directly).
+//
+//  `assertFirstWordIsExec` is replaced by `assertFirstWordIsUsrBinEnv`
+//  below (asserting `/usr/bin/env` instead of `exec`), and this file's
+//  two execution-based stamp tests now run the synthesized command
+//  through `runShCEmulatingGhosttyWrapping`, which reproduces ghostty's
+//  ACTUAL wrapping (`/bin/sh -c "exec <command>"`, with a deliberately
+//  wrong ambient `$HOME` set on the child process) instead of running
+//  the bare command directly -- this locks in the in-app-observed
+//  contract, not just what a bare `/bin/sh -c <command>` happens to
+//  do. RED today: current production code still emits a leading `exec`
+//  of its own, so the emulated wrapper produces `exec exec ...` and
+//  fails exactly like the real pane, before the dumper script ever
+//  gets to run and capture anything.
 //
 //  Coverage:
-//  - reattachCommand stamps HOME=<resolver's root> ahead of exec, and
-//    the exec'd process actually observes that value as $HOME
+//  - reattachCommand stamps HOME=<resolver's root> ahead of the
+//    binary, and the exec'd process actually observes that value as
+//    $HOME even when ghostty's own wrapping supplies a different
+//    ambient $HOME
 //  - attachCommand (SessionSpawnPlanner's create-variant) does the same
 //  - reattachCommand with no binary resolvable still returns nil,
 //    unaffected by the new rootResolver parameter's presence/default
-//  - (ROUND 2) both commands' first whitespace-delimited word is
-//    exactly `exec` -- the ghostty compatibility constraint above
+//  - (ROUND 3) both commands' first whitespace-delimited word is
+//    exactly `/usr/bin/env` -- the ghostty exec-wrapping compatibility
+//    constraint above
 //
 
 import XCTest
@@ -138,10 +188,23 @@ final class SessionCommandSynthesizerHomeStampTests: XCTestCase {
         return lines
     }
 
-    private func runShC(_ command: String) throws {
+    /// Runs `command` the way ghostty ACTUALLY invokes a pane's
+    /// configured `command`: wrapped by ghostty itself as `/bin/sh -c
+    /// "exec <command>"` (see `assertFirstWordIsUsrBinEnv`'s doc
+    /// comment for the verified real wrapping this simplifies), with
+    /// `ambientHome` standing in for whatever unrelated `$HOME` value
+    /// ghostty's own environment happens to carry into the pane --
+    /// deliberately different from the rootResolver's stamped root, so
+    /// a passing assertion on the captured `$HOME` proves the stamped
+    /// value actually won, not that the two coincidentally already
+    /// matched.
+    private func runShCEmulatingGhosttyWrapping(_ command: String, ambientHome: String) throws {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", command]
+        process.arguments = ["-c", "exec " + command]
+        var environment = ProcessInfo.processInfo.environment
+        environment["HOME"] = ambientHome
+        process.environment = environment
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
@@ -149,36 +212,60 @@ final class SessionCommandSynthesizerHomeStampTests: XCTestCase {
         process.waitUntilExit()
     }
 
-    /// ROUND 2 (ghostty first-word-exec compatibility): asserts the
-    /// command's first whitespace-delimited word is exactly `exec`.
+    /// ROUND 3 (ghostty exec-wrapping compatibility): asserts the
+    /// command's first whitespace-delimited word is exactly
+    /// `/usr/bin/env`.
     ///
-    /// Verbatim field failure from a real pane, with the pre-fix
-    /// `HOME=<root> exec <bin> ...` shape (what both attachCommand and
-    /// reattachCommand emit as of this RED phase):
+    /// Verbatim field failures from a real pane, across two
+    /// independent fix rounds:
     ///
-    ///   bash: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: No such file or directory
-    ///   bash: line 0: exec: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: cannot execute: No such file or directory
+    ///   ROUND 1 -> ROUND 2 fix (our own command's first word was a
+    ///   bare `HOME=<root>` env-assignment):
     ///
-    /// Ghostty resolves a pane's `command` config by treating the
-    /// FIRST WHITESPACE-DELIMITED WORD as the literal program to exec
-    /// directly, resolving a non-absolute first word against the
-    /// pane's cwd -- NOT by handing the whole string to `/bin/sh -c`
-    /// (that's this file's own `runShC` helper, used only to verify
-    /// the env-stamp/argv side of the contract in a real shell). A
-    /// leading `HOME=<root>` env-assignment word becomes that first
-    /// word, so ghostty tries to execute a nonexistent file literally
-    /// named "HOME=<root>" and the pane dies instantly. First-word-exec
-    /// is therefore load-bearing for ghostty independent of whether the
-    /// HOME stamp itself takes effect when run through a real shell.
-    private func assertFirstWordIsExec(
+    ///     bash: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: No such file or directory
+    ///     bash: line 0: exec: /Users/eguchiyuuichi/projects/Calyx/HOME=/tmp/cxpane: cannot execute: No such file or directory
+    ///
+    ///   ROUND 2 -> ROUND 3 fix (our own command additionally started
+    ///   with its own leading `exec`):
+    ///
+    ///     bash: line 0: exec: exec: not found
+    ///
+    /// Ghostty wraps whatever `command` string we configure ITSELF as
+    /// `<shell> -c "exec <command>"` -- verified directly against
+    /// `ghostty/src/termio/Exec.zig`'s `execCommand`, which for a
+    /// `.shell`-variant command (the default; Calyx never adds a
+    /// `direct:` prefix) builds `/bin/bash --noprofile --norc -c
+    /// "exec -l <command>"`. Ghostty supplies its own leading `exec`;
+    /// it does NOT hand our string to a shell unmodified the way this
+    /// file's own `runShCEmulatingGhosttyWrapping` helper does only to
+    /// verify the env-stamp/argv side of the contract. Within
+    /// that shell invocation, ordinary POSIX shell word semantics
+    /// apply to exec's target word -- nothing ghostty-specific: a word
+    /// containing NO `/` is searched via `PATH`; a word containing a
+    /// `/` is NOT searched via `PATH` and is instead resolved as a
+    /// path, relative to the pane's cwd if not already absolute. The
+    /// first field failure above came from our own command starting
+    /// with a bare `HOME=/tmp/cxpane` word (which contains a `/` from
+    /// its own value), so it got resolved against the pane's cwd
+    /// instead of exec'd directly. The second field failure came from
+    /// keeping `exec` as our OWN first word on top of ghostty's
+    /// already-supplied one: the full invocation became `exec exec
+    /// /usr/bin/env ...`, and a bare `exec` (no `/`) IS searched via
+    /// `PATH` as a literal program named "exec", which does not exist.
+    /// `/usr/bin/env` is immune to both failure modes: it is already
+    /// absolute (no cwd-relative ambiguity) and it is not a second
+    /// `exec` word, so ghostty's own single `exec` finds and execs it
+    /// directly.
+    private func assertFirstWordIsUsrBinEnv(
         _ command: String, file: StaticString = #filePath, line: UInt = #line
     ) {
         let firstWord = command.split(separator: " ", maxSplits: 1).first.map(String.init)
-        XCTAssertEqual(firstWord, "exec",
-                       "The command's first whitespace-delimited word must be exactly \"exec\" -- ghostty " +
-                       "execs the pane command's first word directly (not via /bin/sh -c), so any other " +
-                       "first word (e.g. a leading HOME=... env-assignment) makes ghostty try to execute a " +
-                       "nonexistent file and the pane dies instantly",
+        XCTAssertEqual(firstWord, "/usr/bin/env",
+                       "The command's first whitespace-delimited word must be exactly \"/usr/bin/env\" -- " +
+                       "ghostty wraps our command itself as `<shell> -c \"exec <command>\"`, so our OWN " +
+                       "command must never start with a second `exec` of its own (PATH-searched as a " +
+                       "literal nonexistent program) nor a bare non-absolute word like a leading HOME=... " +
+                       "env-assignment (resolved against the pane's cwd instead of exec'd)",
                        file: file, line: line)
     }
 
@@ -204,9 +291,9 @@ final class SessionCommandSynthesizerHomeStampTests: XCTestCase {
             return
         }
 
-        assertFirstWordIsExec(command)
+        assertFirstWordIsUsrBinEnv(command)
 
-        try runShC(command)
+        try runShCEmulatingGhosttyWrapping(command, ambientHome: "/tmp/calyx-wrong-ambient-home")
         let lines = readCapturedLines(at: outputPath)
 
         XCTAssertEqual(lines.first, "HOME=/opt/calyx-fixture/custom-home",
@@ -250,9 +337,9 @@ final class SessionCommandSynthesizerHomeStampTests: XCTestCase {
             rootResolver: FakeRootResolver(root: "/opt/calyx-fixture/spawn-home")
         )
 
-        assertFirstWordIsExec(command)
+        assertFirstWordIsUsrBinEnv(command)
 
-        try runShC(command)
+        try runShCEmulatingGhosttyWrapping(command, ambientHome: "/tmp/calyx-wrong-ambient-home")
         let lines = readCapturedLines(at: outputPath)
 
         XCTAssertEqual(lines.first, "HOME=/opt/calyx-fixture/spawn-home",
