@@ -21,20 +21,28 @@
 //  needing an env override or an `/usr/bin/env` wrapper at all.
 //
 //  This also RETIRES the entire ghostty-exec-wrapping saga the old
-//  HomeStampTests file fought through three rounds (bare `HOME=<root>`
-//  first word resolved as a cwd-relative path; a redundant leading
-//  `exec` PATH-searched as a literal nonexistent program; finally
-//  routing through `/usr/bin/env`) -- once the session root travels as
-//  ordinary argv words to the binary itself rather than as an env
-//  assignment ahead of it, the command's first word is simply the
-//  absolute calyx-session binary path again, exactly like the
-//  pre-HOME-stamp original. Ghostty wraps whatever `command` string we
-//  configure itself as `<shell> -c "exec <command>"` (`ghostty/src/termio/Exec.zig`'s
-//  `execCommand`, for the default `.shell`-variant command Calyx always
-//  produces); its own single `exec` finds and execs an absolute first
-//  word directly, with no cwd-relative or PATH-search ambiguity, so
-//  there is no failure mode left for this file to guard against the way
-//  the old ROUND 1/2/3 tests did.
+//  HomeStampTests file fought through three rounds:
+//  - ROUND 1: a bare `HOME=<root>` first word resolved as a cwd-relative
+//    path, field-verified broken as `bash: .../HOME=/tmp/cxpane: No such
+//    file or directory`.
+//  - ROUND 2: a redundant leading `exec` PATH-searched as a literal
+//    nonexistent program, field-verified broken as `bash: line 0: exec:
+//    exec: not found`.
+//  - ROUND 3: finally routing through `/usr/bin/env` to make the `HOME=`
+//    word an actual env assignment rather than a literal argv word.
+//  Once the session root travels as ordinary argv words to the binary
+//  itself rather than as an env assignment ahead of it, the command's
+//  first word is simply the absolute calyx-session binary path again,
+//  exactly like the pre-HOME-stamp original. Ghostty wraps whatever
+//  `command` string we configure itself as `<shell> -c "exec <command>"`
+//  (`ghostty/src/termio/Exec.zig`'s `execCommand`, for the default
+//  `.shell`-variant command Calyx always produces); its own single
+//  `exec` finds and execs an absolute first word directly, with no
+//  cwd-relative or PATH-search ambiguity, so there is no failure mode
+//  left for this file to guard against the way the old ROUND 1/2/3 tests
+//  did. (This is the canonical copy of this narrative -- other files
+//  that reference this saga, including `SessionCommandSynthesizer.swift`
+//  itself, point back here rather than repeating it.)
 //
 //  Verified by actually running the synthesized command through a real
 //  `/bin/sh -c` emulating ghostty's own `exec <command>` wrapping,

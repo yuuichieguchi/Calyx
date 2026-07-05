@@ -75,8 +75,8 @@ import GhosttyKit
 final class SessionReconnectAttemptResetTimingTests: XCTestCase {
 
     /// sessionIDs registered with `SessionSurfaceMap.shared` by
-    /// `makeFixture()`, unregistered in `tearDown` (the map is a
-    /// process-wide singleton shared across the whole test run).
+    /// `makeReconnectFixture()`, unregistered in `tearDown` (the map is
+    /// a process-wide singleton shared across the whole test run).
     private var registeredSessionIDs: [String] = []
 
     override func tearDown() {
@@ -85,63 +85,6 @@ final class SessionReconnectAttemptResetTimingTests: XCTestCase {
         }
         registeredSessionIDs.removeAll()
         super.tearDown()
-    }
-
-    /// Spins the run loop in short steps, checking `condition()` after
-    /// each, until it returns `true` or `timeout` elapses. Duplicated
-    /// from `SessionReconnectGiveUpTests`'s identical helper per this
-    /// codebase's established per-file fixture-duplication convention
-    /// (see that file's own header comment).
-    private func pumpRunLoop(timeout: TimeInterval, until condition: () -> Bool) {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition(), Date() < deadline {
-            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
-        }
-    }
-
-    private struct ReconnectFixture {
-        let controller: CalyxWindowController
-        let tab: Tab
-        let trackedLeafID: UUID
-        let sessionID: String
-    }
-
-    /// A single-leaf tab carrying `sessionID`'s `SessionRef`, placed as
-    /// the SECOND (non-active) tab of a two-tab group -- a separate,
-    /// empty `otherTab` is the active one -- so `performReconnect`'s
-    /// `tab.id == activeTab?.id` branch (`splitContainerView
-    /// .updateLayout`/`window.makeFirstResponder`) never runs. That
-    /// branch's own UI-update behavior is not this test's concern, and
-    /// dodging it avoids reasoning about `makeFirstResponder`'s
-    /// behavior on a detached, `_testInsert`-only `SurfaceView`.
-    /// `findTab(surfaceID:)` searches every tab in every group
-    /// regardless of which is active, so `performReconnect` still finds
-    /// this tab.
-    private func makeFixture() -> ReconnectFixture {
-        let registry = SurfaceRegistry()
-        let trackedLeafID = UUID()
-        registry._testInsert(view: SurfaceView(frame: .zero), id: trackedLeafID)
-
-        let sessionID = "test-session-\(UUID().uuidString)"
-        let tab = Tab(
-            splitTree: SplitTree(leafID: trackedLeafID),
-            registry: registry,
-            sessionRefs: [trackedLeafID: SessionRef(sessionID: sessionID)]
-        )
-        SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: trackedLeafID)
-        registeredSessionIDs.append(sessionID)
-
-        let otherTab = Tab()
-        let group = TabGroup(name: "Default", tabs: [otherTab, tab], activeTabID: otherTab.id)
-        let session = WindowSession(groups: [group], activeGroupID: group.id)
-        let window = CalyxWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        let controller = CalyxWindowController(window: window, windowSession: session, restoring: true)
-        return ReconnectFixture(controller: controller, tab: tab, trackedLeafID: trackedLeafID, sessionID: sessionID)
     }
 
     /// The bug itself. Against the CURRENT code, `performReconnect`
@@ -158,7 +101,8 @@ final class SessionReconnectAttemptResetTimingTests: XCTestCase {
     /// period confirms the replacement survived), but today it reads
     /// `nil`.
     func test_performReconnect_doesNotResetAttemptCountImmediately_uponSwappingInReplacementSurface() {
-        let fixture = makeFixture()
+        let fixture = makeReconnectFixture()
+        registeredSessionIDs.append(fixture.sessionID)
         fixture.controller._sessionReconnectCoordinatorForTesting._testSeedAttemptCount(
             sessionID: fixture.sessionID, count: 2
         )

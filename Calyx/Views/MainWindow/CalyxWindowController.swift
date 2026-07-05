@@ -78,14 +78,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     var isClosingForShutdown: Bool = false
     private var browserControllers: [UUID: BrowserTabController] = [:]
     private var diffStates: [UUID: DiffLoadState] = [:]
-    private var diffTasks: [UUID: Task<Void, Never>] = [:]
+    private var diffTasks = KeyedTaskRegistry<UUID>()
     private var refreshTask: Task<Void, Never>?
     private var loadMoreTask: Task<Void, Never>?
     /// Herdr layer-2 screen-classification poll (see
     /// `startScreenPollTask`). Runs for the window's lifetime, cancelled
     /// in `windowWillClose`.
     private var screenPollTask: Task<Void, Never>?
-    private var expandTasks: [String: Task<Void, Never>] = [:]
+    private var expandTasks = KeyedTaskRegistry<String>()
     /// R14-B sweep addendum item 2 (r14-fix-spec.md): tracks
     /// `processChildExited`'s per-surface reconnect-decision `Task`,
     /// keyed by surface ID like `diffTasks`/`expandTasks` above, so
@@ -94,14 +94,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// untracked fire-and-forget one -- consistency/resource hygiene
     /// (R14-B's longer 15s `sessionStateBoundTimeoutSeconds` bound
     /// triples how long an orphaned one could linger).
-    private var childExitedTasks: [UUID: Task<Void, Never>] = [:]
+    private var childExitedTasks = KeyedTaskRegistry<UUID>()
     #if DEBUG
     /// Test seam (P4 round-16 fix RED phase): read-only observability
     /// into `childExitedTasks`, mirroring `_closingTabIDsForTesting`'s
     /// naming/gating convention, so tests can await a tracked Task's
     /// `.value` and then confirm it removed its own entry. DO NOT use
     /// from production code.
-    var _childExitedTasksForTesting: [UUID: Task<Void, Never>] { childExitedTasks }
+    var _childExitedTasksForTesting: KeyedTaskRegistry<UUID> { childExitedTasks }
     #endif
     /// Reconnect-flashing-bug fix: `performReconnect`'s deferred-reset
     /// confirmation `Task` per replacement surface, keyed by the NEW
@@ -112,7 +112,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// and cleared in `windowWillClose` alongside `childExitedTasks`'s
     /// other siblings, per this file's established per-window `Task`-
     /// dictionary discipline.
-    private var reconnectEstablishGraceTasks: [UUID: Task<Void, Never>] = [:]
+    private var reconnectEstablishGraceTasks = KeyedTaskRegistry<UUID>()
     private var hasMoreCommits = true
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
@@ -1997,12 +1997,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // mirroring `expandTasks[hash]`'s self-removing Task
         // (`expandCommit(hash:)`) -- otherwise a completed entry is
         // retained forever.
-        childExitedTasks[surfaceID]?.cancel()
-        childExitedTasks[surfaceID] = Task { [weak self] in
+        childExitedTasks.insert(surfaceID, task: Task { [weak self] in
             guard let self else { return }
             await self.sessionReconnectCoordinator.childExited(surfaceID: surfaceID)
             self.childExitedTasks.removeValue(forKey: surfaceID)
-        }
+        })
     }
 
     /// R6-A (r6-fix-spec.md item 4): single choke point pairing the
@@ -2433,20 +2432,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // backoff recovery, while wrongly resetting reopens the unbounded
         // loop.
         //
-        // The `.cancel()` below is cheap insurance, not the real
-        // mechanism: newSurfaceID is a fresh UUID on every call, so this
-        // key was never registered before and the cancel never actually
-        // matches an in-flight task. Superseded grace tasks are not
-        // proactively cancelled; they are outlived and neutralized by
-        // the SessionSurfaceMap re-check once the wait elapses: if this
-        // replacement was itself already swapped out again by a second
-        // reconnect within the grace window,
-        // `SessionSurfaceMap.shared.surfaceID(for:)` no longer equals
-        // newSurfaceID, so that second attempt now owns the attempt
-        // count, and this stale confirmation must not wrongly reset it
-        // out from under an unrelated, still-in-progress retry.
-        reconnectEstablishGraceTasks[newSurfaceID]?.cancel()
-        reconnectEstablishGraceTasks[newSurfaceID] = Task { [weak self] in
+        // The cancel-before-replace inside `insert` below is cheap
+        // insurance, not the real mechanism: newSurfaceID is a fresh
+        // UUID on every call, so this key was never registered before
+        // and the cancel never actually matches an in-flight task.
+        // Superseded grace tasks are not proactively cancelled; they are
+        // outlived and neutralized by the SessionSurfaceMap re-check once
+        // the wait elapses: if this replacement was itself already
+        // swapped out again by a second reconnect within the grace
+        // window, `SessionSurfaceMap.shared.surfaceID(for:)` no longer
+        // equals newSurfaceID, so that second attempt now owns the
+        // attempt count, and this stale confirmation must not wrongly
+        // reset it out from under an unrelated, still-in-progress retry.
+        reconnectEstablishGraceTasks.insert(newSurfaceID, task: Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(Self.reconnectEstablishGraceMilliseconds))
             guard let self else { return }
             if !Task.isCancelled, SessionSurfaceMap.shared.surfaceID(for: sessionID) == newSurfaceID,
@@ -2454,7 +2452,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 self.sessionReconnectCoordinator.markEstablished(sessionID: sessionID)
             }
             self.reconnectEstablishGraceTasks.removeValue(forKey: newSurfaceID)
-        }
+        })
 
         if tab.id == activeTab?.id {
             splitContainerView?.updateLayout(tree: tab.splitTree)
@@ -3145,16 +3143,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         browserControllers.removeAll()
 
-        for (_, task) in diffTasks { task.cancel() }
-        diffTasks.removeAll()
+        diffTasks.cancelAll()
         diffStates.removeAll()
         reviewStores.removeAll()
-        for (_, task) in expandTasks { task.cancel() }
-        expandTasks.removeAll()
-        for (_, task) in childExitedTasks { task.cancel() }
-        childExitedTasks.removeAll()
-        for (_, task) in reconnectEstablishGraceTasks { task.cancel() }
-        reconnectEstablishGraceTasks.removeAll()
+        expandTasks.cancelAll()
+        childExitedTasks.cancelAll()
+        reconnectEstablishGraceTasks.cancelAll()
         refreshTask?.cancel()
         loadMoreTask?.cancel()
         screenPollTask?.cancel()
@@ -3285,6 +3279,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard let workDir = findWorkDir(),
               let repoRoot = windowSession.repoRoots[workDir] else { return }
 
+        // Plain subscript store, not `insert(_:task:)`: unlike this
+        // file's other three `KeyedTaskRegistry`s, `hash` is NOT
+        // guaranteed fresh here -- a rapid double-expand of the same
+        // not-yet-loaded commit before this Task completes reaches this
+        // line twice for the same key (the guard above only checks
+        // `commitFiles[hash] != nil`, not whether a fetch is already in
+        // flight). `insert`'s cancel-before-replace would cancel the
+        // first fetch's Task, which -- because `GitService.commitFiles`
+        // routes through `GitService.run`'s cancellation propagation --
+        // would terminate its underlying git subprocess early, changing
+        // today's behavior (both fetches currently run to completion).
         expandTasks[hash] = Task { [weak self] in
             guard let self else { return }
             do {
@@ -3353,6 +3358,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         refreshHostingView()
 
         let tabID = tab.id
+        // Plain subscript store, not `insert(_:task:)`: tabID is the id
+        // of the `Tab()` just created above, so this key was never
+        // registered before -- `insert`'s cancel-before-replace would
+        // never actually match anything here, mirroring
+        // `reconnectEstablishGraceTasks`' own "fresh key" reasoning at
+        // its `insert` call site above. This Task also never self-
+        // removes its own entry once done (unlike `expandTasks`'/
+        // `childExitedTasks`' Tasks) -- a pre-existing divergence kept
+        // as-is here, not something this refactor changes.
         diffTasks[tabID] = Task { [weak self] in
             guard let self else { return }
             do {

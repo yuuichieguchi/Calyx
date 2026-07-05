@@ -80,25 +80,20 @@ enum SessionCommandSynthesizer {
     /// PATH-search ambiguity to worry about.
     ///
     /// Two earlier shapes of this function stamped the session root as
-    /// an env override ahead of the binary instead (a bare `HOME=<root>`
-    /// word, then that same stamp routed through `/usr/bin/env`) and
-    /// were each field-verified broken by how ghostty's own `exec`
-    /// wrapping resolves its target word (verbatim field failures: `bash:
-    /// .../HOME=/tmp/cxpane: No such file or directory` for the bare
-    /// word; `bash: line 0: exec: exec: not found` for the
-    /// `/usr/bin/env`-plus-our-own-leading-`exec` shape; see this
-    /// method's test file for the full narrative). Round 18 retires that
+    /// an env override ahead of the binary instead, and both were
+    /// field-verified broken by how ghostty's own `exec` wrapping
+    /// resolves its target word; see
+    /// `SessionCommandSynthesizerRuntimeStateDirFlagsTests` for that full
+    /// saga, including the verbatim field failures. Round 18 retires that
     /// whole approach: the session root now travels as the Rust CLI's own
     /// global `--runtime-dir`/`--state-dir` flags
     /// (`calyx-session/crates/cli/src/cli.rs:15-20`, `global = true`),
     /// which `attach` both accepts and forwards verbatim to the daemon it
     /// auto-spawns (`calyx-session/crates/cli/src/commands/attach.rs:193-224`).
-    /// Passing these two flags directly says the same thing the old HOME
-    /// stamp said indirectly, without needing an env override or an
-    /// `/usr/bin/env` wrapper at all. With no `rootResolver` override
-    /// (real production use), the composed paths equal
-    /// `<real $HOME>/.calyx/{run,state}`, identical to the Rust CLI's
-    /// own fallback (`calyx-session/crates/cli/src/commands/mod.rs:74`'s
+    /// With no `rootResolver` override (real production use), the
+    /// composed paths equal `<real $HOME>/.calyx/{run,state}`, identical
+    /// to the Rust CLI's own fallback
+    /// (`calyx-session/crates/cli/src/commands/mod.rs:74`'s
     /// `default_home_subdir`), so this is behaviorally invisible for
     /// normal users.
     ///

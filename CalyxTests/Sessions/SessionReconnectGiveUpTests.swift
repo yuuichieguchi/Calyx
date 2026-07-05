@@ -402,11 +402,9 @@ final class SessionReconnectGiveUpTests: XCTestCase {
         // R6-A (r6-fix-spec.md, r5-verdicts.md V1/V5): the drain is now
         // scheduled on a fresh MainActor turn rather than replaying
         // synchronously inside the didSet, so the replay's effect must
-        // be observed after pumping (via `pumpRunLoop`, defined further
-        // down in this file's ROUND-6 section, called directly since
-        // Swift methods are visible throughout their enclosing type
-        // regardless of declaration order), not immediately. The
-        // CONTRACT under test (a decision deferred while confirming quit
+        // be observed after pumping (via the shared `pumpRunLoop`
+        // helper, `CalyxTests/ReconnectFixture.swift`), not immediately.
+        // The CONTRACT under test (a decision deferred while confirming quit
         // is eventually replayed once the gate clears, not permanently
         // lost) is unchanged; only the synchronization needed to observe
         // it is updated to match the now-intentionally-asynchronous
@@ -434,20 +432,6 @@ final class SessionReconnectGiveUpTests: XCTestCase {
     // the main run loop with a bounded deadline rather than assuming a
     // synchronous effect, since the fix is expected to make the drain
     // genuinely asynchronous.
-
-    /// Spins the run loop in short steps, checking `condition()` after
-    /// each, until it returns `true` or `timeout` elapses. Lets a test
-    /// observe an asynchronously-scheduled MainActor `Task`'s effect
-    /// deterministically (bounded wait, no fixed `sleep`) rather than
-    /// assuming any particular synchronous timing. Mirrors this
-    /// codebase's own `AppDelegate.saveImmediately`/`restoreSession`
-    /// bounded-spin style.
-    private func pumpRunLoop(timeout: TimeInterval, until condition: () -> Bool) {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition(), Date() < deadline {
-            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
-        }
-    }
 
     /// `AppDelegate` subclass simulating a red-button/last-window close
     /// that the user CANCELS, with a `.giveUp` decision arriving mid-modal

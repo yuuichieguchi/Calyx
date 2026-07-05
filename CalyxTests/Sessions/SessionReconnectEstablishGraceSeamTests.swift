@@ -69,8 +69,9 @@
 //  `SessionReconnectCoordinator._testSeedAttemptCount(sessionID:count:)`,
 //  the CALYX_SESSION_BIN env override, the inactive-second-tab fixture
 //  shape) -- see that file's own header comment for why each of those
-//  is necessary/safe. Duplicated here per this codebase's established
-//  per-file fixture-duplication convention.
+//  is necessary/safe. `pumpRunLoop`/`ReconnectFixture`/
+//  `makeReconnectFixture` themselves live in the shared
+//  `CalyxTests/ReconnectFixture.swift` (round-18 cleanup).
 //
 //  Coverage:
 //  - A replacement surface that survives past the (overridden, tiny)
@@ -99,50 +100,6 @@ final class SessionReconnectEstablishGraceSeamTests: XCTestCase {
         super.tearDown()
     }
 
-    private func pumpRunLoop(timeout: TimeInterval, until condition: () -> Bool) {
-        let deadline = Date().addingTimeInterval(timeout)
-        while !condition(), Date() < deadline {
-            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
-        }
-    }
-
-    private struct ReconnectFixture {
-        let controller: CalyxWindowController
-        let tab: Tab
-        let trackedLeafID: UUID
-        let sessionID: String
-    }
-
-    /// See SessionReconnectAttemptResetTimingTests.makeFixture's own
-    /// doc comment for why the tracked leaf lives on a non-active
-    /// second tab.
-    private func makeFixture() -> ReconnectFixture {
-        let registry = SurfaceRegistry()
-        let trackedLeafID = UUID()
-        registry._testInsert(view: SurfaceView(frame: .zero), id: trackedLeafID)
-
-        let sessionID = "test-session-\(UUID().uuidString)"
-        let tab = Tab(
-            splitTree: SplitTree(leafID: trackedLeafID),
-            registry: registry,
-            sessionRefs: [trackedLeafID: SessionRef(sessionID: sessionID)]
-        )
-        SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: trackedLeafID)
-        registeredSessionIDs.append(sessionID)
-
-        let otherTab = Tab()
-        let group = TabGroup(name: "Default", tabs: [otherTab, tab], activeTabID: otherTab.id)
-        let session = WindowSession(groups: [group], activeGroupID: group.id)
-        let window = CalyxWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-        let controller = CalyxWindowController(window: window, windowSession: session, restoring: true)
-        return ReconnectFixture(controller: controller, tab: tab, trackedLeafID: trackedLeafID, sessionID: sessionID)
-    }
-
     /// RED (COMPILE-RED per this file's header comment):
     /// `CalyxWindowControllerReconnectGraceOverrides` does not exist
     /// yet, so this file fails to compile until Green adds the
@@ -161,7 +118,8 @@ final class SessionReconnectEstablishGraceSeamTests: XCTestCase {
     func test_performReconnect_replacementSurvivesGracePeriod_attemptCountEventuallyResets() {
         CalyxWindowControllerReconnectGraceOverrides.reconnectEstablishGraceMilliseconds = 30
 
-        let fixture = makeFixture()
+        let fixture = makeReconnectFixture()
+        registeredSessionIDs.append(fixture.sessionID)
         fixture.controller._sessionReconnectCoordinatorForTesting._testSeedAttemptCount(
             sessionID: fixture.sessionID, count: 2
         )
