@@ -41,6 +41,11 @@ protocol SessionDaemonClientProtocol: Sendable {
     /// (`calyx-session meta set <id> <key>=<value>`). Added for P4's
     /// `AgentSessionMetaBridge`.
     func setMeta(id: String, key: String, value: String) async
+    /// Deploys the daemon binary to `host` via the local bundled
+    /// `calyx-session`'s own `remote-install` subcommand. Returns `nil`
+    /// when the underlying run couldn't be attempted at all (e.g. no
+    /// local binary resolvable). Added for P5's remote-install wiring.
+    func installRemote(host: String) async -> CommandResult?
 }
 
 /// R14-B (r14-fix-spec.md): narrow `#if DEBUG` override hook for the
@@ -135,6 +140,12 @@ extension SessionDaemonClientProtocol {
     /// `AgentSessionMetaBridgeTests`) overrides these itself.
     func listAll() async -> [SessionInfo] { [] }
     func setMeta(id: String, key: String, value: String) async {}
+    /// Default `nil`-returning implementation (mirrors `LSPCommandRunner`'s
+    /// own default `installRun`-forwards-to-`run` precedent), so every
+    /// existing `SessionDaemonClientProtocol` fake predating P5's
+    /// `installRemote(host:)` keeps conforming without modification. A
+    /// fake that actually exercises this behavior overrides it itself.
+    func installRemote(host: String) async -> CommandResult? { nil }
 
     /// R10-C item 2 (r10-fix-spec.md): the single bound shared by every
     /// query-style caller that must not await `listAll()` unbounded,
@@ -341,6 +352,12 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     /// default, so this is behaviorally invisible for normal users.
     private let runtimeDirArgument: [String]
 
+    /// Resolves the bundled resources `installRemote(host:)` needs
+    /// (cross-compiled Linux musl payloads, bundled terminfo entry).
+    /// See `SessionRemotePayloadResolver`'s own doc comment for the
+    /// bundle layout.
+    private let payloadResolver: SessionRemotePayloadResolverProtocol
+
     /// Exposes the resolved binary path for tests
     /// (`SessionBinaryResolverTests`) that need to confirm this client
     /// and `SessionSpawnPlanner`, given the same injected
@@ -362,11 +379,13 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     init(
         resolver: SessionBinaryResolverProtocol,
         commandRunner: LSPCommandRunner = SystemCommandRunner(),
-        rootResolver: SessionRootResolverProtocol = SessionRootResolver()
+        rootResolver: SessionRootResolverProtocol = SessionRootResolver(),
+        payloadResolver: SessionRemotePayloadResolverProtocol = SessionRemotePayloadResolver()
     ) {
         self.binaryPath = resolver.resolve()
         self.commandRunner = commandRunner
         self.runtimeDirArgument = ["--runtime-dir", rootResolver.resolve() + "/.calyx/run"]
+        self.payloadResolver = payloadResolver
     }
 
     func sessionState(id: String) async -> SessionQueryResult {
@@ -469,6 +488,39 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
         await Task {
             _ = try? await commandRunner.run(
                 executable: binaryPath, arguments: runtimeDirArgument + ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: nil
+            )
+        }.value
+    }
+
+    /// Deploys the daemon to `host` by running the LOCAL bundled
+    /// `calyx-session` binary's own `remote-install` subcommand, with
+    /// `--host-binary` pointing at that SAME local path — a Darwin
+    /// arm64 remote reuses this Mac's own build bit-for-bit
+    /// (remote_install.rs's `PayloadKind::HostBinary` mapping). Returns
+    /// `nil` without ever invoking the command runner when no local
+    /// binary is resolvable — there is no executable to run
+    /// remote-install with at all.
+    ///
+    /// Shielded from the caller's own ambient Task cancellation the
+    /// same structural way `kill(id:)`/`setMeta(id:key:value:)` are: an
+    /// inner unstructured `Task` around `commandRunner.run(...)` that
+    /// ambient cancellation can never reach — this is a WRITE (deploys
+    /// a binary to the remote host), so cancelling mid-run risks the
+    /// same silent-loss failure mode those methods' own doc comments
+    /// describe.
+    func installRemote(host: String) async -> CommandResult? {
+        guard let binaryPath else { return nil }
+        let commandRunner = self.commandRunner
+        let argv = RemoteInstallArgvBuilder.buildArgv(
+            host: host,
+            payloadX86_64Path: payloadResolver.payloadPath(forArch: "x86_64"),
+            payloadAarch64Path: payloadResolver.payloadPath(forArch: "aarch64"),
+            hostBinaryPath: binaryPath,
+            terminfoPath: payloadResolver.terminfoPath()
+        )
+        return await Task {
+            try? await commandRunner.run(
+                executable: binaryPath, arguments: argv, workingDirectory: nil, environment: nil
             )
         }.value
     }

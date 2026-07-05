@@ -523,6 +523,37 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ) { [weak self] in
             self?.closeFocusedSessionSurface(killSessions: true)
         })
+        // Gated on `SessionSettings.persistentSessionsEnabled` — unlike
+        // `session.attach` (ungated: it only opens the browser) and
+        // `session.detach`/`session.kill` (gated on an existing tracked
+        // pane) — because this command's entire purpose is spawning a
+        // brand-new persistent session, exactly what
+        // `SessionSpawnPlanner.plan(for:)`'s own guard already gates.
+        commandRegistry.register(PaletteCommand(
+            id: "session.newRemote",
+            title: "New Remote Session…",
+            category: "Sessions",
+            isAvailable: { SessionSettings.persistentSessionsEnabled }
+        ) { [weak self] in
+            self?.presentSessionsBrowserForRemoteHostPicker()
+        })
+    }
+
+    /// `session.newRemote`'s handler: reuses the existing Sessions
+    /// browser panel, where remote host candidates surface via
+    /// `SessionBrowserModel.remoteHostCandidates` — no new visual
+    /// components this cycle.
+    private func presentSessionsBrowserForRemoteHostPicker() {
+        SessionBrowserWindowController.shared.showBrowser()
+    }
+
+    /// Turns a chosen remote host into the `SessionSpawnContext` the
+    /// spawn path (`SessionSpawnPlanner`) consumes. `origin == .tab`:
+    /// a remote session created via the palette is still a new TAB at
+    /// the surface-creation level — `SessionSpawnOrigin` has no
+    /// dedicated palette-specific case.
+    func remoteSessionSpawnContext(forHost host: String) -> SessionSpawnContext {
+        SessionSpawnContext(host: host, origin: .tab)
     }
 
     private func setupUI() {
