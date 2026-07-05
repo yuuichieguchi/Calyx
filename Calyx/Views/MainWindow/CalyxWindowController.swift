@@ -9,6 +9,21 @@ private let logger = Logger(
     category: "CalyxWindowController"
 )
 
+/// Reconnect-flashing-bug fix: narrow `#if DEBUG` override hook for
+/// `CalyxWindowController.reconnectEstablishGraceMilliseconds`,
+/// mirroring `SessionDaemonClientBoundTimeoutOverrides`'s identical
+/// shape/reasoning exactly. `nil` (the default) means "use the
+/// production value" (2000ms); a test sets a tiny, distinguishable
+/// value so it can assert the grace-period wait's plumbing without
+/// waiting out the real one. `nonisolated(unsafe)` is sound because the
+/// only production reader is that computed property, and every test
+/// that sets it resets it back to `nil` in its own `tearDown()`.
+#if DEBUG
+enum CalyxWindowControllerReconnectGraceOverrides {
+    nonisolated(unsafe) static var reconnectEstablishGraceMilliseconds: UInt64?
+}
+#endif
+
 @MainActor
 class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private(set) var windowSession: WindowSession
@@ -74,6 +89,16 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// from production code.
     var _childExitedTasksForTesting: [UUID: Task<Void, Never>] { childExitedTasks }
     #endif
+    /// Reconnect-flashing-bug fix: `performReconnect`'s deferred-reset
+    /// confirmation `Task` per replacement surface, keyed by the NEW
+    /// surfaceID (not sessionID) so two different reconnects never
+    /// collide on the same key. See `performReconnect`'s doc comment for
+    /// why the `markEstablished(sessionID:)` reset itself is deferred
+    /// behind a grace period rather than firing immediately. Cancelled
+    /// and cleared in `windowWillClose` alongside `childExitedTasks`'s
+    /// other siblings, per this file's established per-window `Task`-
+    /// dictionary discipline.
+    private var reconnectEstablishGraceTasks: [UUID: Task<Void, Never>] = [:]
     private var hasMoreCommits = true
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
@@ -90,6 +115,30 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             self?.handleSessionReconnectDecision(surfaceID: surfaceID, decision: decision)
         }
     )
+    #if DEBUG
+    /// Test seam (reconnect-flashing-bug RED phase): when non-nil,
+    /// called INSTEAD of the real `tab.registry.createSurface(...)` FFI
+    /// call inside `performReconnect`, mirroring `AppDelegate
+    /// ._createSurfaceWithPwdHookForTesting`'s exact style/reasoning (a
+    /// real ghostty surface is confirmed unsafe to construct in this
+    /// test host, see `AppDelegateAttachWindowTests`'s header comment
+    /// for the hang this caused). Returns the UUID to report as the
+    /// newly created replacement surface (simulating success), or
+    /// `nil` to simulate surface-creation failure. `nil` (the default)
+    /// leaves production behavior unchanged: every guard/step around
+    /// this call in `performReconnect`, including the `markEstablished`
+    /// timing under test, remains real, unmodified production code. DO
+    /// NOT use from production code.
+    var _performReconnectSurfaceCreationHookForTesting: (() -> UUID?)?
+
+    /// Test seam: read-only access to `sessionReconnectCoordinator`,
+    /// mirroring `_childExitedTasksForTesting`'s/`_closingTabIDsForTesting`'s
+    /// read-only-accessor convention, so a test can inspect
+    /// `attemptCounts` (and, via `SessionReconnectCoordinator
+    /// ._testSeedAttemptCount(sessionID:count:)`, seed it) without a
+    /// live daemon round-trip. DO NOT use from production code.
+    var _sessionReconnectCoordinatorForTesting: SessionReconnectCoordinator { sessionReconnectCoordinator }
+    #endif
     /// Surface UUIDs currently being destroyed as part of
     /// `performReconnect`'s surface swap (populated right before, and
     /// cleared right after, its `destroySurface` call). Consulted by
@@ -2253,6 +2302,23 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// corruption). `reconnectingSurfaceIDs` adds a second, independent
     /// layer of defense in `killSessionIfPersistent` regardless of this
     /// ordering.
+    /// Thin wrapper around the one actually-unsafe-to-test call
+    /// `performReconnect` makes (`tab.registry.createSurface`, a real
+    /// ghostty FFI surface), mirroring `AppDelegate.createRegistrySurface`'s
+    /// identical wrapper/reasoning, so
+    /// `_performReconnectSurfaceCreationHookForTesting` can intercept
+    /// exactly that call and nothing else.
+    private func createReconnectSurface(
+        tab: Tab, app: ghostty_app_t, config: ghostty_surface_config_s, pwd: String?, command: String?
+    ) -> UUID? {
+        #if DEBUG
+        if let hook = _performReconnectSurfaceCreationHookForTesting {
+            return hook()
+        }
+        #endif
+        return tab.registry.createSurface(app: app, config: config, pwd: pwd, command: command)
+    }
+
     private func performReconnect(oldSurfaceID: UUID, sessionID: String) {
         guard let tab = findTab(surfaceID: oldSurfaceID) else { return }
         guard let app = GhosttyAppController.shared.app, let window = self.window else { return }
@@ -2264,7 +2330,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
 
-        guard let newSurfaceID = tab.registry.createSurface(app: app, config: config, pwd: tab.pwd, command: command) else {
+        guard let newSurfaceID = createReconnectSurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: command) else {
             logger.error("Failed to create reconnect surface for session \(sessionID, privacy: .public)")
             return
         }
@@ -2278,10 +2344,40 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         tab.registry.destroySurface(oldSurfaceID)
         reconnectingSurfaceIDs.remove(oldSurfaceID)
 
-        // This session's attempt counter must reset now that the
-        // reconnect succeeded, so a later, unrelated disconnect on the
-        // new surface starts backing off from attempt 1 again.
-        sessionReconnectCoordinator.markEstablished(sessionID: sessionID)
+        // HIGH-SPEED RECONNECT FLASHING BUG (see
+        // SessionReconnectAttemptResetTimingTests's header comment):
+        // resetting sessionID's attempt count immediately here, right
+        // after the swap, used to mean a replacement surface whose
+        // attach process dies right away against a still-unreachable
+        // daemon is followed by another childExited decision that gets
+        // treated as attempt 1 again (0s backoff, see
+        // `reconnectBackoffSeconds(forAttempt:)`) instead of attempt 2+
+        // -- backoff never grows and `maxReconnectAttempts` is never
+        // reached, so `giveUp` never fires: an infinite full-speed
+        // reconnect loop (the user-visible pane flashing). Deferring the
+        // reset behind a grace period instead lets a replacement that
+        // keeps dying accumulate attempts normally; only a replacement
+        // that survives past the grace period resets the count, so a
+        // later, unrelated disconnect still starts backing off from
+        // attempt 1 again (`markEstablished`'s original purpose).
+        //
+        // Cancel-before-replace mirrors `childExitedTasks`'s discipline
+        // above, keyed by newSurfaceID so two different reconnects never
+        // share a key. Re-checks `SessionSurfaceMap.shared.surfaceID(for:)`
+        // once the wait elapses: if this replacement was itself already
+        // swapped out again by a second reconnect within the grace
+        // window, that second attempt now owns the attempt count, and
+        // this stale confirmation must not wrongly reset it out from
+        // under an unrelated, still-in-progress retry.
+        reconnectEstablishGraceTasks[newSurfaceID]?.cancel()
+        reconnectEstablishGraceTasks[newSurfaceID] = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(Self.reconnectEstablishGraceMilliseconds))
+            guard let self else { return }
+            if !Task.isCancelled, SessionSurfaceMap.shared.surfaceID(for: sessionID) == newSurfaceID {
+                self.sessionReconnectCoordinator.markEstablished(sessionID: sessionID)
+            }
+            self.reconnectEstablishGraceTasks.removeValue(forKey: newSurfaceID)
+        }
 
         if tab.id == activeTab?.id {
             splitContainerView?.updateLayout(tree: tab.splitTree)
@@ -2301,6 +2397,25 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private static func reconnectBackoffSeconds(forAttempt attempt: Int) -> Double {
         guard attempt > 1 else { return 0 }
         return min(30.0, pow(2.0, Double(attempt - 2)))
+    }
+
+    /// How long `performReconnect`'s confirmation `Task` waits before
+    /// resetting a replacement surface's session's attempt count (see
+    /// that method's doc comment for why the reset is deferred at all).
+    /// Production default 2000ms: long enough that a replacement whose
+    /// attach process dies right away (the flashing bug's own failure
+    /// mode) is very unlikely to still look "alive" by the time this
+    /// fires, without leaving a legitimately-recovered session's attempt
+    /// count wrongly nonzero for long after it's actually fine again.
+    /// Same `#if DEBUG`-only override seam as `SessionDaemonClientProtocol
+    /// .daemonQueryBoundTimeoutSeconds`.
+    private static var reconnectEstablishGraceMilliseconds: UInt64 {
+        #if DEBUG
+        if let override = CalyxWindowControllerReconnectGraceOverrides.reconnectEstablishGraceMilliseconds {
+            return override
+        }
+        #endif
+        return 2000
     }
 
     @objc private func handleGotoSplitNotification(_ notification: Notification) {
@@ -2961,6 +3076,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         expandTasks.removeAll()
         for (_, task) in childExitedTasks { task.cancel() }
         childExitedTasks.removeAll()
+        for (_, task) in reconnectEstablishGraceTasks { task.cancel() }
+        reconnectEstablishGraceTasks.removeAll()
         refreshTask?.cancel()
         loadMoreTask?.cancel()
         screenPollTask?.cancel()

@@ -138,4 +138,15 @@ final class SessionReconnectCoordinator {
     func markClosed(sessionID: String) {
         attemptCounts[sessionID] = nil
     }
+
+    #if DEBUG
+    /// Test seam (reconnect-flashing-bug RED phase): directly seeds
+    /// `attemptCounts[sessionID]`, letting a controller-level test set
+    /// up "N prior consecutive failures already recorded" without a
+    /// live daemon round-trip through `childExited(surfaceID:)`. DO NOT
+    /// use from production code.
+    func _testSeedAttemptCount(sessionID: String, count: Int) {
+        attemptCounts[sessionID] = count
+    }
+    #endif
 }
