@@ -254,14 +254,28 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
 
         createNewTabViaMenu()
         waitFor(app.windows.firstMatch)
-        ensureAppIsFrontmost()
 
-        typeTextSafely("echo $$ > \(pidFile1)\n")
-        guard let pid1 = waitForPID(atPath: pidFile1, timeout: 10) else {
+        // The daemon-spawned shell's PTY isn't necessarily draining input
+        // the instant the pane appears, the same asynchrony phase 2
+        // already accounts for after restart. A single early keystroke
+        // can land before the shell is ready and be lost, so retry the
+        // echo up to 4 times over ~20s rather than relying on one attempt.
+        var pid1: Int?
+        for _ in 1...4 {
+            ensureAppIsFrontmost()
+            typeTextSafely("echo $$ > \(pidFile1)\n")
+            if let pid = waitForPID(atPath: pidFile1, timeout: 5) {
+                pid1 = pid
+                break
+            }
+        }
+
+        guard let confirmedPID1 = pid1 else {
             XCTFail(
-                "The pane's shell never wrote its PID to \(pidFile1) within 10s, " +
-                "meaning the persistent-session pane never became an interactive " +
-                "shell that accepts input, so there is nothing to compare after restart."
+                "The pane's shell never wrote its PID to \(pidFile1) after 4 attempts " +
+                "over ~20s, meaning the persistent-session pane never became an " +
+                "interactive shell that accepts input, so there is nothing to compare " +
+                "after restart."
             )
             return
         }
@@ -296,9 +310,9 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         }
 
         XCTAssertEqual(
-            confirmedPID2, pid1,
+            confirmedPID2, confirmedPID1,
             "The restored pane's shell PID (\(confirmedPID2)) must equal the original " +
-            "pane's shell PID (\(pid1)); this proves calyx-session's daemon kept the " +
+            "pane's shell PID (\(confirmedPID1)); this proves calyx-session's daemon kept the " +
             "SAME shell process alive across Calyx.app's termination and the restored " +
             "pane reattached to it with working I/O, rather than a fresh replacement " +
             "shell being spawned."
