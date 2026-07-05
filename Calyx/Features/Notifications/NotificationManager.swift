@@ -23,6 +23,15 @@ class NotificationManager {
     }
 
     private func requestPermission() {
+        // The CalyxTests process is an XCTest host, not a real running
+        // app — requesting notification permission here would either
+        // hang the test run on a system permission dialog or spuriously
+        // prompt on a developer's machine every test run (review
+        // finding). Mirrors `AppDelegate.installGlobalEventTap`'s
+        // existing `NSClassFromString("XCTestCase") != nil` test-host
+        // detection, this codebase's established convention for
+        // skipping side-effecting setup under test.
+        guard NSClassFromString("XCTestCase") == nil else { return }
         center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
             Task { @MainActor in
                 self.permissionGranted = granted

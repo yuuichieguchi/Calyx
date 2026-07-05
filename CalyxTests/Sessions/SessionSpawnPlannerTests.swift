@@ -163,9 +163,18 @@ final class SessionSpawnPlannerTests: XCTestCase {
     func test_plan_enabledTabOrigin_distinctCallsProduceDistinctSessionIDs() {
         SessionSettings.persistentSessionsEnabled = true
         let context = SessionSpawnContext(cwd: "/Users/dev/repo")
+        // An injected FakeBinaryResolver, exactly like the other tests in
+        // this file — plan(for:) only needs resolve() to return non-nil
+        // to take the .persistent branch; nothing here executes the
+        // path, so it need not point at a real binary. Using the
+        // no-argument plan(for:) (the production default resolver) made
+        // this test's outcome depend on whether a real calyx-session
+        // binary happened to be bundled in the test environment, rather
+        // than on the ULID-distinctness behavior it's meant to verify.
+        let resolver = FakeBinaryResolver(path: "/dummy/calyx-session")
 
-        guard case .persistent(let firstID, _) = SessionSpawnPlanner.plan(for: context),
-              case .persistent(let secondID, _) = SessionSpawnPlanner.plan(for: context) else {
+        guard case .persistent(let firstID, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver),
+              case .persistent(let secondID, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver) else {
             XCTFail("Both calls must produce .persistent while the feature is enabled")
             return
         }

@@ -13,11 +13,20 @@
 //  here on top of the original contract:
 //    (a) attempt tracking must survive a reconnect's surface swap
 //        (keyed by sessionID, not surfaceID)
-//    (b) a consecutive-failure cap (maxReconnectAttempts) must close
-//        the pane instead of reconnecting forever
+//    (b) a consecutive-failure cap (maxReconnectAttempts) must decide
+//        .giveUp instead of reconnecting forever
 //    (c) the gate is "does SessionSurfaceMap have a session for this
 //        surface", not the global SessionSettings
 //        .persistentSessionsEnabled toggle
+//
+//  Second fix round (give-up redesign) changes one more thing: .giveUp
+//  used to carry a sessionID and its caller deliberately left the pane
+//  open. It now carries no payload (the caller resolves whatever it
+//  needs via SessionSurfaceMap/the surfaceID in hand), and the caller
+//  (CalyxWindowController.handleReconnectGiveUp, see
+//  SessionReconnectGiveUpTests) closes the pane with detach semantics
+//  through the same path .closePane uses — a decision this coordinator
+//  itself is not involved in and does not test.
 //
 //  Coverage:
 //  - Daemon reports .exited -> .closePane
@@ -28,8 +37,8 @@
 //  - Attempt count persists across a surface replacement
 //    (SessionSurfaceMap.replaceSurface), proving it's keyed by
 //    sessionID and not surfaceID
-//  - Exceeding maxReconnectAttempts closes the pane instead of
-//    continuing to reconnect
+//  - Exceeding maxReconnectAttempts decides .giveUp instead of
+//    continuing to reconnect forever
 //  - markEstablished(sessionID:) resets that session's attempt count
 //    back to 0
 //  - The gate is "SessionSurfaceMap has a session for this surface",
@@ -186,9 +195,20 @@ final class SessionReconnectCoordinatorTests: XCTestCase {
            "proving it's tracked by sessionID rather than being silently reset by tracking surfaceID instead")
     }
 
-    // MARK: - Cap: exceeding maxReconnectAttempts closes the pane (fix round, item 3b)
+    // MARK: - Cap: exceeding maxReconnectAttempts decides .giveUp
+    //
+    // Regression coverage: exceeding the cap used to decide `.closePane`,
+    // which conflated two distinct situations under one kill-semantics
+    // close: "the daemon confirmed the session really exited" (kill is
+    // correct) versus "reconnect attempts were merely exhausted, the
+    // daemon may still be legitimately running" (detach, not kill, is
+    // correct). `.giveUp` keeps those cases distinguishable for the
+    // caller (`CalyxWindowController.handleReconnectGiveUp`), which
+    // closes the pane with detach semantics through the same
+    // `closeSurfaceAndCleanUp` path as `.closePane`, rather than the
+    // coordinator itself deciding kill-vs-detach.
 
-    func test_repeatedUnreachable_exceedingMaxAttempts_closesPaneInsteadOfReconnectingForever() async {
+    func test_repeatedUnreachable_exceedingMaxAttempts_decidesGiveUp() async {
         let sessionID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
         let surfaceID = UUID()
         surfaceMap.register(sessionID: sessionID, surfaceID: surfaceID)
@@ -205,9 +225,31 @@ final class SessionReconnectCoordinatorTests: XCTestCase {
         // One more consecutive failure exceeds the cap.
         await coordinator.childExited(surfaceID: surfaceID)
 
-        XCTAssertEqual(recorded.last?.decision, .closePane,
-                       "Exceeding maxReconnectAttempts consecutive failures must give up and close the " +
-                       "pane instead of reconnecting forever")
+        XCTAssertEqual(recorded.last?.decision, .giveUp,
+                       "Exceeding maxReconnectAttempts consecutive failures must decide .giveUp instead of " +
+                       "continuing to reconnect forever")
+    }
+
+    // MARK: - After giving up, a fresh disconnect starts a new cycle from attempt 1
+
+    func test_afterGiveUp_attemptCountReset_soANewDisconnectRestartsAtOne() async {
+        let sessionID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        let surfaceID = UUID()
+        surfaceMap.register(sessionID: sessionID, surfaceID: surfaceID)
+        let maxAttempts = SessionReconnectCoordinator.maxReconnectAttempts
+        let results = [SessionQueryResult](repeating: .unreachable, count: maxAttempts + 2)
+        let coordinator = makeCoordinator(daemon: FakeSessionDaemonClient(results: results))
+
+        for _ in 0...maxAttempts {
+            await coordinator.childExited(surfaceID: surfaceID)
+        }
+        XCTAssertEqual(recorded.last?.decision, .giveUp)
+
+        await coordinator.childExited(surfaceID: surfaceID)
+
+        XCTAssertEqual(recorded.last?.decision, .reconnect(sessionID: sessionID, attempt: 1),
+                       "giveUp must clear the attempt counter just like markEstablished/markClosed, so a " +
+                       "later, unrelated disconnect backs off from attempt 1 again instead of giving up immediately")
     }
 
     // MARK: - markEstablished(sessionID:) resets backoff

@@ -15,10 +15,13 @@ class SettingsWindowController: NSWindowController {
     private let presetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let colorWell = NSColorWell()
     private let hexField = NSTextField()
+    private let persistentSessionsSwitch = NSSwitch()
+    private let agentResumeSwitch = NSSwitch()
+    private let agentResumeAutoExecuteSwitch = NSSwitch()
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 550),
+            contentRect: NSRect(x: 0, y: 0, width: 600, height: 760),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -175,6 +178,49 @@ class SettingsWindowController: NSWindowController {
         lspDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
         root.addArrangedSubview(lspDivider)
 
+        // --- Sessions Section ---
+        let sessionsTitle = NSTextField(labelWithString: "Sessions")
+        sessionsTitle.font = .systemFont(ofSize: 20, weight: .semibold)
+        root.addArrangedSubview(sessionsTitle)
+
+        let sessionsSubtitle = NSTextField(labelWithString: "Persistent terminal sessions survive a crash or quit and can be reattached later, from this window or from the session browser.")
+        sessionsSubtitle.textColor = .secondaryLabelColor
+        sessionsSubtitle.font = .systemFont(ofSize: 13)
+        sessionsSubtitle.maximumNumberOfLines = 0
+        sessionsSubtitle.preferredMaxLayoutWidth = 460
+        root.addArrangedSubview(sessionsSubtitle)
+
+        persistentSessionsSwitch.state = SessionSettings.persistentSessionsEnabled ? .on : .off
+        persistentSessionsSwitch.target = self
+        persistentSessionsSwitch.action = #selector(persistentSessionsDidChange(_:))
+        root.addArrangedSubview(row(label: "Enable persistent sessions", control: persistentSessionsSwitch))
+
+        agentResumeSwitch.state = SessionSettings.agentResumeEnabled ? .on : .off
+        agentResumeSwitch.target = self
+        agentResumeSwitch.action = #selector(agentResumeDidChange(_:))
+        root.addArrangedSubview(row(label: "Offer to resume agent CLI conversations", control: agentResumeSwitch))
+
+        agentResumeAutoExecuteSwitch.state = SessionSettings.agentResumeAutoExecute ? .on : .off
+        agentResumeAutoExecuteSwitch.target = self
+        agentResumeAutoExecuteSwitch.action = #selector(agentResumeAutoExecuteDidChange(_:))
+        root.addArrangedSubview(row(label: "Auto-execute resume (skip confirmation)", control: agentResumeAutoExecuteSwitch))
+
+        let openBrowserButton = NSButton(
+            title: "Open Session Browser", target: self, action: #selector(openSessionBrowser(_:))
+        )
+        openBrowserButton.bezelStyle = .rounded
+        let sessionsActions = NSStackView()
+        sessionsActions.orientation = .horizontal
+        sessionsActions.addArrangedSubview(openBrowserButton)
+        sessionsActions.addArrangedSubview(NSView())
+        root.addArrangedSubview(sessionsActions)
+
+        let sessionsDivider = NSBox()
+        sessionsDivider.boxType = .separator
+        sessionsDivider.translatesAutoresizingMaskIntoConstraints = false
+        sessionsDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        root.addArrangedSubview(sessionsDivider)
+
         // --- Config Actions ---
         let actions = NSStackView()
         actions.orientation = .horizontal
@@ -279,6 +325,22 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func lspRequireConfirmationDidChange(_ sender: NSSwitch) {
         LSPSettings.requireInstallConfirmation = (sender.state == .on)
+    }
+
+    @objc private func persistentSessionsDidChange(_ sender: NSSwitch) {
+        SessionSettings.persistentSessionsEnabled = (sender.state == .on)
+    }
+
+    @objc private func agentResumeDidChange(_ sender: NSSwitch) {
+        SessionSettings.agentResumeEnabled = (sender.state == .on)
+    }
+
+    @objc private func agentResumeAutoExecuteDidChange(_ sender: NSSwitch) {
+        SessionSettings.agentResumeAutoExecute = (sender.state == .on)
+    }
+
+    @objc private func openSessionBrowser(_ sender: Any?) {
+        SessionBrowserWindowController.shared.showBrowser()
     }
 
     @objc private func presetDidChange(_ sender: Any?) {

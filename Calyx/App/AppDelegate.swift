@@ -79,6 +79,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         quickTerminalController == nil
     }
 
+    /// Reads and clears `isTerminationConfirmed` — set ahead of time by
+    /// `windowShouldClose` when the last-window close path already ran
+    /// its own pre-close confirm-quit prompt, so this method doesn't
+    /// prompt a second time for the same termination. See
+    /// `windowShouldClose` for that last-window pre-close prompt path.
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if ProcessInfo.processInfo.arguments.contains("--uitesting") {
             markAllControllersClosingForShutdown()
@@ -245,6 +250,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wc.showWindow(nil)
     }
 
+    /// Session Browser's "Attach" action for a *running* session with
+    /// no live surface in this process (`SessionBrowserRow.isOrphan`):
+    /// opens a new window whose sole tab reattaches to `sessionID`.
+    /// Reuses `restoreTabSurfaces`/`fallbackCreateSurface` — the same
+    /// machinery a snapshot restore uses — with a placeholder leaf UUID
+    /// standing in for the "old leaf" `tab.sessionRefs` key
+    /// `restoreTabSurfaces` expects, so this is exactly the single-tab,
+    /// single-leaf case of a snapshot restore rather than a second,
+    /// parallel code path.
+    func attachWindow(sessionID: String, cwd: String?) {
+        guard let app = GhosttyAppController.shared.app else { return }
+
+        let placeholderLeafID = UUID()
+        let tab = Tab(
+            pwd: cwd,
+            splitTree: SplitTree(leafID: placeholderLeafID),
+            sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID)]
+        )
+        let windowSession = WindowSession(initialTab: tab)
+        appSession.addWindow(windowSession)
+
+        let window = CalyxWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        let wc = CalyxWindowController(window: window, windowSession: windowSession, restoring: true)
+        windowControllers.append(wc)
+
+        let restored = restoreTabSurfaces(tab: tab, app: app, window: window)
+        guard restored || fallbackCreateSurface(tab: tab, app: app, window: window) else {
+            window.close()
+            appSession.removeWindow(id: windowSession.id)
+            windowControllers.removeAll { $0 === wc }
+            logger.error("Failed to attach window for session \(sessionID, privacy: .private)")
+            return
+        }
+
+        wc.activateRestoredSession()
+        wc.showWindow(nil)
+    }
+
     func removeWindowController(_ controller: CalyxWindowController) {
         appSession.removeWindow(id: controller.windowSession.id)
         windowControllers.removeAll { $0 === controller }
@@ -259,28 +307,73 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         windowControllers.count == 1 && windowControllers.first === controller
     }
 
-    /// Returns true if the app should proceed with quit, false if user cancelled.
-    func confirmQuitIfNeeded() -> Bool {
-        // Check for running processes
-        if let app = GhosttyAppController.shared.app,
-           ghostty_app_needs_confirm_quit(app) {
-            let alert = NSAlert()
-            alert.messageText = "Quit Calyx?"
-            alert.informativeText = "A process is still running. Do you want to quit?"
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "Quit")
-            alert.addButton(withTitle: "Cancel")
-
-            if alert.runModal() == .alertSecondButtonReturn {
-                return false
-            }
-        }
-
-        return true
-    }
-
+    /// True when closing `controller` would empty the last managed
+    /// window and no quick terminal is open to keep the app alive —
+    /// i.e. closing it would terminate the app. Consulted by
+    /// `CalyxWindowController`'s close paths (`windowShouldClose`,
+    /// `closeTab`, `closeActiveGroup`, `closeAllTabsInGroup`,
+    /// `confirmQuitBeforeCloseIfWouldTerminate`) to decide whether a
+    /// pre-teardown confirm-quit prompt is needed at all.
     func closingWouldTerminate(_ controller: CalyxWindowController) -> Bool {
         isClosingLastManagedWindow(controller) && quickTerminalController == nil
+    }
+
+    /// Distinguishes the two confirm-quit wordings: `.killProcesses`
+    /// (the default — a real process is about to be killed) vs.
+    /// `.detachOnly` (the session will keep running headless in the
+    /// daemon, detached rather than killed). Passed through by
+    /// `CalyxWindowController.confirmQuitBeforeCloseIfWouldTerminate`
+    /// from whichever close path is asking (kill vs. detach semantics).
+    enum ConfirmQuitMode {
+        case killProcesses
+        case detachOnly
+    }
+
+    /// Set for the duration of `confirmQuitIfNeeded`'s `alert.runModal()`
+    /// call (see Patch 2's header comment there). While `true`, other
+    /// MainActor entry points that could mutate window/tab state out
+    /// from under an in-flight confirm-quit prompt — currently
+    /// `CalyxWindowController.handleShowChildExitedNotification` and
+    /// `handleSessionReconnectDecision` — no-op instead of enqueueing or
+    /// dispatching new teardown work.
+    private(set) var isConfirmingQuit: Bool = false
+
+    /// Returns true if the app should proceed with quit, false if user
+    /// cancelled. Called both from `applicationShouldTerminate` (the
+    /// Cmd+Q / "Quit Calyx" path) and, via
+    /// `CalyxWindowController.confirmQuitBeforeCloseIfWouldTerminate`,
+    /// from individual close paths (`windowShouldClose`, `closeTab`,
+    /// `closeActiveGroup`, `closeAllTabsInGroup`,
+    /// `closeFocusedSessionSurface`, `handleReconnectGiveUp`) BEFORE
+    /// they tear anything down, when closing would terminate the app —
+    /// see `closingWouldTerminate`. `mode` selects the wording: a
+    /// kill-semantics close (default) warns that a running process is
+    /// about to end; a detach-semantics close (`.detachOnly`) explains
+    /// the session will keep running headless instead.
+    func confirmQuitIfNeeded(_ mode: ConfirmQuitMode = .killProcesses) -> Bool {
+        // Check for running processes
+        guard let app = GhosttyAppController.shared.app,
+              ghostty_app_needs_confirm_quit(app) else {
+            return true
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Quit Calyx?"
+        switch mode {
+        case .killProcesses:
+            alert.informativeText = "A process is still running. Do you want to quit?"
+        case .detachOnly:
+            alert.informativeText = "The session will be detached and remain running in the background. The daemon will keep it alive for later reattachment. Do you want to quit?"
+        }
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+
+        isConfirmingQuit = true
+        let response = alert.runModal()
+        isConfirmingQuit = false
+
+        return response != .alertSecondButtonReturn
     }
 
     func applyCurrentGhosttyConfigToAllWindows() {
@@ -863,9 +956,59 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if let oldLeafID, let sessionRef = tab.sessionRefs[oldLeafID],
            let command = SessionCommandSynthesizer.reattachCommand(sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()) {
-            return tab.registry.createSurface(app: app, config: config, pwd: tab.pwd, command: command)
+            guard let surfaceID = tab.registry.createSurface(app: app, config: config, pwd: tab.pwd, command: command) else {
+                return nil
+            }
+            offerAgentResume(tab: tab, surfaceID: surfaceID, sessionID: sessionRef.sessionID)
+            return surfaceID
         }
         return tab.registry.createSurface(app: app, config: config, pwd: tab.pwd)
+    }
+
+    /// P4: once a reattached persistent-session surface exists, checks
+    /// the daemon's per-session meta (`AgentSessionMetaBridge`'s
+    /// recording) for a resumable agent CLI session and, if
+    /// `SessionSettings.agentResumeEnabled`, types
+    /// `SessionResumePlanner.initialInput` into the live surface via
+    /// `sendText` — a fire-and-forget `Task` (same idiom as
+    /// `SessionKillTracker.track`'s callers) so it never blocks or
+    /// delays surface/window creation, including on the app-launch
+    /// restore path.
+    ///
+    /// Deliberately uses `GhosttySurfaceController.sendText` (which
+    /// resolves to ghostty's `textCallback` -> `completeClipboardPaste`)
+    /// rather than `ghostty_surface_config_s.initial_input`: the
+    /// `initial_input` path only queues bytes into the surface's pty at
+    /// creation time, before `calyx-session attach`'s reattach
+    /// connection is even established, which is unverified — this
+    /// method waits for a live, reattached surface first, at the cost
+    /// of one caveat verified against ghostty's core (`Surface
+    /// .textCallback`): pasted text goes through the same completion
+    /// path a real clipboard paste does, and most shells' bracketed
+    /// paste handling does not treat a pasted trailing newline as
+    /// Return — so this reliably reproduces "propose" mode
+    /// (`agentResumeAutoExecute == false`, no trailing newline, user
+    /// presses Return themselves) but "auto-execute" mode's trailing
+    /// newline may not actually submit the command. Flagged in this
+    /// feature's P4 handoff as needing live verification.
+    private func offerAgentResume(tab: Tab, surfaceID: UUID, sessionID: String) {
+        guard SessionSettings.agentResumeEnabled else { return }
+        Task {
+            let sessions = await SessionDaemonClient.shared.listAll()
+            guard let info = sessions.first(where: { $0.id == sessionID }) else { return }
+            let resumable = info.meta.compactMap { key, value -> (kind: String, agentSessionID: String)? in
+                guard let kind = SessionResumePlanner.decodeMetaKey(key) else { return nil }
+                return (kind, value)
+            }.first
+            guard let resumable else { return }
+            guard let input = SessionResumePlanner.initialInput(
+                agentKind: resumable.kind,
+                agentSessionID: resumable.agentSessionID,
+                autoExecute: SessionSettings.agentResumeAutoExecute
+            ) else { return }
+            guard let controller = tab.registry.controller(for: surfaceID) else { return }
+            controller.sendText(input)
+        }
     }
 
     // MARK: - Finder Services

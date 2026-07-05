@@ -57,4 +57,39 @@ final class SessionSettingsTests: XCTestCase {
         XCTAssertFalse(SessionSettings.persistentSessionsEnabled,
                       "resetToDefaults() must strip the persisted value, restoring the documented default")
     }
+
+    // MARK: - P4: agentResumeEnabled / agentResumeAutoExecute
+
+    func test_agentResumeEnabled_defaultsToFalse() {
+        XCTAssertFalse(SessionSettings.agentResumeEnabled,
+                      "agentResumeEnabled must default to false — resume is opt-in")
+    }
+
+    func test_agentResumeEnabled_setTrue_persistsAcrossReads() {
+        SessionSettings.agentResumeEnabled = true
+
+        XCTAssertTrue(SessionSettings.agentResumeEnabled)
+    }
+
+    func test_agentResumeAutoExecute_defaultsToFalse() {
+        XCTAssertFalse(SessionSettings.agentResumeAutoExecute,
+                      "agentResumeAutoExecute must default to false — resume proposes, it does not " +
+                      "auto-submit, until the user opts in")
+    }
+
+    func test_agentResumeAutoExecute_setTrue_persistsAcrossReads() {
+        SessionSettings.agentResumeAutoExecute = true
+
+        XCTAssertTrue(SessionSettings.agentResumeAutoExecute)
+    }
+
+    func test_resetToDefaults_alsoRestoresAgentResumeSettings() {
+        SessionSettings.agentResumeEnabled = true
+        SessionSettings.agentResumeAutoExecute = true
+
+        SessionSettings.resetToDefaults()
+
+        XCTAssertFalse(SessionSettings.agentResumeEnabled)
+        XCTAssertFalse(SessionSettings.agentResumeAutoExecute)
+    }
 }

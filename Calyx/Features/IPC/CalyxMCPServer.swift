@@ -91,6 +91,13 @@ final class CalyxMCPServer {
     /// `parseSurfaceID` fails to parse the header as a raw UUID.
     var sessionSurfaceMap: SessionSurfaceMap = .shared
 
+    /// Records an agent hook event's self-reported session ID into the
+    /// calyx-session daemon's per-session meta map (P4), so a later
+    /// reattach can offer to resume the same CLI conversation. Defaults
+    /// to a bridge over the shared singletons; tests inject their own
+    /// instance the same way as `agentRegistry`/`sessionSurfaceMap`.
+    var agentSessionMetaBridge = AgentSessionMetaBridge()
+
     /// Directory `agent-endpoint.json` is written to (by `finishStart`)
     /// and removed from (by `stop()`). Defaults to
     /// `AgentEndpointFile.defaultDirectory`
@@ -261,6 +268,16 @@ final class CalyxMCPServer {
             kind = AgentEntry.claudeCodeKind
         }
         agentRegistry.handleHookEvent(event, surfaceID: surfaceID, kind: kind)
+        // P4: record the agent's self-reported session ID (when
+        // present) into the calyx-session daemon's per-session meta so
+        // a later reattach can offer to resume this conversation. A
+        // no-op inside the bridge itself when `surfaceID` has no
+        // tracked calyx-session (an ordinary, non-persistent pane).
+        if let agentSessionID = event.sessionID {
+            await agentSessionMetaBridge.recordAgentSession(
+                surfaceID: surfaceID, agentKind: kind, agentSessionID: agentSessionID
+            )
+        }
         return HTTPParser.response(statusCode: 204, body: nil)
     }
 

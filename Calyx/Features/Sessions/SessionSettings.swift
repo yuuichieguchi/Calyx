@@ -19,6 +19,8 @@ import Foundation
 struct SessionSettings: Sendable {
 
     static let persistentSessionsEnabledKey = "calyx.session.persistentSessionsEnabled"
+    static let agentResumeEnabledKey = "calyx.session.agentResumeEnabled"
+    static let agentResumeAutoExecuteKey = "calyx.session.agentResumeAutoExecute"
 
     /// Test isolation hook: production reads/writes `UserDefaults
     /// .standard`; tests call `_testUseSuite(named:)` with a
@@ -51,7 +53,31 @@ struct SessionSettings: Sendable {
         set { (_testStore ?? .standard).set(newValue, forKey: persistentSessionsEnabledKey) }
     }
 
+    /// Whether a reattached persistent-session pane offers to resume
+    /// the agent CLI conversation that was running inside it (via
+    /// `SessionResumePlanner`, keyed by the meta
+    /// `AgentSessionMetaBridge` recorded). Defaults OFF, same
+    /// rationale as `persistentSessionsEnabled` — resuming an agent
+    /// conversation injects synthesized input into the pane, which
+    /// should be opt-in.
+    static var agentResumeEnabled: Bool {
+        get { (_testStore ?? .standard).bool(forKey: agentResumeEnabledKey) }
+        set { (_testStore ?? .standard).set(newValue, forKey: agentResumeEnabledKey) }
+    }
+
+    /// When `agentResumeEnabled` is on: `false` (the default)
+    /// "proposes" the resume command — typed into the pane with no
+    /// trailing newline, so the user presses Return themselves — while
+    /// `true` submits it automatically (trailing newline). See
+    /// `SessionResumePlanner.initialInput(agentKind:agentSessionID:autoExecute:)`.
+    static var agentResumeAutoExecute: Bool {
+        get { (_testStore ?? .standard).bool(forKey: agentResumeAutoExecuteKey) }
+        set { (_testStore ?? .standard).set(newValue, forKey: agentResumeAutoExecuteKey) }
+    }
+
     static func resetToDefaults() {
         (_testStore ?? .standard).removeObject(forKey: persistentSessionsEnabledKey)
+        (_testStore ?? .standard).removeObject(forKey: agentResumeEnabledKey)
+        (_testStore ?? .standard).removeObject(forKey: agentResumeAutoExecuteKey)
     }
 }

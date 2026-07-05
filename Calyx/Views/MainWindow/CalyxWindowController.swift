@@ -15,7 +15,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var splitContainerView: SplitContainerView?
     private var hostingView: NSHostingView<MainContentView>?
     private var wasOccluded = false
-    private let commandRegistry = CommandRegistry()
+    /// Not `private` (P4): `SessionCommandPaletteTests` reads
+    /// `allCommands` directly (via `@testable import Calyx`) to assert
+    /// `session.attach`/`session.detach`/`session.kill` are registered
+    /// with the right `isAvailable` gate — matching the existing
+    /// direct-query test style (`route(request:)`, `_testInsert`) this
+    /// codebase favors over driving real UI. No other production code
+    /// outside this file reads it.
+    let commandRegistry = CommandRegistry()
     private var closingTabIDs: Set<UUID> = []
     private var focusRequestID: UInt64 = 0
     private var isRestoring = false
@@ -68,6 +75,16 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     private var activeRegistry: SurfaceRegistry? {
         activeTab?.registry
+    }
+
+    /// Gate shared by the `session.detach`/`session.kill` command
+    /// palette entries: `true` only when the focused pane (the active
+    /// tab's `splitTree.focusedLeafID`) has a tracked `SessionRef` —
+    /// an ordinary (non-persistent) pane, or no focused leaf at all,
+    /// has nothing to detach or kill.
+    private var focusedPaneHasTrackedSession: Bool {
+        guard let tab = activeTab, let leafID = tab.splitTree.focusedLeafID else { return false }
+        return tab.sessionRefs[leafID] != nil
     }
 
     private var activeBrowserController: BrowserTabController? {
@@ -298,6 +315,29 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ) { [weak self] in
             self?.submitAllDiffReviews()
         })
+        commandRegistry.register(PaletteCommand(
+            id: "session.attach",
+            title: "Attach Session…",
+            category: "Sessions"
+        ) {
+            SessionBrowserWindowController.shared.showBrowser()
+        })
+        commandRegistry.register(PaletteCommand(
+            id: "session.detach",
+            title: "Detach Session",
+            category: "Sessions",
+            isAvailable: { [weak self] in self?.focusedPaneHasTrackedSession ?? false }
+        ) { [weak self] in
+            self?.closeFocusedSessionSurface(killSessions: false)
+        })
+        commandRegistry.register(PaletteCommand(
+            id: "session.kill",
+            title: "Kill Session",
+            category: "Sessions",
+            isAvailable: { [weak self] in self?.focusedPaneHasTrackedSession ?? false }
+        ) { [weak self] in
+            self?.closeFocusedSessionSurface(killSessions: true)
+        })
     }
 
     private func setupUI() {
@@ -448,6 +488,114 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         SessionKillTracker.track {
             await SessionDaemonClient.shared.kill(id: sessionID)
         }
+    }
+
+    /// `session.detach` command palette action's per-surface half:
+    /// drops `surfaceID`'s `SessionSurfaceMap`/`tab.sessionRefs`
+    /// tracking exactly like `killSessionIfPersistent` above, but never
+    /// calls `daemonClient.kill` — the underlying calyx-session keeps
+    /// running headless, reattachable later from the session browser or
+    /// a future restore. A no-op for a surface with no tracked session.
+    ///
+    /// Guards on `isClosingForShutdown` exactly like
+    /// `killSessionIfPersistent`'s `SessionCloseKillPolicy.shouldKill`
+    /// check does (review finding: this method used to have no such
+    /// guard) — during quit/last-window-close teardown, `tab.sessionRefs`
+    /// must survive untouched into the snapshot `applicationWillTerminate`/
+    /// `windowWillClose` save, not be cleared here first. Without this
+    /// guard, a `.giveUp`/`session.detach` teardown racing Cmd+Q could
+    /// clear `SessionRef` before that snapshot is built, permanently
+    /// losing this session's tracking even though it survives in the
+    /// daemon.
+    private func detachSessionIfPersistent(tab: Tab, surfaceID: UUID) {
+        guard !isClosingForShutdown else { return }
+        guard let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID) else { return }
+        SessionSurfaceMap.shared.unregister(sessionID: sessionID)
+        tab.sessionRefs[surfaceID] = nil
+        sessionReconnectCoordinator.markClosed(sessionID: sessionID)
+    }
+
+    /// Pre-teardown quit-confirmation gate shared by every close path
+    /// that can empty the last managed window: bails out early (with
+    /// `true`, nothing to confirm) unless `AppDelegate.closingWouldTerminate`
+    /// says closing this window would terminate the app AND the quit
+    /// hasn't already been confirmed once (`isTerminationConfirmed`) —
+    /// avoids double-prompting when, e.g., a Cmd+Q already confirmed
+    /// termination and this close path is now running as part of that
+    /// same teardown. `mode` selects `confirmQuitIfNeeded`'s wording for
+    /// whichever semantics this particular close uses (kill vs. detach).
+    /// Returns `false` only when the user cancelled the prompt.
+    private func confirmQuitBeforeCloseIfWouldTerminate(mode: AppDelegate.ConfirmQuitMode = .killProcesses) -> Bool {
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              appDelegate.closingWouldTerminate(self),
+              !appDelegate.isTerminationConfirmed else {
+            return true
+        }
+        return appDelegate.confirmQuitIfNeeded(mode)
+    }
+
+    /// Marks `AppDelegate.isTerminationConfirmed` so the subsequent
+    /// `windowShouldClose` -> `applicationShouldTerminate` cascade
+    /// triggered by `window?.close()` doesn't prompt a second time for
+    /// the same already-confirmed quit. A no-op unless closing this
+    /// window would actually terminate the app (see `closingWouldTerminate`).
+    private func markTerminationConfirmedIfWouldTerminate() {
+        guard let appDelegate = NSApp.delegate as? AppDelegate,
+              appDelegate.closingWouldTerminate(self) else { return }
+        appDelegate.isTerminationConfirmed = true
+    }
+
+    /// True when `tab` is the sole tab of the sole group of this window
+    /// AND has exactly one pane (a single, unsplit leaf) — i.e. closing
+    /// this one pane empties the tab, the group, and the window all at
+    /// once. Used by `closeFocusedSessionSurface`/`handleReconnectGiveUp`
+    /// to decide whether their pre-teardown confirm-quit gate applies.
+    private func isLastPaneEverywhere(tab: Tab, group: TabGroup) -> Bool {
+        !tab.splitTree.isEmpty && !tab.splitTree.isSplit
+            && group.tabs.count == 1
+            && windowSession.groups.count == 1
+    }
+
+    /// `session.detach`/`session.kill` command palette actions' shared
+    /// implementation: tears down only the focused pane's surface, via
+    /// the same single-surface `closeSurfaceAndCleanUp` path
+    /// `closeDeadPersistentSessionSurface` uses, instead of the whole
+    /// tab. Fixes a review finding: both commands used to call
+    /// `closeTab(id:)` (with a since-removed `killSessions` parameter),
+    /// which destroys EVERY surface in the active tab even though
+    /// `focusedPaneHasTrackedSession` only checks the ONE focused pane
+    /// — invoking either command on a
+    /// multi-pane tab silently tore down untracked sibling panes too.
+    /// A no-op if there is no active tab, no focused leaf, or the
+    /// focused leaf has no tracked session (re-checked here, not just
+    /// via the palette's `isAvailable` gate, in case focus moved to an
+    /// untracked pane between the palette listing this command and the
+    /// user invoking it).
+    ///
+    /// When this is the last pane everywhere (`isLastPaneEverywhere`),
+    /// gates on `confirmQuitBeforeCloseIfWouldTerminate` BEFORE tearing
+    /// anything down — cancelling leaves the pane/session untouched.
+    /// The flag itself is not set here (see `closeSurfaceAndCleanUp`'s
+    /// `markTerminationConfirmedOnWindowClose` parameter): it's set only
+    /// once teardown actually reaches the `.windowShouldClose` case, so
+    /// a reentrant/interrupted teardown that doesn't reach that point
+    /// never leaves `isTerminationConfirmed` stuck `true`.
+    private func closeFocusedSessionSurface(killSessions: Bool) {
+        guard let group = windowSession.activeGroup,
+              let tab = group.activeTab,
+              let surfaceID = tab.splitTree.focusedLeafID,
+              tab.sessionRefs[surfaceID] != nil else { return }
+
+        let isLastPane = isLastPaneEverywhere(tab: tab, group: group)
+        if isLastPane {
+            guard confirmQuitBeforeCloseIfWouldTerminate(mode: killSessions ? .killProcesses : .detachOnly) else { return }
+        }
+
+        closeSurfaceAndCleanUp(
+            tab: tab, group: group, surfaceID: surfaceID,
+            killSessions: killSessions,
+            markTerminationConfirmedOnWindowClose: isLastPane
+        )
     }
 
     // MARK: - Content View Building
@@ -738,13 +886,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // Quit confirmation: if this is the last tab in the last group, closing it
         // would terminate the app. Confirm BEFORE destroying anything.
         if group.tabs.count == 1 && windowSession.groups.count == 1 {
-            if let appDelegate = NSApp.delegate as? AppDelegate,
-               appDelegate.closingWouldTerminate(self),
-               !appDelegate.isTerminationConfirmed {
-                if !appDelegate.confirmQuitIfNeeded() {
-                    closingTabIDs.remove(tabID)
-                    return
-                }
+            guard confirmQuitBeforeCloseIfWouldTerminate() else {
+                closingTabIDs.remove(tabID)
+                return
             }
         }
 
@@ -771,9 +915,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         diffStates.removeValue(forKey: tabID)
         reviewStores.removeValue(forKey: tabID)
 
-        // Destroy all surfaces in the tab (killing any persistent
+        // Destroy all surfaces in the tab, killing any persistent
         // session each was attached to — an explicit tab close, unlike
-        // quitting the app, ends the session rather than detaching it)
+        // quitting the app, ends the session rather than detaching it.
+        // (`session.detach`/`session.kill` no longer route through this
+        // method — see `closeFocusedSessionSurface`.)
         for surfaceID in tab.registry.allIDs {
             killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
             tab.registry.destroySurface(surfaceID)
@@ -785,10 +931,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         case .switchedTab, .switchedGroup:
             activateCurrentTab()
         case .windowShouldClose:
-            if let appDelegate = NSApp.delegate as? AppDelegate,
-               appDelegate.closingWouldTerminate(self) {
-                appDelegate.isTerminationConfirmed = true
-            }
+            markTerminationConfirmedIfWouldTerminate()
             window?.close()
         }
 
@@ -882,15 +1025,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // Quit confirmation: if this is the last group, closing it would terminate
         // the app. Confirm BEFORE destroying anything.
         if windowSession.groups.count == 1 {
-            if let appDelegate = NSApp.delegate as? AppDelegate,
-               appDelegate.closingWouldTerminate(self),
-               !appDelegate.isTerminationConfirmed {
-                if !appDelegate.confirmQuitIfNeeded() {
-                    for tabID in tabIDs {
-                        closingTabIDs.remove(tabID)
-                    }
-                    return
+            guard confirmQuitBeforeCloseIfWouldTerminate() else {
+                for tabID in tabIDs {
+                    closingTabIDs.remove(tabID)
                 }
+                return
             }
         }
 
@@ -929,10 +1068,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             refreshHostingView()
             requestSave()
         case .windowShouldClose:
-            if let appDelegate = NSApp.delegate as? AppDelegate,
-               appDelegate.closingWouldTerminate(self) {
-                appDelegate.isTerminationConfirmed = true
-            }
+            markTerminationConfirmedIfWouldTerminate()
             window?.close()
             requestSave()
         }
@@ -950,15 +1086,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // Quit confirmation: if this is the last group, closing it would terminate
         // the app. Confirm BEFORE destroying anything.
         if windowSession.groups.count == 1 {
-            if let appDelegate = NSApp.delegate as? AppDelegate,
-               appDelegate.closingWouldTerminate(self),
-               !appDelegate.isTerminationConfirmed {
-                if !appDelegate.confirmQuitIfNeeded() {
-                    for tabID in tabIDs {
-                        closingTabIDs.remove(tabID)
-                    }
-                    return
+            guard confirmQuitBeforeCloseIfWouldTerminate() else {
+                for tabID in tabIDs {
+                    closingTabIDs.remove(tabID)
                 }
+                return
             }
         }
 
@@ -995,10 +1127,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             refreshHostingView()
             requestSave()
         case .windowShouldClose:
-            if let appDelegate = NSApp.delegate as? AppDelegate,
-               appDelegate.closingWouldTerminate(self) {
-                appDelegate.isTerminationConfirmed = true
-            }
+            markTerminationConfirmedIfWouldTerminate()
             window?.close()
             requestSave()
         }
@@ -1389,26 +1518,58 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         closeSurfaceAndCleanUp(tab: owningTab, group: owningGroup, surfaceID: surfaceID)
     }
 
-    /// Shared surface-teardown sequence: kill any persistent session
-    /// attached to `surfaceID`, remove the leaf from `tab`'s split
-    /// tree, destroy the surface, and — if that leaves the tab with no
-    /// leaves at all — remove the tab (closing the window if it was the
-    /// last one). Used by both `handleCloseSurfaceNotification` (a
-    /// ghostty-driven close, e.g. `exit` in a plain pane, or a key press
-    /// acknowledging a dead persistent-session pane) and
+    /// Shared surface-teardown sequence: kill (or, when `killSessions`
+    /// is `false`, merely detach — see `detachSessionIfPersistent`'s
+    /// doc comment) any persistent session attached to `surfaceID`,
+    /// remove the leaf from `tab`'s split tree, destroy the surface,
+    /// and — if that leaves the tab with no leaves at all — remove the
+    /// tab (closing the window if it was the last one). Used by:
+    /// `handleCloseSurfaceNotification` (a ghostty-driven close, e.g.
+    /// `exit` in a plain pane, or a key press acknowledging a dead
+    /// persistent-session pane — kill semantics, default);
     /// `closeDeadPersistentSessionSurface` (`SessionReconnectCoordinator`
     /// confirming, via the daemon, that a persistent session's process
-    /// really did exit).
-    private func closeSurfaceAndCleanUp(tab: Tab, group: TabGroup, surfaceID: UUID) {
-        killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
+    /// really did exit — kill semantics, default); `handleReconnectGiveUp`
+    /// (reconnect attempts exhausted — detach semantics,
+    /// `killSessions: false`, since the daemon may still be legitimately
+    /// running); and `closeFocusedSessionSurface` (`session.detach`/
+    /// `session.kill` command palette actions, either semantics per
+    /// which command fired).
+    ///
+    /// Quit confirmation, when needed, is the caller's responsibility
+    /// BEFORE calling this method (see `confirmQuitBeforeCloseIfWouldTerminate`
+    /// and each caller above) — this method only marks
+    /// `AppDelegate.isTerminationConfirmed` (via
+    /// `markTerminationConfirmedOnWindowClose`, when the caller already
+    /// confirmed) once teardown actually reaches the `.windowShouldClose`
+    /// case below, so a reentrant/interrupted teardown that never
+    /// reaches that point never leaves the flag stuck `true`.
+    private func closeSurfaceAndCleanUp(
+        tab: Tab,
+        group: TabGroup,
+        surfaceID: UUID,
+        killSessions: Bool = true,
+        markTerminationConfirmedOnWindowClose: Bool = false
+    ) {
+        // If closeTab/closeActiveGroup/closeAllTabsInGroup is already
+        // driving this tab's teardown, this call is a reentrant one —
+        // ghostty's close_surface callback firing synchronously from
+        // inside `destroySurface`'s `requestClose()` — and that owning
+        // method's own loop already kills/detaches every surface and
+        // will remove the tab/group wholesale once it finishes.
+        // Checked first (review finding), before any of the kill/
+        // detach/split-tree work below, which would otherwise run
+        // redundantly for every surface in the tab being closed.
+        guard !closingTabIDs.contains(tab.id) else { return }
+
+        if killSessions {
+            killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
+        } else {
+            detachSessionIfPersistent(tab: tab, surfaceID: surfaceID)
+        }
         let (newTree, focusTarget) = tab.splitTree.remove(surfaceID)
         tab.registry.destroySurface(surfaceID)
         tab.splitTree = newTree
-
-        // If closeTab is handling this tab, skip tab removal (closeTab will do it)
-        if closingTabIDs.contains(tab.id) {
-            return
-        }
 
         // Below runs only for process-initiated closes (e.g. `exit` command)
         if tab.splitTree.isEmpty {
@@ -1419,6 +1580,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 case .switchedTab, .switchedGroup:
                     activateCurrentTab()
                 case .windowShouldClose:
+                    if markTerminationConfirmedOnWindowClose {
+                        markTerminationConfirmedIfWouldTerminate()
+                    }
                     window?.close()
                 }
             } else {
@@ -1443,11 +1607,24 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// surface: hand off to `sessionReconnectCoordinator`, which queries
     /// the daemon (macOS never reports a trustworthy exit code for this
     /// action — see `SessionDaemonClient.swift`'s header comment) and
-    /// decides reconnect vs. close via `handleSessionReconnectDecision`.
-    /// A no-op for an ordinary (non-persistent-session) surface, since
-    /// the coordinator's own `surfaceMap.sessionID(for:)` lookup finds
-    /// nothing for one.
+    /// decides reconnect vs. close vs. give up via
+    /// `handleSessionReconnectDecision`. A no-op for an ordinary
+    /// (non-persistent-session) surface, since the coordinator's own
+    /// `surfaceMap.sessionID(for:)` lookup finds nothing for one.
+    ///
+    /// Also a no-op once `isClosingForShutdown` is set (review finding):
+    /// `windowWillClose`'s teardown destroys every surface in the
+    /// window, which can itself trigger this same notification for a
+    /// persistent-session surface — without this guard, that could
+    /// enqueue a `.giveUp`/`.closePane` decision that races the
+    /// in-flight quit teardown and reaches `detachSessionIfPersistent`/
+    /// `killSessionIfPersistent` after (or racing) the snapshot save,
+    /// even though `SessionCloseKillPolicy`/`detachSessionIfPersistent`'s
+    /// own `isClosingForShutdown` checks are the last line of defense
+    /// against that outcome.
     @objc private func handleShowChildExitedNotification(_ notification: Notification) {
+        guard !isClosingForShutdown else { return }
+        guard !((NSApp.delegate as? AppDelegate)?.isConfirmingQuit ?? false) else { return }
         guard let surfaceView = notification.object as? SurfaceView else { return }
         guard belongsToThisWindow(surfaceView) else { return }
         guard let surfaceID = findTab(for: surfaceView)?.0.registry.id(for: surfaceView) else { return }
@@ -1457,12 +1634,26 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func handleSessionReconnectDecision(surfaceID: UUID, decision: SessionReconnectDecision) {
+    /// Not `private` (P4 review fix): `SessionReconnectGiveUpTests`
+    /// calls this directly to drive the `.giveUp` case end-to-end
+    /// without needing a live daemon to actually exhaust
+    /// `maxReconnectAttempts` — matching the existing direct-query test
+    /// style (`commandRegistry`, `_testInsert`) this codebase favors
+    /// over driving real UI. The real production call site remains
+    /// `sessionReconnectCoordinator`'s `onDecision` closure.
+    func handleSessionReconnectDecision(surfaceID: UUID, decision: SessionReconnectDecision) {
+        // A `.giveUp`/`.closePane` decision already in flight (queried from
+        // the daemon before a confirm-quit modal started) must not dispatch
+        // into teardown while that modal is pumping the MainActor — see
+        // `AppDelegate.isConfirmingQuit`'s header comment.
+        guard !((NSApp.delegate as? AppDelegate)?.isConfirmingQuit ?? false) else { return }
         switch decision {
         case .closePane:
             closeDeadPersistentSessionSurface(surfaceID: surfaceID)
         case .reconnect(let sessionID, let attempt):
             scheduleReconnect(surfaceID: surfaceID, sessionID: sessionID, attempt: attempt)
+        case .giveUp:
+            handleReconnectGiveUp(surfaceID: surfaceID)
         }
     }
 
@@ -1472,6 +1663,57 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private func closeDeadPersistentSessionSurface(surfaceID: UUID) {
         guard let (tab, group) = findTabAndGroup(surfaceID: surfaceID) else { return }
         closeSurfaceAndCleanUp(tab: tab, group: group, surfaceID: surfaceID)
+    }
+
+    /// Reconnect attempts for `surfaceID`'s session exceeded
+    /// `maxReconnectAttempts` (`SessionReconnectDecision.giveUp`).
+    /// Unlike `.closePane` (the daemon confirmed the session's process
+    /// actually exited, so a full kill is correct), the daemon here was
+    /// only ever reported unreachable — the underlying `calyx-session`
+    /// daemon may still be legitimately running (e.g. slow to start),
+    /// so this closes the pane with DETACH, not kill, semantics: the
+    /// session survives, reattachable later from the session browser
+    /// (`calyx-session ls --all` still lists it) or a future restore.
+    ///
+    /// Deliberately closes the pane now, through the same
+    /// `closeSurfaceAndCleanUp` path `closeDeadPersistentSessionSurface`
+    /// uses (with `killSessions: false`), rather than leaving it open:
+    /// review found that leaving a dead pane open did not prevent the
+    /// last-pane/last-window quit cascade it was meant to avoid — it
+    /// only deferred that same cascade to whenever the user next
+    /// pressed a key on the dead pane, and ghostty may not even render
+    /// an informative screen by then on a fast/abnormal exit. Closing
+    /// deterministically here keeps cascade timing consistent with
+    /// every other session-ending path.
+    ///
+    /// When this would empty the last tab/group/window, gates on
+    /// `confirmQuitBeforeCloseIfWouldTerminate(mode: .detachOnly)` BEFORE
+    /// tearing anything down, exactly like `closeFocusedSessionSurface` —
+    /// cancelling leaves this (already-dead) pane in place rather than
+    /// forcing the app closed. `.detachOnly` wording, since the session
+    /// survives in the daemon either way.
+    ///
+    /// A no-op if the pane was already closed by the user in the
+    /// meantime (`findTabAndGroup` returns `nil`).
+    private func handleReconnectGiveUp(surfaceID: UUID) {
+        guard let (tab, group) = findTabAndGroup(surfaceID: surfaceID) else { return }
+
+        let isLastPane = isLastPaneEverywhere(tab: tab, group: group)
+        if isLastPane {
+            guard confirmQuitBeforeCloseIfWouldTerminate(mode: .detachOnly) else {
+                logger.info("User cancelled quit prompt for exhausted-reconnect pane; leaving pane in place")
+                return
+            }
+        }
+
+        let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID)
+        logger.error("Reconnect attempts exhausted for session \(sessionID ?? "unknown", privacy: .public); detaching and closing pane")
+        NotificationManager.shared.sendNotification(
+            title: "Session unreachable",
+            body: "Calyx couldn't reattach this session. If the daemon returns, you can start a new session with the same ID from the session browser — but any scrollback and running commands from this session are lost.",
+            tabID: tab.id
+        )
+        closeSurfaceAndCleanUp(tab: tab, group: group, surfaceID: surfaceID, killSessions: false, markTerminationConfirmedOnWindowClose: isLastPane)
     }
 
     /// Waits out `attempt`'s backoff delay, then re-attaches. A stale
@@ -2051,8 +2293,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     /// Like `findTab(surfaceID:)`, but also returns the owning group —
-    /// needed by `closeDeadPersistentSessionSurface` to remove the tab
-    /// via `WindowSession.removeTab(id:fromGroup:)` when a persistent
+    /// needed by `closeDeadPersistentSessionSurface` and
+    /// `handleReconnectGiveUp` to remove the tab via
+    /// `WindowSession.removeTab(id:fromGroup:)` when a persistent
     /// session's pane closes and empties the tab's split tree.
     private func findTabAndGroup(surfaceID: UUID) -> (Tab, TabGroup)? {
         for group in windowSession.groups {
@@ -2098,6 +2341,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    /// Last-window pre-close prompt path: if closing this window would
+    /// terminate the app (`AppDelegate.closingWouldTerminate`), runs the
+    /// confirm-quit gate BEFORE returning `true`, i.e. before AppKit
+    /// proceeds to tear the window down — cancelling here leaves the
+    /// window (and everything in it) untouched. On success, marks
+    /// `isTerminationConfirmed` so the `applicationShouldTerminate` this
+    /// close eventually cascades into (via `windowWillClose` ->
+    /// `removeWindowController` -> `NSApp.terminate(nil)`) doesn't
+    /// prompt a second time. Not gated when this isn't the last managed
+    /// window, or a quick terminal is open, or the quit was already
+    /// confirmed elsewhere (e.g. Cmd+Q racing this same close).
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard let appDelegate = NSApp.delegate as? AppDelegate,
               appDelegate.closingWouldTerminate(self) else {

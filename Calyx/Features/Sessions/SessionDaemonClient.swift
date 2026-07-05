@@ -33,6 +33,25 @@ enum SessionQueryResult: Sendable, Equatable {
 protocol SessionDaemonClientProtocol: Sendable {
     func sessionState(id: String) async -> SessionQueryResult
     func kill(id: String) async
+    /// The full ledger view (`ls --all --json`) -- every session the
+    /// daemon has ever recorded, running or exited, with `meta`. Added
+    /// for P4's `SessionBrowserModel`.
+    func listAll() async -> [SessionInfo]
+    /// Persists `key=value` into session `id`'s daemon-side meta map
+    /// (`calyx-session meta set <id> <key>=<value>`). Added for P4's
+    /// `AgentSessionMetaBridge`.
+    func setMeta(id: String, key: String, value: String) async
+}
+
+extension SessionDaemonClientProtocol {
+    /// Default empty/no-op implementations, so fakes built before P4
+    /// introduced `listAll()`/`setMeta(id:key:value:)` (e.g.
+    /// `SessionReconnectCoordinatorTests`'s `FakeSessionDaemonClient`)
+    /// keep conforming without modification. A fake that actually
+    /// exercises P4 behavior (`SessionBrowserModelTests`,
+    /// `AgentSessionMetaBridgeTests`) overrides these itself.
+    func listAll() async -> [SessionInfo] { [] }
+    func setMeta(id: String, key: String, value: String) async {}
 }
 
 /// Production client: shells out to the bundled `calyx-session` binary
@@ -79,7 +98,7 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
         ), result.exitCode == 0 else {
             return .unreachable
         }
-        guard let sessions = try? JSONDecoder().decode([SessionInfoJSON].self, from: Data(result.stdout.utf8)) else {
+        guard let sessions = try? JSONDecoder().decode([SessionInfo].self, from: Data(result.stdout.utf8)) else {
             return .unreachable
         }
         guard let match = sessions.first(where: { $0.id == id }) else {
@@ -105,23 +124,73 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
             executable: binaryPath, arguments: ["kill", id], workingDirectory: nil, environment: nil
         )
     }
+
+    /// Runs the same `ls --all --json` invocation `sessionState(id:)`
+    /// above already does and decodes the result as `[SessionInfo]`,
+    /// returning `[]` when the binary is unresolvable or the daemon is
+    /// unreachable — mirroring that method's own degrade-gracefully
+    /// contract.
+    func listAll() async -> [SessionInfo] {
+        guard let binaryPath else { return [] }
+        guard let result = try? await commandRunner.run(
+            executable: binaryPath, arguments: ["ls", "--all", "--json"], workingDirectory: nil, environment: nil
+        ), result.exitCode == 0 else {
+            return []
+        }
+        guard let sessions = try? JSONDecoder().decode([SessionInfo].self, from: Data(result.stdout.utf8)) else {
+            return []
+        }
+        return sessions
+    }
+
+    /// Shells out to `meta set <id> <key>=<value>` exactly like
+    /// `kill(id:)` above, ignoring the result the same way — a failed
+    /// meta write is not user-visible, it just means resume won't be
+    /// offered next time.
+    func setMeta(id: String, key: String, value: String) async {
+        guard let binaryPath else { return }
+        _ = try? await commandRunner.run(
+            executable: binaryPath, arguments: ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: nil
+        )
+    }
 }
 
-/// Mirrors `proto::SessionInfo`'s `id`/`state` fields (the CLI's
-/// `ls --json` output — see `calyx-session/crates/proto/src/control.rs`).
-/// Only the fields `SessionDaemonClient` actually consumes are
-/// declared; the JSON also carries `name`/`cwd`/`created_at_ms`/
-/// `attached_clients`/`pid`/`meta`, which `Decodable` simply ignores.
-private struct SessionInfoJSON: Decodable {
+/// Mirrors `proto::SessionInfo` (the CLI's `ls --json` / `ls --all
+/// --json` output — see `calyx-session/crates/proto/src/control.rs`).
+/// Originally a `private` `id`/`state`-only `SessionInfoJSON`
+/// (everything else `Decodable` simply ignored); extended for P4 to
+/// carry every field `SessionBrowserModel` needs (`name`, `cwd`,
+/// `createdAtMs`, `attachedClients`, `pid`, `meta`) and un-privated so
+/// `SessionDaemonClient.listAll()` and the session-browser layer can
+/// share one decoder.
+struct SessionInfo: Decodable, Equatable, Sendable {
     let id: String
-    let state: SessionStateJSON
+    let name: String?
+    let cwd: String?
+    let state: SessionLifecycleState
+    let createdAtMs: UInt64
+    let attachedClients: UInt32
+    let pid: UInt32
+    let meta: [String: String]
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, cwd, state
+        case createdAtMs = "created_at_ms"
+        case attachedClients = "attached_clients"
+        case pid, meta
+    }
 }
 
 /// Mirrors `proto::SessionState`'s serde default (externally tagged)
 /// representation: the unit variant `Running` encodes as the bare
 /// string `"Running"`; the struct variant `Exited { code }` encodes as
-/// `{"Exited": {"code": N}}`.
-private enum SessionStateJSON: Decodable {
+/// `{"Exited": {"code": N}}`. Renamed from the former `private
+/// SessionStateJSON` (P4) to `SessionLifecycleState` — not
+/// `SessionState`, which already names an unrelated LSP-layer type in
+/// `LSPSession.swift` — and un-privated so `SessionInfo.state` can be
+/// inspected outside this file (e.g. `SessionBrowserModel`'s orphan
+/// detection, which only considers `.running` sessions).
+enum SessionLifecycleState: Decodable, Equatable, Sendable {
     case running
     case exited(code: Int32)
 

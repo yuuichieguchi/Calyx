@@ -11,24 +11,42 @@
 // Attempt tracking is keyed by sessionID rather than surfaceID so it
 // survives a reconnect's surface swap (`SessionSurfaceMap
 // .replaceSurface`); consecutive `.running`/`.unreachable` decisions
-// are capped at `maxReconnectAttempts`, closing the pane instead of
-// retrying forever once exceeded; and the gate for whether a surface is
-// managed at all is "does `surfaceMap` have a session for this
-// surface", not the global `SessionSettings.persistentSessionsEnabled`
-// toggle — a surface already tracked must keep being managed even if
-// the user turns off "start new panes as persistent" afterward (that
-// toggle only affects `SessionSpawnPlanner`'s decision for *new*
-// surfaces).
+// are capped at `maxReconnectAttempts`, giving up (closing the pane
+// with DETACH, not kill, semantics — see `SessionReconnectDecision
+// .giveUp`'s doc comment) instead of retrying forever once exceeded;
+// and the gate for whether a surface is managed at all is "does
+// `surfaceMap` have a session for this surface", not the global
+// `SessionSettings.persistentSessionsEnabled` toggle — a surface
+// already tracked must keep being managed even if the user turns off
+// "start new panes as persistent" afterward (that toggle only affects
+// `SessionSpawnPlanner`'s decision for *new* surfaces).
 
 import Foundation
 
 enum SessionReconnectDecision: Sendable, Equatable {
-    /// The session actually ended — close the pane normally.
+    /// The session actually ended — close the pane normally (kill
+    /// semantics: the daemon confirmed the child process is gone, so
+    /// there is nothing left to reattach to).
     case closePane
     /// Re-run `calyx-session attach --create` for `sessionID`. `attempt`
     /// is the 1-based count of consecutive reconnect attempts for this
     /// sessionID, for the caller to compute a backoff delay from.
     case reconnect(sessionID: String, attempt: Int)
+    /// Reconnect attempts exceeded `maxReconnectAttempts`; give up and
+    /// close the pane now, using DETACH (not kill) semantics. Unlike
+    /// `.closePane`, the daemon here was only ever reported unreachable
+    /// — never confirmed exited — so the underlying `calyx-session` may
+    /// still be legitimately running (e.g. slow to start). Closing the
+    /// pane deterministically at this point, rather than leaving it
+    /// dangling for a later keypress to close, keeps the last-pane/
+    /// last-window quit cascade's timing consistent with every other
+    /// session-ending path (a prior design that left the pane open only
+    /// deferred that same cascade to an unpredictable later moment,
+    /// per review finding, and could not rely on ghostty rendering
+    /// anything informative in the meantime). Carries no payload: the
+    /// caller already has `surfaceID` in hand and resolves whatever
+    /// else it needs (sessionID, tab) itself via `SessionSurfaceMap`.
+    case giveUp
 }
 
 @MainActor
@@ -36,8 +54,9 @@ final class SessionReconnectCoordinator {
 
     /// After this many consecutive `.running`/`.unreachable` reconnect
     /// decisions for the same sessionID with no intervening
-    /// `markEstablished(sessionID:)`, give up and close the pane
-    /// instead of retrying forever.
+    /// `markEstablished(sessionID:)`, give up (`.giveUp` — closes the
+    /// pane with detach, not kill, semantics; see the case's doc
+    /// comment) instead of retrying forever.
     static let maxReconnectAttempts = 5
 
     private let daemonClient: SessionDaemonClientProtocol
@@ -91,7 +110,7 @@ final class SessionReconnectCoordinator {
             let attempt = (attemptCounts[sessionID] ?? 0) + 1
             guard attempt <= Self.maxReconnectAttempts else {
                 attemptCounts[sessionID] = nil
-                onDecision(surfaceID, .closePane)
+                onDecision(surfaceID, .giveUp)
                 return
             }
             attemptCounts[sessionID] = attempt

@@ -118,7 +118,18 @@ final class SurfaceRegistry {
     }
 
     func destroySurface(_ id: UUID) {
-        guard var entry = entries[id] else { return }
+        guard var entry = entries[id] else {
+            #if DEBUG
+            // Symmetric with `contains(_:)`'s injected-ID fallback
+            // (review finding): a `_testInsert`-only entry has no live
+            // ghostty surface to tear down, but it must still be
+            // dropped from test-only storage so `contains(_:)` (and
+            // `view(for:)`/`id(for:)`) correctly stop resolving it
+            // afterward, matching what destroying a real entry does.
+            _testViewsByID.removeValue(forKey: id)
+            #endif
+            return
+        }
         guard entry.state != .destroyed else { return }
 
         if entry.isDragging {
@@ -202,7 +213,12 @@ final class SurfaceRegistry {
     }
 
     func contains(_ id: UUID) -> Bool {
-        entries[id] != nil
+        if entries[id] != nil { return true }
+        #if DEBUG
+        return _testViewsByID[id] != nil
+        #else
+        return false
+        #endif
     }
 
     func applyConfig(_ config: ghostty_config_t) {
@@ -216,9 +232,19 @@ final class SurfaceRegistry {
 
     #if DEBUG
     /// Test-only: inject a `SurfaceView` with a fixed UUID, bypassing the
-    /// ghostty FFI surface-creation path. Both `view(for:)` and
-    /// `id(for:)` will resolve the injected view. DO NOT call from
-    /// production code.
+    /// ghostty FFI surface-creation path. `view(for:)`, `id(for:)`, and
+    /// `contains(_:)` will all resolve the injected view — the latter
+    /// added for `SessionReconnectGiveUpTests`/`SessionCommandPaletteTests`,
+    /// which need `findTab(surfaceID:)`/`findTabAndGroup(surfaceID:)`
+    /// (both gated on `contains(_:)`) to find a `_testInsert`-only tab
+    /// without a live ghostty app. `destroySurface(_:)` is ALSO extended
+    /// to remove an injected entry (review finding: it used to leave
+    /// `_testViewsByID` untouched, so `contains(_:)` kept reporting
+    /// `true` for an ID that had just been torn down — an asymmetry
+    /// with the production-entry path, where `destroySurface` always
+    /// makes `contains` flip to `false`). `allIDs` remains deliberately
+    /// NOT extended to see injected entries: no test needs iteration
+    /// over test-only entries. DO NOT use from production code.
     func _testInsert(view: SurfaceView, id: UUID) {
         _testViewsByID[id] = view
     }
