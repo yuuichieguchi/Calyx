@@ -278,34 +278,22 @@ final class SessionCommandPaletteTests: XCTestCase {
     /// `AppDelegate` subclass that lets the last-pane-everywhere
     /// confirm-quit gate be driven deterministically, without a real
     /// `NSAlert.runModal()` blocking the test run, and counts how many
-    /// times it was consulted. Overrides `closingWouldTerminate` to
-    /// always report `true` regardless of this test process's real
-    /// `windowControllers` (which the fixture's contrived controller was
-    /// never added to), and `removeWindowController` to a no-op purely
-    /// as test-process safety: invoking `session.detach`/`session.kill`
-    /// on `SinglePaneFixture` below, when `shouldConfirm` is `true`,
-    /// empties the window for real, so `closeSurfaceAndCleanUp` calls
-    /// `window?.close()`, which fires `windowWillClose` ->
-    /// `AppDelegate.removeWindowController`. The real implementation
-    /// calls `NSApp.terminate(nil)` there once its (private)
-    /// `windowControllers` list is empty — swapped into `NSApp.delegate`
-    /// for the duration of each test below so the test process itself
-    /// never risks exiting, regardless of how many real windows the
-    /// host app happens to have at the time.
-    private final class MockConfirmQuitAppDelegate: AppDelegate {
+    /// times it was consulted. `closingWouldTerminate`/`removeWindowController`
+    /// come from `ConfirmQuitMockAppDelegate` (R6-J, r6-fix-spec.md):
+    /// invoking `session.detach`/`session.kill` on `SinglePaneFixture`
+    /// below, when `shouldConfirm` is `true`, empties the window for
+    /// real, so `closeSurfaceAndCleanUp` calls `window?.close()`, which
+    /// fires `windowWillClose` -> `AppDelegate.removeWindowController`,
+    /// see that base class's own doc comment for why the override is a
+    /// no-op.
+    private final class MockConfirmQuitAppDelegate: ConfirmQuitMockAppDelegate {
         var shouldConfirm = true
         private(set) var confirmQuitCallCount = 0
-
-        override func closingWouldTerminate(_ controller: CalyxWindowController) -> Bool {
-            true
-        }
 
         override func confirmQuitIfNeeded(_ mode: ConfirmQuitMode) -> Bool {
             confirmQuitCallCount += 1
             return shouldConfirm
         }
-
-        override func removeWindowController(_ controller: CalyxWindowController) {}
     }
 
     private func withMockAppDelegate(_ mock: MockConfirmQuitAppDelegate, _ body: () throws -> Void) rethrows {
@@ -515,7 +503,7 @@ final class SessionCommandPaletteTests: XCTestCase {
     // guard instead of tearing down twice. `handleReconnectGiveUp`'s own
     // (multi-pane) insertion is covered separately in
     // `SessionReconnectGiveUpTests`, using a different, already-present
-    // checkpoint (a `NotificationManager` spy) — this file's
+    // checkpoint (a `NotificationManager` spy), this file's
     // `confirmQuitIfNeeded` override is the natural checkpoint for
     // `closeFocusedSessionSurface` specifically, since ONLY its
     // last-pane-everywhere branch consults that gate.
@@ -524,22 +512,16 @@ final class SessionCommandPaletteTests: XCTestCase {
     /// `CalyxWindowController._closingTabIDsForTesting`'s state at the
     /// moment `confirmQuitIfNeeded` is consulted. Cannot reuse
     /// `MockConfirmQuitAppDelegate` above (it's `final`, and doesn't
-    /// expose this hook) — `removeWindowController` is a no-op for the
-    /// same test-process-safety reason documented on that class.
-    private final class ClosingTabIDsSpyAppDelegate: AppDelegate {
+    /// expose this hook); `closingWouldTerminate`/`removeWindowController`
+    /// come from `ConfirmQuitMockAppDelegate` (R6-J, r6-fix-spec.md).
+    private final class ClosingTabIDsSpyAppDelegate: ConfirmQuitMockAppDelegate {
         weak var controller: CalyxWindowController?
         private(set) var observedClosingTabIDs: Set<UUID>?
-
-        override func closingWouldTerminate(_ controller: CalyxWindowController) -> Bool {
-            true
-        }
 
         override func confirmQuitIfNeeded(_ mode: ConfirmQuitMode = .killProcesses) -> Bool {
             observedClosingTabIDs = controller?._closingTabIDsForTesting
             return true
         }
-
-        override func removeWindowController(_ controller: CalyxWindowController) {}
     }
 
     /// Against the CURRENT code, `closeFocusedSessionSurface` never
@@ -589,7 +571,7 @@ final class SessionCommandPaletteTests: XCTestCase {
     // MARK: - Round-4 fix (F7/T7): isClosingForShutdown timing
     //
     // r4-fix-spec.md F7 (S2, WARNING): `closeSurfaceAndCleanUp`'s
-    // `.windowShouldClose` arm (one of the four arms covered by F7/F8 —
+    // `.windowShouldClose` arm (one of the four arms covered by F7/F8,
     // the other three, `closeTab`/`closeActiveGroup`/
     // `closeAllTabsInGroup`, are covered by
     // `CalyxWindowControllerCloseArmsTests`) must set

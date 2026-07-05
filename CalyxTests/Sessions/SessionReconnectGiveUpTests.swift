@@ -36,17 +36,17 @@
 //
 //  - F1/T1: `.giveUp` on a pane that is last-pane-everywhere AND
 //    `closingWouldTerminate` must NOT close the pane and must NOT
-//    consult the confirm-quit gate at all — detach bookkeeping only,
+//    consult the confirm-quit gate at all, detach bookkeeping only,
 //    leaving the leaf in the split tree (contrast with the two-pane
-//    tests above, whose `.giveUp` DOES close the pane — that multi-pane
+//    tests above, whose `.giveUp` DOES close the pane, that multi-pane
 //    behavior is explicitly unchanged by F1).
 //  - F2/T2 (`handleReconnectGiveUp`'s own insert, not
-//    `closeFocusedSessionSurface`'s — see `SessionCommandPaletteTests`
+//    `closeFocusedSessionSurface`'s, see `SessionCommandPaletteTests`
 //    for that one): the multi-pane close branch must insert `tab.id`
 //    into `closingTabIDs` before tearing the surface down, observed via
 //    a `NotificationManager` spy (the call already happens before
 //    `closeSurfaceAndCleanUp` in the current code, giving a convenient,
-//    already-present mid-sequence checkpoint — no new seam beyond the
+//    already-present mid-sequence checkpoint, no new seam beyond the
 //    `_closingTabIDsForTesting` read-only accessor and the
 //    `NotificationManager.shared` swap seam was needed for this one).
 //  - F4/T4: while `AppDelegate.isConfirmingQuit` is true (driven via
@@ -58,7 +58,7 @@
 //    of dropping it, and replay it once the gate clears. RESIDUAL GAP:
 //    only `handleSessionReconnectDecision` is covered here.
 //    `handleShowChildExitedNotification`'s identical guard is NOT
-//    separately covered — it kicks off an async `Task` into
+//    separately covered, it kicks off an async `Task` into
 //    `sessionReconnectCoordinator.childExited(surfaceID:)`, which has
 //    no injection seam at this call site (the coordinator is
 //    constructed internally with the real `SessionDaemonClient.shared`)
@@ -66,17 +66,30 @@
 //    deterministically. Uses `.giveUp` (detach semantics), not
 //    `.closePane`, so this test never triggers
 //    `killSessionIfPersistent`'s real `SessionDaemonClient.shared.kill`
-//    subprocess call for a fake test session ID — the gate itself is
+//    subprocess call for a fake test session ID, the gate itself is
 //    decision-agnostic (checked once, before the `switch`), so `.giveUp`
 //    exercises the identical guard `.closePane` would.
 //  - F5/T5: the give-up notification body must no longer claim
 //    scrollback/commands are "lost", and must tell the user the session
-//    may still be running — observed via the same `NotificationManager`
+//    may still be running, observed via the same `NotificationManager`
 //    spy as F2/T2 above (`NotificationManager.shared` is swappable and
-//    `sendNotification` overridable specifically for this — see that
+//    `sendNotification` overridable specifically for this, see that
 //    file's own test-seam doc comment; production `sendNotification` is
 //    otherwise unobservable in the test host, since `permissionGranted`
 //    is never set `true` under `XCTestCase`).
+//
+//  ROUND-6 FIX ADDITIONS (RED phase, r6-fix-spec.md R6-A): round-4's F4
+//  defer mechanism above is itself unsafe (r5-verdicts.md V1/V5):
+//  synchronous, nested replay with no shutdown awareness. Covers the
+//  unified, asynchronous-drain redesign: a decision deferred mid-modal
+//  during a CANCELLED close must still be applied once the caller's own
+//  post-modal bookkeeping has run, not lost (V1 cancel path); a deferred
+//  event must NOT be replayed while the app is actually terminating (V5);
+//  a replay landing during a second, already-active modal must re-defer,
+//  not apply early (item 4); and `handleCloseSurfaceNotification` must
+//  defer (not immediately tear down) a close_surface notification the
+//  same way (items 1/2, V2/V3). See each test's own doc comment for its
+//  specific CURRENT-code failure mode.
 //
 
 import XCTest
@@ -202,7 +215,7 @@ final class SessionReconnectGiveUpTests: XCTestCase {
 
     /// Single-pane/single-tab/single-group fixture: the sole leaf
     /// carries a `SessionRef`, tracked in both `tab.sessionRefs` and
-    /// `SessionSurfaceMap.shared` — the "closing this pane empties the
+    /// `SessionSurfaceMap.shared`, the "closing this pane empties the
     /// window" case `isLastPaneEverywhere` gates on. Mirrors
     /// `SessionCommandPaletteTests.makeSinglePaneFixture()`.
     private struct SinglePaneFixture {
@@ -241,7 +254,7 @@ final class SessionReconnectGiveUpTests: XCTestCase {
     /// `AppDelegate` subclass reporting `closingWouldTerminate == true`
     /// unconditionally (so `isLastPaneEverywhere && closingWouldTerminate`
     /// is satisfied for `SinglePaneFixture`) and counting
-    /// `confirmQuitIfNeeded` calls — F1's redesigned last-pane-everywhere
+    /// `confirmQuitIfNeeded` calls, F1's redesigned last-pane-everywhere
     /// `.giveUp` branch must never reach it at all. `removeWindowController`
     /// is a no-op purely as test-process safety, matching
     /// `SessionCommandPaletteTests.MockConfirmQuitAppDelegate`'s reasoning:
@@ -265,7 +278,7 @@ final class SessionReconnectGiveUpTests: XCTestCase {
 
     /// F1 (V01, CRITICAL): the last-pane-everywhere `.giveUp` branch
     /// must switch from "close the pane" to "detach bookkeeping only,
-    /// leave the leaf in place" — no modal, no window close, no app
+    /// leave the leaf in place", no modal, no window close, no app
     /// termination. Against the CURRENT code, this fails because
     /// `handleReconnectGiveUp` still gates on and calls
     /// `confirmQuitBeforeCloseIfWouldTerminate`, then closes the pane
@@ -284,26 +297,26 @@ final class SessionReconnectGiveUpTests: XCTestCase {
 
         XCTAssertEqual(mock.confirmQuitCallCount, 0,
                        "The redesigned last-pane-everywhere .giveUp branch must never consult the " +
-                       "confirm-quit gate at all — no modal, since the pane isn't being closed")
+                       "confirm-quit gate at all, no modal, since the pane isn't being closed")
         XCTAssertEqual(fixture.tab.splitTree.allLeafIDs(), [fixture.leafID],
-                       "The pane must remain in the split tree — .giveUp must leave the leaf in place, " +
+                       "The pane must remain in the split tree, .giveUp must leave the leaf in place, " +
                        "not close it")
         XCTAssertNil(fixture.tab.sessionRefs[fixture.leafID],
                     "Detach bookkeeping must still clear tab.sessionRefs for the given-up leaf")
         XCTAssertNil(SessionSurfaceMap.shared.sessionID(for: fixture.leafID),
                     "Detach bookkeeping must still clear SessionSurfaceMap's entry for the given-up leaf")
         XCTAssertEqual(fixture.controller.windowSession.groups.count, 1,
-                       "The group/tab must remain in place — the window must not be emptied or closed")
+                       "The group/tab must remain in place, the window must not be emptied or closed")
     }
 
     // MARK: - F2/T2 & F5/T5: closingTabIDs insertion + corrected notification text
 
     /// `NotificationManager` subclass spying on `sendNotification`
     /// instead of going through `UNUserNotificationCenter` (a no-op in
-    /// the test host regardless — see `NotificationManager`'s own
+    /// the test host regardless, see `NotificationManager`'s own
     /// test-seam doc comment). Also captures
     /// `CalyxWindowController._closingTabIDsForTesting` AT THE MOMENT
-    /// `sendNotification` fires — `handleReconnectGiveUp` calls
+    /// `sendNotification` fires, `handleReconnectGiveUp` calls
     /// `NotificationManager.shared.sendNotification` before
     /// `closeSurfaceAndCleanUp` in the current code, giving a
     /// conveniently-already-present mid-sequence checkpoint for F2's
@@ -344,7 +357,7 @@ final class SessionReconnectGiveUpTests: XCTestCase {
 
     /// F5 (V06, MEDIUM): the give-up notification text must no longer
     /// claim scrollback/commands are lost (false in the reachable
-    /// `.running`/`.unreachable` cases this branch fires for — the
+    /// `.running`/`.unreachable` cases this branch fires for, the
     /// daemon-side PTY is setsid'd and browser attach() reattaches the
     /// SAME session), and must no longer frame reattachment as only
     /// possible via a brand-new session with the same ID (the current
@@ -354,11 +367,11 @@ final class SessionReconnectGiveUpTests: XCTestCase {
     /// session with the same ID".
     ///
     /// NOTE: deliberately does NOT assert `body.contains("running")` as
-    /// a stand-in for "tells the user the session may still be running"
-    /// — the CURRENT text already contains that substring incidentally
+    /// a stand-in for "tells the user the session may still be running",
+    /// the CURRENT text already contains that substring incidentally
     /// (as part of "...scrollback and running commands... are lost"),
     /// which would make that assertion pass today for the wrong reason
-    /// (a test that can't fail proves nothing — see this project's test
+    /// (a test that can't fail proves nothing, see this project's test
     /// authoring rules). "new session" is the substring that actually
     /// distinguishes the false "only a new session is possible" framing
     /// from the corrected text.
@@ -374,18 +387,18 @@ final class SessionReconnectGiveUpTests: XCTestCase {
 
         let body = spy.lastBody?.lowercased() ?? ""
         XCTAssertFalse(body.contains("lost"),
-                       "The notification must not claim scrollback/commands are lost — the session may " +
+                       "The notification must not claim scrollback/commands are lost, the session may " +
                        "still be fully intact and reattachable from the session browser")
         XCTAssertFalse(body.contains("new session"),
                        "The notification must not frame recovery as only possible via a brand-new " +
-                       "session — the daemon session itself may still be reattachable as-is")
+                       "session, the daemon session itself may still be reattachable as-is")
     }
 
     // MARK: - F4/T4: defer, don't drop, a decision gated on isConfirmingQuit
 
     /// F4 (V05, HIGH): while `AppDelegate.isConfirmingQuit` is true,
     /// `handleSessionReconnectDecision` must defer the decision instead
-    /// of dropping it, and replay it once the gate clears — a dropped
+    /// of dropping it, and replay it once the gate clears, a dropped
     /// `.giveUp` currently has no recovery path (see r4-verdicts.md V05).
     /// `isConfirmingQuit` is driven via the `_setConfirmingQuitForTesting`
     /// test seam rather than a real `confirmQuitIfNeeded`/`NSAlert
@@ -396,14 +409,14 @@ final class SessionReconnectGiveUpTests: XCTestCase {
     /// Uses `.giveUp` (detach semantics) rather than `.closePane`
     /// (kill semantics) so this test never triggers
     /// `killSessionIfPersistent`'s real `SessionDaemonClient.shared.kill`
-    /// subprocess call for a fake test session ID — the
+    /// subprocess call for a fake test session ID, the
     /// `isConfirmingQuit` guard is checked once, before the `switch` on
     /// `decision`, so it is exercised identically regardless of which
     /// case follows.
     ///
     /// RESIDUAL GAP: only `handleSessionReconnectDecision` is exercised
     /// here. `handleShowChildExitedNotification`'s identical guard is
-    /// NOT separately covered (see this file's header comment) — no
+    /// NOT separately covered (see this file's header comment), no
     /// injection seam exists for `sessionReconnectCoordinator`'s async
     /// daemon round-trip without a larger, invasive refactor.
     func test_handleSessionReconnectDecision_deferredWhileConfirmingQuit_thenReplayedAfterGateClears() {
@@ -425,8 +438,280 @@ final class SessionReconnectGiveUpTests: XCTestCase {
 
         appDelegate._setConfirmingQuitForTesting(false)
 
+        // R6-A (r6-fix-spec.md, r5-verdicts.md V1/V5): the drain is now
+        // scheduled on a fresh MainActor turn rather than replaying
+        // synchronously inside the didSet, so the replay's effect must
+        // be observed after pumping (via `pumpRunLoop`, defined further
+        // down in this file's ROUND-6 section, called directly since
+        // Swift methods are visible throughout their enclosing type
+        // regardless of declaration order), not immediately. The
+        // CONTRACT under test (a decision deferred while confirming quit
+        // is eventually replayed once the gate clears, not permanently
+        // lost) is unchanged; only the synchronization needed to observe
+        // it is updated to match the now-intentionally-asynchronous
+        // timing.
+        pumpRunLoop(timeout: 1.0) {
+            !fixture.tab.splitTree.allLeafIDs().contains(fixture.trackedLeafID)
+        }
+
         XCTAssertEqual(fixture.tab.splitTree.allLeafIDs(), [fixture.siblingLeafID],
                        "Once isConfirmingQuit clears, the deferred .giveUp decision must be replayed, not " +
                        "permanently lost")
+    }
+
+    // MARK: - ROUND-6 FIX ADDITIONS (RED phase, r6-fix-spec.md R6-A)
+    //
+    // r5-verdicts.md's V1/V5 CONFIRMED the round-4 defer mechanism above
+    // (F4) is itself unsafe: the `isConfirmingQuit` didSet replays
+    // deferred events SYNCHRONOUSLY, nested inside whatever call flipped
+    // the flag back to false (`confirmQuitIfNeeded`'s own bracket),
+    // BEFORE that caller's own post-modal bookkeeping (e.g.
+    // `windowShouldClose`'s cancel-path `closingTabIDs.subtract`) has run,
+    // and with no awareness of real app termination. R6-A's fix is an
+    // asynchronous drain (a fresh MainActor turn, so the caller's stack
+    // unwinds first) plus a shutdown-suppression check. Tests below pump
+    // the main run loop with a bounded deadline rather than assuming a
+    // synchronous effect, since the fix is expected to make the drain
+    // genuinely asynchronous.
+
+    /// Spins the run loop in short steps, checking `condition()` after
+    /// each, until it returns `true` or `timeout` elapses. Lets a test
+    /// observe an asynchronously-scheduled MainActor `Task`'s effect
+    /// deterministically (bounded wait, no fixed `sleep`) rather than
+    /// assuming any particular synchronous timing. Mirrors this
+    /// codebase's own `AppDelegate.saveImmediately`/`restoreSession`
+    /// bounded-spin style.
+    private func pumpRunLoop(timeout: TimeInterval, until condition: () -> Bool) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+    }
+
+    /// `AppDelegate` subclass simulating a red-button/last-window close
+    /// that the user CANCELS, with a `.giveUp` decision arriving mid-modal
+    /// (e.g. from `SessionReconnectCoordinator`'s background `Task`):
+    /// the exact CONFIRMED collision in r5-verdicts.md V1's cancel-path
+    /// sub-claim. `confirmQuitIfNeeded` here stands in for the real
+    /// method's `isConfirmingQuit = true; alert.runModal(); isConfirmingQuit
+    /// = false` bracket (driven via the `_setConfirmingQuitForTesting` seam,
+    /// since a real blocking `NSAlert.runModal()` can't run in this test
+    /// host; same reasoning as F4's test above), firing the deferred
+    /// decision partway through, then returning `false` (Cancel) exactly
+    /// like `windowShouldClose`'s own cancel path expects.
+    private final class CancelPathReplayAppDelegate: AppDelegate {
+        weak var controller: CalyxWindowController?
+        var surfaceIDToDefer: UUID?
+
+        override func closingWouldTerminate(_ controller: CalyxWindowController) -> Bool { true }
+
+        override func confirmQuitIfNeeded(_ mode: ConfirmQuitMode = .killProcesses) -> Bool {
+            _setConfirmingQuitForTesting(true)
+            if let surfaceIDToDefer {
+                controller?.handleSessionReconnectDecision(surfaceID: surfaceIDToDefer, decision: .giveUp)
+            }
+            _setConfirmingQuitForTesting(false)
+            return false
+        }
+
+        override func removeWindowController(_ controller: CalyxWindowController) {}
+    }
+
+    /// R6-A item 6, first bullet (r5-verdicts.md V1 cancel-path): drives
+    /// the REAL `windowShouldClose(_:)`, which pre-populates
+    /// `closingTabIDs` with every tab in the window (F3) BEFORE calling
+    /// `confirmQuitIfNeeded`, our mock fires the deferred `.giveUp`
+    /// WHILE `closingTabIDs` still contains this tab (mid-modal), then
+    /// cancels. `windowShouldClose` only subtracts `closingTabIDs` AFTER
+    /// `confirmQuitIfNeeded` returns.
+    ///
+    /// Against the CURRENT code, the drain runs SYNCHRONOUSLY inside the
+    /// mock's `confirmQuitIfNeeded` (nested inside the `isConfirmingQuit
+    /// = false` assignment), i.e. BEFORE `windowShouldClose`'s own
+    /// `closingTabIDs.subtract` has run, so the replayed decision hits
+    /// `handleReconnectGiveUp`'s reentrancy guard (`closingTabIDs` still
+    /// contains this tab) and is silently dropped, never re-deferred.
+    /// The fixed (asynchronous) drain must instead run on a fresh
+    /// MainActor turn, after `windowShouldClose` has fully unwound and
+    /// removed this tab from `closingTabIDs`, so the replay finds the
+    /// guard clear and actually applies the decision.
+    func test_giveUp_deferredDuringWindowShouldCloseCancelPath_isAppliedAfterClosingTabIDsSubtract_notLost() throws {
+        let fixture = makeFixture()
+        let mock = CancelPathReplayAppDelegate()
+        mock.controller = fixture.controller
+        mock.surfaceIDToDefer = fixture.trackedLeafID
+        let window = try XCTUnwrap(fixture.controller.window)
+
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = mock
+        defer { NSApp.delegate = originalDelegate }
+
+        let shouldClose = withExtendedLifetime(mock) {
+            fixture.controller.windowShouldClose(window)
+        }
+        XCTAssertFalse(shouldClose, "Cancelling the confirm-quit prompt must return false")
+
+        pumpRunLoop(timeout: 1.0) {
+            !fixture.tab.splitTree.allLeafIDs().contains(fixture.trackedLeafID)
+        }
+
+        XCTAssertEqual(fixture.tab.splitTree.allLeafIDs(), [fixture.siblingLeafID],
+                       "A .giveUp decision deferred mid-modal during a CANCELLED close must still be " +
+                       "applied once windowShouldClose's own closingTabIDs.subtract has run, losing it " +
+                       "silently downgrades the pane's eventual keypress-close to kill semantics instead " +
+                       "of the intended detach (see r5-verdicts.md V1)")
+        XCTAssertNil(SessionSurfaceMap.shared.sessionID(for: fixture.trackedLeafID),
+                    "The eventually-applied decision must still run detach bookkeeping")
+    }
+
+    /// R6-A item 3 (shutdown suppression, r5-verdicts.md V5): while the
+    /// app is actually terminating (`AppDelegate.isApplicationTerminating`,
+    /// new this round, see its own doc comment in AppDelegate.swift; a
+    /// broader, app-wide signal than any one window's
+    /// `isClosingForShutdown`), a deferred decision must NOT be replayed
+    /// at all once the confirm-quit gate clears: `windowWillClose`'s
+    /// teardown during quit intentionally PRESERVES `sessionRefs` into
+    /// the snapshot (see `CalyxWindowControllerNonLastWindowCloseTests`),
+    /// so replaying a `.giveUp`/`.closePane` decision on top of that is
+    /// both unnecessary and dangerous (r5-verdicts.md V5: a replayed
+    /// decision's teardown can cascade into `window?.close()` ->
+    /// `removeWindowController` -> reentrant `NSApp.terminate` from
+    /// inside `applicationWillTerminate`).
+    ///
+    /// Against the CURRENT code, `isApplicationTerminating` does not
+    /// exist as a concept the drain consults at all (it is a new,
+    /// not-yet-wired seam, see AppDelegate.swift), so the deferred
+    /// decision is applied regardless of it, exactly as the F4 test
+    /// above already proves for the non-terminating case.
+    func test_handleSessionReconnectDecision_deferredEvent_notReplayed_whileApplicationIsTerminating() {
+        let fixture = makeFixture()
+        let appDelegate = AppDelegate()
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = appDelegate
+        defer { NSApp.delegate = originalDelegate }
+
+        appDelegate._setApplicationTerminatingForTesting(true)
+        appDelegate._setConfirmingQuitForTesting(true)
+        fixture.controller.handleSessionReconnectDecision(surfaceID: fixture.trackedLeafID, decision: .giveUp)
+
+        appDelegate._setConfirmingQuitForTesting(false)
+        pumpRunLoop(timeout: 1.0) {
+            !fixture.tab.splitTree.allLeafIDs().contains(fixture.trackedLeafID)
+        }
+
+        XCTAssertEqual(
+            Set(fixture.tab.splitTree.allLeafIDs()),
+            Set([fixture.trackedLeafID, fixture.siblingLeafID]),
+            "While the app is actually terminating, a decision deferred while isConfirmingQuit was true " +
+            "must NOT be replayed once that gate clears, quit's own teardown already preserves tracking " +
+            "state into the snapshot; replaying on top of that is exactly r5-verdicts.md V5's hazard"
+        )
+        XCTAssertNotNil(SessionSurfaceMap.shared.sessionID(for: fixture.trackedLeafID),
+                        "...and must leave SessionSurfaceMap's entry untouched, matching the preserve-not-" +
+                        "teardown contract quit teardown relies on")
+    }
+
+    /// R6-A item 4 (re-defer on back-to-back modals): a deferred decision
+    /// whose replay would land while `isConfirmingQuit` is ALREADY true
+    /// again (a second confirm-quit modal already up, e.g. two closes
+    /// racing) must re-defer via the SAME mechanism, not apply early or
+    /// drop. `handleSessionReconnectDecision`'s own entry guard gives
+    /// this "for free" once replay genuinely re-enters the public
+    /// handler on a later, asynchronous turn.
+    ///
+    /// Against the CURRENT code, the drain is synchronous: it runs
+    /// immediately inside the very `_setConfirmingQuitForTesting(false)`
+    /// call below, before this test ever gets a chance to flip
+    /// `isConfirmingQuit` true again, so the decision is always applied
+    /// immediately, with no window for a second modal to matter at all.
+    func test_handleSessionReconnectDecision_replayLandingDuringSecondModal_reDefersInsteadOfApplying() {
+        let fixture = makeFixture()
+        let appDelegate = AppDelegate()
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = appDelegate
+        defer { NSApp.delegate = originalDelegate }
+
+        appDelegate._setConfirmingQuitForTesting(true)
+        fixture.controller.handleSessionReconnectDecision(surfaceID: fixture.trackedLeafID, decision: .giveUp)
+
+        appDelegate._setConfirmingQuitForTesting(false)
+        // A second modal is already up by the time the deferred drain's
+        // scheduled turn would arrive.
+        appDelegate._setConfirmingQuitForTesting(true)
+
+        pumpRunLoop(timeout: 0.5) {
+            !fixture.tab.splitTree.allLeafIDs().contains(fixture.trackedLeafID)
+        }
+
+        XCTAssertEqual(
+            Set(fixture.tab.splitTree.allLeafIDs()),
+            Set([fixture.trackedLeafID, fixture.siblingLeafID]),
+            "A replay landing while a second confirm-quit modal is already active must re-defer, not apply " +
+            "the decision. The pane must still be intact"
+        )
+
+        // Only once the gate is genuinely, finally clear must the
+        // decision actually land.
+        appDelegate._setConfirmingQuitForTesting(false)
+        pumpRunLoop(timeout: 1.0) {
+            !fixture.tab.splitTree.allLeafIDs().contains(fixture.trackedLeafID)
+        }
+
+        XCTAssertEqual(fixture.tab.splitTree.allLeafIDs(), [fixture.siblingLeafID],
+                       "Once no modal remains active, the re-deferred decision must eventually be applied, " +
+                       "not permanently dropped")
+    }
+
+    /// R6-A items 1/2 (defer close_surface too, r5-verdicts.md V3/V2):
+    /// `handleCloseSurfaceNotification` must defer (not immediately tear
+    /// down) a `.ghosttyCloseSurface` notification for a tracked surface
+    /// while `isConfirmingQuit` is true, and replay it once the gate
+    /// clears, mirroring the `.decision`/`.childExited` deferral F4
+    /// already established. Posts the real notification
+    /// `ghosttyCloseSurfaceCallback` posts (see GhosttyApp.swift), rather
+    /// than calling the `@objc private` handler directly, since
+    /// `NotificationCenter` dispatch doesn't care about access control:
+    /// this exercises the exact production entry point.
+    ///
+    /// Against the CURRENT code, `handleCloseSurfaceNotification` has NO
+    /// `isConfirmingQuit` guard at all. It tears the pane down
+    /// immediately, regardless of the gate. The primary RED-proving
+    /// assertion is therefore the first one below (still both panes
+    /// immediately after posting, while the gate is up): against today's
+    /// code the pane is ALREADY gone at that point, so it fails.
+    func test_handleCloseSurfaceNotification_deferredWhileConfirmingQuit_thenReplayedAfterGateClears() {
+        let fixture = makeFixture()
+        let appDelegate = AppDelegate()
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = appDelegate
+        defer { NSApp.delegate = originalDelegate }
+
+        guard let trackedSurfaceView = fixture.tab.registry.view(for: fixture.trackedLeafID) else {
+            XCTFail("makeFixture's _testInsert must make the tracked leaf's SurfaceView resolvable")
+            return
+        }
+
+        appDelegate._setConfirmingQuitForTesting(true)
+        NotificationCenter.default.post(
+            name: .ghosttyCloseSurface, object: trackedSurfaceView, userInfo: ["process_alive": false]
+        )
+
+        XCTAssertEqual(
+            Set(fixture.tab.splitTree.allLeafIDs()),
+            Set([fixture.trackedLeafID, fixture.siblingLeafID]),
+            "A close_surface notification arriving while isConfirmingQuit is true must be deferred, not " +
+            "torn down immediately. This is the primary RED-proving assertion for this test"
+        )
+
+        appDelegate._setConfirmingQuitForTesting(false)
+        pumpRunLoop(timeout: 1.0) {
+            !fixture.tab.splitTree.allLeafIDs().contains(fixture.trackedLeafID)
+        }
+
+        XCTAssertEqual(fixture.tab.splitTree.allLeafIDs(), [fixture.siblingLeafID],
+                       "Once isConfirmingQuit clears, the deferred close_surface event must be replayed, " +
+                       "tearing the pane down exactly once")
+        XCTAssertNil(SessionSurfaceMap.shared.sessionID(for: fixture.trackedLeafID),
+                    "The replayed close must run the same kill/detach teardown an immediate close would")
     }
 }

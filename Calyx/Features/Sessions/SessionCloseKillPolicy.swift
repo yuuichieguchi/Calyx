@@ -26,31 +26,37 @@
 
 enum SessionCloseKillPolicy {
 
-    /// - `hasSession == false`: nothing to kill (an ordinary pane, or
-    ///   a surface already unregistered from `SessionSurfaceMap`).
+    /// R6-H (r6-fix-spec.md, F2f/G1): the single shared predicate both
+    /// `shouldKill` and `shouldDetach` delegate to, since kill and
+    /// detach are mutually exclusive alternatives for tearing down a
+    /// persistent-session surface (see each call site for which one
+    /// runs) that share the exact same gate:
+    /// - `hasSession == false`: nothing to tear down (an ordinary pane,
+    ///   or a surface already unregistered from `SessionSurfaceMap`).
     /// - `isTerminating == true`: quit / last-window-close teardown —
-    ///   detach, don't kill, so the session survives to be reattached
-    ///   on next launch.
+    ///   leave the session alone, don't kill or detach, so it survives
+    ///   to be reattached on next launch.
     /// - `isReconnectSwap == true`: the destroy is `performReconnect`
-    ///   replacing the surface, not a real close — killing here would
+    ///   replacing the surface, not a real close, acting here would
     ///   self-destruct the very session being reconnected to.
     /// - Otherwise (a genuine explicit close: `closeTab`,
-    ///   `closeActiveGroup`, `closeAllTabsInGroup`, or a
-    ///   ghostty-driven `close_surface` for a pane the user didn't
-    ///   ask to keep alive): kill.
-    static func shouldKill(hasSession: Bool, isTerminating: Bool, isReconnectSwap: Bool) -> Bool {
+    ///   `closeActiveGroup`, `closeAllTabsInGroup`, a ghostty-driven
+    ///   `close_surface` for a pane the user didn't ask to keep alive,
+    ///   or `session.detach`/`.giveUp`): tear down.
+    private static func shouldTearDown(hasSession: Bool, isTerminating: Bool, isReconnectSwap: Bool) -> Bool {
         hasSession && !isTerminating && !isReconnectSwap
     }
 
-    /// F9 (V10, WARNING, r4-fix-spec.md): the detach-instead-of-kill
-    /// paths' (`session.detach`, `.giveUp`) counterpart to `shouldKill`
-    /// above, using the same gate, since detach and kill are mutually
-    /// exclusive alternatives for tearing down a persistent-session
-    /// surface (see each call site for which one runs): nothing to
-    /// detach with no session; quit/last-window-close teardown must
-    /// leave `tab.sessionRefs` untouched so the snapshot save sees it;
-    /// and a reconnect surface swap must never touch the session it's
-    /// reconnecting to. Detach's own call site
+    /// Kill semantics: a genuine explicit close ends the underlying
+    /// calyx-session too, rather than leaving it running headless.
+    static func shouldKill(hasSession: Bool, isTerminating: Bool, isReconnectSwap: Bool) -> Bool {
+        shouldTearDown(hasSession: hasSession, isTerminating: isTerminating, isReconnectSwap: isReconnectSwap)
+    }
+
+    /// F9 (V10, WARNING, r4-fix-spec.md): detach semantics for the
+    /// detach-instead-of-kill paths (`session.detach`, `.giveUp`) —
+    /// the session keeps running headless, reattachable later, instead
+    /// of being killed. Detach's own call site
     /// (`detachSessionIfPersistent`) previously checked only
     /// `!isTerminating` inline, never consulting `reconnectingSurfaceIDs`
     /// the way `killSessionIfPersistent` does. That is currently inert
@@ -59,6 +65,6 @@ enum SessionCloseKillPolicy {
     /// relying on incidental caller ordering the way kill used to before
     /// this policy existed.
     static func shouldDetach(hasSession: Bool, isTerminating: Bool, isReconnectSwap: Bool) -> Bool {
-        hasSession && !isTerminating && !isReconnectSwap
+        shouldTearDown(hasSession: hasSession, isTerminating: isTerminating, isReconnectSwap: isReconnectSwap)
     }
 }

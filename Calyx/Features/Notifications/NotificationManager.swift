@@ -15,23 +15,40 @@ class NotificationManager {
     // `var`, not `let` (P4 round-4 fix RED phase test seam): lets tests
     // swap in a subclass that overrides `sendNotification` to spy on
     // calls instead of going through `UNUserNotificationCenter` (which
-    // is a no-op in the test host anyway — `permissionGranted` is never
+    // is a no-op in the test host anyway, `permissionGranted` is never
     // set true under `XCTestCase`, see `requestPermission()` below).
     // Mirrors `AppDelegate`'s existing `NSApp.delegate` swap pattern
     // (see `SessionCommandPaletteTests.withMockAppDelegate`). Restored
     // by every test that swaps it. DO NOT reassign from production code.
+    //
+    // R6-F (r6-fix-spec.md, round-5 review finding C2): `#if DEBUG`-
+    // gated, unlike the other three seams' convention, this and `init`
+    // below were not, weakening Release's compile-time singleton
+    // guarantee. `static let` (Release) still gives every production
+    // reader the same `NotificationManager.shared` API.
+    #if DEBUG
     static var shared = NotificationManager()
+    #else
+    static let shared = NotificationManager()
+    #endif
 
     private let center = UNUserNotificationCenter.current()
     private var rateLimiter = RateLimiter(maxPerSecond: 5)
     private var permissionGranted = false
 
-    // Not `private` (same test seam as `shared` above): a test-only
-    // subclass defined outside this file must be able to call
-    // `super.init()`.
+    // Not `private` in DEBUG (same test seam as `shared` above): a
+    // test-only subclass defined outside this file must be able to call
+    // `super.init()`. R6-F: `private` in Release, since no Release
+    // reader needs to construct a second instance.
+    #if DEBUG
     init() {
         requestPermission()
     }
+    #else
+    private init() {
+        requestPermission()
+    }
+    #endif
 
     private func requestPermission() {
         // The CalyxTests process is an XCTest host, not a real running

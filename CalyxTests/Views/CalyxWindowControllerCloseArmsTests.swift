@@ -9,7 +9,7 @@
 //
 //  - F3/T3: `windowShouldClose` must pre-populate `closingTabIDs` with
 //    EVERY tab id in this window BEFORE consulting `confirmQuitIfNeeded`
-//    (closing the only gate — V03 — that does NOT already do this: an
+//    (closing the only gate, V03, that does NOT already do this: an
 //    unrelated pane's process can exit synchronously mid-modal via
 //    ghostty's `close_surface` callback, and without this
 //    pre-population, `closeSurfaceAndCleanUp`'s `:1563` reentrancy guard
@@ -20,14 +20,14 @@
 //    `closeTab`, `closeActiveGroup` (via the public `closeGroup(_:)`),
 //    and `closeAllTabsInGroup` must set `isClosingForShutdown = true`
 //    immediately before `window?.close()`, matching `windowShouldClose`'s
-//    own eager set — currently dead code for `windowDidExitFullScreen`'s
+//    own eager set, currently dead code for `windowDidExitFullScreen`'s
 //    stale-snapshot guard on these three paths (V07's "bonus lead").
 //
 //  Fixtures below use plain, leaf-less `Tab(title:)` tabs (no
 //  `SurfaceRegistry` surfaces): `closeTab`/`closeActiveGroup`/
 //  `closeAllTabsInGroup`/`windowShouldClose` all operate on
 //  `WindowSession`'s tab/group model and `tab.registry.allIDs` (empty
-//  here, so the kill/destroy loop is a harmless no-op) — no live
+//  here, so the kill/destroy loop is a harmless no-op), no live
 //  ghostty surface is needed to exercise the confirm-gate/flag-timing
 //  contracts under test.
 //
@@ -74,7 +74,7 @@ final class CalyxWindowControllerCloseArmsTests: XCTestCase {
         let tabBID: UUID
     }
 
-    /// Two tabs in one (the only) group — proves `windowShouldClose`
+    /// Two tabs in one (the only) group, proves `windowShouldClose`
     /// pre-populates `closingTabIDs` with EVERY tab id in the window,
     /// not just the active one.
     private func makeTwoTabFixture() -> TwoTabFixture {
@@ -94,40 +94,32 @@ final class CalyxWindowControllerCloseArmsTests: XCTestCase {
 
     // MARK: - Mocks
 
-    /// `AppDelegate` subclass reporting `closingWouldTerminate == true`
-    /// unconditionally and confirming quit unconditionally — drives
+    /// `AppDelegate` subclass confirming quit unconditionally, driving
     /// every close path under test through to its `.windowShouldClose`
     /// arm without a real, blocking `NSAlert.runModal()`.
-    /// `removeWindowController` is a no-op purely as test-process
-    /// safety (mirrors `SessionCommandPaletteTests
-    /// .MockConfirmQuitAppDelegate`'s reasoning): confirmed teardown
-    /// here empties the window for real, calling `window?.close()` ->
-    /// `windowWillClose` -> `AppDelegate.removeWindowController`, whose
-    /// real implementation calls `NSApp.terminate(nil)` once its
-    /// (private) `windowControllers` list is empty.
-    private final class ConfirmingAppDelegate: AppDelegate {
-        override func closingWouldTerminate(_ controller: CalyxWindowController) -> Bool { true }
+    /// `closingWouldTerminate`/`removeWindowController` come from
+    /// `ConfirmQuitMockAppDelegate` (R6-J, r6-fix-spec.md): confirmed
+    /// teardown here empties the window for real, calling
+    /// `window?.close()` -> `windowWillClose` ->
+    /// `AppDelegate.removeWindowController`, see that base class's own
+    /// doc comment for why the override is a no-op.
+    private final class ConfirmingAppDelegate: ConfirmQuitMockAppDelegate {
         override func confirmQuitIfNeeded(_ mode: ConfirmQuitMode = .killProcesses) -> Bool { true }
-        override func removeWindowController(_ controller: CalyxWindowController) {}
     }
 
     /// Like `ConfirmingAppDelegate`, but captures
     /// `CalyxWindowController._closingTabIDsForTesting`'s state at the
     /// moment `confirmQuitIfNeeded` is consulted, and lets the test
     /// choose whether to confirm or cancel.
-    private final class ClosingTabIDsWindowCloseSpyAppDelegate: AppDelegate {
+    private final class ClosingTabIDsWindowCloseSpyAppDelegate: ConfirmQuitMockAppDelegate {
         var shouldConfirm = true
         weak var controller: CalyxWindowController?
         private(set) var observedClosingTabIDs: Set<UUID>?
-
-        override func closingWouldTerminate(_ controller: CalyxWindowController) -> Bool { true }
 
         override func confirmQuitIfNeeded(_ mode: ConfirmQuitMode = .killProcesses) -> Bool {
             observedClosingTabIDs = controller?._closingTabIDsForTesting
             return shouldConfirm
         }
-
-        override func removeWindowController(_ controller: CalyxWindowController) {}
     }
 
     // MARK: - F7/T7: isClosingForShutdown timing
@@ -214,7 +206,7 @@ final class CalyxWindowControllerCloseArmsTests: XCTestCase {
     /// `windowShouldClose` inserted, matching `closeTab`'s established
     /// insert-then-remove-on-cancel pattern. This assertion alone would
     /// trivially pass against the CURRENT code too (nothing is ever
-    /// inserted, so the set is vacuously empty on cancel) — it is
+    /// inserted, so the set is vacuously empty on cancel), it is
     /// meaningful only once the insertion above is implemented, which
     /// is why `test_windowShouldClose_insertsAllTabIDsIntoClosingTabIDs_beforeConfirmQuitGate`
     /// is the primary RED-proving assertion for F3.

@@ -42,7 +42,29 @@ final class SurfaceRegistry {
 
     var count: Int { entries.count }
 
-    var allIDs: [UUID] { Array(entries.keys) }
+    /// P4 round-6 fix (R6-D, r6-fix-spec.md): also includes
+    /// `_testInsert`-only entries under `#if DEBUG`. `closeTab`/
+    /// `closeAllTabsInGroup`/`closeActiveGroup`, and (as of round 6)
+    /// `CalyxWindowController.windowWillClose`, iterate `allIDs` to
+    /// decide which surfaces to run kill/detach close-policy handling on
+    /// before destroying them. A `_testInsert`-only fixture (this
+    /// codebase's established no-live-ghostty-surface test pattern; see
+    /// `SessionReconnectGiveUpTests`/`SessionCommandPaletteTests`) used
+    /// to be invisible to that iteration, which made `windowWillClose`'s
+    /// per-surface close-policy behavior untestable without an unsafe
+    /// live ghostty surface (see `AppDelegateAttachWindowTests`'s header
+    /// comment on why that hangs the XCTest process). No pre-existing
+    /// test combines `_testInsert` with any `allIDs`-iterating call site
+    /// (verified by inspection), so this is additive: it does not change
+    /// the value `allIDs` returns for a registry that never called
+    /// `_testInsert`. Inert in Release, matching `_testViewsByID` itself.
+    var allIDs: [UUID] {
+        #if DEBUG
+        Array(entries.keys) + Array(_testViewsByID.keys)
+        #else
+        Array(entries.keys)
+        #endif
+    }
 
     // MARK: - Surface Lifecycle
 
