@@ -21,7 +21,15 @@ final class UpdateController: NSObject {
         self.installSource = InstallSource(bundleURL: Bundle.main.bundleURL)
         super.init()
 
-        if !isHomebrew {
+        // Under UI testing, starting Sparkle (startingUpdater: true) pops
+        // the first-run "Check for updates automatically?" modal, which
+        // sits in front of the app-under-test and blocks every keystroke
+        // XCUITest sends to a pane. Skip updater setup entirely for
+        // --uitesting runs (matches AppDelegate.installGlobalEventTap's
+        // existing --uitesting guard); production launches are unaffected.
+        if ProcessInfo.processInfo.arguments.contains("--uitesting") {
+            logger.info("UI testing detected; Sparkle updater disabled")
+        } else if !isHomebrew {
             setupSparkle()
         } else {
             logger.info("Homebrew installation detected — Sparkle updater disabled")
