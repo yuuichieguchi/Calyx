@@ -102,11 +102,15 @@ targets:
               rm -f "$DEST_DIR/calyx-session"
               cp "$SRC" "$DEST_DIR/calyx-session"
               chmod 0755 "$DEST_DIR/calyx-session"
-            elif [ "${CONFIGURATION}" = "Debug" ]; then
-              : # Debug without a prior --all build: remote install simply stays unavailable.
-            else
+            elif [ "${CONFIGURATION}" = "Release" ]; then
+              # Hard error only for Release: a shipped build must carry the
+              # remote payloads. Every other config (Debug, DebugUITesting,
+              # any future debug variant) warns and skips below, so e.g.
+              # UI-test builds don't fail when --all was never run.
               echo "error: $SRC not found for a ${CONFIGURATION} build. Run scripts/build-session.sh --all before building Release."
               exit 1
+            else
+              echo "warning: $SRC not found. Run scripts/build-session.sh --all to enable remote install in this ${CONFIGURATION} build. Skipping (remote install stays unavailable)."
             fi
           done
         name: Bundle Remote Session Binaries

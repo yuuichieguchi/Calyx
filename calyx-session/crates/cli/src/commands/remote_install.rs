@@ -64,15 +64,34 @@
 //!   again. Piping the local payload into `ssh <host> cat > <path>`
 //!   keeps exactly one code path (an `ssh` argv, joined and parsed by
 //!   ONE real remote shell) for every remote operation this module
-//!   performs -- detection, mkdir, transfer, chmod -- with one single,
+//!   performs -- detection, mkdir, transfer, chmod, rename -- with one single,
 //!   already-reasoned-about set of quoting rules, instead of mixing two
 //!   transports with two different expansion semantics.
 //!
-//! - THE BINARY TRANSFER AND ITS `chmod 755` SHARE ONE ssh INVOCATION
-//!   (`transfer_and_chmod_command`, joined with `&&`): this halves the
-//!   network round-trips for the required step (the daemon binary must
-//!   both exist and be executable for anything else to work) versus two
-//!   separate `ssh` calls.
+//! - THE BINARY TRANSFER, ITS `chmod 755`, AND THE FINAL RENAME SHARE
+//!   ONE ssh INVOCATION (`transfer_and_chmod_command`, joined with
+//!   `&&`): this keeps the required step (the daemon binary must both
+//!   exist and be executable for anything else to work) to a single
+//!   network round-trip versus separate `ssh` calls.
+//!
+//! - TRANSFER TO `<dest>.tmp`, THEN `mv -f` OVER THE DESTINATION, never
+//!   `cat > <dest>` directly: on Linux, opening the currently running
+//!   daemon binary for write fails with ETXTBSY ("Text file busy"), so
+//!   truncating the destination in place would make every upgrade of a
+//!   live deployment error out. `mv -f` (rename(2)) replaces the
+//!   directory entry with a fresh inode, which is legal while the old
+//!   binary keeps executing from the old inode. The terminfo transfer
+//!   (`transfer_command`) deliberately keeps the direct `cat > <dest>`
+//!   shape: the terminfo entry is a plain data file no process ever
+//!   executes or maps executable, so ETXTBSY cannot apply to it.
+//!
+//! - SSH PROGRAM RESOLUTION mirrors the Swift side's `SSHBinaryResolver`
+//!   contract exactly: the `CALYX_SSH_BIN` env override when set and
+//!   non-empty, else the literal absolute `/usr/bin/ssh` (see that Swift
+//!   file for why an absolute path beats a PATH-resolved bare `ssh`).
+//!   The environment is read ONCE, at the [`run`] entry point; every
+//!   argv builder takes the resolved program as a plain parameter so the
+//!   pure functions stay pure.
 //!
 //! - TERMINFO FAILURE IS A WARNING, NOT AN ERROR: `remote_install`
 //!   still returns `Ok` if the terminfo mkdir/transfer step fails,
@@ -100,6 +119,15 @@ pub const REMOTE_BIN_PATH: &str = "$HOME/.calyx/bin/calyx-session";
 pub const REMOTE_TERMINFO_DIR: &str = "$HOME/.terminfo/x";
 /// Remote path of the installed ghostty terminfo entry.
 pub const REMOTE_TERMINFO_PATH: &str = "$HOME/.terminfo/x/xterm-ghostty";
+
+/// Env var overriding which local `ssh` program to exec. Same name and
+/// same set-and-non-empty semantics as the Swift side's
+/// `SSHBinaryResolver` (see this module's header).
+pub const SSH_PROGRAM_ENV_VAR: &str = "CALYX_SSH_BIN";
+/// The `ssh` program execed when [`SSH_PROGRAM_ENV_VAR`] is unset or
+/// empty. Absolute, never a PATH-resolved bare `"ssh"`, matching the
+/// Swift side's `SSHBinaryResolver` (see this module's header).
+pub const DEFAULT_SSH_PROGRAM: &str = "/usr/bin/ssh";
 
 // ==================== R1: arch detection ====================
 
@@ -202,43 +230,78 @@ pub fn payload_for(arch: RemoteArch) -> PayloadKind {
 
 // ==================== R3: argv construction ====================
 
-/// Builds `ssh -- <host> uname -sm`, the detection step run against the
-/// remote host before anything else. `--` precedes `host` so a
+/// Resolves which `ssh` program to exec: `env_value` (the value of
+/// [`SSH_PROGRAM_ENV_VAR`]) when set and non-empty, else
+/// [`DEFAULT_SSH_PROGRAM`]. Pure: the caller reads the environment once
+/// (see [`run`]) and passes the value in, mirroring the Swift side's
+/// `SSHBinaryResolver` contract (see this module's header).
+pub fn resolve_ssh_program(env_value: Option<&str>) -> &str {
+    match env_value {
+        Some(value) if !value.is_empty() => value,
+        _ => DEFAULT_SSH_PROGRAM,
+    }
+}
+
+/// Builds `<ssh> -- <host> uname -sm`, the detection step run against
+/// the remote host before anything else. `--` precedes `host` so a
 /// dash-leading host cannot be misparsed as an `ssh` option (see this
 /// module's header).
-pub fn detect_command(host: &str) -> Vec<String> {
-    ssh_argv(host, &["uname", "-sm"])
+pub fn detect_command(ssh_program: &str, host: &str) -> Vec<String> {
+    ssh_argv(ssh_program, host, &["uname", "-sm"])
 }
 
-/// Builds `ssh -- <host> mkdir -p <remote_dir>`.
-pub fn mkdir_command(host: &str, remote_dir: &str) -> Vec<String> {
-    ssh_argv(host, &["mkdir", "-p", remote_dir])
+/// Builds `<ssh> -- <host> mkdir -p <remote_dir>`.
+pub fn mkdir_command(ssh_program: &str, host: &str, remote_dir: &str) -> Vec<String> {
+    ssh_argv(ssh_program, host, &["mkdir", "-p", remote_dir])
 }
 
-/// Builds `ssh -- <host> cat > <remote_path> && chmod 755
-/// <remote_path>`. The caller pipes the local payload file's bytes into
-/// the returned argv's stdin (see [`CommandRunner::run_with_stdin_file`]);
-/// `cat`'s own stdin becomes that piped data once `ssh` forwards it to
-/// the remote `cat` process. Combines the transfer and the chmod into
-/// one `ssh` invocation (see this module's header).
-pub fn transfer_and_chmod_command(host: &str, remote_path: &str) -> Vec<String> {
+/// Builds `<ssh> -- <host> cat > <remote_path>.tmp && chmod 755
+/// <remote_path>.tmp && mv -f <remote_path>.tmp <remote_path>`. The
+/// caller pipes the local payload file's bytes into the returned argv's
+/// stdin (see [`CommandRunner::run_with_stdin_file`]); `cat`'s own stdin
+/// becomes that piped data once `ssh` forwards it to the remote `cat`
+/// process. Writes to a sibling `.tmp` path and renames it over the
+/// destination rather than truncating `<remote_path>` in place, which
+/// would fail with ETXTBSY on Linux whenever the destination is the
+/// currently running daemon binary (see this module's header). Combines
+/// the transfer, chmod, and rename into one `ssh` invocation (see this
+/// module's header).
+pub fn transfer_and_chmod_command(ssh_program: &str, host: &str, remote_path: &str) -> Vec<String> {
+    let tmp = format!("{remote_path}.tmp");
     ssh_argv(
+        ssh_program,
         host,
-        &["cat", ">", remote_path, "&&", "chmod", "755", remote_path],
+        &[
+            "cat",
+            ">",
+            &tmp,
+            "&&",
+            "chmod",
+            "755",
+            &tmp,
+            "&&",
+            "mv",
+            "-f",
+            &tmp,
+            remote_path,
+        ],
     )
 }
 
-/// Builds `ssh -- <host> cat > <remote_path>` (no chmod: the terminfo
-/// entry never needs to be executable).
-pub fn transfer_command(host: &str, remote_path: &str) -> Vec<String> {
-    ssh_argv(host, &["cat", ">", remote_path])
+/// Builds `<ssh> -- <host> cat > <remote_path>` (no chmod: the terminfo
+/// entry never needs to be executable; no temp-then-rename either: the
+/// terminfo entry is a plain data file no process executes, so the
+/// ETXTBSY hazard that shapes [`transfer_and_chmod_command`] cannot
+/// apply to it).
+pub fn transfer_command(ssh_program: &str, host: &str, remote_path: &str) -> Vec<String> {
+    ssh_argv(ssh_program, host, &["cat", ">", remote_path])
 }
 
 /// Shared shape of every remote invocation this module builds:
-/// `ssh -- <host> <remote words...>`, with `--` always preceding the
+/// `<ssh> -- <host> <remote words...>`, with `--` always preceding the
 /// host (see this module's header on dash-leading hosts).
-fn ssh_argv(host: &str, remote_words: &[&str]) -> Vec<String> {
-    let mut argv = vec!["ssh".to_string(), "--".to_string(), host.to_string()];
+fn ssh_argv(ssh_program: &str, host: &str, remote_words: &[&str]) -> Vec<String> {
+    let mut argv = vec![ssh_program.to_string(), "--".to_string(), host.to_string()];
     argv.extend(remote_words.iter().map(|w| w.to_string()));
     argv
 }
@@ -280,6 +343,10 @@ pub trait CommandRunner {
 /// CLI invocation and from a test fixture without cloning paths.
 pub struct RemoteInstallInputs<'a> {
     pub host: &'a str,
+    /// The already-resolved `ssh` program to exec (see
+    /// [`resolve_ssh_program`]): the environment is read once at the
+    /// [`run`] entry point, never inside the orchestration.
+    pub ssh_program: &'a str,
     pub payload_x86_64: Option<&'a Path>,
     pub payload_aarch64: Option<&'a Path>,
     pub host_binary: Option<&'a Path>,
@@ -358,7 +425,7 @@ pub fn remote_install(
     inputs: &RemoteInstallInputs,
 ) -> Result<RemoteInstallSummary, RemoteInstallError> {
     let detect = runner
-        .run(&detect_command(inputs.host))
+        .run(&detect_command(inputs.ssh_program, inputs.host))
         .map_err(RemoteInstallError::Detect)?;
     if !detect.success {
         return Err(RemoteInstallError::DetectFailed(lossy(&detect.stderr)));
@@ -379,7 +446,11 @@ pub fn remote_install(
     };
 
     let mkdir = runner
-        .run(&mkdir_command(inputs.host, REMOTE_BIN_DIR))
+        .run(&mkdir_command(
+            inputs.ssh_program,
+            inputs.host,
+            REMOTE_BIN_DIR,
+        ))
         .map_err(|e| RemoteInstallError::Mkdir(e.to_string()))?;
     if !mkdir.success {
         return Err(RemoteInstallError::Mkdir(lossy(&mkdir.stderr)));
@@ -387,7 +458,7 @@ pub fn remote_install(
 
     let transfer = runner
         .run_with_stdin_file(
-            &transfer_and_chmod_command(inputs.host, REMOTE_BIN_PATH),
+            &transfer_and_chmod_command(inputs.ssh_program, inputs.host, REMOTE_BIN_PATH),
             payload,
         )
         .map_err(|e| RemoteInstallError::Transfer(e.to_string()))?;
@@ -396,7 +467,7 @@ pub fn remote_install(
     }
 
     let terminfo_warning = match inputs.terminfo {
-        Some(terminfo) => install_terminfo(runner, inputs.host, terminfo).err(),
+        Some(terminfo) => install_terminfo(runner, inputs.ssh_program, inputs.host, terminfo).err(),
         None => None,
     };
 
@@ -409,9 +480,14 @@ pub fn remote_install(
 /// The best-effort terminfo step: remote mkdir, then transfer. Returns
 /// the would-be warning message on failure; [`remote_install`] records
 /// it in the summary instead of failing (see this module's header).
-fn install_terminfo(runner: &dyn CommandRunner, host: &str, terminfo: &Path) -> Result<(), String> {
+fn install_terminfo(
+    runner: &dyn CommandRunner,
+    ssh_program: &str,
+    host: &str,
+    terminfo: &Path,
+) -> Result<(), String> {
     let mkdir = runner
-        .run(&mkdir_command(host, REMOTE_TERMINFO_DIR))
+        .run(&mkdir_command(ssh_program, host, REMOTE_TERMINFO_DIR))
         .map_err(|e| format!("could not run the terminfo mkdir step: {e}"))?;
     if !mkdir.success {
         return Err(format!(
@@ -420,7 +496,10 @@ fn install_terminfo(runner: &dyn CommandRunner, host: &str, terminfo: &Path) -> 
         ));
     }
     let transfer = runner
-        .run_with_stdin_file(&transfer_command(host, REMOTE_TERMINFO_PATH), terminfo)
+        .run_with_stdin_file(
+            &transfer_command(ssh_program, host, REMOTE_TERMINFO_PATH),
+            terminfo,
+        )
         .map_err(|e| format!("could not run the terminfo transfer step: {e}"))?;
     if !transfer.success {
         return Err(format!(
@@ -479,8 +558,15 @@ pub fn run(
     _state_dir: &Option<PathBuf>,
     args: RemoteInstallArgs,
 ) -> Result<u8, CommandError> {
+    // The single place the CALYX_SSH_BIN override is read; everything
+    // below takes the resolved program as a plain parameter (see this
+    // module's header). `.ok()` treats a non-unicode value as unset:
+    // the Swift `SSHBinaryResolver` contract this mirrors is defined
+    // over a String-typed environment, where such a value cannot exist.
+    let ssh_env = std::env::var(SSH_PROGRAM_ENV_VAR).ok();
     let inputs = RemoteInstallInputs {
         host: &args.host,
+        ssh_program: resolve_ssh_program(ssh_env.as_deref()),
         payload_x86_64: args.payload_x86_64.as_deref(),
         payload_aarch64: args.payload_aarch64.as_deref(),
         host_binary: args.host_binary.as_deref(),
@@ -710,10 +796,31 @@ mod tests {
     // ==================== R3: argv construction ====================
 
     #[test]
+    fn resolve_ssh_program_defaults_to_usr_bin_ssh_when_the_env_var_is_unset() {
+        assert_eq!(resolve_ssh_program(None), "/usr/bin/ssh");
+    }
+
+    /// Mirrors the Swift `SSHBinaryResolver` contract exactly: an
+    /// override that is set but EMPTY falls back to the default too
+    /// (`!override.isEmpty` on the Swift side).
+    #[test]
+    fn resolve_ssh_program_treats_an_empty_override_as_unset() {
+        assert_eq!(resolve_ssh_program(Some("")), "/usr/bin/ssh");
+    }
+
+    #[test]
+    fn resolve_ssh_program_uses_a_non_empty_override_verbatim() {
+        assert_eq!(
+            resolve_ssh_program(Some("/opt/homebrew/bin/ssh")),
+            "/opt/homebrew/bin/ssh"
+        );
+    }
+
+    #[test]
     fn detect_command_puts_dash_dash_before_the_host() {
         assert_eq!(
-            detect_command("myhost"),
-            vec!["ssh", "--", "myhost", "uname", "-sm"]
+            detect_command("/usr/bin/ssh", "myhost"),
+            vec!["/usr/bin/ssh", "--", "myhost", "uname", "-sm"]
         );
     }
 
@@ -725,34 +832,54 @@ mod tests {
     #[test]
     fn detect_command_keeps_a_dash_leading_host_as_one_intact_word_after_dash_dash() {
         assert_eq!(
-            detect_command("-evilhost"),
-            vec!["ssh", "--", "-evilhost", "uname", "-sm"]
+            detect_command("/usr/bin/ssh", "-evilhost"),
+            vec!["/usr/bin/ssh", "--", "-evilhost", "uname", "-sm"]
         );
     }
 
     #[test]
     fn mkdir_command_targets_the_given_remote_dir_after_dash_dash_host() {
         assert_eq!(
-            mkdir_command("myhost", REMOTE_BIN_DIR),
-            vec!["ssh", "--", "myhost", "mkdir", "-p", "$HOME/.calyx/bin"]
+            mkdir_command("/usr/bin/ssh", "myhost", REMOTE_BIN_DIR),
+            vec![
+                "/usr/bin/ssh",
+                "--",
+                "myhost",
+                "mkdir",
+                "-p",
+                "$HOME/.calyx/bin"
+            ]
         );
     }
 
+    /// Pins the exact remote word sequence, including the
+    /// temp-then-rename shape: `cat > <dest>.tmp && chmod 755 <dest>.tmp
+    /// && mv -f <dest>.tmp <dest>`. A direct `cat > <dest>` would
+    /// truncate the destination in place, which fails with ETXTBSY on
+    /// Linux whenever <dest> is the currently running daemon binary;
+    /// `mv -f` (rename(2)) swaps in a fresh inode and stays legal while
+    /// the old binary runs (see this module's header). Also guards the
+    /// no-single-quoting rule for `$HOME` words.
     #[test]
-    fn transfer_and_chmod_command_never_single_quotes_home() {
-        let argv = transfer_and_chmod_command("myhost", REMOTE_BIN_PATH);
+    fn transfer_and_chmod_command_writes_a_temp_path_then_renames_and_never_single_quotes_home() {
+        let argv = transfer_and_chmod_command("/usr/bin/ssh", "myhost", REMOTE_BIN_PATH);
         assert_eq!(
             argv,
             vec![
-                "ssh",
+                "/usr/bin/ssh",
                 "--",
                 "myhost",
                 "cat",
                 ">",
-                "$HOME/.calyx/bin/calyx-session",
+                "$HOME/.calyx/bin/calyx-session.tmp",
                 "&&",
                 "chmod",
                 "755",
+                "$HOME/.calyx/bin/calyx-session.tmp",
+                "&&",
+                "mv",
+                "-f",
+                "$HOME/.calyx/bin/calyx-session.tmp",
                 "$HOME/.calyx/bin/calyx-session",
             ]
         );
@@ -768,9 +895,9 @@ mod tests {
     #[test]
     fn transfer_command_for_terminfo_has_no_chmod_step() {
         assert_eq!(
-            transfer_command("myhost", REMOTE_TERMINFO_PATH),
+            transfer_command("/usr/bin/ssh", "myhost", REMOTE_TERMINFO_PATH),
             vec![
-                "ssh",
+                "/usr/bin/ssh",
                 "--",
                 "myhost",
                 "cat",
@@ -801,7 +928,7 @@ mod tests {
         // mechanism first. (Spec amendment approved by the lead after
         // GREEN found the original RED test unsatisfiable without this
         // precondition.)
-        let mkdir_remote = mkdir_command("myhost", REMOTE_BIN_DIR)[3..].join(" ");
+        let mkdir_remote = mkdir_command("/usr/bin/ssh", "myhost", REMOTE_BIN_DIR)[3..].join(" ");
         let mkdir_status = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(&mkdir_remote)
@@ -813,10 +940,10 @@ mod tests {
             "constructed mkdir command should exit 0 under a real shell, got {mkdir_status:?}"
         );
 
-        let argv = transfer_and_chmod_command("myhost", REMOTE_BIN_PATH);
-        // argv[0..=2] is ["ssh", "--", "myhost"]; argv[3..] is exactly
-        // what `ssh` would join with single spaces and send over the
-        // wire for the remote shell to parse.
+        let argv = transfer_and_chmod_command("/usr/bin/ssh", "myhost", REMOTE_BIN_PATH);
+        // argv[0..=2] is ["/usr/bin/ssh", "--", "myhost"]; argv[3..] is
+        // exactly what `ssh` would join with single spaces and send over
+        // the wire for the remote shell to parse.
         let remote_command = argv[3..].join(" ");
 
         let payload = b"#!/bin/sh\necho payload\n";
@@ -861,7 +988,15 @@ mod tests {
             & 0o777;
         assert_eq!(
             mode, 0o755,
-            "installed binary should end up chmod 755, got {mode:o}"
+            "installed binary should end up chmod 755 at the FINAL path, got {mode:o}"
+        );
+
+        let tmp = tempdir.path().join(".calyx/bin/calyx-session.tmp");
+        assert!(
+            !tmp.exists(),
+            "the .tmp staging path should have been renamed away by `mv -f`, \
+             but {} still exists",
+            tmp.display()
         );
     }
 
@@ -939,6 +1074,7 @@ mod tests {
         let runner = RecordingRunner::scripted(vec![ok("Darwin x86_64\n")]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: "/usr/bin/ssh",
             payload_x86_64: Some(Path::new("/tmp/payload-x86_64")),
             payload_aarch64: Some(Path::new("/tmp/payload-aarch64")),
             host_binary: Some(Path::new("/tmp/host-binary")),
@@ -957,7 +1093,10 @@ mod tests {
             1,
             "only the detection call should have run, got {calls:?}"
         );
-        assert_eq!(calls[0], RecordedCall::Run(detect_command("myhost")));
+        assert_eq!(
+            calls[0],
+            RecordedCall::Run(detect_command("/usr/bin/ssh", "myhost"))
+        );
     }
 
     #[test]
@@ -966,6 +1105,7 @@ mod tests {
             RecordingRunner::scripted(vec![Err(io::Error::other("ssh: connection refused"))]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: "/usr/bin/ssh",
             payload_x86_64: Some(Path::new("/tmp/payload-x86_64")),
             payload_aarch64: None,
             host_binary: None,
@@ -986,6 +1126,7 @@ mod tests {
         let runner = RecordingRunner::scripted(vec![failed("ssh: Host key verification failed.")]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: "/usr/bin/ssh",
             payload_x86_64: Some(Path::new("/tmp/payload-x86_64")),
             payload_aarch64: None,
             host_binary: None,
@@ -1006,6 +1147,7 @@ mod tests {
         let runner = RecordingRunner::scripted(vec![ok("Linux aarch64\n")]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: "/usr/bin/ssh",
             payload_x86_64: Some(Path::new("/tmp/payload-x86_64")),
             payload_aarch64: None, // missing -- this is the one detection selected
             host_binary: Some(Path::new("/tmp/host-binary")),
@@ -1028,19 +1170,25 @@ mod tests {
         );
     }
 
+    /// Also proves the resolved ssh program threads from the inputs into
+    /// EVERY invocation's argv[0]: a non-default program is used on
+    /// purpose, so a regression back to a hardcoded `"ssh"` anywhere in
+    /// the orchestration would mismatch the recorded calls.
     #[test]
     fn remote_install_happy_path_runs_mkdir_transfer_chmod_and_terminfo_in_order() {
+        let ssh = "/opt/homebrew/bin/ssh";
         let payload = tempfile::NamedTempFile::new().expect("create scratch payload file");
         let terminfo = tempfile::NamedTempFile::new().expect("create scratch terminfo file");
         let runner = RecordingRunner::scripted(vec![
             ok("Linux x86_64\n"), // detect
             ok(""),               // mkdir bin dir
-            ok(""),               // transfer + chmod binary
+            ok(""),               // transfer + chmod + rename binary
             ok(""),               // mkdir terminfo dir
             ok(""),               // transfer terminfo
         ]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: ssh,
             payload_x86_64: Some(payload.path()),
             payload_aarch64: None,
             host_binary: None,
@@ -1054,15 +1202,15 @@ mod tests {
         assert_eq!(
             *runner.calls.borrow(),
             vec![
-                RecordedCall::Run(detect_command("myhost")),
-                RecordedCall::Run(mkdir_command("myhost", REMOTE_BIN_DIR)),
+                RecordedCall::Run(detect_command(ssh, "myhost")),
+                RecordedCall::Run(mkdir_command(ssh, "myhost", REMOTE_BIN_DIR)),
                 RecordedCall::RunWithStdinFile(
-                    transfer_and_chmod_command("myhost", REMOTE_BIN_PATH),
+                    transfer_and_chmod_command(ssh, "myhost", REMOTE_BIN_PATH),
                     payload.path().to_path_buf(),
                 ),
-                RecordedCall::Run(mkdir_command("myhost", REMOTE_TERMINFO_DIR)),
+                RecordedCall::Run(mkdir_command(ssh, "myhost", REMOTE_TERMINFO_DIR)),
                 RecordedCall::RunWithStdinFile(
-                    transfer_command("myhost", REMOTE_TERMINFO_PATH),
+                    transfer_command(ssh, "myhost", REMOTE_TERMINFO_PATH),
                     terminfo.path().to_path_buf(),
                 ),
             ]
@@ -1075,6 +1223,7 @@ mod tests {
         let runner = RecordingRunner::scripted(vec![ok("Darwin arm64\n"), ok(""), ok("")]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: "/usr/bin/ssh",
             payload_x86_64: None,
             payload_aarch64: None,
             host_binary: Some(payload.path()),
@@ -1087,10 +1236,10 @@ mod tests {
         assert_eq!(
             *runner.calls.borrow(),
             vec![
-                RecordedCall::Run(detect_command("myhost")),
-                RecordedCall::Run(mkdir_command("myhost", REMOTE_BIN_DIR)),
+                RecordedCall::Run(detect_command("/usr/bin/ssh", "myhost")),
+                RecordedCall::Run(mkdir_command("/usr/bin/ssh", "myhost", REMOTE_BIN_DIR)),
                 RecordedCall::RunWithStdinFile(
-                    transfer_and_chmod_command("myhost", REMOTE_BIN_PATH),
+                    transfer_and_chmod_command("/usr/bin/ssh", "myhost", REMOTE_BIN_PATH),
                     payload.path().to_path_buf(),
                 ),
             ]
@@ -1107,6 +1256,7 @@ mod tests {
         ]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: "/usr/bin/ssh",
             payload_x86_64: Some(payload.path()),
             payload_aarch64: None,
             host_binary: None,
@@ -1132,6 +1282,7 @@ mod tests {
         ]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: "/usr/bin/ssh",
             payload_x86_64: Some(payload.path()),
             payload_aarch64: None,
             host_binary: None,
@@ -1155,6 +1306,7 @@ mod tests {
         let runner = RecordingRunner::scripted(vec![ok("Linux x86_64\n"), ok(""), ok("")]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
+            ssh_program: "/usr/bin/ssh",
             payload_x86_64: Some(payload.path()),
             payload_aarch64: None,
             host_binary: None,
