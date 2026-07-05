@@ -543,19 +543,24 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     ///
     /// `isTerminating` (R8-C, r8-fix-spec.md; consolidates r7-
     /// verdicts.md's I1/A2/C2 dormant discriminator-mismatch finding):
-    /// `nil` (every caller except `windowWillClose`'s teardown loop)
-    /// reads this window's own `isClosingForShutdown`, exactly as
-    /// before. `windowWillClose` passes its own already-computed
-    /// discriminator explicitly instead, so the outer "is the app
-    /// actually terminating" gate and this policy call always agree,
-    /// even in cases (a future call path, or a test) where
-    /// `isClosingForShutdown` and the app-level state happen to
-    /// disagree.
-    private func killSessionIfPersistent(tab: Tab, surfaceID: UUID, isTerminating: Bool? = nil) {
+    /// REQUIRED (R10-C item 3, r10-fix-spec.md, no default; the stale
+    /// doc this replaces claimed "every caller except `windowWillClose`"
+    /// read `isClosingForShutdown` via a `nil` default, but in fact 4 of
+    /// this method's 5 call sites already passed an explicit value
+    /// before this fix, only `closeSurfaceAndCleanUp` relied on the
+    /// default). `tearDownSurfaces` (R8-F) passes its own `isTerminating`
+    /// parameter straight through for `closeTab`/`closeActiveGroup`/
+    /// `closeAllTabsInGroup` (always `false`) and `windowWillClose`
+    /// (its own already-computed discriminator); `closeSurfaceAndCleanUp`
+    /// now passes this window's own `isClosingForShutdown` explicitly
+    /// too, so the outer "is the app actually terminating" gate and this
+    /// policy call always visibly agree, with no caller left relying on
+    /// an implicit default.
+    private func killSessionIfPersistent(tab: Tab, surfaceID: UUID, isTerminating: Bool) {
         let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID)
         guard SessionCloseKillPolicy.shouldKill(
             hasSession: sessionID != nil,
-            isTerminating: isTerminating ?? isClosingForShutdown,
+            isTerminating: isTerminating,
             isReconnectSwap: reconnectingSurfaceIDs.contains(surfaceID)
         ), let sessionID else {
             return
@@ -588,13 +593,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// snapshot is built, permanently losing this session's tracking
     /// even though it survives in the daemon.
     ///
-    /// `isTerminating`: see `killSessionIfPersistent`'s identical
-    /// parameter doc comment (R8-C, r8-fix-spec.md).
-    private func detachSessionIfPersistent(tab: Tab, surfaceID: UUID, isTerminating: Bool? = nil) {
+    /// R10-C item 3 (r10-fix-spec.md): unlike `killSessionIfPersistent`,
+    /// takes no `isTerminating` parameter, since every call site left it
+    /// at its default, so it was dead: this always reads this window's own
+    /// `isClosingForShutdown` directly instead.
+    private func detachSessionIfPersistent(tab: Tab, surfaceID: UUID) {
         let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID)
         guard SessionCloseKillPolicy.shouldDetach(
             hasSession: sessionID != nil,
-            isTerminating: isTerminating ?? isClosingForShutdown,
+            isTerminating: isClosingForShutdown,
             isReconnectSwap: reconnectingSurfaceIDs.contains(surfaceID)
         ), let sessionID else {
             return
@@ -652,6 +659,21 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         appDelegate.isTerminationConfirmed = true
     }
 
+    /// R10-C item 4 (r10-fix-spec.md): the two-statement pair shared,
+    /// identically, by `closeLastWindow`'s default
+    /// (`markTerminationConfirmed: true`) path and `windowShouldClose`'s
+    /// success path. Marks termination already confirmed (a no-op
+    /// unless closing this window would actually terminate the app, see
+    /// `markTerminationConfirmedIfWouldTerminate`), THEN sets
+    /// `isClosingForShutdown`. Order matters: `isClosingForShutdown`
+    /// must be set eagerly, before `window?.close()` (or the caller's
+    /// own subsequent teardown) runs, see `closeLastWindow`'s own doc
+    /// comment for why.
+    private func markTerminationConfirmedAndSetClosingForShutdown() {
+        markTerminationConfirmedIfWouldTerminate()
+        isClosingForShutdown = true
+    }
+
     /// Shared `.windowShouldClose` case body (F7/F8, r4-fix-spec.md) for
     /// the four close paths that can empty the last managed window
     /// (`closeTab`, `closeActiveGroup`, `closeAllTabsInGroup`,
@@ -667,9 +689,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// mid-close.
     private func closeLastWindow(markTerminationConfirmed: Bool = true) {
         if markTerminationConfirmed {
-            markTerminationConfirmedIfWouldTerminate()
+            markTerminationConfirmedAndSetClosingForShutdown()
+        } else {
+            isClosingForShutdown = true
         }
-        isClosingForShutdown = true
         window?.close()
     }
 
@@ -1761,7 +1784,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard callerAlreadyClaimedClosingTabIDs || !closingTabIDs.contains(tab.id) else { return }
 
         if killSessions {
-            killSessionIfPersistent(tab: tab, surfaceID: surfaceID)
+            // R10-C item 3 (r10-fix-spec.md): isTerminating is now
+            // required, passed explicitly rather than relying on the
+            // (removed) default of this window's own isClosingForShutdown.
+            killSessionIfPersistent(tab: tab, surfaceID: surfaceID, isTerminating: isClosingForShutdown)
         } else {
             detachSessionIfPersistent(tab: tab, surfaceID: surfaceID)
         }
@@ -2645,7 +2671,16 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                     titleOverride: tab.titleOverride,
                     pwd: tab.pwd,
                     splitTree: tab.splitTree,
-                    browserURL: browserURL
+                    browserURL: browserURL,
+                    // R10-A (r10-fix-spec.md): production saves go
+                    // through this method, which used to drop
+                    // sessionRefs entirely, so a persistent session's
+                    // SessionRef never reached disk. Empty normalizes
+                    // to nil, matching Tab.snapshot()'s (tested but
+                    // production-unused until this fix) convention, so
+                    // a tab with no persistent sessions still produces
+                    // a byte-stable v5-shaped snapshot.
+                    sessionRefs: tab.sessionRefs.isEmpty ? nil : tab.sessionRefs
                 )
             }
             return TabGroupSnapshot(
@@ -2823,8 +2858,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // the window still closes either way (isClosingForShutdown/
         // return true below are unaffected), only whether a LATER
         // Cmd+Q silently skips its own confirm-quit prompt changes.
-        markTerminationConfirmedIfWouldTerminate()
-        isClosingForShutdown = true
+        markTerminationConfirmedAndSetClosingForShutdown()
         return true
     }
 

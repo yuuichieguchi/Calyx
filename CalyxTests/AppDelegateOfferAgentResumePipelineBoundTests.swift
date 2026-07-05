@@ -143,7 +143,12 @@ final class AppDelegateOfferAgentResumePipelineBoundTests: XCTestCase {
         let restored = appDelegate.restoreTabSurfaces(tab: tab, app: dummyApp, window: window)
         XCTAssertTrue(restored, "Precondition: the single-leaf restore itself (the synchronous part) must succeed")
 
-        let waiterResult = XCTWaiter.wait(for: [completionExpectation], timeout: 8.0)
+        // R10-C item 5 (r10-fix-spec.md): raised from 8.0s to 15.0s,
+        // still a generous margin over the ~5s
+        // SessionDaemonClientProtocol.listAllBoundTimeoutSeconds default
+        // this pipeline is bounded by, but with more slack for a slow
+        // CI/test-host run than the original margin left.
+        let waiterResult = XCTWaiter.wait(for: [completionExpectation], timeout: 15.0)
 
         XCTAssertEqual(waiterResult, .completed,
                       "The per-surface offer-agent-resume pipeline must reach a terminal state within a " +

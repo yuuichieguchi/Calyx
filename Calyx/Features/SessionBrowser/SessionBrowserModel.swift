@@ -56,8 +56,15 @@ final class SessionBrowserModel {
     }
 
     /// Refreshes `rows` from `daemonClient.listAll()`.
+    ///
+    /// R10-C item 2 (r10-fix-spec.md): routed through `listAllBounded()`
+    /// rather than `listAll()` directly, since a hung daemon used to
+    /// freeze the whole session browser forever. Shares the same 5s
+    /// bound `AppDelegate`'s agent-resume path already applied to itself
+    /// (see `SessionDaemonClientProtocol.listAllBounded()`'s own doc
+    /// comment).
     func refresh() async {
-        let sessions = await daemonClient.listAll()
+        let sessions = await daemonClient.listAllBounded()
         rows = sessions.map { info in
             let isAttached = surfaceMap.surfaceID(for: info.id) != nil
             return SessionBrowserRow(

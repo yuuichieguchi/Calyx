@@ -52,6 +52,70 @@ extension SessionDaemonClientProtocol {
     /// `AgentSessionMetaBridgeTests`) overrides these itself.
     func listAll() async -> [SessionInfo] { [] }
     func setMeta(id: String, key: String, value: String) async {}
+
+    /// R10-C item 2 (r10-fix-spec.md): the single bound shared by every
+    /// caller that must not await `listAll()` unbounded, originally
+    /// `AppDelegate`'s agent-resume path alone
+    /// (`listAllSessionsBounded`, R8-D item 1), now also
+    /// `SessionBrowserModel.refresh()`, which used to await `listAll()`
+    /// completely unbounded and freeze the whole session browser behind
+    /// a hung `calyx-session` daemon.
+    static var listAllBoundTimeoutSeconds: UInt64 { 5 }
+
+    /// Races `listAll()` against `listAllBoundTimeoutSeconds`, degrading
+    /// to `[]` if the daemon round-trip hasn't completed by then, so a
+    /// hung daemon never blocks a caller indefinitely. Lifted from
+    /// `AppDelegate`'s former private `listAllSessionsBounded` (R8-D
+    /// item 1) into this shared default so `SessionBrowserModel
+    /// .refresh()` and `AppDelegate.fetchSessionsForAgentResume()` share
+    /// one bound and one implementation instead of the browser path
+    /// omitting it entirely.
+    ///
+    /// Deliberately NOT a `TaskGroup` race: `withTaskGroup` always
+    /// awaits every child task to completion before returning, even
+    /// after `cancelAll()` (cancellation is cooperative; an
+    /// unresponsive daemon's `listAll()`, awaiting a
+    /// `CheckedContinuation` nobody ever resumes, never observes it),
+    /// which would make the whole race hang exactly as long as the call
+    /// it exists to bound. Instead, two independent, unstructured
+    /// `Task`s race to resume `continuation` first, guarded by
+    /// `resumed`; `@MainActor` isolation means both closures (each
+    /// inherits this method's actor context, per `Task.init`'s
+    /// `@_inheritActorContext`) can never execute concurrently with
+    /// each other, mirroring `AppDelegate.applicationWillTerminate`'s
+    /// identical `killsDrained` pattern, no lock needed.
+    ///
+    /// R10-C item 1 (r10-fix-spec.md): the winner cancels the loser (a
+    /// beaten daemon task is cancelled, not merely abandoned; the
+    /// subprocess layer may ignore it, but the signal is sent; a beaten
+    /// timeout task is cancelled too), and the timeout arm re-checks
+    /// `Task.isCancelled` before resuming, closing the
+    /// `try?`-swallows-`CancellationError` hole the old, unguarded
+    /// `Task.sleep` had (a cancelled sleep could still fall through to
+    /// resume the continuation with a stale `[]` after the daemon task
+    /// had already won).
+    @MainActor
+    func listAllBounded() async -> [SessionInfo] {
+        await withCheckedContinuation { (continuation: CheckedContinuation<[SessionInfo], Never>) in
+            var resumed = false
+            var daemonTask: Task<Void, Never>?
+            var timeoutTask: Task<Void, Never>?
+            daemonTask = Task {
+                let result = await listAll()
+                guard !resumed else { return }
+                resumed = true
+                timeoutTask?.cancel()
+                continuation.resume(returning: result)
+            }
+            timeoutTask = Task {
+                try? await Task.sleep(nanoseconds: Self.listAllBoundTimeoutSeconds * 1_000_000_000)
+                guard !Task.isCancelled, !resumed else { return }
+                resumed = true
+                daemonTask?.cancel()
+                continuation.resume(returning: [])
+            }
+        }
+    }
 }
 
 /// Production client: shells out to the bundled `calyx-session` binary

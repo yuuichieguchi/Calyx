@@ -1369,15 +1369,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// a task was actually started, now that
     /// `fetchSessionsForAgentResume()` itself no longer returns a
     /// meaningful synchronous result.
+    ///
+    /// R10-B (r10-fix-spec.md): reset back to `nil` once the task it
+    /// holds actually COMPLETES (see `agentResumeFetchGeneration`'s doc
+    /// comment), not only when agent resume is disabled. Before this
+    /// fix, the `== nil` reuse guard in `fetchSessionsForAgentResume()`
+    /// never reset after a successful fetch, so every call after the
+    /// very first one silently reused the launch-time snapshot forever;
+    /// a first fetch that timed out permanently pinned an empty `[:]`
+    /// result.
     private(set) var agentResumeSessionsTask: Task<[String: SessionInfo], Never>?
 
+    /// R10-B (r10-fix-spec.md): monotonic counter identifying which
+    /// `fetchSessionsForAgentResume()` call started the currently
+    /// in-flight `agentResumeSessionsTask`, mirroring
+    /// `BrowserTabController.snapshotGeneration`'s established pattern.
+    /// The task's own completion compares this against its own captured
+    /// generation before resetting `agentResumeSessionsTask` to `nil`,
+    /// so a disable-then-re-enable cycle that starts a NEWER fetch
+    /// while an older, already-cancelled one is still unwinding can
+    /// never have that older fetch's completion clobber the newer
+    /// task's reference.
+    private var agentResumeFetchGeneration = 0
+
     /// R8-D item 1 (r8-fix-spec.md; r7-verdicts.md's "Unbounded await
-    /// (D1)" finding): the deadline `listAllSessionsBounded()` races the
-    /// real daemon round-trip against, so `agentResumeSessionsTask`
-    /// always reaches a terminal state even if the daemon never
-    /// responds at all. `AppDelegateOfferAgentResumePipelineBoundTests`'s
-    /// 8s `XCTWaiter` bound comfortably exceeds this.
-    private static let agentResumeFetchTimeoutSeconds: UInt64 = 5
+    /// (D1)" finding): the deadline `SessionDaemonClientProtocol
+    /// .listAllBounded()` races the real daemon round-trip against, so
+    /// `agentResumeSessionsTask` always reaches a terminal state even
+    /// if the daemon never responds at all.
+    /// `AppDelegateOfferAgentResumePipelineBoundTests`'s 15s `XCTWaiter`
+    /// bound comfortably exceeds this (R10-C item 2/5, r10-fix-spec.md:
+    /// shared with `SessionBrowserModel.refresh()` as
+    /// `SessionDaemonClientProtocol.listAllBoundTimeoutSeconds`, one
+    /// constant instead of two ad hoc bounds).
 
     /// F10 (V11, WARNING, r4-fix-spec.md): starts (but does not wait
     /// for) the daemon's session list fetch, keyed by session ID, gated
@@ -1412,6 +1436,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// `offerAgentResume`/`attachWindow` direct-drive precedent.
     func fetchSessionsForAgentResume() {
         guard SessionSettings.agentResumeEnabled else {
+            // R10-B item 2 (r10-fix-spec.md): cancel a still-in-flight
+            // fetch instead of merely dropping the reference, so a
+            // disable mid-flight doesn't leak an unobserved running
+            // daemon round-trip.
+            agentResumeSessionsTask?.cancel()
             agentResumeSessionsTask = nil
             return
         }
@@ -1424,49 +1453,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         #else
         let client = SessionDaemonClient.shared
         #endif
+        agentResumeFetchGeneration += 1
+        let generation = agentResumeFetchGeneration
         agentResumeSessionsTask = Task {
-            await AppDelegate.listAllSessionsBounded(client: client)
+            let result = await AppDelegate.listAllSessionsBounded(client: client)
+            // R10-B item 1 (r10-fix-spec.md): reset back to nil once
+            // THIS fetch completes, so the next
+            // fetchSessionsForAgentResume() call starts a fresh daemon
+            // round-trip instead of reusing an already-resolved (or
+            // timed-out) snapshot forever. Guarded by generation (see
+            // agentResumeFetchGeneration's own doc comment) so a newer
+            // fetch started after a disable/re-enable cycle is never
+            // clobbered by this one's completion.
+            if self.agentResumeFetchGeneration == generation {
+                self.agentResumeSessionsTask = nil
+            }
+            return result
         }
     }
 
     /// R8-D item 1 (r8-fix-spec.md; r7-verdicts.md's "Unbounded await
-    /// (D1)" finding): bounds the daemon round-trip to
-    /// `agentResumeFetchTimeoutSeconds`, completing with `[:]` if it
-    /// hasn't responded by then, so `agentResumeSessionsTask` always
-    /// reaches a terminal state.
-    ///
-    /// Deliberately NOT a `TaskGroup` race: `withTaskGroup` always
-    /// awaits every child task to completion before returning, even
-    /// after `cancelAll()` (cancellation is cooperative; an
-    /// unresponsive daemon's `listAll()`, awaiting a `CheckedContinuation`
-    /// nobody ever resumes, never observes it), which would make the
-    /// whole race hang exactly as long as the call it exists to bound.
-    /// Instead, two independent, unstructured `Task`s race to resume
-    /// `continuation` first, guarded by `resumed`; both closures run on
-    /// the MainActor (inherited from this `static` method's caller,
-    /// itself always called from `agentResumeSessionsTask`'s own
-    /// MainActor-isolated `Task`), so they can never execute
-    /// concurrently with each other, mirroring `applicationWillTerminate`'s
-    /// identical `killsDrained` pattern above, no lock needed. The loser
-    /// (almost always the real daemon call, on timeout) is abandoned,
-    /// not awaited: this function returns as soon as the winner resumes.
+    /// (D1)" finding): delegates to
+    /// `SessionDaemonClientProtocol.listAllBounded()` (R10-C item 2,
+    /// r10-fix-spec.md, lifted from this method's own former
+    /// implementation so `SessionBrowserModel.refresh()` shares the
+    /// same bounded race and the same timeout constant instead of
+    /// awaiting `listAll()` unbounded), then keys the result by session
+    /// ID for `offerAgentResume`'s lookup.
     @MainActor
     private static func listAllSessionsBounded(client: SessionDaemonClientProtocol) async -> [String: SessionInfo] {
-        let sessions = await withCheckedContinuation { (continuation: CheckedContinuation<[SessionInfo], Never>) in
-            var resumed = false
-            Task {
-                let result = await client.listAll()
-                guard !resumed else { return }
-                resumed = true
-                continuation.resume(returning: result)
-            }
-            Task {
-                try? await Task.sleep(nanoseconds: agentResumeFetchTimeoutSeconds * 1_000_000_000)
-                guard !resumed else { return }
-                resumed = true
-                continuation.resume(returning: [])
-            }
-        }
+        let sessions = await client.listAllBounded()
         return Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
     }
 
