@@ -189,12 +189,20 @@ extension WindowSession {
 }
 
 extension TabGroup {
-    func snapshot() -> TabGroupSnapshot {
+    /// - Parameter browserURLOverride: Consulted per-tab (by tab id) for
+    ///   a live URL that wins over a `.browser` tab's configured one.
+    ///   Round 12 (r12-fix-spec.md, R12-C): lets
+    ///   `CalyxWindowController.windowSnapshot()` delegate its
+    ///   TabGroupSnapshot/TabSnapshot construction to this tested chain
+    ///   while still injecting its live `browserControllers` state;
+    ///   every other caller uses the default (no override) and gets
+    ///   each tab's configured URL unchanged.
+    func snapshot(browserURLOverride: (UUID) -> URL? = { _ in nil }) -> TabGroupSnapshot {
         TabGroupSnapshot(
             id: id,
             name: name,
             color: color.rawValue,
-            tabs: tabs.compactMap { $0.snapshot() },
+            tabs: tabs.compactMap { $0.snapshot(browserURLOverride: browserURLOverride($0.id)) },
             activeTabID: activeTabID,
             isCollapsed: isCollapsed
         )
@@ -202,7 +210,10 @@ extension TabGroup {
 }
 
 extension Tab {
-    func snapshot() -> TabSnapshot? {
+    /// - Parameter browserURLOverride: When non-nil and `content` is
+    ///   `.browser`, wins over the tab's configured URL. See
+    ///   `TabGroup.snapshot(browserURLOverride:)`'s doc comment.
+    func snapshot(browserURLOverride: URL? = nil) -> TabSnapshot? {
         let refs = sessionRefs.isEmpty ? nil : sessionRefs
         switch content {
         case .diff:
@@ -210,7 +221,7 @@ extension Tab {
         case .terminal:
             return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: nil, sessionRefs: refs)
         case .browser(let url):
-            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: url, sessionRefs: refs)
+            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: browserURLOverride ?? url, sessionRefs: refs)
         }
     }
 

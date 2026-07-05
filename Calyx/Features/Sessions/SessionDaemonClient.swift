@@ -62,46 +62,50 @@ extension SessionDaemonClientProtocol {
     /// a hung `calyx-session` daemon.
     static var listAllBoundTimeoutSeconds: UInt64 { 5 }
 
-    /// Races `listAll()` against `listAllBoundTimeoutSeconds`, degrading
-    /// to `[]` if the daemon round-trip hasn't completed by then, so a
-    /// hung daemon never blocks a caller indefinitely. Lifted from
-    /// `AppDelegate`'s former private `listAllSessionsBounded` (R8-D
-    /// item 1) into this shared default so `SessionBrowserModel
-    /// .refresh()` and `AppDelegate.fetchSessionsForAgentResume()` share
-    /// one bound and one implementation instead of the browser path
-    /// omitting it entirely.
+    /// R12-B (r12-fix-spec.md): generalized race shape shared by every
+    /// bounded daemon call. Races `operation()` against
+    /// `listAllBoundTimeoutSeconds`, resolving to `onTimeout()` if
+    /// `operation()` hasn't completed by then, so a hung daemon never
+    /// blocks a caller indefinitely. Originally `listAllBounded()`'s own
+    /// implementation (lifted from `AppDelegate`'s former private
+    /// `listAllSessionsBounded`, R8-D item 1); generalized here so
+    /// `sessionStateBounded(id:)` (R12-B) shares the identical race
+    /// shape and the same timeout constant instead of duplicating it.
     ///
     /// Deliberately NOT a `TaskGroup` race: `withTaskGroup` always
     /// awaits every child task to completion before returning, even
     /// after `cancelAll()` (cancellation is cooperative; an
-    /// unresponsive daemon's `listAll()`, awaiting a
-    /// `CheckedContinuation` nobody ever resumes, never observes it),
-    /// which would make the whole race hang exactly as long as the call
-    /// it exists to bound. Instead, two independent, unstructured
-    /// `Task`s race to resume `continuation` first, guarded by
-    /// `resumed`; `@MainActor` isolation means both closures (each
-    /// inherits this method's actor context, per `Task.init`'s
-    /// `@_inheritActorContext`) can never execute concurrently with
-    /// each other, mirroring `AppDelegate.applicationWillTerminate`'s
-    /// identical `killsDrained` pattern, no lock needed.
+    /// unresponsive daemon's call, awaiting a `CheckedContinuation`
+    /// nobody ever resumes, never observes it), which would make the
+    /// whole race hang exactly as long as the call it exists to bound.
+    /// Instead, two independent, unstructured `Task`s race to resume
+    /// `continuation` first, guarded by `resumed`; `@MainActor`
+    /// isolation means both closures (each inherits this method's actor
+    /// context, per `Task.init`'s `@_inheritActorContext`) can never
+    /// execute concurrently with each other, mirroring
+    /// `AppDelegate.applicationWillTerminate`'s identical `killsDrained`
+    /// pattern, no lock needed.
     ///
     /// R10-C item 1 (r10-fix-spec.md): the winner cancels the loser (a
-    /// beaten daemon task is cancelled, not merely abandoned; the
+    /// beaten operation task is cancelled, not merely abandoned; the
     /// subprocess layer may ignore it, but the signal is sent; a beaten
     /// timeout task is cancelled too), and the timeout arm re-checks
     /// `Task.isCancelled` before resuming, closing the
     /// `try?`-swallows-`CancellationError` hole the old, unguarded
     /// `Task.sleep` had (a cancelled sleep could still fall through to
-    /// resume the continuation with a stale `[]` after the daemon task
-    /// had already won).
+    /// resume the continuation with a stale value after the operation
+    /// task had already won).
     @MainActor
-    func listAllBounded() async -> [SessionInfo] {
-        await withCheckedContinuation { (continuation: CheckedContinuation<[SessionInfo], Never>) in
+    private func bounded<T: Sendable>(
+        operation: @escaping @Sendable () async -> T,
+        onTimeout: @escaping @Sendable () -> T
+    ) async -> T {
+        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
             var resumed = false
-            var daemonTask: Task<Void, Never>?
+            var operationTask: Task<Void, Never>?
             var timeoutTask: Task<Void, Never>?
-            daemonTask = Task {
-                let result = await listAll()
+            operationTask = Task {
+                let result = await operation()
                 guard !resumed else { return }
                 resumed = true
                 timeoutTask?.cancel()
@@ -111,10 +115,35 @@ extension SessionDaemonClientProtocol {
                 try? await Task.sleep(nanoseconds: Self.listAllBoundTimeoutSeconds * 1_000_000_000)
                 guard !Task.isCancelled, !resumed else { return }
                 resumed = true
-                daemonTask?.cancel()
-                continuation.resume(returning: [])
+                operationTask?.cancel()
+                continuation.resume(returning: onTimeout())
             }
         }
+    }
+
+    /// Races `listAll()` against `listAllBoundTimeoutSeconds`, degrading
+    /// to `[]` if the daemon round-trip hasn't completed by then, so a
+    /// hung daemon never blocks a caller indefinitely. Shared by
+    /// `SessionBrowserModel.refresh()` and
+    /// `AppDelegate.fetchSessionsForAgentResume()`.
+    @MainActor
+    func listAllBounded() async -> [SessionInfo] {
+        await bounded(operation: { await listAll() }, onTimeout: { [] })
+    }
+
+    /// R12-B (r12-fix-spec.md): `sessionState(id:)` used to await the
+    /// underlying `commandRunner.run(...)` completely unbounded, so a
+    /// hung `calyx-session` daemon could stall
+    /// `SessionReconnectCoordinator.childExited`'s reconnect decision
+    /// indefinitely -- exactly the failure mode `listAllBounded()`
+    /// already fixed for the ledger listing alone. Read-only, so racing
+    /// it against the timeout and cancelling the loser (mirroring
+    /// `listAllBounded()`'s shape exactly) is safe. Degrades to
+    /// `.unreachable` on timeout, which `SessionReconnectCoordinator`
+    /// already treats as a retry/give-up input.
+    @MainActor
+    func sessionStateBounded(id: String) async -> SessionQueryResult {
+        await bounded(operation: { await sessionState(id: id) }, onTimeout: { .unreachable })
     }
 }
 
@@ -182,6 +211,14 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
         }
     }
 
+    /// Deliberately NOT bounded (R12-B sweep addendum, r12-fix-spec.md):
+    /// with R12-A's SIGTERM-on-cancel now reaching the actual
+    /// `calyx-session kill` subprocess, racing it against a timeout and
+    /// cancelling the loser could terminate it mid-IPC-write, silently
+    /// losing the kill -- worse than a slow-but-eventually-completed
+    /// one. Keeps its unbounded complete-or-watchdog semantics;
+    /// `SessionKillTracker`'s 2s quit-drain already abandons (without
+    /// cancelling) rather than needing a bounded wrapper here.
     func kill(id: String) async {
         guard let binaryPath else { return }
         _ = try? await commandRunner.run(
@@ -210,7 +247,13 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     /// Shells out to `meta set <id> <key>=<value>` exactly like
     /// `kill(id:)` above, ignoring the result the same way — a failed
     /// meta write is not user-visible, it just means resume won't be
-    /// offered next time.
+    /// offered next time. Left unbounded (R12-B sweep addendum,
+    /// r12-fix-spec.md): a WRITE, so bounding it would need an
+    /// abandon-style wrapper that resumes the caller without cancelling
+    /// the write arm (cancelling mid-write risks the same silent loss
+    /// `kill(id:)`'s doc comment describes); this fire-and-forget
+    /// background call already never blocks a user-visible flow, so the
+    /// simplest acceptable choice is leaving it as-is.
     func setMeta(id: String, key: String, value: String) async {
         guard let binaryPath else { return }
         _ = try? await commandRunner.run(

@@ -102,7 +102,7 @@ final class SessionReconnectCoordinator {
         inFlightSurfaceIDs.insert(surfaceID)
         defer { inFlightSurfaceIDs.remove(surfaceID) }
 
-        switch await daemonClient.sessionState(id: sessionID) {
+        switch await daemonClient.sessionStateBounded(id: sessionID) {
         case .exited:
             attemptCounts[sessionID] = nil
             onDecision(surfaceID, .closePane)

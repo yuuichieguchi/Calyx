@@ -40,6 +40,14 @@ final class SessionBrowserModel {
     private let daemonClient: SessionDaemonClientProtocol
     private let surfaceMap: SessionSurfaceMap
 
+    /// R12-A item 3 (r12-fix-spec.md): guards against `refresh()`'s 1s
+    /// poll timer stacking an unbounded number of concurrent
+    /// `listAllBounded()` round-trips behind a slow/hung daemon. A
+    /// second `refresh()` issued while one is still in flight is a
+    /// no-op instead of starting its own overlapping daemon call; the
+    /// poll naturally backs off to the bound's own cadence instead.
+    private var isRefreshing = false
+
     /// Invoked by `attach(_:)` with the row to attach to. Actual
     /// surface/window creation is a `SessionBrowserWindowController` /
     /// `CalyxWindowController` concern, deliberately kept out of this
@@ -64,6 +72,9 @@ final class SessionBrowserModel {
     /// (see `SessionDaemonClientProtocol.listAllBounded()`'s own doc
     /// comment).
     func refresh() async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        defer { isRefreshing = false }
         let sessions = await daemonClient.listAllBounded()
         rows = sessions.map { info in
             let isAttached = surfaceMap.surfaceID(for: info.id) != nil

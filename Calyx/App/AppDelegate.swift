@@ -1437,9 +1437,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func fetchSessionsForAgentResume() {
         guard SessionSettings.agentResumeEnabled else {
             // R10-B item 2 (r10-fix-spec.md): cancel a still-in-flight
-            // fetch instead of merely dropping the reference, so a
-            // disable mid-flight doesn't leak an unobserved running
-            // daemon round-trip.
+            // fetch instead of merely dropping the reference. This is
+            // best-effort -- `Task.cancel()` only sets a cooperative
+            // flag, and `listAllSessionsBounded` below only checks it
+            // once, right after its own await returns -- but R12-A item
+            // 1 (r12-fix-spec.md) made `SystemCommandRunner.run()` honor
+            // that flag by SIGTERMing the underlying `calyx-session`
+            // subprocess, so a disable mid-flight now also ends the
+            // daemon round-trip instead of merely dropping an
+            // unobserved reference to it.
             agentResumeSessionsTask?.cancel()
             agentResumeSessionsTask = nil
             return
@@ -1483,6 +1489,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor
     private static func listAllSessionsBounded(client: SessionDaemonClientProtocol) async -> [String: SessionInfo] {
         let sessions = await client.listAllBounded()
+        // R12-A item 4 (r12-fix-spec.md): a disable mid-flight
+        // (`fetchSessionsForAgentResume`'s guard above) cancels this
+        // call's enclosing Task; skip the otherwise-pointless keying
+        // work once cancelled instead of building a dictionary nobody
+        // will read.
+        guard !Task.isCancelled else { return [:] }
         return Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
     }
 

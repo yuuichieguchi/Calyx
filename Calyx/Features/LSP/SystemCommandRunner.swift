@@ -313,6 +313,41 @@ struct SystemCommandRunner: LSPCommandRunner {
         )
     }
 
+    /// Thread-safe bridge between `withTaskCancellationHandler`'s
+    /// `onCancel` closure (which may run before the `Process` even
+    /// exists yet, concurrently with, or after it starts) and the
+    /// dispatch-queue block that actually launches it. Whichever side
+    /// observes the other's write first under `lock` is responsible for
+    /// calling `terminate()`: `cancel()` terminates directly if
+    /// `register(_:)` already ran; otherwise `register(_:)`'s return
+    /// value tells the launching side the task was already cancelled by
+    /// the time the process came into being, so it must terminate it
+    /// itself right after `process.run()` succeeds (calling
+    /// `terminate()` on an unlaunched `Process` is unsafe, so `cancel()`
+    /// alone must never do so).
+    private final class CancellationBridge: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isCancelled = false
+        private var process: Process?
+
+        /// Called once, immediately after `process.run()` succeeds.
+        /// Returns whether the task was already cancelled by this
+        /// point.
+        func register(_ process: Process) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            self.process = process
+            return isCancelled
+        }
+
+        func cancel() {
+            lock.lock()
+            isCancelled = true
+            let proc = process
+            lock.unlock()
+            proc?.terminate()
+        }
+    }
+
     /// Shared `Process`-spawning core for `run(...)` and `installRun(...)`.
     /// The only behavioural difference between the two public entry
     /// points is the `timeoutSeconds` value passed in here, so we keep a
@@ -324,132 +359,152 @@ struct SystemCommandRunner: LSPCommandRunner {
         environment: [String: String]?,
         timeoutSeconds: TimeInterval
     ) async throws -> CommandResult {
-        // Build / spawn `Process` and perform the blocking
-        // `waitUntilExit()` from a background dispatch queue so we do
-        // not park a Swift Concurrency executor thread. Mirrors the
-        // pattern used by `GitService.run(args:workDir:)`.
-        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CommandResult, Error>) in
-            DispatchQueue.global().async {
-                let process = Process()
+        let cancellationBridge = CancellationBridge()
+        // R12-A item 1 (r12-fix-spec.md): a plain `withCheckedThrowingContinuation`
+        // never observes Swift Task cancellation, so `task.cancel()` on a
+        // caller awaiting `run(...)` used to reach nothing -- the spawned
+        // `Process` kept running until it exited naturally or the
+        // `timeoutSeconds` watchdog eventually tripped. Wrapping the
+        // continuation in `withTaskCancellationHandler` makes cancellation
+        // SIGTERM the process promptly instead, with the watchdog below
+        // kept as a backstop for children that ignore SIGTERM.
+        return try await withTaskCancellationHandler {
+            // Build / spawn `Process` and perform the blocking
+            // `waitUntilExit()` from a background dispatch queue so we do
+            // not park a Swift Concurrency executor thread. Mirrors the
+            // pattern used by `GitService.run(args:workDir:)`.
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<CommandResult, Error>) in
+                DispatchQueue.global().async {
+                    let process = Process()
 
-                // Absolute path → spawn directly. Bare name → defer to
-                // `/usr/bin/env` so PATH lookup still resolves the binary.
-                if executable.hasPrefix("/") {
-                    process.executableURL = URL(fileURLWithPath: executable)
-                    process.arguments = arguments
-                } else {
-                    process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                    process.arguments = [executable] + arguments
-                }
-
-                if let workingDirectory {
-                    process.currentDirectoryURL = workingDirectory
-                }
-                // Always overlay the augmented PATH so Finder-launched
-                // callers still find Homebrew / Cargo / npm binaries.
-                process.environment = Self.augmentedEnvironment(base: environment)
-
-                let stdout = Pipe()
-                let stderr = Pipe()
-                process.standardOutput = stdout
-                process.standardError = stderr
-                // Detach stdin: never let the child inherit a TTY
-                // from the host app process.
-                process.standardInput = FileHandle.nullDevice
-
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                // Watchdog: terminate runaway children at `timeoutSeconds`,
-                // then SIGKILL 5s later if they still refuse to exit. The
-                // `TimeoutFlag` is a single-writer (timer handler) /
-                // single-reader (post-`waitUntilExit`) boolean guarded
-                // by a lock so we don't trip Swift 6 strict-concurrency
-                // diagnostics. The flag is only read after the timer
-                // has been cancelled (and therefore can no longer fire
-                // a new write), so contention is nil in practice.
-                final class TimeoutFlag: @unchecked Sendable {
-                    private let lock = NSLock()
-                    private var fired = false
-                    func markFired() {
-                        lock.lock(); defer { lock.unlock() }
-                        fired = true
+                    // Absolute path → spawn directly. Bare name → defer to
+                    // `/usr/bin/env` so PATH lookup still resolves the binary.
+                    if executable.hasPrefix("/") {
+                        process.executableURL = URL(fileURLWithPath: executable)
+                        process.arguments = arguments
+                    } else {
+                        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                        process.arguments = [executable] + arguments
                     }
-                    func value() -> Bool {
-                        lock.lock(); defer { lock.unlock() }
-                        return fired
+
+                    if let workingDirectory {
+                        process.currentDirectoryURL = workingDirectory
                     }
-                }
-                let timedOut = TimeoutFlag()
-                let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
-                timer.schedule(deadline: .now() + timeoutSeconds)
-                timer.setEventHandler {
-                    timedOut.markFired()
-                    process.terminate()
-                    let pid = process.processIdentifier
-                    DispatchQueue.global().asyncAfter(deadline: .now() + Self.killGraceSeconds) {
-                        if process.isRunning {
-                            kill(pid, SIGKILL)
+                    // Always overlay the augmented PATH so Finder-launched
+                    // callers still find Homebrew / Cargo / npm binaries.
+                    process.environment = Self.augmentedEnvironment(base: environment)
+
+                    let stdout = Pipe()
+                    let stderr = Pipe()
+                    process.standardOutput = stdout
+                    process.standardError = stderr
+                    // Detach stdin: never let the child inherit a TTY
+                    // from the host app process.
+                    process.standardInput = FileHandle.nullDevice
+
+                    do {
+                        try process.run()
+                    } catch {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                    if cancellationBridge.register(process) {
+                        // The task was already cancelled by the time
+                        // this process launched; `cancel()` found
+                        // nothing registered yet, so terminate it here
+                        // instead.
+                        process.terminate()
+                    }
+
+                    // Watchdog: terminate runaway children at `timeoutSeconds`,
+                    // then SIGKILL 5s later if they still refuse to exit. The
+                    // `TimeoutFlag` is a single-writer (timer handler) /
+                    // single-reader (post-`waitUntilExit`) boolean guarded
+                    // by a lock so we don't trip Swift 6 strict-concurrency
+                    // diagnostics. The flag is only read after the timer
+                    // has been cancelled (and therefore can no longer fire
+                    // a new write), so contention is nil in practice.
+                    final class TimeoutFlag: @unchecked Sendable {
+                        private let lock = NSLock()
+                        private var fired = false
+                        func markFired() {
+                            lock.lock(); defer { lock.unlock() }
+                            fired = true
+                        }
+                        func value() -> Bool {
+                            lock.lock(); defer { lock.unlock() }
+                            return fired
                         }
                     }
-                }
-                timer.resume()
+                    let timedOut = TimeoutFlag()
+                    let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+                    timer.schedule(deadline: .now() + timeoutSeconds)
+                    timer.setEventHandler {
+                        timedOut.markFired()
+                        process.terminate()
+                        let pid = process.processIdentifier
+                        DispatchQueue.global().asyncAfter(deadline: .now() + Self.killGraceSeconds) {
+                            if process.isRunning {
+                                kill(pid, SIGKILL)
+                            }
+                        }
+                    }
+                    timer.resume()
 
-                // Drain stdout/stderr concurrently from dedicated
-                // background queues so the child cannot block on a
-                // full pipe buffer (~16-64KB on macOS) and deadlock us
-                // inside `waitUntilExit()`. `OutputBox` is a reference
-                // wrapper so the read closures can mutate captured
-                // storage without tripping Swift 6 strict-concurrency
-                // diagnostics on mutable captures from `@Sendable`
-                // closures. Each box is written exactly once on its
-                // own queue and observed only after `group.wait()`
-                // synchronises, so `@unchecked Sendable` is sound.
-                final class OutputBox: @unchecked Sendable {
-                    var data = Data()
-                }
-                let outBox = OutputBox()
-                let errBox = OutputBox()
+                    // Drain stdout/stderr concurrently from dedicated
+                    // background queues so the child cannot block on a
+                    // full pipe buffer (~16-64KB on macOS) and deadlock us
+                    // inside `waitUntilExit()`. `OutputBox` is a reference
+                    // wrapper so the read closures can mutate captured
+                    // storage without tripping Swift 6 strict-concurrency
+                    // diagnostics on mutable captures from `@Sendable`
+                    // closures. Each box is written exactly once on its
+                    // own queue and observed only after `group.wait()`
+                    // synchronises, so `@unchecked Sendable` is sound.
+                    final class OutputBox: @unchecked Sendable {
+                        var data = Data()
+                    }
+                    let outBox = OutputBox()
+                    let errBox = OutputBox()
 
-                let group = DispatchGroup()
-                group.enter()
-                DispatchQueue.global().async {
-                    outBox.data = stdout.fileHandleForReading.readDataToEndOfFile()
-                    group.leave()
-                }
-                group.enter()
-                DispatchQueue.global().async {
-                    errBox.data = stderr.fileHandleForReading.readDataToEndOfFile()
-                    group.leave()
-                }
+                    let group = DispatchGroup()
+                    group.enter()
+                    DispatchQueue.global().async {
+                        outBox.data = stdout.fileHandleForReading.readDataToEndOfFile()
+                        group.leave()
+                    }
+                    group.enter()
+                    DispatchQueue.global().async {
+                        errBox.data = stderr.fileHandleForReading.readDataToEndOfFile()
+                        group.leave()
+                    }
 
-                process.waitUntilExit()
-                group.wait()
-                // Cancel the watchdog before reading its flag so the
-                // event handler can no longer mutate it concurrently.
-                timer.cancel()
+                    process.waitUntilExit()
+                    group.wait()
+                    // Cancel the watchdog before reading its flag so the
+                    // event handler can no longer mutate it concurrently.
+                    timer.cancel()
 
-                let didTimeOut = timedOut.value()
-                let stdoutStr = String(data: outBox.data, encoding: .utf8) ?? ""
-                var stderrStr = String(data: errBox.data, encoding: .utf8) ?? ""
-                let exitCode: Int32
-                if didTimeOut {
-                    exitCode = Self.timeoutExitCode
-                    stderrStr += "\ncommand timed out after \(Int(timeoutSeconds))s"
-                } else {
-                    exitCode = process.terminationStatus
+                    let didTimeOut = timedOut.value()
+                    let stdoutStr = String(data: outBox.data, encoding: .utf8) ?? ""
+                    var stderrStr = String(data: errBox.data, encoding: .utf8) ?? ""
+                    let exitCode: Int32
+                    if didTimeOut {
+                        exitCode = Self.timeoutExitCode
+                        stderrStr += "\ncommand timed out after \(Int(timeoutSeconds))s"
+                    } else {
+                        exitCode = process.terminationStatus
+                    }
+
+                    continuation.resume(returning: CommandResult(
+                        exitCode: exitCode,
+                        stdout: stdoutStr,
+                        stderr: stderrStr
+                    ))
                 }
-
-                continuation.resume(returning: CommandResult(
-                    exitCode: exitCode,
-                    stdout: stdoutStr,
-                    stderr: stderrStr
-                ))
             }
+        } onCancel: {
+            cancellationBridge.cancel()
         }
     }
 }

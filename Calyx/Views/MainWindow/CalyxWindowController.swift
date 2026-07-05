@@ -200,6 +200,21 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         browserController(for: tabID)
     }
 
+    #if DEBUG
+    /// Test seam (round 12, R12-C RED phase, sweep addendum item 3):
+    /// registers `controller` as tabID's live BrowserTabController
+    /// without driving a full navigation through the real
+    /// BrowserView/WebKit stack, so windowSnapshot()'s live-browserURL-
+    /// override branch (which reads `browserControllers`) can be
+    /// exercised directly against a URL that deliberately differs from
+    /// the tab's configured `content` URL. Mirrors
+    /// `_closingTabIDsForTesting`'s naming/gating convention. DO NOT use
+    /// from production code.
+    func _setBrowserControllerForTesting(tabID: UUID, controller: BrowserTabController) {
+        browserControllers[tabID] = controller
+    }
+    #endif
+
     private func wireBrowserCallbacks(controller: BrowserTabController, tab: Tab) {
         controller.browserView.onTitleChanged = { [weak tab] title in
             tab?.title = title
@@ -2645,6 +2660,16 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         activateCurrentTab()
     }
 
+    /// R12-C (r12-fix-spec.md): delegates TabSnapshot/TabGroupSnapshot
+    /// construction to the tested `Tab.snapshot()`/`TabGroup.snapshot()`
+    /// extension chain (SessionSnapshot.swift) instead of duplicating a
+    /// second, hand-kept-in-sync builder here. Only the live-window-only
+    /// inputs stay local: `frame`/`isFullScreen`
+    /// (`trackedFullScreen`/`preFullScreenFrame`), and the live
+    /// `browserURL` override from `browserControllers`, threaded through
+    /// as the `browserURLOverride` closure the chain already supports.
+    /// Diff-tab exclusion and the live-URL-over-configured-URL
+    /// precedence are therefore inherited from that chain unchanged.
     func windowSnapshot() -> WindowSnapshot {
         let frame: NSRect
         if trackedFullScreen {
@@ -2653,44 +2678,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             frame = window?.frame ?? .zero
         }
         let groups = windowSession.groups.map { group in
-            let tabs = group.tabs.compactMap { tab -> TabSnapshot? in
-                // Skip diff tabs — they are not persisted
-                if case .diff = tab.content { return nil }
-                let browserURL: URL?
-                switch tab.content {
-                case .terminal:
-                    browserURL = nil
-                case .browser(let configuredURL):
-                    browserURL = browserControllers[tab.id]?.browserState.url ?? configuredURL
-                case .diff:
-                    return nil  // Already handled above, but needed for exhaustive switch
-                }
-                return TabSnapshot(
-                    id: tab.id,
-                    title: tab.title,
-                    titleOverride: tab.titleOverride,
-                    pwd: tab.pwd,
-                    splitTree: tab.splitTree,
-                    browserURL: browserURL,
-                    // R10-A (r10-fix-spec.md): production saves go
-                    // through this method, which used to drop
-                    // sessionRefs entirely, so a persistent session's
-                    // SessionRef never reached disk. Empty normalizes
-                    // to nil, matching Tab.snapshot()'s (tested but
-                    // production-unused until this fix) convention, so
-                    // a tab with no persistent sessions still produces
-                    // a byte-stable v5-shaped snapshot.
-                    sessionRefs: tab.sessionRefs.isEmpty ? nil : tab.sessionRefs
-                )
-            }
-            return TabGroupSnapshot(
-                id: group.id,
-                name: group.name,
-                color: group.color.rawValue,
-                tabs: tabs,
-                activeTabID: group.activeTabID,
-                isCollapsed: group.isCollapsed
-            )
+            group.snapshot(browserURLOverride: { tabID in browserControllers[tabID]?.browserState.url })
         }
         return WindowSnapshot(
             id: windowSession.id,
