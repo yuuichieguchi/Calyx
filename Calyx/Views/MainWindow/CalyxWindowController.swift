@@ -361,17 +361,20 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: - Initialization
 
-    convenience init(windowSession: WindowSession) {
+    /// `initialHost` (P5, remote sessions): forwarded to
+    /// `setupTerminalSurface(host:)` for this window's first tab --
+    /// see that method's own doc comment.
+    convenience init(windowSession: WindowSession, initialHost: String? = nil) {
         let window = CalyxWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        self.init(window: window, windowSession: windowSession)
+        self.init(window: window, windowSession: windowSession, initialHost: initialHost)
     }
 
-    init(window: NSWindow, windowSession: WindowSession, restoring: Bool = false) {
+    init(window: NSWindow, windowSession: WindowSession, restoring: Bool = false, initialHost: String? = nil) {
         self.windowSession = windowSession
         self.isRestoring = restoring
         super.init(window: window)
@@ -379,7 +382,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         window.center()
         setupCommandRegistry()
         setupUI()
-        if !restoring { setupTerminalSurface() }
+        if !restoring { setupTerminalSurface(host: initialHost) }
         registerNotificationObservers()
         startScreenPollTask()
     }
@@ -553,10 +556,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ) { [weak self] in
             self?.closeFocusedSessionSurface(killSessions: true)
         })
-        // Gated on `SessionSettings.persistentSessionsEnabled` — unlike
+        // Gated on `SessionSettings.persistentSessionsEnabled` -- unlike
         // `session.attach` (ungated: it only opens the browser) and
         // `session.detach`/`session.kill` (gated on an existing tracked
-        // pane) — because this command's entire purpose is spawning a
+        // pane) -- because this command's entire purpose is spawning a
         // brand-new persistent session, exactly what
         // `SessionSpawnPlanner.plan(for:)`'s own guard already gates.
         commandRegistry.register(PaletteCommand(
@@ -571,7 +574,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     /// `session.newRemote`'s handler: reuses the existing Sessions
     /// browser panel, where remote host candidates surface via
-    /// `SessionBrowserModel.remoteHostCandidates` — no new visual
+    /// `SessionBrowserModel.remoteHostCandidates` -- no new visual
     /// components this cycle.
     private func presentSessionsBrowserForRemoteHostPicker() {
         SessionBrowserWindowController.shared.showBrowser()
@@ -580,7 +583,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// Turns a chosen remote host into the `SessionSpawnContext` the
     /// spawn path (`SessionSpawnPlanner`) consumes. `origin == .tab`:
     /// a remote session created via the palette is still a new TAB at
-    /// the surface-creation level — `SessionSpawnOrigin` has no
+    /// the surface-creation level -- `SessionSpawnOrigin` has no
     /// dedicated palette-specific case.
     func remoteSessionSpawnContext(forHost host: String) -> SessionSpawnContext {
         SessionSpawnContext(host: host, origin: .tab)
@@ -617,7 +620,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // Title bar glass is now handled by SwiftUI overlay in MainContentView
     }
 
-    private func setupTerminalSurface() {
+    /// `host` (P5, remote sessions): threaded straight into
+    /// `createManagedSurface(host:)` for this window's very first tab --
+    /// `nil` (every existing caller's shape) leaves this unchanged, a
+    /// local surface exactly as before this parameter existed. Lets
+    /// `AppDelegate.spawnRemoteSessionTab(host:)` open a fresh window
+    /// whose sole initial tab is the remote session directly, instead
+    /// of a spurious local tab that would need a second, wasteful
+    /// teardown.
+    private func setupTerminalSurface(host: String? = nil) {
         guard let tab = activeTab else {
             logger.error("No active tab during setup")
             return
@@ -634,7 +645,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         guard let surfaceID = createManagedSurface(
             tab: tab, app: app, config: config,
-            passthroughPwd: tab.pwd, spawnCwd: tab.pwd ?? NSHomeDirectory(), origin: .tab
+            passthroughPwd: tab.pwd, spawnCwd: tab.pwd ?? NSHomeDirectory(), origin: .tab, host: host
         ) else {
             logger.error("Failed to create initial surface")
             return
@@ -679,7 +690,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// (unchanged, all still local). Passed into the
     /// `SessionSpawnContext` this method builds; the `SessionRef` it
     /// stores reads the resulting plan's OWN `host` (not this parameter
-    /// directly — see `SessionSpawnPlannerHostPropagationTests` for why
+    /// directly -- see `SessionSpawnPlannerHostPropagationTests` for why
     /// the plan itself is the source of truth for a caller applying it).
     ///
     /// Not `private` any more (P5; mirrors `closeAllTabsInGroup(id:)`'s/
@@ -1169,7 +1180,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: - Tab Operations
 
-    func createNewTab(inheritedConfig: Any? = nil) {
+    /// `host` (P5, remote sessions): threaded into `createManagedSurface
+    /// (host:)` for the new tab's surface -- `nil` (every existing
+    /// caller's shape) is unchanged, a local tab exactly as before this
+    /// parameter existed. Reached by `AppDelegate.spawnRemoteSessionTab
+    /// (host:)` when a key window controller already exists.
+    func createNewTab(inheritedConfig: Any? = nil, host: String? = nil) {
         guard let app = GhosttyAppController.shared.app,
               let window = self.window,
               let group = windowSession.activeGroup else { return }
@@ -1186,7 +1202,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         guard let surfaceID = createManagedSurface(
             tab: tab, app: app, config: config,
-            passthroughPwd: nil, spawnCwd: activeTab?.pwd ?? NSHomeDirectory(), origin: .tab
+            passthroughPwd: nil, spawnCwd: activeTab?.pwd ?? NSHomeDirectory(), origin: .tab, host: host
         ) else {
             logger.error("Failed to create surface for new tab")
             return

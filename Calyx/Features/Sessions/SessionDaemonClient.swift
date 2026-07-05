@@ -516,17 +516,17 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
 
     /// Deploys the daemon to `host` by running the LOCAL bundled
     /// `calyx-session` binary's own `remote-install` subcommand, with
-    /// `--host-binary` pointing at that SAME local path — a Darwin
+    /// `--host-binary` pointing at that SAME local path -- a Darwin
     /// arm64 remote reuses this Mac's own build bit-for-bit
     /// (remote_install.rs's `PayloadKind::HostBinary` mapping). Returns
     /// `nil` without ever invoking the command runner when no local
-    /// binary is resolvable — there is no executable to run
+    /// binary is resolvable -- there is no executable to run
     /// remote-install with at all.
     ///
     /// Shielded from the caller's own ambient Task cancellation the
     /// same structural way `kill(id:)`/`setMeta(id:key:value:)` are: an
     /// inner unstructured `Task` around `commandRunner.run(...)` that
-    /// ambient cancellation can never reach — this is a WRITE (deploys
+    /// ambient cancellation can never reach -- this is a WRITE (deploys
     /// a binary to the remote host), so cancelling mid-run risks the
     /// same silent-loss failure mode those methods' own doc comments
     /// describe.

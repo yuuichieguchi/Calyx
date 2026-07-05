@@ -312,13 +312,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Window Management
 
     @objc func createNewWindow() {
+        openNewWindow(initialHost: nil)
+    }
+
+    /// `initialHost` (P5, remote sessions): forwarded to
+    /// `CalyxWindowController.init(initialHost:)` for the new window's
+    /// sole initial tab. `nil` (`createNewWindow()` above, every
+    /// existing caller) is unchanged, a local window exactly as before
+    /// this parameter existed. Reached by `spawnRemoteSessionTab(host:)`
+    /// when no key window controller exists yet to add a tab to. Named
+    /// distinctly from `createNewWindow()` (rather than an overload of
+    /// it) since `#selector(createNewWindow)` above resolves by base
+    /// name alone and would become ambiguous with a same-named overload.
+    private func openNewWindow(initialHost: String?) {
         let initialTab = Tab()
         let windowSession = WindowSession(initialTab: initialTab)
         appSession.addWindow(windowSession)
 
-        let wc = CalyxWindowController(windowSession: windowSession)
+        let wc = CalyxWindowController(windowSession: windowSession, initialHost: initialHost)
         windowControllers.append(wc)
         wc.showWindow(nil)
+    }
+
+    /// `SessionBrowserModel.onRemoteSessionRequested`'s target (Session
+    /// Browser's remote-host picker, `SessionBrowserWindowController
+    /// .attachRemote(_:)`): spawns a new tab against `host` in the key
+    /// window's controller if one exists -- mirrors `handleNewTab`'s own
+    /// key-window lookup for a local ghostty-originated new tab --
+    /// otherwise opens a fresh window whose sole initial tab spawns
+    /// against `host`, reaching a window controller the same way
+    /// `attachWindow` always does for a session with no live surface
+    /// anywhere yet.
+    func spawnRemoteSessionTab(host: String?) {
+        if let keyWC = windowControllers.first(where: { $0.window?.isKeyWindow == true }) {
+            keyWC.createNewTab(host: host)
+            return
+        }
+        openNewWindow(initialHost: host)
     }
 
     func toggleQuickTerminal() {

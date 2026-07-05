@@ -80,11 +80,15 @@ targets:
             rm -f "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
             cp "$SESSION_BIN" "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
             chmod 0755 "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
-          elif [ "${CONFIGURATION}" = "Debug" ]; then
-            echo "warning: build/session/calyx-session not found — run scripts/build-session.sh to enable persistent sessions in this Debug build. Skipping (feature stays gated off)."
-          else
+          elif [ "${CONFIGURATION}" = "Release" ]; then
+            # Hard error only for Release: a shipped build must carry the
+            # session daemon. Every other config (Debug, DebugUITesting,
+            # any future debug variant) warns and skips below, so e.g.
+            # UI-test builds don't fail when build-session.sh was never run.
             echo "error: build/session/calyx-session not found for a ${CONFIGURATION} build. Run scripts/build-session.sh before building Release."
             exit 1
+          else
+            echo "warning: build/session/calyx-session not found. Run scripts/build-session.sh to enable persistent sessions in this ${CONFIGURATION} build. Skipping (feature stays gated off)."
           fi
         name: Bundle Session Daemon
       - script: |

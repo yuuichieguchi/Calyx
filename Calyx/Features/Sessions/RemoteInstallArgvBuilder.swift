@@ -5,7 +5,7 @@
 // calyx-session CLI's own `remote-install` argv
 // (calyx-session/crates/cli/src/commands/remote_install.rs: positional
 // host, --payload-x86-64/--payload-aarch64/--host-binary/--terminfo).
-// Missing bundled payloads/terminfo simply omit their flags entirely —
+// Missing bundled payloads/terminfo simply omit their flags entirely --
 // this builder never duplicates the CLI's own MissingPayload fail-fast
 // validation locally.
 

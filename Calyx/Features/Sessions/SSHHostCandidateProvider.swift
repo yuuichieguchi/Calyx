@@ -5,8 +5,8 @@
 // into an actual list of remote-host candidates for the "New Remote
 // Session…" picker, by reading `~/.ssh/config`'s content through an
 // injectable loader. The config path is derived from
-// `SessionRootResolverProtocol` — never re-derived independently via
-// `NSHomeDirectory()`/`ProcessInfo` directly — mirroring
+// `SessionRootResolverProtocol` -- never re-derived independently via
+// `NSHomeDirectory()`/`ProcessInfo` directly -- mirroring
 // `SessionRootResolver`'s own HOME-resolution discipline.
 
 import Foundation
@@ -27,7 +27,7 @@ struct SSHHostCandidateProvider {
 
     /// Reads `<rootResolver.resolve()>/.ssh/config`, delegates parsing
     /// to `SSHConfigParser.hostCandidates(from:)`, and deduplicates
-    /// repeated aliases, preserving first-seen declaration order —
+    /// repeated aliases, preserving first-seen declaration order --
     /// a contract `SSHConfigParser.hostCandidates(from:)` itself
     /// deliberately does not provide (see that function's own doc
     /// comment). A missing/unreadable config (`loadConfig` returns

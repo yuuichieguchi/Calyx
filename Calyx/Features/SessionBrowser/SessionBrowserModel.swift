@@ -47,12 +47,12 @@ final class SessionBrowserModel {
     private(set) var remoteHostCandidates: [String] = []
 
     /// Invoked by `attachToRemoteHost(_:)` with the `SessionSpawnContext`
-    /// a chosen remote host must turn into — structurally identical to
+    /// a chosen remote host must turn into -- structurally identical to
     /// what `CalyxWindowController.remoteSessionSpawnContext(forHost:)`
     /// produces for the same host, so both entry points feed the same
     /// downstream spawn contract. Actual surface/window creation is a
     /// `CalyxWindowController` concern, kept out of this pure logic
-    /// layer — mirrors `onAttachRequested`'s injectable-closure
+    /// layer -- mirrors `onAttachRequested`'s injectable-closure
     /// pattern.
     var onRemoteSessionRequested: ((SessionSpawnContext) -> Void)?
 
@@ -137,7 +137,7 @@ final class SessionBrowserModel {
     }
 
     /// Deploys the daemon to `host` via the injected `daemonClient`'s
-    /// own `installRemote(host:)`, returning its result — mirrors
+    /// own `installRemote(host:)`, returning its result -- mirrors
     /// `kill(_:)`'s existing injectable-client pattern.
     func installRemote(host: String) async -> CommandResult? {
         await daemonClient.installRemote(host: host)

@@ -138,6 +138,17 @@ for entry in "${REMOTE_TARGETS[@]}"; do
             CARGO_PROFILE_RELEASE_STRIP=symbols \
             cargo build --release -p cli --target "$rust_triple"
     )
+done
+
+# Stage-then-install: every musl target above must finish building
+# before any of them is copied into session-remote/. set -e already
+# aborts the build loop the moment one target's cargo build fails, so
+# by construction this loop only starts once both targets built clean
+# -- a second-target failure can no longer leave a freshly-built first
+# target's binary sitting next to the second's stale one from a prior
+# run, since neither gets copied at all until both succeed.
+for entry in "${REMOTE_TARGETS[@]}"; do
+    read -r rust_triple zig_triple arch_dir <<< "$entry"
 
     dest_dir="$OUT_DIR/session-remote/$arch_dir"
     mkdir -p "$dest_dir"
