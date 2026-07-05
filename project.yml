@@ -70,6 +70,12 @@ targets:
           SESSION_BIN="${PROJECT_DIR}/build/session/calyx-session"
           if [ -f "$SESSION_BIN" ]; then
             mkdir -p "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin"
+            # rm before cp: overwriting the same inode in place leaves the
+            # kernel's code-signature cache stale for a binary that has
+            # already been executed, and every later exec of it dies with
+            # SIGKILL (field-verified: exit 137 at the bundle path, same
+            # bytes run fine after an rm+cp re-copy created a fresh inode).
+            rm -f "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
             cp "$SESSION_BIN" "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
             chmod 0755 "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
           elif [ "${CONFIGURATION}" = "Debug" ]; then
