@@ -503,4 +503,117 @@ final class SessionCommandPaletteTests: XCTestCase {
         XCTAssertTrue(fixture.controller.windowSession.groups.isEmpty,
                      "Teardown must remove the now-empty tab and its now-empty group")
     }
+
+    // MARK: - Round-4 fix (F2/T2): closingTabIDs insertion ordering
+    //
+    // r4-fix-spec.md F2 (V02, CRITICAL): `closeFocusedSessionSurface`
+    // must insert `tab.id` into `closingTabIDs` BEFORE consulting the
+    // confirm-quit gate, mirroring `closeTab`'s exact `:884 insert,
+    // :890 remove-on-cancel` pattern, so a synchronous reentrant close
+    // for the same tab (ghostty's `close_surface` callback firing from
+    // inside `requestClose()`) hits the existing `closeSurfaceAndCleanUp`
+    // guard instead of tearing down twice. `handleReconnectGiveUp`'s own
+    // (multi-pane) insertion is covered separately in
+    // `SessionReconnectGiveUpTests`, using a different, already-present
+    // checkpoint (a `NotificationManager` spy) — this file's
+    // `confirmQuitIfNeeded` override is the natural checkpoint for
+    // `closeFocusedSessionSurface` specifically, since ONLY its
+    // last-pane-everywhere branch consults that gate.
+
+    /// `AppDelegate` subclass that captures
+    /// `CalyxWindowController._closingTabIDsForTesting`'s state at the
+    /// moment `confirmQuitIfNeeded` is consulted. Cannot reuse
+    /// `MockConfirmQuitAppDelegate` above (it's `final`, and doesn't
+    /// expose this hook) — `removeWindowController` is a no-op for the
+    /// same test-process-safety reason documented on that class.
+    private final class ClosingTabIDsSpyAppDelegate: AppDelegate {
+        weak var controller: CalyxWindowController?
+        private(set) var observedClosingTabIDs: Set<UUID>?
+
+        override func closingWouldTerminate(_ controller: CalyxWindowController) -> Bool {
+            true
+        }
+
+        override func confirmQuitIfNeeded(_ mode: ConfirmQuitMode = .killProcesses) -> Bool {
+            observedClosingTabIDs = controller?._closingTabIDsForTesting
+            return true
+        }
+
+        override func removeWindowController(_ controller: CalyxWindowController) {}
+    }
+
+    /// Against the CURRENT code, `closeFocusedSessionSurface` never
+    /// touches `closingTabIDs` at all, so the observed set is empty at
+    /// confirm time (expected: `[fixture.tab.id]`).
+    func test_sessionDetachCommand_lastPaneEverywhere_insertsTabIntoClosingTabIDs_beforeConfirmQuitGate() throws {
+        let fixture = makeSinglePaneFixture()
+        let detachCommand = try command("session.detach", in: fixture.controller)
+        let mock = ClosingTabIDsSpyAppDelegate()
+        mock.controller = fixture.controller
+
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = mock
+        defer { NSApp.delegate = originalDelegate }
+
+        withExtendedLifetime(mock) {
+            detachCommand.handler()
+        }
+
+        XCTAssertEqual(mock.observedClosingTabIDs, [fixture.tab.id],
+                       "closeFocusedSessionSurface must insert tab.id into closingTabIDs BEFORE " +
+                       "consulting the confirm-quit gate, mirroring closeTab's insert-then-confirm " +
+                       "ordering")
+    }
+
+    /// Same contract for `session.kill`.
+    func test_sessionKillCommand_lastPaneEverywhere_insertsTabIntoClosingTabIDs_beforeConfirmQuitGate() throws {
+        let fixture = makeSinglePaneFixture()
+        let killCommand = try command("session.kill", in: fixture.controller)
+        let mock = ClosingTabIDsSpyAppDelegate()
+        mock.controller = fixture.controller
+
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = mock
+        defer { NSApp.delegate = originalDelegate }
+
+        withExtendedLifetime(mock) {
+            killCommand.handler()
+        }
+
+        XCTAssertEqual(mock.observedClosingTabIDs, [fixture.tab.id],
+                       "closeFocusedSessionSurface must insert tab.id into closingTabIDs BEFORE " +
+                       "consulting the confirm-quit gate, mirroring closeTab's insert-then-confirm " +
+                       "ordering")
+    }
+
+    // MARK: - Round-4 fix (F7/T7): isClosingForShutdown timing
+    //
+    // r4-fix-spec.md F7 (S2, WARNING): `closeSurfaceAndCleanUp`'s
+    // `.windowShouldClose` arm (one of the four arms covered by F7/F8 —
+    // the other three, `closeTab`/`closeActiveGroup`/
+    // `closeAllTabsInGroup`, are covered by
+    // `CalyxWindowControllerCloseArmsTests`) must set
+    // `isClosingForShutdown = true` immediately before `window?.close()`,
+    // matching `windowShouldClose`'s own eager set. Against the CURRENT
+    // code, none of the four arms do this, so `isClosingForShutdown`
+    // remains `false` after this call.
+
+    /// Reuses the last-pane-everywhere `session.detach` path
+    /// (`closeFocusedSessionSurface` -> `closeSurfaceAndCleanUp`'s
+    /// `.windowShouldClose` arm) already exercised above, adding only
+    /// the `isClosingForShutdown` assertion.
+    func test_sessionDetachCommand_lastPaneEverywhere_setsIsClosingForShutdown_beforeWindowCloses() throws {
+        let fixture = makeSinglePaneFixture()
+        let detachCommand = try command("session.detach", in: fixture.controller)
+        let mock = MockConfirmQuitAppDelegate()
+        mock.shouldConfirm = true
+
+        withMockAppDelegate(mock) {
+            detachCommand.handler()
+        }
+
+        XCTAssertTrue(fixture.controller.isClosingForShutdown,
+                      "closeSurfaceAndCleanUp's .windowShouldClose arm must set isClosingForShutdown " +
+                      "before window?.close(), matching windowShouldClose's own eager set")
+    }
 }

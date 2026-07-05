@@ -41,4 +41,24 @@ enum SessionCloseKillPolicy {
     static func shouldKill(hasSession: Bool, isTerminating: Bool, isReconnectSwap: Bool) -> Bool {
         hasSession && !isTerminating && !isReconnectSwap
     }
+
+    /// F9 (V10, WARNING, r4-fix-spec.md): the detach-instead-of-kill
+    /// paths' (`session.detach`, `.giveUp`) counterpart to `shouldKill`
+    /// above, using the same gate, since detach and kill are mutually
+    /// exclusive alternatives for tearing down a persistent-session
+    /// surface (see each call site for which one runs): nothing to
+    /// detach with no session; quit/last-window-close teardown must
+    /// leave `tab.sessionRefs` untouched so the snapshot save sees it;
+    /// and a reconnect surface swap must never touch the session it's
+    /// reconnecting to. Detach's own call site
+    /// (`detachSessionIfPersistent`) previously checked only
+    /// `!isTerminating` inline, never consulting `reconnectingSurfaceIDs`
+    /// the way `killSessionIfPersistent` does. That is currently inert
+    /// (no reachable path calls detach mid-reconnect-swap; see
+    /// r4-verdicts.md V10), but structurally required so detach isn't
+    /// relying on incidental caller ordering the way kill used to before
+    /// this policy existed.
+    static func shouldDetach(hasSession: Bool, isTerminating: Bool, isReconnectSwap: Bool) -> Bool {
+        hasSession && !isTerminating && !isReconnectSwap
+    }
 }

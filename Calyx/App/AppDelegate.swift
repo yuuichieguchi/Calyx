@@ -259,8 +259,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// `restoreTabSurfaces` expects, so this is exactly the single-tab,
     /// single-leaf case of a snapshot restore rather than a second,
     /// parallel code path.
+    #if DEBUG
+    /// Test seam (P4 round-4 fix RED phase): when non-nil, consulted
+    /// right where `attachWindow` is about to construct a real window
+    /// and ghostty surface — invoked instead of that real work, which
+    /// never runs. Driving `attachWindow` end-to-end with a live
+    /// surface is unsafe from this test host (confirmed empirically:
+    /// it hangs the XCTest process indefinitely — no other test in
+    /// this suite creates a real ghostty surface or calls
+    /// `showWindow`). This seam lets `AppDelegateAttachWindowTests`
+    /// observe WHETHER `attachWindow` reaches its window-creation step
+    /// at all — exactly what F6's double-attach guard must prevent for
+    /// an already-attached sessionID — without ever performing that
+    /// real, unsafe-to-test work. Does not affect production behavior:
+    /// `nil` (the default) leaves this line as a no-op; every guard
+    /// ABOVE this point (including the fix this seam was added for)
+    /// still runs for real, unmodified. DO NOT use from production
+    /// code.
+    var _attachWindowCreationHookForTesting: (() -> Void)?
+    #endif
+
     func attachWindow(sessionID: String, cwd: String?) {
         guard let app = GhosttyAppController.shared.app else { return }
+
+        // F6 (S1, HIGH, r4-fix-spec.md): a sessionID already registered
+        // in SessionSurfaceMap already has a live surface somewhere in
+        // this process. This covers the session browser's double-click/
+        // stale-row race (rows only refresh on poll, and this method has
+        // no debounce of its own). Focus that existing surface's window
+        // instead of creating a second one. Checked BEFORE the
+        // test-creation hook below, so AppDelegateAttachWindowTests can
+        // observe the guard firing without ever reaching real window/
+        // surface creation.
+        if SessionSurfaceMap.shared.surfaceID(for: sessionID) != nil {
+            focusWindowForExistingSession(sessionID: sessionID)
+            return
+        }
+
+        #if DEBUG
+        if let hook = _attachWindowCreationHookForTesting {
+            hook()
+            return
+        }
+        #endif
 
         let placeholderLeafID = UUID()
         let tab = Tab(
@@ -269,28 +310,79 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID)]
         )
         let windowSession = WindowSession(initialTab: tab)
-        appSession.addWindow(windowSession)
-
-        let window = CalyxWindow(
+        let (window, wc) = makeRestoringWindowController(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            windowSession: windowSession
+        )
+
+        let sessions = fetchSessionsForAgentResume()
+        let restored = restoreTabSurfaces(tab: tab, app: app, window: window, sessions: sessions)
+        guard restored || fallbackCreateSurface(tab: tab, app: app, window: window) else {
+            cleanupFailedWindow(window, windowSession, wc, message: "Failed to attach window for session \(sessionID)")
+            return
+        }
+
+        wc.activateRestoredSession()
+        wc.showWindow(nil)
+    }
+
+    /// F6: brings the window already hosting `sessionID`'s live surface
+    /// to the front, instead of `attachWindow` creating a second one for
+    /// the same session.
+    private func focusWindowForExistingSession(sessionID: String) {
+        guard let surfaceID = SessionSurfaceMap.shared.surfaceID(for: sessionID) else { return }
+        guard let wc = windowControllers.first(where: { controller in
+            controller.windowSession.groups.contains { group in
+                group.tabs.contains { $0.registry.contains(surfaceID) }
+            }
+        }) else { return }
+        wc.showWindow(nil)
+    }
+
+    /// F11 (V13, WARNING, r4-fix-spec.md): the window-construction +
+    /// registration boilerplate shared identically by `attachWindow` and
+    /// `restoreWindow`. Does NOT cover the tab-restoration control flow
+    /// around it (single guard vs. loop+accumulator) or the fullscreen
+    /// branch, which genuinely differ and must stay separate (see
+    /// r4-verdicts.md V13). Registers `windowSession` with `appSession`
+    /// and appends the new controller to `windowControllers` as a side
+    /// effect, exactly matching both callers' prior inline code.
+    private func makeRestoringWindowController(
+        contentRect: NSRect,
+        windowSession: WindowSession
+    ) -> (window: CalyxWindow, controller: CalyxWindowController) {
+        appSession.addWindow(windowSession)
+        let window = CalyxWindow(
+            contentRect: contentRect,
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         let wc = CalyxWindowController(window: window, windowSession: windowSession, restoring: true)
         windowControllers.append(wc)
+        return (window, wc)
+    }
 
-        let restored = restoreTabSurfaces(tab: tab, app: app, window: window)
-        guard restored || fallbackCreateSurface(tab: tab, app: app, window: window) else {
-            window.close()
-            appSession.removeWindow(id: windowSession.id)
-            windowControllers.removeAll { $0 === wc }
-            logger.error("Failed to attach window for session \(sessionID, privacy: .private)")
-            return
-        }
-
-        wc.activateRestoredSession()
-        wc.showWindow(nil)
+    /// F11 (V13, WARNING): the failure-cleanup triple shared identically
+    /// by `attachWindow` and `restoreWindow` when no surface could be
+    /// restored at all. Closes the just-created (never shown) window,
+    /// undoes its `appSession`/`windowControllers` registration, and
+    /// logs `message`. Logged `.public` (matching this file's other
+    /// session-ID log statements, e.g. `performReconnect`'s); the
+    /// `.private` this exact line used before extraction was an
+    /// inconsistency, not a deliberate secrecy decision, since every
+    /// other session-ID log statement in this codebase already uses
+    /// `.public`.
+    private func cleanupFailedWindow(
+        _ window: CalyxWindow,
+        _ windowSession: WindowSession,
+        _ wc: CalyxWindowController,
+        message: String
+    ) {
+        window.close()
+        appSession.removeWindow(id: windowSession.id)
+        windowControllers.removeAll { $0 === wc }
+        logger.error("\(message, privacy: .public)")
     }
 
     func removeWindowController(_ controller: CalyxWindowController) {
@@ -332,11 +424,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Set for the duration of `confirmQuitIfNeeded`'s `alert.runModal()`
     /// call (see Patch 2's header comment there). While `true`, other
     /// MainActor entry points that could mutate window/tab state out
-    /// from under an in-flight confirm-quit prompt — currently
+    /// from under an in-flight confirm-quit prompt, currently
     /// `CalyxWindowController.handleShowChildExitedNotification` and
-    /// `handleSessionReconnectDecision` — no-op instead of enqueueing or
-    /// dispatching new teardown work.
-    private(set) var isConfirmingQuit: Bool = false
+    /// `handleSessionReconnectDecision`, defer their work instead of
+    /// acting immediately (see each's doc comment). The `didSet` below
+    /// posts `.calyxConfirmingQuitDidEnd` on the `true` -> `false`
+    /// transition so every live `CalyxWindowController` can replay
+    /// whatever it deferred (F4, r4-fix-spec.md). This fires for both
+    /// the real `alert.runModal()` return path below AND the
+    /// `_setConfirmingQuitForTesting` test seam, since both assign this
+    /// same property.
+    private(set) var isConfirmingQuit: Bool = false {
+        didSet {
+            guard oldValue, !isConfirmingQuit else { return }
+            NotificationCenter.default.post(name: .calyxConfirmingQuitDidEnd, object: nil)
+        }
+    }
+
+    #if DEBUG
+    /// Test seam (P4 round-4 fix RED phase): lets tests simulate the
+    /// `isConfirmingQuit` gate flipping on/off without driving a real,
+    /// blocking `NSAlert.runModal()` through `confirmQuitIfNeeded` —
+    /// mirrors `SurfaceRegistry._testInsert`'s naming/gating convention.
+    /// Production code only ever toggles `isConfirmingQuit` itself, from
+    /// within `confirmQuitIfNeeded`'s own bracket. DO NOT use from
+    /// production code.
+    func _setConfirmingQuitForTesting(_ value: Bool) {
+        isConfirmingQuit = value
+    }
+    #endif
 
     /// Returns true if the app should proceed with quit, false if user
     /// cancelled. Called both from `applicationShouldTerminate` (the
@@ -742,10 +858,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
 
+        // F10 (V11, WARNING, r4-fix-spec.md): one listAll() subprocess
+        // for the whole restore pass, instead of one per surface (see
+        // fetchSessionsForAgentResume's doc comment).
+        let sessions = fetchSessionsForAgentResume()
         var restoredAny = false
 
         for windowSnap in snapshot.windows {
-            if restoreWindow(windowSnap) {
+            if restoreWindow(windowSnap, sessions: sessions) {
                 restoredAny = true
             }
         }
@@ -764,7 +884,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func restoreWindow(_ windowSnap: WindowSnapshot) -> Bool {
+    private func restoreWindow(_ windowSnap: WindowSnapshot, sessions: [String: SessionInfo]) -> Bool {
         guard let app = GhosttyAppController.shared.app else { return false }
 
         // Clamp window frame to screen
@@ -773,18 +893,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Create WindowSession from snapshot
         let windowSession = WindowSession(snapshot: clampedSnap)
-        appSession.addWindow(windowSession)
-
-        // Create window with the restored frame
-        let window = CalyxWindow(
-            contentRect: clampedSnap.frame,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-            backing: .buffered,
-            defer: false
-        )
-
-        let wc = CalyxWindowController(window: window, windowSession: windowSession, restoring: true)
-        windowControllers.append(wc)
+        let (window, wc) = makeRestoringWindowController(contentRect: clampedSnap.frame, windowSession: windowSession)
 
         // Restore surfaces for each tab
         var anyTabRestored = false
@@ -795,7 +904,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     anyTabRestored = true
                     continue
                 }
-                if restoreTabSurfaces(tab: tab, app: app, window: window) {
+                if restoreTabSurfaces(tab: tab, app: app, window: window, sessions: sessions) {
                     anyTabRestored = true
                 } else {
                     // Fallback: create a single new surface for this tab
@@ -807,11 +916,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if !anyTabRestored {
-            // Complete failure — clean up the window
-            window.close()
-            appSession.removeWindow(id: windowSession.id)
-            windowControllers.removeAll { $0 === wc }
-            logger.error("Failed to restore any tabs for window \(windowSnap.id)")
+            cleanupFailedWindow(window, windowSession, wc, message: "Failed to restore any tabs for window \(windowSnap.id)")
             return false
         }
 
@@ -878,7 +983,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var activate: (() -> Void)?
     }
 
-    private func restoreTabSurfaces(tab: Tab, app: ghostty_app_t, window: NSWindow) -> Bool {
+    private func restoreTabSurfaces(tab: Tab, app: ghostty_app_t, window: NSWindow, sessions: [String: SessionInfo]) -> Bool {
         let oldLeafIDs = tab.splitTree.allLeafIDs()
         guard !oldLeafIDs.isEmpty else { return false }
 
@@ -896,7 +1001,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var mapping: [UUID: UUID] = [:]
 
         for oldID in oldLeafIDs {
-            guard let newID = createSurfaceWithPwd(tab: tab, app: app, window: window, oldLeafID: oldID) else {
+            guard let newID = createSurfaceWithPwd(tab: tab, app: app, window: window, oldLeafID: oldID, sessions: sessions) else {
                 continue
             }
             mapping[oldID] = newID
@@ -949,8 +1054,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// whole-tree-failed path calls this with the default `oldLeafID:
     /// nil`, so it always falls back to a plain passthrough surface —
     /// matching this method's pre-feature behavior exactly for that
-    /// rare failure case.
-    private func createSurfaceWithPwd(tab: Tab, app: ghostty_app_t, window: NSWindow, oldLeafID: UUID? = nil) -> UUID? {
+    /// rare failure case (and never reaches `offerAgentResume` below,
+    /// since that needs a `sessionRefs` entry keyed by `oldLeafID`).
+    private func createSurfaceWithPwd(
+        tab: Tab, app: ghostty_app_t, window: NSWindow, oldLeafID: UUID? = nil, sessions: [String: SessionInfo] = [:]
+    ) -> UUID? {
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
 
@@ -959,21 +1067,53 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard let surfaceID = tab.registry.createSurface(app: app, config: config, pwd: tab.pwd, command: command) else {
                 return nil
             }
-            offerAgentResume(tab: tab, surfaceID: surfaceID, sessionID: sessionRef.sessionID)
+            offerAgentResume(tab: tab, surfaceID: surfaceID, sessionID: sessionRef.sessionID, sessions: sessions)
             return surfaceID
         }
         return tab.registry.createSurface(app: app, config: config, pwd: tab.pwd)
     }
 
+    /// F10 (V11, WARNING, r4-fix-spec.md): fetches the daemon's session
+    /// list once, keyed by session ID, gated on
+    /// `SessionSettings.agentResumeEnabled` (off, the default, spawns no
+    /// subprocess at all, the same gate `offerAgentResume` itself used
+    /// to check before spawning its own `Task`). `offerAgentResume` used
+    /// to call `SessionDaemonClient.shared.listAll()` itself, once per
+    /// restored surface: N concurrent `calyx-session ls --all --json`
+    /// subprocesses at launch for N restored persistent-session
+    /// surfaces, each decoding the full ledger just to pick out one ID.
+    /// Shared by `restoreSession` (one call for the whole restore pass)
+    /// and `attachWindow` (one call for the single session being
+    /// attached).
+    private func fetchSessionsForAgentResume() -> [String: SessionInfo] {
+        guard SessionSettings.agentResumeEnabled else { return [:] }
+        var sessionsByID: [String: SessionInfo] = [:]
+        var done = false
+        Task {
+            let sessions = await SessionDaemonClient.shared.listAll()
+            sessionsByID = Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+            done = true
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while !done, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+        return sessionsByID
+    }
+
     /// P4: once a reattached persistent-session surface exists, checks
     /// the daemon's per-session meta (`AgentSessionMetaBridge`'s
-    /// recording) for a resumable agent CLI session and, if
-    /// `SessionSettings.agentResumeEnabled`, types
+    /// recording, resolved from the caller-supplied `sessions`, i.e.
+    /// `fetchSessionsForAgentResume`'s result (F10), rather than this
+    /// method querying the daemon itself) for a resumable agent CLI
+    /// session and, if `SessionSettings.agentResumeEnabled`, types
     /// `SessionResumePlanner.initialInput` into the live surface via
-    /// `sendText` — a fire-and-forget `Task` (same idiom as
-    /// `SessionKillTracker.track`'s callers) so it never blocks or
-    /// delays surface/window creation, including on the app-launch
-    /// restore path.
+    /// `sendText`. The `sendText` call is deliberately left as its own
+    /// fire-and-forget `Task`, not tracked the way
+    /// `SessionKillTracker.track`'s callers are, since dropping it on
+    /// quit is intentional and harmless: it's a resume command not yet
+    /// typed into a surface that's being quit anyway, not state that
+    /// needs to survive teardown.
     ///
     /// Deliberately uses `GhosttySurfaceController.sendText` (which
     /// resolves to ghostty's `textCallback` -> `completeClipboardPaste`)
@@ -991,25 +1131,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// presses Return themselves) but "auto-execute" mode's trailing
     /// newline may not actually submit the command. Flagged in this
     /// feature's P4 handoff as needing live verification.
-    private func offerAgentResume(tab: Tab, surfaceID: UUID, sessionID: String) {
+    ///
+    /// Not `private` (P4 round-4 fix RED phase): `AppDelegateOfferAgentResumeTests`
+    /// calls this directly to drive its decode/selection/sendText
+    /// pipeline without a live daemon round-trip, matching this file's
+    /// existing `attachWindow` direct-drive precedent.
+    func offerAgentResume(tab: Tab, surfaceID: UUID, sessionID: String, sessions: [String: SessionInfo]) {
         guard SessionSettings.agentResumeEnabled else { return }
+        guard let info = sessions[sessionID] else { return }
+        let resumable = info.meta.compactMap { key, value -> (kind: String, agentSessionID: String)? in
+            guard let kind = SessionResumePlanner.decodeMetaKey(key) else { return nil }
+            return (kind, value)
+        }.first
+        guard let resumable else { return }
+        guard let input = SessionResumePlanner.initialInput(
+            agentKind: resumable.kind,
+            agentSessionID: resumable.agentSessionID,
+            autoExecute: SessionSettings.agentResumeAutoExecute
+        ) else { return }
+
+        #if DEBUG
+        if let hook = _offerAgentResumeSendTextHookForTesting {
+            Task { hook(surfaceID, input) }
+            return
+        }
+        #endif
         Task {
-            let sessions = await SessionDaemonClient.shared.listAll()
-            guard let info = sessions.first(where: { $0.id == sessionID }) else { return }
-            let resumable = info.meta.compactMap { key, value -> (kind: String, agentSessionID: String)? in
-                guard let kind = SessionResumePlanner.decodeMetaKey(key) else { return nil }
-                return (kind, value)
-            }.first
-            guard let resumable else { return }
-            guard let input = SessionResumePlanner.initialInput(
-                agentKind: resumable.kind,
-                agentSessionID: resumable.agentSessionID,
-                autoExecute: SessionSettings.agentResumeAutoExecute
-            ) else { return }
             guard let controller = tab.registry.controller(for: surfaceID) else { return }
             controller.sendText(input)
         }
     }
+
+    #if DEBUG
+    /// Test seam (P4 round-4 fix, F14): when non-nil, called instead of
+    /// `tab.registry.controller(for: surfaceID)?.sendText(_:)` inside
+    /// `offerAgentResume`'s fire-and-forget `Task`. Lets
+    /// `AppDelegateOfferAgentResumeTests` observe the exact text
+    /// `offerAgentResume` computed without a live ghostty surface
+    /// controller (`SurfaceRegistry.controller(for:)` only resolves
+    /// real, ghostty-backed entries; a `_testInsert`-only fixture,
+    /// this codebase's existing no-live-surface test pattern, never has
+    /// one). `nil` (the default) leaves production behavior unchanged.
+    /// DO NOT use from production code.
+    var _offerAgentResumeSendTextHookForTesting: ((UUID, String) -> Void)?
+    #endif
 
     // MARK: - Finder Services
 
@@ -1033,7 +1198,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// This allows keybindings like quick terminal toggle to work from any app.
     private func installGlobalEventTap() {
         if ProcessInfo.processInfo.arguments.contains("--uitesting")
-            || NSClassFromString("XCTestCase") != nil { return }
+            || TestEnvironment.isTestHost { return }
         guard let app = GhosttyAppController.shared.app else {
             logger.warning("installGlobalEventTap: no ghostty app available")
             return
@@ -1363,4 +1528,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func handleToggleQuickTerminal() {
         toggleQuickTerminal()
     }
+}
+
+// MARK: - Notification Names
+
+extension Notification.Name {
+    /// Posted when `AppDelegate.isConfirmingQuit` transitions from
+    /// `true` to `false` (see that property's `didSet`): the
+    /// confirm-quit gate has cleared, whether via a real
+    /// `NSAlert.runModal()` return or the `_setConfirmingQuitForTesting`
+    /// test seam. `CalyxWindowController` observes this to replay events
+    /// it deferred while the gate was up (F4, r4-fix-spec.md); see
+    /// `drainDeferredReconnectEvents()`.
+    static let calyxConfirmingQuitDidEnd = Notification.Name("com.calyx.session.confirmingQuitDidEnd")
 }
