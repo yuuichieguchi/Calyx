@@ -74,16 +74,20 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     override func setUp() {
         continueAfterFailure = false
 
-        do {
-            guard try Self.isDeveloperModeEnabled() else {
-                XCTFail("Developer mode is not enabled; run `sudo DevToolsSecurity -enable` first, " +
-                         "then re-run this test. (Without it, XCUITest hangs waiting for an " +
-                         "automation-permission dialog instead of failing visibly.)")
+        if !Self.isManualAuthMode {
+            do {
+                guard try Self.isDeveloperModeEnabled() else {
+                    XCTFail("Developer mode is not enabled; run `sudo DevToolsSecurity -enable` first, " +
+                             "then re-run this test. (Without it, XCUITest hangs waiting for an " +
+                             "automation-permission dialog instead of failing visibly.) Alternatively, " +
+                             "for an attended run where you will manually approve the automation " +
+                             "dialog yourself, set CALYX_E2E_MANUAL_AUTH=1.")
+                    return
+                }
+            } catch {
+                XCTFail("Could not check developer-mode status via `DevToolsSecurity -status`: \(error)")
                 return
             }
-        } catch {
-            XCTFail("Could not check developer-mode status via `DevToolsSecurity -status`: \(error)")
-            return
         }
 
         homeDir = NSTemporaryDirectory() + "CalyxSessionE2E-Home-\(UUID().uuidString)"
@@ -120,12 +124,29 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         super.tearDown()
     }
 
+    /// When set to `"1"` in the test runner process's environment (via
+    /// `ProcessInfo.processInfo.environment`, the same mechanism
+    /// `CALYX_SESSION_BIN` uses above), skips the developer-mode
+    /// fail-fast entirely (`isDeveloperModeEnabled()` is not called)
+    /// and proceeds straight to launching `app`.
+    ///
+    /// This is for ATTENDED runs only: a human sitting at the machine
+    /// who will manually approve the automation-permission dialog
+    /// XCUITest triggers on first keystroke/query. Unattended/CI runs
+    /// must NOT set this: without developer mode enabled, such a run
+    /// would hang indefinitely waiting for a dialog nobody is present
+    /// to approve.
+    private static var isManualAuthMode: Bool {
+        ProcessInfo.processInfo.environment["CALYX_E2E_MANUAL_AUTH"] == "1"
+    }
+
     /// Checks `DevToolsSecurity -status` so a missing automation
     /// authorization fails this test immediately with a clear message
     /// instead of hanging on an unattended permission dialog. Verified
     /// output strings: "Developer mode is currently enabled." /
     /// "...disabled." — the disabled string never contains "enabled" as
-    /// a substring, so this check is unambiguous either way.
+    /// a substring, so this check is unambiguous either way. Not called
+    /// at all when `isManualAuthMode` is true (see above).
     private static func isDeveloperModeEnabled() throws -> Bool {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/sbin/DevToolsSecurity")
