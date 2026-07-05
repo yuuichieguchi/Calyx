@@ -7,6 +7,7 @@ pub mod kill;
 pub mod ls;
 pub mod meta;
 pub mod new;
+pub mod remote_install;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,7 @@ pub enum CommandError {
         code: String,
         msg: String,
     },
+    RemoteInstall(remote_install::RemoteInstallError),
 }
 
 impl fmt::Display for CommandError {
@@ -31,7 +33,14 @@ impl fmt::Display for CommandError {
             CommandError::Protocol(e) => write!(f, "{e}"),
             CommandError::Daemon(e) => write!(f, "{e}"),
             CommandError::Server { code, msg } => write!(f, "daemon error [{code}]: {msg}"),
+            CommandError::RemoteInstall(e) => write!(f, "{e}"),
         }
+    }
+}
+
+impl From<remote_install::RemoteInstallError> for CommandError {
+    fn from(e: remote_install::RemoteInstallError) -> Self {
+        CommandError::RemoteInstall(e)
     }
 }
 
