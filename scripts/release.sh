@@ -19,16 +19,13 @@ echo "Generating Xcode project..."
 xcodegen generate
 echo "Xcode project generated."
 
-# TODO(P5): this script does not yet build/bundle calyx-session before
-# the Release build below. project.yml's "Bundle Session Daemon"
-# postBuildScript hard-fails a non-Debug build when
-# build/session/calyx-session is missing, so a Release build here
-# currently requires `scripts/build-session.sh` to have been run
-# manually first. P5 (remote sessions, cross-compilation) should wire
-# that build in here directly, and decide whether calyx-session needs
-# its own explicit codesign step alongside the CalyxCLI/Sparkle
-# handling below rather than relying solely on the outer app's
-# (non-`--deep`) signature.
+# 2.5. Build calyx-session (host binary + Linux remote payloads).
+# The "Bundle Session Daemon" / "Bundle Remote Session Binaries"
+# postBuildScripts in project.yml hard-fail a Release build when any of
+# these are missing, so this must run before xcodebuild.
+echo "Building calyx-session (host + Linux remote targets)..."
+scripts/build-session.sh --all
+echo "calyx-session build complete."
 
 # 3. Build
 echo "Building Calyx (Release)..."
@@ -98,6 +95,19 @@ done
 
 # 4. Sign the framework itself
 codesign --force --sign "$SIGN_IDENTITY" --timestamp "$SPARKLE_FW"
+
+# 4.5. Sign the bundled calyx-session host binary. cargo produces it
+# only linker-adhoc-signed, and the outer app's non---deep signature
+# does not re-sign nested Mach-O files, so notarization needs this
+# explicit Developer ID + hardened runtime + timestamp signature.
+# The Linux payloads under Resources/session-remote/ are ELF, not
+# Mach-O: codesign cannot sign them and seals them as plain resources.
+SESSION_HOST_BIN="$APP_PATH/Contents/Resources/bin/calyx-session"
+if [ ! -f "$SESSION_HOST_BIN" ]; then
+  echo "ERROR: bundled calyx-session not found at $SESSION_HOST_BIN"
+  exit 1
+fi
+codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime "$SESSION_HOST_BIN"
 
 # 5. Re-sign the outer app (inner re-signing invalidates outer seal)
 codesign --force --sign "$SIGN_IDENTITY" --timestamp --options runtime \

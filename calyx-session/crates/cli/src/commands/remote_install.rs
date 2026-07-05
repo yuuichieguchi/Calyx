@@ -409,11 +409,7 @@ pub fn remote_install(
 /// The best-effort terminfo step: remote mkdir, then transfer. Returns
 /// the would-be warning message on failure; [`remote_install`] records
 /// it in the summary instead of failing (see this module's header).
-fn install_terminfo(
-    runner: &dyn CommandRunner,
-    host: &str,
-    terminfo: &Path,
-) -> Result<(), String> {
+fn install_terminfo(runner: &dyn CommandRunner, host: &str, terminfo: &Path) -> Result<(), String> {
     let mkdir = runner
         .run(&mkdir_command(host, REMOTE_TERMINFO_DIR))
         .map_err(|e| format!("could not run the terminfo mkdir step: {e}"))?;
@@ -457,7 +453,10 @@ impl CommandRunner for ProcessRunner {
 
 fn run_process(argv: &[String], stdin: std::process::Stdio) -> io::Result<CommandOutput> {
     let (program, args) = argv.split_first().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "empty argv given to ProcessRunner")
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "empty argv given to ProcessRunner",
+        )
     })?;
     let output = std::process::Command::new(program)
         .args(args)
@@ -493,9 +492,9 @@ pub fn run(
         summary.arch, args.host
     );
     match &summary.terminfo_warning {
-        Some(warning) => eprintln!(
-            "warning: {warning} (remote sessions still work with TERM=xterm-256color)"
-        ),
+        Some(warning) => {
+            eprintln!("warning: {warning} (remote sessions still work with TERM=xterm-256color)")
+        }
         None => {
             if args.terminfo.is_some() {
                 println!("installed the ghostty terminfo entry at {REMOTE_TERMINFO_PATH}");
@@ -523,7 +522,10 @@ mod tests {
 
     #[test]
     fn parse_uname_sm_maps_linux_aarch64() {
-        assert_eq!(parse_uname_sm("Linux aarch64"), Ok(RemoteArch::LinuxAarch64));
+        assert_eq!(
+            parse_uname_sm("Linux aarch64"),
+            Ok(RemoteArch::LinuxAarch64)
+        );
     }
 
     #[test]
@@ -550,8 +552,14 @@ mod tests {
             }
         );
         let message = err.to_string();
-        assert!(message.contains("Darwin"), "message should name the OS: {message}");
-        assert!(message.contains("x86_64"), "message should name the machine: {message}");
+        assert!(
+            message.contains("Darwin"),
+            "message should name the OS: {message}"
+        );
+        assert!(
+            message.contains("x86_64"),
+            "message should name the machine: {message}"
+        );
     }
 
     #[test]
@@ -568,7 +576,10 @@ mod tests {
 
     #[test]
     fn parse_uname_sm_rejects_empty_output_as_malformed() {
-        assert_eq!(parse_uname_sm(""), Err(ArchDetectError::Malformed(String::new())));
+        assert_eq!(
+            parse_uname_sm(""),
+            Err(ArchDetectError::Malformed(String::new()))
+        );
     }
 
     #[test]
@@ -589,17 +600,26 @@ mod tests {
 
     #[test]
     fn payload_for_maps_linux_x86_64_to_the_linux_x86_64_payload() {
-        assert_eq!(payload_for(RemoteArch::LinuxX86_64), PayloadKind::LinuxX86_64);
+        assert_eq!(
+            payload_for(RemoteArch::LinuxX86_64),
+            PayloadKind::LinuxX86_64
+        );
     }
 
     #[test]
     fn payload_for_maps_linux_aarch64_to_the_linux_aarch64_payload() {
-        assert_eq!(payload_for(RemoteArch::LinuxAarch64), PayloadKind::LinuxAarch64);
+        assert_eq!(
+            payload_for(RemoteArch::LinuxAarch64),
+            PayloadKind::LinuxAarch64
+        );
     }
 
     #[test]
     fn payload_for_maps_darwin_arm64_to_the_host_binary() {
-        assert_eq!(payload_for(RemoteArch::DarwinArm64), PayloadKind::HostBinary);
+        assert_eq!(
+            payload_for(RemoteArch::DarwinArm64),
+            PayloadKind::HostBinary
+        );
     }
 
     // ==================== R2: CLI surface ====================
@@ -624,12 +644,18 @@ mod tests {
         match cli.command {
             crate::cli::Command::RemoteInstall(args) => {
                 assert_eq!(args.host, "myhost");
-                assert_eq!(args.payload_x86_64.as_deref(), Some(Path::new("/tmp/payload-x86_64")));
+                assert_eq!(
+                    args.payload_x86_64.as_deref(),
+                    Some(Path::new("/tmp/payload-x86_64"))
+                );
                 assert_eq!(
                     args.payload_aarch64.as_deref(),
                     Some(Path::new("/tmp/payload-aarch64"))
                 );
-                assert_eq!(args.host_binary.as_deref(), Some(Path::new("/tmp/host-binary")));
+                assert_eq!(
+                    args.host_binary.as_deref(),
+                    Some(Path::new("/tmp/host-binary"))
+                );
                 assert_eq!(args.terminfo.as_deref(), Some(Path::new("/tmp/terminfo")));
             }
             other => panic!("expected Command::RemoteInstall, got {other:?}"),
@@ -658,7 +684,10 @@ mod tests {
     #[test]
     fn cli_remote_install_requires_the_host_positional() {
         let result = crate::cli::Cli::try_parse_from(["calyx-session", "remote-install"]);
-        assert!(result.is_err(), "remote-install with no host should be a parse error");
+        assert!(
+            result.is_err(),
+            "remote-install with no host should be a parse error"
+        );
     }
 
     #[test]
@@ -740,7 +769,14 @@ mod tests {
     fn transfer_command_for_terminfo_has_no_chmod_step() {
         assert_eq!(
             transfer_command("myhost", REMOTE_TERMINFO_PATH),
-            vec!["ssh", "--", "myhost", "cat", ">", "$HOME/.terminfo/x/xterm-ghostty"]
+            vec![
+                "ssh",
+                "--",
+                "myhost",
+                "cat",
+                ">",
+                "$HOME/.terminfo/x/xterm-ghostty"
+            ]
         );
     }
 
@@ -797,7 +833,9 @@ mod tests {
             .expect("piped stdin")
             .write_all(payload)
             .expect("pipe the fake payload into the remote command's stdin");
-        let status = child.wait().expect("wait for the constructed remote command");
+        let status = child
+            .wait()
+            .expect("wait for the constructed remote command");
         assert!(
             status.success(),
             "constructed remote command should exit 0 under a real shell, got {status:?}"
@@ -812,8 +850,7 @@ mod tests {
             )
         });
         assert_eq!(
-            written,
-            payload,
+            written, payload,
             "the transferred file's content should match what was piped in as stdin"
         );
 
@@ -822,7 +859,10 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(mode, 0o755, "installed binary should end up chmod 755, got {mode:o}");
+        assert_eq!(
+            mode, 0o755,
+            "installed binary should end up chmod 755, got {mode:o}"
+        );
     }
 
     // ==================== R4: runner trait + orchestration ====================
@@ -855,10 +895,9 @@ mod tests {
 
         fn respond_to(&self, call: RecordedCall) -> io::Result<CommandOutput> {
             self.calls.borrow_mut().push(call.clone());
-            self.responses
-                .borrow_mut()
-                .pop()
-                .unwrap_or_else(|| panic!("RecordingRunner: no scripted response left for {call:?}"))
+            self.responses.borrow_mut().pop().unwrap_or_else(|| {
+                panic!("RecordingRunner: no scripted response left for {call:?}")
+            })
         }
     }
 
@@ -867,8 +906,15 @@ mod tests {
             self.respond_to(RecordedCall::Run(argv.to_vec()))
         }
 
-        fn run_with_stdin_file(&self, argv: &[String], stdin_path: &Path) -> io::Result<CommandOutput> {
-            self.respond_to(RecordedCall::RunWithStdinFile(argv.to_vec(), stdin_path.to_path_buf()))
+        fn run_with_stdin_file(
+            &self,
+            argv: &[String],
+            stdin_path: &Path,
+        ) -> io::Result<CommandOutput> {
+            self.respond_to(RecordedCall::RunWithStdinFile(
+                argv.to_vec(),
+                stdin_path.to_path_buf(),
+            ))
         }
     }
 
@@ -906,15 +952,18 @@ mod tests {
             "expected an Arch error, got {result:?}"
         );
         let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 1, "only the detection call should have run, got {calls:?}");
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the detection call should have run, got {calls:?}"
+        );
         assert_eq!(calls[0], RecordedCall::Run(detect_command("myhost")));
     }
 
     #[test]
     fn remote_install_fails_fast_when_detection_itself_errors() {
-        let runner = RecordingRunner::scripted(vec![Err(io::Error::other(
-            "ssh: connection refused",
-        ))]);
+        let runner =
+            RecordingRunner::scripted(vec![Err(io::Error::other("ssh: connection refused"))]);
         let inputs = RemoteInstallInputs {
             host: "myhost",
             payload_x86_64: Some(Path::new("/tmp/payload-x86_64")),
@@ -1032,8 +1081,8 @@ mod tests {
             terminfo: None,
         };
 
-        let result =
-            remote_install(&runner, &inputs).expect("Darwin arm64 with --host-binary should succeed");
+        let result = remote_install(&runner, &inputs)
+            .expect("Darwin arm64 with --host-binary should succeed");
         assert_eq!(result.arch, RemoteArch::DarwinArm64);
         assert_eq!(
             *runner.calls.borrow(),

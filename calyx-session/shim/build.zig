@@ -10,6 +10,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/gvt.zig"),
         .target = target,
         .optimize = optimize,
+        // gvt.zig allocates through std.heap.c_allocator. macOS links
+        // libSystem implicitly, but Linux targets refuse to reference
+        // libc symbols unless it is declared; the final musl link is
+        // done by the consumer (rustc) against its own musl libc.
+        .link_libc = true,
     });
 
     // `simd = false` keeps this a pure static build (no libc++, no

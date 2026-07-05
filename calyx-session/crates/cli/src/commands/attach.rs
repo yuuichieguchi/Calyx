@@ -267,7 +267,8 @@ pub(crate) fn tty_size() -> Option<(u16, u16)> {
     for fd in [libc::STDOUT_FILENO, libc::STDIN_FILENO] {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         // SAFETY: TIOCGWINSZ only writes the winsize out-param.
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as libc::c_ulong, &mut ws) };
+        // Inferred cast: request is c_ulong on macOS/glibc, c_int on musl.
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ as _, &mut ws) };
         if rc == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
             return Some((ws.ws_col, ws.ws_row));
         }

@@ -87,6 +87,29 @@ targets:
             exit 1
           fi
         name: Bundle Session Daemon
+      - script: |
+          set -e
+          # Linux musl payloads for remote-install, produced by
+          # scripts/build-session.sh --all. They are ELF, not Mach-O:
+          # codesign seals them as plain resources, so no per-binary
+          # signing step exists for them. rm before cp kept anyway for
+          # parity with the other bundling steps' stale-inode rule.
+          for REMOTE_ARCH in x86_64 aarch64; do
+            SRC="${PROJECT_DIR}/build/session/session-remote/${REMOTE_ARCH}/calyx-session"
+            DEST_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/session-remote/${REMOTE_ARCH}"
+            if [ -f "$SRC" ]; then
+              mkdir -p "$DEST_DIR"
+              rm -f "$DEST_DIR/calyx-session"
+              cp "$SRC" "$DEST_DIR/calyx-session"
+              chmod 0755 "$DEST_DIR/calyx-session"
+            elif [ "${CONFIGURATION}" = "Debug" ]; then
+              : # Debug without a prior --all build: remote install simply stays unavailable.
+            else
+              echo "error: $SRC not found for a ${CONFIGURATION} build. Run scripts/build-session.sh --all before building Release."
+              exit 1
+            fi
+          done
+        name: Bundle Remote Session Binaries
     info:
       path: Calyx/Info.plist
       properties:
