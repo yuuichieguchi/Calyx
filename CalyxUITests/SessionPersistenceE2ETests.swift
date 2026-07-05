@@ -175,6 +175,24 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         launchApp()
     }
 
+    /// Quits the app through its own application menu ("Calyx" > "Quit
+    /// Calyx"), instead of `app.terminate()`. `app.terminate()` sends
+    /// SIGTERM, which kills the process WITHOUT running AppKit's
+    /// termination flow, so `applicationWillTerminate`'s synchronous
+    /// snapshot save (see `AppDelegate.swift`, `saveImmediately` pumped via
+    /// a short runloop wait) never runs; the debounced autosave may also
+    /// not have fired yet by the time the test quits. Only an actual quit
+    /// (this menu path, or a real Cmd+Q) drives
+    /// `applicationShouldTerminate`/`applicationWillTerminate`, which is
+    /// the save path this test exists to verify survives a restart. Under
+    /// `--uitesting`, `applicationShouldTerminate` short-circuits straight
+    /// to `.terminateNow` with no confirmation dialog (see
+    /// `AppDelegate.swift`), so this click alone is enough to trigger
+    /// termination.
+    private func quitAppViaMenu() {
+        menuAction("Calyx", item: "Quit Calyx")
+    }
+
     // MARK: - Daemon-ledger polling
     //
     // Verification is daemon-ledger-based, not keystroke-based: this
@@ -379,7 +397,16 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
             )
         }
 
-        app.terminate()
+        // Quit via the app's own menu, NOT `app.terminate()`: `terminate()`
+        // sends SIGTERM, which bypasses AppKit's termination flow, so the
+        // synchronous snapshot save this test depends on never runs (see
+        // `quitAppViaMenu()`'s doc comment). Wait for the process to fully
+        // exit before relaunching, so the relaunch can't race the save.
+        quitAppViaMenu()
+        XCTAssertTrue(
+            app.wait(for: .notRunning, timeout: 10),
+            "App did not fully terminate within 10s of quitting via the menu."
+        )
         relaunchWithSameEnvironment()
         XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not reappear after relaunch.")
 
