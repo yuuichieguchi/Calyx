@@ -312,13 +312,43 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Window Management
 
     @objc func createNewWindow() {
+        openNewWindow(initialHost: nil)
+    }
+
+    /// `initialHost` (P5, remote sessions): forwarded to
+    /// `CalyxWindowController.init(initialHost:)` for the new window's
+    /// sole initial tab. `nil` (`createNewWindow()` above, every
+    /// existing caller) is unchanged, a local window exactly as before
+    /// this parameter existed. Reached by `spawnRemoteSessionTab(host:)`
+    /// when no key window controller exists yet to add a tab to. Named
+    /// distinctly from `createNewWindow()` (rather than an overload of
+    /// it) since `#selector(createNewWindow)` above resolves by base
+    /// name alone and would become ambiguous with a same-named overload.
+    private func openNewWindow(initialHost: String?) {
         let initialTab = Tab()
         let windowSession = WindowSession(initialTab: initialTab)
         appSession.addWindow(windowSession)
 
-        let wc = CalyxWindowController(windowSession: windowSession)
+        let wc = CalyxWindowController(windowSession: windowSession, initialHost: initialHost)
         windowControllers.append(wc)
         wc.showWindow(nil)
+    }
+
+    /// `SessionBrowserModel.onRemoteSessionRequested`'s target (Session
+    /// Browser's remote-host picker, `SessionBrowserWindowController
+    /// .attachRemote(_:)`): spawns a new tab against `host` in the key
+    /// window's controller if one exists -- mirrors `handleNewTab`'s own
+    /// key-window lookup for a local ghostty-originated new tab --
+    /// otherwise opens a fresh window whose sole initial tab spawns
+    /// against `host`, reaching a window controller the same way
+    /// `attachWindow` always does for a session with no live surface
+    /// anywhere yet.
+    func spawnRemoteSessionTab(host: String?) {
+        if let keyWC = windowControllers.first(where: { $0.window?.isKeyWindow == true }) {
+            keyWC.createNewTab(host: host)
+            return
+        }
+        openNewWindow(initialHost: host)
     }
 
     func toggleQuickTerminal() {
@@ -364,9 +394,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// still runs for real, unmodified. DO NOT use from production
     /// code.
     var _attachWindowCreationHookForTesting: (() -> Void)?
+
+    /// Test seam (P5, remote sessions, contract 3c): called with the
+    /// constructed placeholder `tab`, immediately before
+    /// `_attachWindowCreationHookForTesting`'s own check -- today's hook
+    /// fires and returns BEFORE the placeholder tab is even constructed,
+    /// so no existing seam can observe the `SessionRef` it would have
+    /// produced. A second, independent, purely additive observer instead
+    /// of changing that hook's signature, mirroring `AppDelegate
+    /// ._createSurfaceWithPwdCommandObserverForTesting`'s/
+    /// `CalyxWindowController._performReconnectCommandObserverForTesting`'s
+    /// identical reasoning. `nil` (the default) leaves production
+    /// behavior unchanged; every existing test using
+    /// `_attachWindowCreationHookForTesting` alone is unaffected. DO NOT
+    /// use from production code.
+    var _attachWindowPlaceholderTabObserverForTesting: ((Tab) -> Void)?
     #endif
 
-    func attachWindow(sessionID: String, cwd: String?) {
+    func attachWindow(sessionID: String, cwd: String?, host: String? = nil) {
         guard let app = GhosttyAppController.shared.app else { return }
 
         // F6 (S1, HIGH, r4-fix-spec.md): a sessionID already registered
@@ -391,19 +436,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        let placeholderLeafID = UUID()
+        let tab = Tab(
+            pwd: cwd,
+            splitTree: SplitTree(leafID: placeholderLeafID),
+            sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID, host: host)]
+        )
+
+        // P5 (remote sessions): Tab's own init has no side effects (no
+        // FFI, no SessionSurfaceMap/global registration), so constructing
+        // it ahead of the creation hook below is behaviorally inert for
+        // every existing caller -- the hook still fires (and still
+        // returns early) at exactly the same decision point relative to
+        // every OTHER guard, just after this (side-effect-free) tab value
+        // now exists to observe.
         #if DEBUG
+        _attachWindowPlaceholderTabObserverForTesting?(tab)
         if let hook = _attachWindowCreationHookForTesting {
             hook()
             return
         }
         #endif
 
-        let placeholderLeafID = UUID()
-        let tab = Tab(
-            pwd: cwd,
-            splitTree: SplitTree(leafID: placeholderLeafID),
-            sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID)]
-        )
         let windowSession = WindowSession(initialTab: tab)
         let (window, wc) = makeRestoringWindowController(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
@@ -1278,12 +1332,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
 
-        if let oldLeafID, let sessionRef = tab.sessionRefs[oldLeafID],
-           let command = SessionCommandSynthesizer.reattachCommand(sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()) {
-            guard let surfaceID = createRegistrySurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: command, oldLeafID: oldLeafID) else {
-                return nil
+        if let oldLeafID, let sessionRef = tab.sessionRefs[oldLeafID] {
+            let command: String?
+            if let host = sessionRef.host {
+                command = SessionCommandSynthesizer.remoteAttachCommand(
+                    host: host, sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()
+                )
+            } else {
+                command = SessionCommandSynthesizer.reattachCommand(
+                    sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()
+                )
             }
-            return (surfaceID, sessionRef.sessionID)
+            #if DEBUG
+            _createSurfaceWithPwdCommandObserverForTesting?(oldLeafID, command)
+            #endif
+            if let command {
+                guard let surfaceID = createRegistrySurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: command, oldLeafID: oldLeafID) else {
+                    return nil
+                }
+                return (surfaceID, sessionRef.sessionID)
+            }
+        } else {
+            #if DEBUG
+            _createSurfaceWithPwdCommandObserverForTesting?(oldLeafID, nil)
+            #endif
         }
         guard let surfaceID = createRegistrySurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: nil, oldLeafID: oldLeafID) else {
             return nil
@@ -1323,6 +1395,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// await from a test. `nil` (the default) leaves production
     /// behavior unchanged. DO NOT use from production code.
     var _createSurfaceWithPwdOfferAgentResumeCompletedHookForTesting: (() -> Void)?
+
+    /// Test seam (P5, remote sessions, contract R2): when non-nil,
+    /// called with `(oldLeafID, command)` from inside
+    /// `createSurfaceWithPwd`, immediately before `createRegistrySurface`
+    /// is invoked, in both of that method's branches -- the
+    /// `sessionRef`-carrying branch (with its local `reattachCommand` or
+    /// remote `remoteAttachCommand` result, either of which may itself be
+    /// `nil`) and the plain-passthrough branch (`command` always `nil`).
+    /// Added as a second, independent observer alongside
+    /// `_createSurfaceWithPwdHookForTesting` rather than changing that
+    /// hook's signature, since every existing caller of it only needs the
+    /// resulting surfaceID, never the command string. `nil` (the default)
+    /// leaves production behavior unchanged. DO NOT use from production
+    /// code.
+    var _createSurfaceWithPwdCommandObserverForTesting: ((UUID?, String?) -> Void)?
     #endif
 
     /// Thin wrapper around the one actually-unsafe-to-test call

@@ -41,6 +41,15 @@ final class SessionBrowserWindowController: NSWindowController {
         model.onAttachRequested = { [weak self] row in
             self?.attach(row)
         }
+
+        // P5 (remote sessions): mirrors the onAttachRequested wiring
+        // immediately above -- reaches a window controller the same
+        // way attach(_:) does (via AppDelegate), for a chosen remote
+        // host's SessionSpawnContext instead of an existing session
+        // row.
+        model.onRemoteSessionRequested = { [weak self] context in
+            self?.attachRemote(context)
+        }
     }
 
     @available(*, unavailable)
@@ -56,9 +65,14 @@ final class SessionBrowserWindowController: NSWindowController {
         (NSApp.delegate as? AppDelegate)?.attachWindow(sessionID: row.id, cwd: row.info.cwd)
     }
 
+    private func attachRemote(_ context: SessionSpawnContext) {
+        (NSApp.delegate as? AppDelegate)?.spawnRemoteSessionTab(host: context.host)
+    }
+
     func showBrowser() {
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        model.refreshRemoteHostCandidates()
         Task { await model.refresh() }
     }
 }

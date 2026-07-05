@@ -41,6 +41,17 @@ protocol SessionDaemonClientProtocol: Sendable {
     /// (`calyx-session meta set <id> <key>=<value>`). Added for P4's
     /// `AgentSessionMetaBridge`.
     func setMeta(id: String, key: String, value: String) async
+    /// Deploys the daemon binary to `host` via the local bundled
+    /// `calyx-session`'s own `remote-install` subcommand. Returns `nil`
+    /// when the underlying run couldn't be attempted at all (e.g. no
+    /// local binary resolvable). Added for P5's remote-install wiring.
+    func installRemote(host: String) async -> CommandResult?
+    /// Kills a REMOTE session by shelling `ssh -- <host>
+    /// "$HOME/.calyx/bin/calyx-session kill '<sessionID>'"` -- the
+    /// remote-host counterpart to `kill(id:)`, which only ever reaches
+    /// the LOCAL daemon. Added for P5's close=kill routing fix
+    /// (`CalyxWindowController.killSessionIfPersistent`).
+    func killRemote(host: String, sessionID: String) async
 }
 
 /// R14-B (r14-fix-spec.md): narrow `#if DEBUG` override hook for the
@@ -135,6 +146,20 @@ extension SessionDaemonClientProtocol {
     /// `AgentSessionMetaBridgeTests`) overrides these itself.
     func listAll() async -> [SessionInfo] { [] }
     func setMeta(id: String, key: String, value: String) async {}
+    /// Default `nil`-returning implementation (mirrors `LSPCommandRunner`'s
+    /// own default `installRun`-forwards-to-`run` precedent), so every
+    /// existing `SessionDaemonClientProtocol` fake predating P5's
+    /// `installRemote(host:)` keeps conforming without modification. A
+    /// fake that actually exercises this behavior overrides it itself.
+    func installRemote(host: String) async -> CommandResult? { nil }
+
+    /// Default no-op implementation, mirroring `installRemote(host:)`'s
+    /// own identical precedent right above, so every existing
+    /// `SessionDaemonClientProtocol` fake predating P5's
+    /// `killRemote(host:sessionID:)` keeps conforming without
+    /// modification. A fake that actually exercises this behavior
+    /// overrides it itself.
+    func killRemote(host: String, sessionID: String) async {}
 
     /// R10-C item 2 (r10-fix-spec.md): the single bound shared by every
     /// query-style caller that must not await `listAll()` unbounded,
@@ -341,6 +366,18 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     /// default, so this is behaviorally invisible for normal users.
     private let runtimeDirArgument: [String]
 
+    /// Resolves the bundled resources `installRemote(host:)` needs
+    /// (cross-compiled Linux musl payloads, bundled terminfo entry).
+    /// See `SessionRemotePayloadResolver`'s own doc comment for the
+    /// bundle layout.
+    private let payloadResolver: SessionRemotePayloadResolverProtocol
+
+    /// Resolves the system `ssh` binary `killRemote(host:sessionID:)`
+    /// execs directly, mirroring `SessionCommandSynthesizer
+    /// .remoteAttachCommand`'s own identical `SSHBinaryResolverProtocol`
+    /// dependency.
+    private let sshResolver: SSHBinaryResolverProtocol
+
     /// Exposes the resolved binary path for tests
     /// (`SessionBinaryResolverTests`) that need to confirm this client
     /// and `SessionSpawnPlanner`, given the same injected
@@ -362,11 +399,15 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     init(
         resolver: SessionBinaryResolverProtocol,
         commandRunner: LSPCommandRunner = SystemCommandRunner(),
-        rootResolver: SessionRootResolverProtocol = SessionRootResolver()
+        rootResolver: SessionRootResolverProtocol = SessionRootResolver(),
+        payloadResolver: SessionRemotePayloadResolverProtocol = SessionRemotePayloadResolver(),
+        sshResolver: SSHBinaryResolverProtocol = SSHBinaryResolver()
     ) {
         self.binaryPath = resolver.resolve()
         self.commandRunner = commandRunner
         self.runtimeDirArgument = ["--runtime-dir", rootResolver.resolve() + "/.calyx/run"]
+        self.payloadResolver = payloadResolver
+        self.sshResolver = sshResolver
     }
 
     func sessionState(id: String) async -> SessionQueryResult {
@@ -469,6 +510,74 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
         await Task {
             _ = try? await commandRunner.run(
                 executable: binaryPath, arguments: runtimeDirArgument + ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: nil
+            )
+        }.value
+    }
+
+    /// Deploys the daemon to `host` by running the LOCAL bundled
+    /// `calyx-session` binary's own `remote-install` subcommand, with
+    /// `--host-binary` pointing at that SAME local path -- a Darwin
+    /// arm64 remote reuses this Mac's own build bit-for-bit
+    /// (remote_install.rs's `PayloadKind::HostBinary` mapping). Returns
+    /// `nil` without ever invoking the command runner when no local
+    /// binary is resolvable -- there is no executable to run
+    /// remote-install with at all.
+    ///
+    /// Shielded from the caller's own ambient Task cancellation the
+    /// same structural way `kill(id:)`/`setMeta(id:key:value:)` are: an
+    /// inner unstructured `Task` around `commandRunner.run(...)` that
+    /// ambient cancellation can never reach -- this is a WRITE (deploys
+    /// a binary to the remote host), so cancelling mid-run risks the
+    /// same silent-loss failure mode those methods' own doc comments
+    /// describe.
+    func installRemote(host: String) async -> CommandResult? {
+        guard let binaryPath else { return nil }
+        let commandRunner = self.commandRunner
+        let argv = RemoteInstallArgvBuilder.buildArgv(
+            host: host,
+            payloadX86_64Path: payloadResolver.payloadPath(forArch: "x86_64"),
+            payloadAarch64Path: payloadResolver.payloadPath(forArch: "aarch64"),
+            hostBinaryPath: binaryPath,
+            terminfoPath: payloadResolver.terminfoPath()
+        )
+        return await Task {
+            try? await commandRunner.run(
+                executable: binaryPath, arguments: argv, workingDirectory: nil, environment: nil
+            )
+        }.value
+    }
+
+    /// Kills a REMOTE session by shelling `ssh -- <host>
+    /// "$HOME/.calyx/bin/calyx-session kill '<sessionID>'"`, with `ssh`
+    /// resolved via the same `sshResolver` dependency
+    /// `SessionCommandSynthesizer.remoteAttachCommand` uses. Invoked as
+    /// argv directly through `commandRunner.run(executable:arguments:)`
+    /// (no local shell parses this array at all), so only `sessionID`
+    /// needs escaping -- via `SessionCommandSynthesizer`'s own
+    /// `shSafeToken`, reused rather than duplicated -- scoped for the
+    /// REMOTE shell `sshd` invokes to run the trailing command argument.
+    ///
+    /// NO `-t`: unlike `remoteAttachCommand` (an interactive ghostty
+    /// pane needing a PTY), `kill` is a one-shot, non-interactive
+    /// command.
+    ///
+    /// Never gated on `binaryPath`: unlike the local `kill(id:)`, which
+    /// returns early without a resolvable local binary, a remote kill
+    /// only ever needs the `ssh` binary -- the local calyx-session
+    /// binary's presence or absence is irrelevant to killing a session
+    /// on the remote host.
+    ///
+    /// Shielded from the caller's own ambient Task cancellation the same
+    /// structural way `kill(id:)` is (see that method's own doc
+    /// comment): an inner unstructured `Task` around `commandRunner
+    /// .run(...)` that ambient cancellation can never reach.
+    func killRemote(host: String, sessionID: String) async {
+        let commandRunner = self.commandRunner
+        let sshPath = sshResolver.resolve()
+        let remoteCommand = "$HOME/.calyx/bin/calyx-session kill \(SessionCommandSynthesizer.shSafeToken(sessionID))"
+        await Task {
+            _ = try? await commandRunner.run(
+                executable: sshPath, arguments: ["--", host, remoteCommand], workingDirectory: nil, environment: nil
             )
         }.value
     }

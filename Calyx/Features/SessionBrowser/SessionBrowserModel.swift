@@ -39,6 +39,22 @@ final class SessionBrowserModel {
 
     private let daemonClient: SessionDaemonClientProtocol
     private let surfaceMap: SessionSurfaceMap
+    private let hostCandidateProvider: SSHHostCandidateProvider
+
+    /// Remote host candidates for the "New Remote Session…" picker,
+    /// populated by `refreshRemoteHostCandidates()` from the injected
+    /// `hostCandidateProvider`, in its own declaration order.
+    private(set) var remoteHostCandidates: [String] = []
+
+    /// Invoked by `attachToRemoteHost(_:)` with the `SessionSpawnContext`
+    /// a chosen remote host must turn into -- structurally identical to
+    /// what `CalyxWindowController.remoteSessionSpawnContext(forHost:)`
+    /// produces for the same host, so both entry points feed the same
+    /// downstream spawn contract. Actual surface/window creation is a
+    /// `CalyxWindowController` concern, kept out of this pure logic
+    /// layer -- mirrors `onAttachRequested`'s injectable-closure
+    /// pattern.
+    var onRemoteSessionRequested: ((SessionSpawnContext) -> Void)?
 
     /// R12-A item 3 (r12-fix-spec.md): guards against `refresh()`'s 1s
     /// poll timer stacking an unbounded number of concurrent
@@ -57,10 +73,12 @@ final class SessionBrowserModel {
 
     init(
         daemonClient: SessionDaemonClientProtocol = SessionDaemonClient.shared,
-        surfaceMap: SessionSurfaceMap = .shared
+        surfaceMap: SessionSurfaceMap = .shared,
+        hostCandidateProvider: SSHHostCandidateProvider = SSHHostCandidateProvider()
     ) {
         self.daemonClient = daemonClient
         self.surfaceMap = surfaceMap
+        self.hostCandidateProvider = hostCandidateProvider
     }
 
     /// Refreshes `rows` from `daemonClient.listAll()`.
@@ -105,5 +123,23 @@ final class SessionBrowserModel {
     func kill(_ row: SessionBrowserRow) async {
         await daemonClient.kill(id: row.info.id)
         await refresh()
+    }
+
+    /// Populates `remoteHostCandidates` from the injected
+    /// `hostCandidateProvider`.
+    func refreshRemoteHostCandidates() {
+        remoteHostCandidates = hostCandidateProvider.hostCandidates()
+    }
+
+    /// Requests spawning a new remote session against `host`.
+    func attachToRemoteHost(_ host: String) {
+        onRemoteSessionRequested?(SessionSpawnContext(host: host, origin: .tab))
+    }
+
+    /// Deploys the daemon to `host` via the injected `daemonClient`'s
+    /// own `installRemote(host:)`, returning its result -- mirrors
+    /// `kill(_:)`'s existing injectable-client pattern.
+    func installRemote(host: String) async -> CommandResult? {
+        await daemonClient.installRemote(host: host)
     }
 }

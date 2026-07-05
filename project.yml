@@ -80,13 +80,44 @@ targets:
             rm -f "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
             cp "$SESSION_BIN" "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
             chmod 0755 "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/bin/calyx-session"
-          elif [ "${CONFIGURATION}" = "Debug" ]; then
-            echo "warning: build/session/calyx-session not found — run scripts/build-session.sh to enable persistent sessions in this Debug build. Skipping (feature stays gated off)."
-          else
+          elif [ "${CONFIGURATION}" = "Release" ]; then
+            # Hard error only for Release: a shipped build must carry the
+            # session daemon. Every other config (Debug, DebugUITesting,
+            # any future debug variant) warns and skips below, so e.g.
+            # UI-test builds don't fail when build-session.sh was never run.
             echo "error: build/session/calyx-session not found for a ${CONFIGURATION} build. Run scripts/build-session.sh before building Release."
             exit 1
+          else
+            echo "warning: build/session/calyx-session not found. Run scripts/build-session.sh to enable persistent sessions in this ${CONFIGURATION} build. Skipping (feature stays gated off)."
           fi
         name: Bundle Session Daemon
+      - script: |
+          set -e
+          # Linux musl payloads for remote-install, produced by
+          # scripts/build-session.sh --all. They are ELF, not Mach-O:
+          # codesign seals them as plain resources, so no per-binary
+          # signing step exists for them. rm before cp kept anyway for
+          # parity with the other bundling steps' stale-inode rule.
+          for REMOTE_ARCH in x86_64 aarch64; do
+            SRC="${PROJECT_DIR}/build/session/session-remote/${REMOTE_ARCH}/calyx-session"
+            DEST_DIR="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/session-remote/${REMOTE_ARCH}"
+            if [ -f "$SRC" ]; then
+              mkdir -p "$DEST_DIR"
+              rm -f "$DEST_DIR/calyx-session"
+              cp "$SRC" "$DEST_DIR/calyx-session"
+              chmod 0755 "$DEST_DIR/calyx-session"
+            elif [ "${CONFIGURATION}" = "Release" ]; then
+              # Hard error only for Release: a shipped build must carry the
+              # remote payloads. Every other config (Debug, DebugUITesting,
+              # any future debug variant) warns and skips below, so e.g.
+              # UI-test builds don't fail when --all was never run.
+              echo "error: $SRC not found for a ${CONFIGURATION} build. Run scripts/build-session.sh --all before building Release."
+              exit 1
+            else
+              echo "warning: $SRC not found. Run scripts/build-session.sh --all to enable remote install in this ${CONFIGURATION} build. Skipping (remote install stays unavailable)."
+            fi
+          done
+        name: Bundle Remote Session Binaries
     info:
       path: Calyx/Info.plist
       properties:

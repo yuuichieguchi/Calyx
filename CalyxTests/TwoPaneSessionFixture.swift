@@ -33,8 +33,12 @@ struct TwoPaneSessionFixture {
     let sessionID: String
 }
 
+/// - Parameter host: P5 (remote sessions) addition. `nil` (the default)
+///   matches every existing call site's local-session fixture exactly.
+///   Non-nil carries a remote host on the fixture's `SessionRef`, for
+///   tests asserting kill/close routing's remote-vs-local behavior.
 @MainActor
-func makeTwoPaneSessionFixture() -> TwoPaneSessionFixture {
+func makeTwoPaneSessionFixture(host: String? = nil) -> TwoPaneSessionFixture {
     let registry = SurfaceRegistry()
     let trackedLeafID = UUID()
     let siblingLeafID = UUID()
@@ -51,7 +55,7 @@ func makeTwoPaneSessionFixture() -> TwoPaneSessionFixture {
     let tab = Tab(
         splitTree: SplitTree(root: root, focusedLeafID: trackedLeafID),
         registry: registry,
-        sessionRefs: [trackedLeafID: SessionRef(sessionID: sessionID)]
+        sessionRefs: [trackedLeafID: SessionRef(sessionID: sessionID, host: host)]
     )
     SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: trackedLeafID)
 

@@ -37,6 +37,9 @@ pub enum Command {
     Kill(KillArgs),
     /// Get/set session metadata.
     Meta(MetaArgs),
+    /// Deploy the session daemon (and, optionally, the ghostty terminfo
+    /// entry) to a remote host over ssh.
+    RemoteInstall(RemoteInstallArgs),
 }
 
 #[derive(Args, Debug)]
@@ -108,6 +111,33 @@ pub enum MetaCommand {
     Get {
         id: String,
     },
+}
+
+#[derive(Args, Debug)]
+pub struct RemoteInstallArgs {
+    /// The remote host, exactly as `ssh` itself would accept it (an
+    /// `~/.ssh/config` alias, a bare hostname, or `user@host`).
+    pub host: String,
+    /// Local path to a Linux x86_64 calyx-session build. Required only
+    /// when `ssh <host> uname -sm` detects a Linux x86_64 remote.
+    #[arg(long = "payload-x86-64")]
+    pub payload_x86_64: Option<PathBuf>,
+    /// Local path to a Linux aarch64 calyx-session build. Required only
+    /// when detection reports a Linux aarch64 remote.
+    #[arg(long = "payload-aarch64")]
+    pub payload_aarch64: Option<PathBuf>,
+    /// Local path to this Mac's own calyx-session binary, reused as-is
+    /// for a Darwin arm64 remote (no separate cross-build exists for
+    /// that target: it is this machine's own build). Required only
+    /// when detection reports a Darwin arm64 remote.
+    #[arg(long = "host-binary")]
+    pub host_binary: Option<PathBuf>,
+    /// Local path to the ghostty terminfo entry to install remotely at
+    /// `$HOME/.terminfo/x/xterm-ghostty`. Optional: a failure to
+    /// install it is reported as a warning, not an error, since the
+    /// session still works remotely with `TERM=xterm-256color`.
+    #[arg(long = "terminfo")]
+    pub terminfo: Option<PathBuf>,
 }
 
 fn parse_kv(s: &str) -> Result<(String, String), String> {

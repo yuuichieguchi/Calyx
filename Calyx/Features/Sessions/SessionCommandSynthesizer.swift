@@ -30,6 +30,14 @@ enum SessionCommandSynthesizer {
     /// drag-and-drop keystroke quoting — and deliberately left
     /// untouched).
     ///
+    /// Internal, not `private` (P5 remote sessions):
+    /// `SessionDaemonClient.killRemote(host:sessionID:)` reuses this
+    /// exact escaping for the sessionID word in the remote `kill`
+    /// command line it shells over `ssh`, rather than reimplementing a
+    /// third copy of the same battle-tested logic (see this function's
+    /// own "two earlier versions" history right below) — widened for
+    /// reuse only, not for general-purpose shell escaping elsewhere.
+    ///
     /// Two earlier versions of this function were built on `Character`
     /// (extended-grapheme-cluster) string APIs and were each bypassed in
     /// turn: a conditional `token.contains("\n") || token.contains("\r")`
@@ -50,7 +58,7 @@ enum SessionCommandSynthesizer {
     /// point, so there is no grapheme-cluster boundary left for an
     /// adjacent combining mark (or any other combining sequence) to hide
     /// behind.
-    private static func shSafeToken(_ token: String) -> String {
+    static func shSafeToken(_ token: String) -> String {
         var bytes: [UInt8] = [0x27] // opening '
         for byte in token.utf8 {
             if byte == 0x27 { // '
@@ -155,5 +163,67 @@ enum SessionCommandSynthesizer {
     ) -> String? {
         guard let binaryPath = resolver.resolve() else { return nil }
         return attachCommand(binaryPath: binaryPath, sessionID: sessionID, cwd: cwd, rootResolver: rootResolver)
+    }
+
+    /// Builds `<sshPath> -t -- <host> <remoteCommand>`, where
+    /// `remoteCommand` is the single shell-safe word `$HOME/.calyx/bin/
+    /// calyx-session attach <sessionID> --create --cwd <cwd> [--name
+    /// <name>]`, with `sshPath` resolved via `sshResolver`.
+    ///
+    /// TWO SHELL LAYERS: exactly like `attachCommand`, ghostty wraps
+    /// whatever `command` string this returns in its own `/bin/sh -c
+    /// "exec <command>"` (see this file's own header and
+    /// `SessionCommandSynthesizerRuntimeStateDirFlagsTests`'s full
+    /// ghostty-exec-wrapping saga). THAT local shell (LAYER 1) execs the
+    /// resolved `sshPath` -- this function's first word -- directly, with
+    /// the rest as its own argv; there is no cwd-relative or PATH-search
+    /// ambiguity as long as that first word stays program-first, exactly
+    /// like `attachCommand`'s own `binaryPath` contract. `ssh` then
+    /// transmits its own trailing "command" argv word to the remote
+    /// sshd, which invokes some POSIX shell remotely as that shell's own
+    /// `-c` argument (LAYER 2). `sessionID`/`cwd`/`name` are each wrapped
+    /// in their own `shSafeToken` call scoped for THAT remote shell's
+    /// parsing, and the entire `remoteCommand` string is then wrapped in
+    /// one more `shSafeToken` call scoped for the LOCAL shell (LAYER 1)
+    /// -- stripped away by the local shell before `ssh` ever transmits
+    /// the bytes onward, so it never affects how the remote shell later
+    /// parses the string it receives.
+    ///
+    /// WHY `$HOME`, NOT `~`: `$HOME/.calyx/bin/calyx-session` is left as
+    /// a literal, UNQUOTED bareword within `remoteCommand`, so the
+    /// REMOTE shell's own parameter expansion resolves it against the
+    /// REMOTE `$HOME`. A single-quoted `'~/.calyx/bin/calyx-session'`
+    /// would be WRONG: single quotes suppress both tilde expansion and
+    /// `$HOME` parameter expansion alike on every POSIX shell, so a
+    /// single-quoted tilde is a literal two-byte string, never a path, on
+    /// the remote end.
+    ///
+    /// WHY `-t -- <host>`: `-t` requests PTY allocation; `--` guards
+    /// against a dash-leading `host` being misparsed as an `ssh` option.
+    /// Verified live against the system `ssh` (OpenSSH_10.2p1): `ssh -t
+    /// -- -evilhost` rejects `-evilhost` as an invalid hostname (treated
+    /// as the destination argument), while `ssh -t -evilhost` (no `--`)
+    /// instead parses it as `-e vilhost`, an ordinary short option -- see
+    /// `SessionCommandSynthesizerRemoteAttachTests`'s header for the full
+    /// verification transcript.
+    ///
+    /// NO `--runtime-dir`/`--state-dir`: unlike `attachCommand`, this
+    /// never stamps a local session root onto the remote command --
+    /// those flags would be meaningless on the remote machine. The
+    /// remote daemon resolves its own `--runtime-dir`/`--state-dir`
+    /// defaults from the REMOTE `$HOME`, exactly like `attachCommand`'s
+    /// own no-flags-given fallback does locally.
+    static func remoteAttachCommand(
+        host: String,
+        sessionID: String,
+        cwd: String,
+        name: String? = nil,
+        sshResolver: SSHBinaryResolverProtocol = SSHBinaryResolver()
+    ) -> String {
+        var remoteCommand = "$HOME/.calyx/bin/calyx-session attach \(shSafeToken(sessionID)) --create --cwd \(shSafeToken(cwd))"
+        if let name {
+            remoteCommand += " --name \(shSafeToken(name))"
+        }
+        return "\(shSafeToken(sshResolver.resolve())) -t -- \(shSafeToken(host)) \(shSafeToken(remoteCommand))"
     }
 }

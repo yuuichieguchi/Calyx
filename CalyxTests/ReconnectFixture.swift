@@ -54,8 +54,14 @@ struct ReconnectFixture {
 /// only `SurfaceView`. `findTab(surfaceID:)` searches every tab in every
 /// group regardless of which is active, so `performReconnect` still
 /// finds this tab.
+///
+/// - Parameter host: P5 (remote sessions) addition. `nil` (the default)
+///   matches every existing call site's local-session fixture exactly.
+///   Non-nil carries a remote host on the fixture's `SessionRef`, for
+///   tests asserting `performReconnect`'s remote-vs-local command
+///   synthesis and grace-establishment branching.
 @MainActor
-func makeReconnectFixture() -> ReconnectFixture {
+func makeReconnectFixture(host: String? = nil) -> ReconnectFixture {
     let registry = SurfaceRegistry()
     let trackedLeafID = UUID()
     registry._testInsert(view: SurfaceView(frame: .zero), id: trackedLeafID)
@@ -64,7 +70,7 @@ func makeReconnectFixture() -> ReconnectFixture {
     let tab = Tab(
         splitTree: SplitTree(leafID: trackedLeafID),
         registry: registry,
-        sessionRefs: [trackedLeafID: SessionRef(sessionID: sessionID)]
+        sessionRefs: [trackedLeafID: SessionRef(sessionID: sessionID, host: host)]
     )
     SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: trackedLeafID)
 

@@ -240,7 +240,10 @@ pub(crate) fn spawn_session(
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
+            // Inferred cast: ioctl's request parameter is c_ulong on
+            // macOS/glibc but c_int on musl, so a concrete cast breaks
+            // one platform or the other.
+            if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -438,7 +441,9 @@ fn session_thread(ctx: SessionThread) {
                     };
                     // SAFETY: master_raw is this thread's live PTY fd.
                     let rc = unsafe {
-                        libc::ioctl(master_raw, libc::TIOCSWINSZ as libc::c_ulong, &winsize)
+                        // Inferred cast: request is c_ulong on
+                        // macOS/glibc, c_int on musl.
+                        libc::ioctl(master_raw, libc::TIOCSWINSZ as _, &winsize)
                     };
                     if rc < 0 {
                         eprintln!(

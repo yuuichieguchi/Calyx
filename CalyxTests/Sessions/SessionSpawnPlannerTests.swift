@@ -112,7 +112,7 @@ final class SessionSpawnPlannerTests: XCTestCase {
         try makeArgvDumperScript(at: binaryPath, outputPath: outputPath)
 
         let plan = SessionSpawnPlanner.plan(for: context, resolver: FakeBinaryResolver(path: binaryPath))
-        guard case .persistent(let sessionID, let command) = plan else { return nil }
+        guard case .persistent(let sessionID, let command, _) = plan else { return nil }
 
         try runShC(command)
         return (sessionID, command, readCapturedArgv(at: outputPath))
@@ -187,8 +187,8 @@ final class SessionSpawnPlannerTests: XCTestCase {
         // than on the ULID-distinctness behavior it's meant to verify.
         let resolver = FakeBinaryResolver(path: "/dummy/calyx-session")
 
-        guard case .persistent(let firstID, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver),
-              case .persistent(let secondID, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver) else {
+        guard case .persistent(let firstID, _, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver),
+              case .persistent(let secondID, _, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver) else {
             XCTFail("Both calls must produce .persistent while the feature is enabled")
             return
         }
