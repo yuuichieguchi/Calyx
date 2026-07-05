@@ -46,9 +46,15 @@ final class AppDelegateOfferAgentResumePipelineBoundTests: XCTestCase {
     override func setUp() {
         super.setUp()
         SessionSettings._testUseSuite(named: settingsSuiteName)
+        // R14-B (r14-fix-spec.md): overrides the general bound to 1s
+        // via the DEBUG timeout seam so this test runs in milliseconds
+        // instead of burning the real ~5s daemonQueryBoundTimeoutSeconds
+        // default.
+        SessionDaemonClientBoundTimeoutOverrides.daemonQueryBoundTimeoutSeconds = 1
     }
 
     override func tearDown() {
+        SessionDaemonClientBoundTimeoutOverrides.daemonQueryBoundTimeoutSeconds = nil
         SessionSettings.resetToDefaults()
         SessionSettings._testTeardownSuite(named: settingsSuiteName)
         super.tearDown()
@@ -143,12 +149,14 @@ final class AppDelegateOfferAgentResumePipelineBoundTests: XCTestCase {
         let restored = appDelegate.restoreTabSurfaces(tab: tab, app: dummyApp, window: window)
         XCTAssertTrue(restored, "Precondition: the single-leaf restore itself (the synchronous part) must succeed")
 
-        // R10-C item 5 (r10-fix-spec.md): raised from 8.0s to 15.0s,
-        // still a generous margin over the ~5s
-        // SessionDaemonClientProtocol.listAllBoundTimeoutSeconds default
-        // this pipeline is bounded by, but with more slack for a slow
-        // CI/test-host run than the original margin left.
-        let waiterResult = XCTWaiter.wait(for: [completionExpectation], timeout: 15.0)
+        // R10-C item 5 (r10-fix-spec.md): originally raised from 8.0s
+        // to 15.0s, a generous margin over the real ~5s
+        // SessionDaemonClientProtocol.daemonQueryBoundTimeoutSeconds
+        // default this pipeline is bounded by. R14-B (r14-fix-spec.md):
+        // setUp above now overrides that bound to 1s via the DEBUG-only
+        // timeout seam, so 3.0s is a generous margin instead -- this
+        // test no longer burns ~5s of real wall-clock time.
+        let waiterResult = XCTWaiter.wait(for: [completionExpectation], timeout: 3.0)
 
         XCTAssertEqual(waiterResult, .completed,
                       "The per-surface offer-agent-resume pipeline must reach a terminal state within a " +

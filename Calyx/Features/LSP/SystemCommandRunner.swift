@@ -324,10 +324,14 @@ struct SystemCommandRunner: LSPCommandRunner {
     /// the time the process came into being, so it must terminate it
     /// itself right after `process.run()` succeeds (calling
     /// `terminate()` on an unlaunched `Process` is unsafe, so `cancel()`
-    /// alone must never do so).
+    /// alone must never do so). R14-D (r14-fix-spec.md): `terminate()`
+    /// below is also the watchdog timer's own termination path, so
+    /// `cancel()` and a natural timeout can never race each other
+    /// calling `Process.terminate()` unsynchronized.
     private final class CancellationBridge: @unchecked Sendable {
         private let lock = NSLock()
         private var isCancelled = false
+        private var terminated = false
         private var process: Process?
 
         /// Called once, immediately after `process.run()` succeeds.
@@ -342,9 +346,23 @@ struct SystemCommandRunner: LSPCommandRunner {
         func cancel() {
             lock.lock()
             isCancelled = true
-            let proc = process
             lock.unlock()
-            proc?.terminate()
+            terminate()
+        }
+
+        /// R14-D (r14-fix-spec.md): single terminate-once path shared
+        /// by both `cancel()` (Task cancellation) and the watchdog
+        /// timer (natural timeout) below, replacing the previous
+        /// unsynchronized two-thread `process.terminate()` call sites --
+        /// Foundation does not document `Process.terminate()` as safe
+        /// to call concurrently from two threads, so this removes that
+        /// unverified assumption entirely rather than relying on it.
+        func terminate() {
+            lock.lock()
+            guard !terminated, let proc = process else { lock.unlock(); return }
+            terminated = true
+            lock.unlock()
+            proc.terminate()
         }
     }
 
@@ -441,7 +459,7 @@ struct SystemCommandRunner: LSPCommandRunner {
                     timer.schedule(deadline: .now() + timeoutSeconds)
                     timer.setEventHandler {
                         timedOut.markFired()
-                        process.terminate()
+                        cancellationBridge.terminate()
                         let pid = process.processIdentifier
                         DispatchQueue.global().asyncAfter(deadline: .now() + Self.killGraceSeconds) {
                             if process.isRunning {

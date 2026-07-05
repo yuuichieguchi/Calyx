@@ -159,93 +159,156 @@ enum GitService {
 
     // MARK: - Process Execution
 
+    /// Thread-safe bridge between `withTaskCancellationHandler`'s
+    /// `onCancel` closure and the dispatch-queue block that actually
+    /// spawns `git`, mirroring `SystemCommandRunner`'s own
+    /// `CancellationBridge` (R14-E, r14-fix-spec.md) -- including
+    /// routing the 10s watchdog's termination through the same
+    /// terminate-once lock below, not a second, unsynchronized
+    /// `process.terminate()` call site.
+    private final class CancellationBridge: @unchecked Sendable {
+        private let lock = NSLock()
+        private var isCancelled = false
+        private var terminated = false
+        private var process: Process?
+
+        /// Called once, immediately after `process.run()` succeeds.
+        /// Returns whether the task was already cancelled by this
+        /// point.
+        func register(_ process: Process) -> Bool {
+            lock.lock(); defer { lock.unlock() }
+            self.process = process
+            return isCancelled
+        }
+
+        func cancel() {
+            lock.lock()
+            isCancelled = true
+            lock.unlock()
+            terminate()
+        }
+
+        func terminate() {
+            lock.lock()
+            guard !terminated, let proc = process else { lock.unlock(); return }
+            terminated = true
+            lock.unlock()
+            proc.terminate()
+        }
+    }
+
+    /// Every public entry point above (`repoRoot`, `gitStatus`,
+    /// `commitLog`, `commitFiles`, `fileDiff`) drives this with a
+    /// read-only git subcommand (`status`, `log`, `diff-tree`, `diff`,
+    /// `show`, `rev-parse`) -- there is no write path through here, so
+    /// propagating cancellation straight to the subprocess (rather than
+    /// the structural-shield treatment `SessionDaemonClient.kill(id:)`
+    /// needs for its WRITE op, R14-C) is safe.
     private static func run(args: [String], workDir: String) async throws -> String {
         guard FileManager.default.fileExists(atPath: gitPath) else {
             throw GitError.gitNotFound
         }
 
-        return try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global().async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: gitPath)
-                process.arguments = args
-                process.currentDirectoryURL = URL(fileURLWithPath: workDir)
-                process.environment = [
-                    "LC_ALL": "C",
-                    "GIT_PAGER": "cat",
-                    "GIT_TERMINAL_PROMPT": "0",
-                    "PATH": "/usr/bin:/usr/local/bin",
-                    "HOME": NSHomeDirectory(),
-                ]
-
-                let stdoutPipe = Pipe()
-                let stderrPipe = Pipe()
-                process.standardOutput = stdoutPipe
-                process.standardError = stderrPipe
-
-                do {
-                    try process.run()
-                } catch {
-                    continuation.resume(throwing: error)
-                    return
-                }
-
-                var didTimeout = false
-                let timeoutItem = DispatchWorkItem {
-                    didTimeout = true
-                    process.terminate()
-                }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: timeoutItem)
-
-                // Read both pipes concurrently to avoid deadlock
-                var stdoutData = Data()
-                var stderrData = Data()
-                let readGroup = DispatchGroup()
-                readGroup.enter()
+        let cancellationBridge = CancellationBridge()
+        // R14-E (r14-fix-spec.md): mirrors SystemCommandRunner
+        // .runInternal's R12-A fix -- withTaskCancellationHandler makes
+        // a caller's Task cancellation SIGTERM the spawned `git`
+        // process promptly instead of leaving it running until it
+        // exits naturally or the unrelated 10s watchdog eventually
+        // trips.
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
                 DispatchQueue.global().async {
-                    stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-                    readGroup.leave()
-                }
-                readGroup.enter()
-                DispatchQueue.global().async {
-                    stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-                    readGroup.leave()
-                }
-                readGroup.wait()
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: gitPath)
+                    process.arguments = args
+                    process.currentDirectoryURL = URL(fileURLWithPath: workDir)
+                    process.environment = [
+                        "LC_ALL": "C",
+                        "GIT_PAGER": "cat",
+                        "GIT_TERMINAL_PROMPT": "0",
+                        "PATH": "/usr/bin:/usr/local/bin",
+                        "HOME": NSHomeDirectory(),
+                    ]
 
-                process.waitUntilExit()
-                timeoutItem.cancel()
+                    let stdoutPipe = Pipe()
+                    let stderrPipe = Pipe()
+                    process.standardOutput = stdoutPipe
+                    process.standardError = stderrPipe
 
-                stdoutPipe.fileHandleForReading.closeFile()
-                stderrPipe.fileHandleForReading.closeFile()
-
-                if didTimeout {
-                    let cmd = args.first ?? "unknown"
-                    continuation.resume(throwing: GitError.timeout(command: cmd))
-                    return
-                }
-
-                let exitCode = process.terminationStatus
-                if exitCode != 0 {
-                    let stderr = String(data: stderrData, encoding: .utf8) ?? ""
-                    let cmd = args.first ?? "unknown"
-
-                    if stderr.contains("not a git repository") {
-                        continuation.resume(throwing: GitError.notARepository)
+                    do {
+                        try process.run()
+                    } catch {
+                        continuation.resume(throwing: error)
                         return
                     }
-                    if stderr.contains("Permission denied") {
-                        continuation.resume(throwing: GitError.permissionDenied(path: workDir))
+                    if cancellationBridge.register(process) {
+                        // Already cancelled by the time this process
+                        // launched; `cancel()` found nothing registered
+                        // yet, so terminate it here instead (mirrors
+                        // SystemCommandRunner.runInternal).
+                        process.terminate()
+                    }
+
+                    var didTimeout = false
+                    let timeoutItem = DispatchWorkItem {
+                        didTimeout = true
+                        cancellationBridge.terminate()
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 10, execute: timeoutItem)
+
+                    // Read both pipes concurrently to avoid deadlock
+                    var stdoutData = Data()
+                    var stderrData = Data()
+                    let readGroup = DispatchGroup()
+                    readGroup.enter()
+                    DispatchQueue.global().async {
+                        stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                        readGroup.leave()
+                    }
+                    readGroup.enter()
+                    DispatchQueue.global().async {
+                        stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                        readGroup.leave()
+                    }
+                    readGroup.wait()
+
+                    process.waitUntilExit()
+                    timeoutItem.cancel()
+
+                    stdoutPipe.fileHandleForReading.closeFile()
+                    stderrPipe.fileHandleForReading.closeFile()
+
+                    if didTimeout {
+                        let cmd = args.first ?? "unknown"
+                        continuation.resume(throwing: GitError.timeout(command: cmd))
                         return
                     }
 
-                    continuation.resume(throwing: GitError.commandFailed(exitCode: exitCode, stderr: stderr, command: cmd))
-                    return
-                }
+                    let exitCode = process.terminationStatus
+                    if exitCode != 0 {
+                        let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+                        let cmd = args.first ?? "unknown"
 
-                let result = String(data: stdoutData, encoding: .utf8) ?? ""
-                continuation.resume(returning: result)
+                        if stderr.contains("not a git repository") {
+                            continuation.resume(throwing: GitError.notARepository)
+                            return
+                        }
+                        if stderr.contains("Permission denied") {
+                            continuation.resume(throwing: GitError.permissionDenied(path: workDir))
+                            return
+                        }
+
+                        continuation.resume(throwing: GitError.commandFailed(exitCode: exitCode, stderr: stderr, command: cmd))
+                        return
+                    }
+
+                    let result = String(data: stdoutData, encoding: .utf8) ?? ""
+                    continuation.resume(returning: result)
+                }
             }
+        } onCancel: {
+            cancellationBridge.cancel()
         }
     }
 

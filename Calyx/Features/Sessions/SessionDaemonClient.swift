@@ -43,6 +43,78 @@ protocol SessionDaemonClientProtocol: Sendable {
     func setMeta(id: String, key: String, value: String) async
 }
 
+/// R14-B (r14-fix-spec.md): narrow `#if DEBUG` override hook for the
+/// two bounded-timeout constants below, mirroring
+/// `NotificationManager.shared`'s R6-F override and
+/// `SessionSettings._testStore`'s suite-swap seam. `nil` (the default)
+/// means "use the production value"; a test sets one or both to a
+/// tiny, distinguishable value so it can assert the bound's plumbing
+/// without waiting out the real 5s/15s. `nonisolated(unsafe)` is sound
+/// because every production reader only consults it via the matching
+/// computed property below, and every test that sets it resets it back
+/// to `nil` in its own `tearDown()`.
+#if DEBUG
+enum SessionDaemonClientBoundTimeoutOverrides {
+    nonisolated(unsafe) static var daemonQueryBoundTimeoutSeconds: UInt64?
+    nonisolated(unsafe) static var sessionStateBoundTimeoutSeconds: UInt64?
+}
+#endif
+
+/// R14-A (r14-fix-spec.md): thread-safe bridge between
+/// `withTaskCancellationHandler`'s `onCancel` closure and
+/// `SessionDaemonClientProtocol.bounded(...)`'s own `operationTask`/
+/// `timeoutTask`/`continuation`, mirroring `SystemCommandRunner`'s
+/// `CancellationBridge`. Declared at file scope, generic over `T`,
+/// because Swift does not allow a nested type inside a generic
+/// function. `resume(with:)` is exactly-once, shared by all three
+/// potential resumers (the operation arm, the timeout arm, and
+/// `cancel(onTimeout:)`). `register(...)`'s return value tells the
+/// caller whether the bridge was already cancelled by the time it ran,
+/// mirroring that type's own already-cancelled-before-register
+/// handling.
+private final class SessionDaemonBoundedRaceBridge<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resumed = false
+    private var isCancelled = false
+    private var operationTask: Task<Void, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var continuation: CheckedContinuation<T, Never>?
+
+    func register(
+        continuation: CheckedContinuation<T, Never>,
+        operationTask: Task<Void, Never>,
+        timeoutTask: Task<Void, Never>
+    ) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        self.continuation = continuation
+        self.operationTask = operationTask
+        self.timeoutTask = timeoutTask
+        return isCancelled
+    }
+
+    @discardableResult
+    func resume(with value: T) -> Bool {
+        lock.lock()
+        guard !resumed, let continuation else { lock.unlock(); return false }
+        resumed = true
+        self.continuation = nil
+        lock.unlock()
+        continuation.resume(returning: value)
+        return true
+    }
+
+    func cancel(onTimeout: @Sendable () -> T) {
+        lock.lock()
+        isCancelled = true
+        let opTask = operationTask
+        let toTask = timeoutTask
+        lock.unlock()
+        opTask?.cancel()
+        toTask?.cancel()
+        resume(with: onTimeout())
+    }
+}
+
 extension SessionDaemonClientProtocol {
     /// Default empty/no-op implementations, so fakes built before P4
     /// introduced `listAll()`/`setMeta(id:key:value:)` (e.g.
@@ -54,23 +126,58 @@ extension SessionDaemonClientProtocol {
     func setMeta(id: String, key: String, value: String) async {}
 
     /// R10-C item 2 (r10-fix-spec.md): the single bound shared by every
-    /// caller that must not await `listAll()` unbounded, originally
-    /// `AppDelegate`'s agent-resume path alone
+    /// query-style caller that must not await `listAll()` unbounded,
+    /// originally `AppDelegate`'s agent-resume path alone
     /// (`listAllSessionsBounded`, R8-D item 1), now also
     /// `SessionBrowserModel.refresh()`, which used to await `listAll()`
     /// completely unbounded and freeze the whole session browser behind
     /// a hung `calyx-session` daemon.
-    static var listAllBoundTimeoutSeconds: UInt64 { 5 }
+    ///
+    /// R14-B (r14-fix-spec.md): renamed from `listAllBoundTimeoutSeconds`
+    /// -- `sessionStateBounded(id:)` now has its own dedicated, longer
+    /// `sessionStateBoundTimeoutSeconds` below, so this name describes
+    /// only the low-consequence query callers that still share the
+    /// original 5s value. Consults the `#if DEBUG`-only
+    /// `SessionDaemonClientBoundTimeoutOverrides` seam first, so tests
+    /// can assert the bound's plumbing with tiny, distinguishable
+    /// values instead of waiting out the real 5s.
+    static var daemonQueryBoundTimeoutSeconds: UInt64 {
+        #if DEBUG
+        if let override = SessionDaemonClientBoundTimeoutOverrides.daemonQueryBoundTimeoutSeconds {
+            return override
+        }
+        #endif
+        return 5
+    }
+
+    /// R14-B (r14-fix-spec.md): `sessionStateBounded(id:)` feeds
+    /// `SessionReconnectCoordinator.childExited`'s reconnect decision --
+    /// a 5-attempt-cap retry/backoff sequence (0/1/2/4/8s) -- so its
+    /// bound must be generous enough to separate "daemon truly hung"
+    /// from "daemon merely busy". The 5s `daemonQueryBoundTimeoutSeconds`
+    /// value was tuned for the low-consequence session-browser poll
+    /// `listAllBounded()` serves, not for this. Same `#if DEBUG`
+    /// override seam as `daemonQueryBoundTimeoutSeconds` above.
+    static var sessionStateBoundTimeoutSeconds: UInt64 {
+        #if DEBUG
+        if let override = SessionDaemonClientBoundTimeoutOverrides.sessionStateBoundTimeoutSeconds {
+            return override
+        }
+        #endif
+        return 15
+    }
 
     /// R12-B (r12-fix-spec.md): generalized race shape shared by every
-    /// bounded daemon call. Races `operation()` against
-    /// `listAllBoundTimeoutSeconds`, resolving to `onTimeout()` if
-    /// `operation()` hasn't completed by then, so a hung daemon never
-    /// blocks a caller indefinitely. Originally `listAllBounded()`'s own
-    /// implementation (lifted from `AppDelegate`'s former private
+    /// bounded daemon call. Races `operation()` against `timeoutSeconds`
+    /// (default `daemonQueryBoundTimeoutSeconds`; R14-B lets
+    /// `sessionStateBounded(id:)` pass its own dedicated, longer bound
+    /// instead), resolving to `onTimeout()` if `operation()` hasn't
+    /// completed by then, so a hung daemon never blocks a caller
+    /// indefinitely. Originally `listAllBounded()`'s own implementation
+    /// (lifted from `AppDelegate`'s former private
     /// `listAllSessionsBounded`, R8-D item 1); generalized here so
     /// `sessionStateBounded(id:)` (R12-B) shares the identical race
-    /// shape and the same timeout constant instead of duplicating it.
+    /// shape instead of duplicating it.
     ///
     /// Deliberately NOT a `TaskGroup` race: `withTaskGroup` always
     /// awaits every child task to completion before returning, even
@@ -79,12 +186,12 @@ extension SessionDaemonClientProtocol {
     /// nobody ever resumes, never observes it), which would make the
     /// whole race hang exactly as long as the call it exists to bound.
     /// Instead, two independent, unstructured `Task`s race to resume
-    /// `continuation` first, guarded by `resumed`; `@MainActor`
-    /// isolation means both closures (each inherits this method's actor
-    /// context, per `Task.init`'s `@_inheritActorContext`) can never
-    /// execute concurrently with each other, mirroring
+    /// `continuation` first, guarded by `SessionDaemonBoundedRaceBridge`;
+    /// `@MainActor` isolation means both closures (each inherits this
+    /// method's actor context, per `Task.init`'s `@_inheritActorContext`)
+    /// can never execute concurrently with each other, mirroring
     /// `AppDelegate.applicationWillTerminate`'s identical `killsDrained`
-    /// pattern, no lock needed.
+    /// pattern.
     ///
     /// R10-C item 1 (r10-fix-spec.md): the winner cancels the loser (a
     /// beaten operation task is cancelled, not merely abandoned; the
@@ -95,36 +202,61 @@ extension SessionDaemonClientProtocol {
     /// `Task.sleep` had (a cancelled sleep could still fall through to
     /// resume the continuation with a stale value after the operation
     /// task had already won).
+    ///
+    /// R14-A (r14-fix-spec.md): the continuation await is now wrapped in
+    /// `withTaskCancellationHandler`, whose handler cancels BOTH the
+    /// operation and timeout arms and resumes promptly with `onTimeout()`
+    /// -- before this fix, cancelling the CALLER's own Task did nothing:
+    /// neither unstructured arm auto-cancels just because the caller's
+    /// Task was cancelled, so the race rode out the full bound
+    /// regardless. `SessionDaemonBoundedRaceBridge` (above) is the
+    /// thread-safe hand-off between `onCancel` (which may run
+    /// concurrently with, and on a different thread than, the two
+    /// MainActor-isolated race arms) and those arms' own exactly-once
+    /// resume discipline -- mirroring
+    /// `SystemCommandRunner`'s own `CancellationBridge`.
     @MainActor
     private func bounded<T: Sendable>(
         operation: @escaping @Sendable () async -> T,
-        onTimeout: @escaping @Sendable () -> T
+        onTimeout: @escaping @Sendable () -> T,
+        timeoutSeconds: UInt64 = Self.daemonQueryBoundTimeoutSeconds
     ) async -> T {
-        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
-            var resumed = false
-            var operationTask: Task<Void, Never>?
-            var timeoutTask: Task<Void, Never>?
-            operationTask = Task {
-                let result = await operation()
-                guard !resumed else { return }
-                resumed = true
-                timeoutTask?.cancel()
-                continuation.resume(returning: result)
+        let bridge = SessionDaemonBoundedRaceBridge<T>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
+                var operationTask: Task<Void, Never>?
+                var timeoutTask: Task<Void, Never>?
+                operationTask = Task {
+                    let result = await operation()
+                    guard bridge.resume(with: result) else { return }
+                    timeoutTask?.cancel()
+                }
+                timeoutTask = Task {
+                    try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    guard bridge.resume(with: onTimeout()) else { return }
+                    operationTask?.cancel()
+                }
+                guard let opTask = operationTask, let toTask = timeoutTask else { return }
+                if bridge.register(continuation: continuation, operationTask: opTask, timeoutTask: toTask) {
+                    // Already cancelled by the time both arms were
+                    // created and registered; cancel them and resume
+                    // right away instead of waiting for either to
+                    // notice on its own.
+                    opTask.cancel()
+                    toTask.cancel()
+                    bridge.resume(with: onTimeout())
+                }
             }
-            timeoutTask = Task {
-                try? await Task.sleep(nanoseconds: Self.listAllBoundTimeoutSeconds * 1_000_000_000)
-                guard !Task.isCancelled, !resumed else { return }
-                resumed = true
-                operationTask?.cancel()
-                continuation.resume(returning: onTimeout())
-            }
+        } onCancel: {
+            bridge.cancel(onTimeout: onTimeout)
         }
     }
 
-    /// Races `listAll()` against `listAllBoundTimeoutSeconds`, degrading
-    /// to `[]` if the daemon round-trip hasn't completed by then, so a
-    /// hung daemon never blocks a caller indefinitely. Shared by
-    /// `SessionBrowserModel.refresh()` and
+    /// Races `listAll()` against `daemonQueryBoundTimeoutSeconds`,
+    /// degrading to `[]` if the daemon round-trip hasn't completed by
+    /// then, so a hung daemon never blocks a caller indefinitely.
+    /// Shared by `SessionBrowserModel.refresh()` and
     /// `AppDelegate.fetchSessionsForAgentResume()`.
     @MainActor
     func listAllBounded() async -> [SessionInfo] {
@@ -141,9 +273,19 @@ extension SessionDaemonClientProtocol {
     /// `listAllBounded()`'s shape exactly) is safe. Degrades to
     /// `.unreachable` on timeout, which `SessionReconnectCoordinator`
     /// already treats as a retry/give-up input.
+    ///
+    /// R14-B (r14-fix-spec.md): threads its own dedicated, longer
+    /// `sessionStateBoundTimeoutSeconds` into `bounded(timeout:)`
+    /// instead of the general `daemonQueryBoundTimeoutSeconds` every
+    /// other bounded call shares (see that constant's own doc comment
+    /// for why).
     @MainActor
     func sessionStateBounded(id: String) async -> SessionQueryResult {
-        await bounded(operation: { await sessionState(id: id) }, onTimeout: { .unreachable })
+        await bounded(
+            operation: { await sessionState(id: id) },
+            onTimeout: { .unreachable },
+            timeoutSeconds: Self.sessionStateBoundTimeoutSeconds
+        )
     }
 }
 
@@ -219,11 +361,27 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     /// one. Keeps its unbounded complete-or-watchdog semantics;
     /// `SessionKillTracker`'s 2s quit-drain already abandons (without
     /// cancelling) rather than needing a bounded wrapper here.
+    ///
+    /// R14-C (r14-fix-spec.md): the same R12-A SIGTERM-on-cancel fix
+    /// also newly exposed this write to the CALLER's own ambient Task
+    /// cancellation -- with no internal race arm shielding it (unlike
+    /// `listAllBounded()`/`sessionStateBounded(id:)`), `commandRunner
+    /// .run(...)` used to await directly in the caller's own Task, so
+    /// cancelling that Task reached straight through to the subprocess
+    /// mid-write, silently losing the kill. Now structurally shielded:
+    /// the run call is wrapped in an inner unstructured `Task` (the same
+    /// pattern `LSPInstaller.runPrerequisiteDeduped` uses) whose
+    /// cancellation is never inherited from its creating context, so
+    /// ambient cancellation of any future caller's Task can no longer
+    /// reach it.
     func kill(id: String) async {
         guard let binaryPath else { return }
-        _ = try? await commandRunner.run(
-            executable: binaryPath, arguments: ["kill", id], workingDirectory: nil, environment: nil
-        )
+        let commandRunner = self.commandRunner
+        await Task {
+            _ = try? await commandRunner.run(
+                executable: binaryPath, arguments: ["kill", id], workingDirectory: nil, environment: nil
+            )
+        }.value
     }
 
     /// Runs the same `ls --all --json` invocation `sessionState(id:)`
@@ -254,11 +412,20 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     /// `kill(id:)`'s doc comment describes); this fire-and-forget
     /// background call already never blocks a user-visible flow, so the
     /// simplest acceptable choice is leaving it as-is.
+    ///
+    /// R14-C (r14-fix-spec.md): shielded from the caller's own ambient
+    /// Task cancellation the same structural way `kill(id:)` now is
+    /// (see its doc comment) -- an inner unstructured `Task` around
+    /// `commandRunner.run(...)` that ambient cancellation can never
+    /// reach.
     func setMeta(id: String, key: String, value: String) async {
         guard let binaryPath else { return }
-        _ = try? await commandRunner.run(
-            executable: binaryPath, arguments: ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: nil
-        )
+        let commandRunner = self.commandRunner
+        await Task {
+            _ = try? await commandRunner.run(
+                executable: binaryPath, arguments: ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: nil
+            )
+        }.value
     }
 }
 

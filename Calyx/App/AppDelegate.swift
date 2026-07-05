@@ -1437,15 +1437,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func fetchSessionsForAgentResume() {
         guard SessionSettings.agentResumeEnabled else {
             // R10-B item 2 (r10-fix-spec.md): cancel a still-in-flight
-            // fetch instead of merely dropping the reference. This is
-            // best-effort -- `Task.cancel()` only sets a cooperative
-            // flag, and `listAllSessionsBounded` below only checks it
-            // once, right after its own await returns -- but R12-A item
-            // 1 (r12-fix-spec.md) made `SystemCommandRunner.run()` honor
-            // that flag by SIGTERMing the underlying `calyx-session`
-            // subprocess, so a disable mid-flight now also ends the
-            // daemon round-trip instead of merely dropping an
-            // unobserved reference to it.
+            // fetch instead of merely dropping the reference.
+            // `Task.cancel()` only sets a cooperative flag, but R14-A
+            // (r14-fix-spec.md) made `SessionDaemonClientProtocol
+            // .bounded(...)` (the race `listAllSessionsBounded` below
+            // ultimately awaits) honor that flag with a
+            // `withTaskCancellationHandler` that cancels both its
+            // internal race arms and resumes promptly -- reaching, in
+            // turn, `SystemCommandRunner.run()`'s own R12-A cancellation
+            // handler, which SIGTERMs the underlying `calyx-session`
+            // subprocess -- so a disable mid-flight now genuinely ends
+            // the daemon round-trip promptly instead of merely dropping
+            // an unobserved reference to it (or, pre-R14-A, riding out
+            // the full bound regardless of this cancel() call).
             agentResumeSessionsTask?.cancel()
             agentResumeSessionsTask = nil
             return

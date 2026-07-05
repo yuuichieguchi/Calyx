@@ -64,12 +64,23 @@ private struct FixedBinaryResolver: SessionBinaryResolverProtocol {
 
 final class SessionDaemonClientBoundedListTests: XCTestCase {
 
+    override func tearDown() {
+        // R14-B (r14-fix-spec.md): test isolation, mirroring
+        // SessionDaemonClientSessionStateBoundTimeoutSeamTests' own
+        // tearDown -- no override must leak into a later test.
+        SessionDaemonClientBoundTimeoutOverrides.daemonQueryBoundTimeoutSeconds = nil
+        super.tearDown()
+    }
+
     /// R10-C item 2: against a never-completing commandRunner,
     /// listAllBounded() must still reach a terminal [] within a
-    /// generous margin over its own bound, exactly mirroring
-    /// AppDelegateOfferAgentResumePipelineBoundTests' 8s margin over the
-    /// same 5s default.
+    /// generous margin over its own bound. R14-B (r14-fix-spec.md):
+    /// overrides `daemonQueryBoundTimeoutSeconds` to 1s via the DEBUG
+    /// timeout seam so this test runs in milliseconds instead of
+    /// burning the real ~5s default.
     func test_listAllBounded_returnsEmptyWithinBound_whenCommandRunnerNeverCompletes() async {
+        SessionDaemonClientBoundTimeoutOverrides.daemonQueryBoundTimeoutSeconds = 1
+
         let resolver = FixedBinaryResolver(path: "/opt/calyx-fixture/bin/calyx-session")
         let client = SessionDaemonClient(resolver: resolver, commandRunner: NeverCompletingCommandRunner())
 
@@ -83,8 +94,8 @@ final class SessionDaemonClientBoundedListTests: XCTestCase {
             "completes"
         )
         XCTAssertLessThan(
-            elapsed, 8.0,
-            "listAllBounded() must be bounded by its own timeout (~5s default), not the unbounded " +
+            elapsed, 3.0,
+            "listAllBounded() must be bounded by its own timeout (overridden to 1s here), not the unbounded " +
             "subprocess layer"
         )
     }

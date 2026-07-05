@@ -71,11 +71,21 @@ final class SessionBrowserModel {
     /// bound `AppDelegate`'s agent-resume path already applied to itself
     /// (see `SessionDaemonClientProtocol.listAllBounded()`'s own doc
     /// comment).
+    ///
+    /// R14-A sweep addendum item 1 (r14-fix-spec.md): guards on
+    /// `Task.isCancelled` before assigning `rows`, mirroring
+    /// `AppDelegate.listAllSessionsBounded`'s identical R12-A item 4
+    /// guard. Without this, a closed-window poll cancellation (once
+    /// R14-A propagates it into `listAllBounded()`'s own race) could
+    /// still resolve early with a result that arrives after the
+    /// caller gave up, wiping this SHARED model's rows with a stale
+    /// value -- an empty flash on reopen.
     func refresh() async {
         guard !isRefreshing else { return }
         isRefreshing = true
         defer { isRefreshing = false }
         let sessions = await daemonClient.listAllBounded()
+        guard !Task.isCancelled else { return }
         rows = sessions.map { info in
             let isAttached = surfaceMap.surfaceID(for: info.id) != nil
             return SessionBrowserRow(

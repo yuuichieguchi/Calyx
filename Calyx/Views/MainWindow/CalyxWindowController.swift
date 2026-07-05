@@ -57,6 +57,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// in `windowWillClose`.
     private var screenPollTask: Task<Void, Never>?
     private var expandTasks: [String: Task<Void, Never>] = [:]
+    /// R14-B sweep addendum item 2 (r14-fix-spec.md): tracks
+    /// `processChildExited`'s per-surface reconnect-decision `Task`,
+    /// keyed by surface ID like `diffTasks`/`expandTasks` above, so
+    /// `windowWillClose` can cancel it the same way it cancels every
+    /// other per-window `Task` instead of leaving it as the sole
+    /// untracked fire-and-forget one -- consistency/resource hygiene
+    /// (R14-B's longer 15s `sessionStateBoundTimeoutSeconds` bound
+    /// triples how long an orphaned one could linger).
+    private var childExitedTasks: [UUID: Task<Void, Never>] = [:]
     private var hasMoreCommits = true
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
@@ -1885,7 +1894,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         guard !isShuttingDown else { return }
         guard let surfaceID = findTab(for: surfaceView)?.0.registry.id(for: surfaceView) else { return }
 
-        Task { [weak self] in
+        // R14-B sweep addendum item 2 (r14-fix-spec.md): tracked in
+        // `childExitedTasks`, cancelled alongside its `diffTasks`/
+        // `expandTasks` siblings in `windowWillClose`, instead of being
+        // left as an untracked fire-and-forget `Task`.
+        childExitedTasks[surfaceID] = Task { [weak self] in
             await self?.sessionReconnectCoordinator.childExited(surfaceID: surfaceID)
         }
     }
@@ -2918,6 +2931,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         reviewStores.removeAll()
         for (_, task) in expandTasks { task.cancel() }
         expandTasks.removeAll()
+        for (_, task) in childExitedTasks { task.cancel() }
+        childExitedTasks.removeAll()
         refreshTask?.cancel()
         loadMoreTask?.cancel()
         screenPollTask?.cancel()
