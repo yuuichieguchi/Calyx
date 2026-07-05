@@ -152,27 +152,25 @@ final class SessionSpawnPlannerTests: XCTestCase {
         }
 
         XCTAssertTrue(isValidULID(sessionID), "sessionID must be a 26-character Crockford base32 ULID, got \(sessionID)")
-        // Ghostty wraps whatever `command` string we configure ITSELF
-        // as `<shell> -c "exec <command>"` -- it supplies its own
-        // leading `exec`, so our OWN synthesized command must never
-        // start with a second `exec` of its own (PATH-searched as a
-        // literal nonexistent program, producing "exec: exec: not
-        // found" in a real pane) nor a bare non-absolute word like a
-        // leading `HOME=<root>` env-assignment (resolved against the
-        // pane's cwd instead of exec'd, producing "No such file or
-        // directory" in a real pane) -- see
-        // SessionCommandSynthesizerHomeStampTests for both verbatim
-        // field failures and the full ghostty-compatibility contract.
-        // `/usr/bin/env` is immune to both: it is already absolute and
-        // it is not a second `exec` word.
-        XCTAssertTrue(command.hasPrefix("/usr/bin/env HOME="),
-                     "The synthesized command's first word must be exactly \"/usr/bin/env\" -- ghostty " +
-                     "already wraps our command as `<shell> -c \"exec <command>\"` itself, so our own " +
-                     "command must not add a second `exec` of its own nor start with a bare env-assignment " +
-                     "word")
-        XCTAssertEqual(argv, ["attach", sessionID, "--create", "--cwd", "/Users/dev/repo"],
-                       "The synthesized command must attach/create the exact sessionID returned alongside " +
-                       "it, positionally (matching the P2 CLI's AttachArgs, not a --id flag), and carry the " +
+        // Round-18 flags migration: the session root travels as the
+        // Rust CLI's own global --runtime-dir/--state-dir argv flags
+        // now, prepended ahead of the attach subcommand, rather than as
+        // a leading /usr/bin/env HOME=<root> env-assignment word -- see
+        // SessionCommandSynthesizerRuntimeStateDirFlagsTests for the
+        // full migration rationale.
+        XCTAssertFalse(command.contains("/usr/bin/env"),
+                       "The synthesized command must never wrap itself in /usr/bin/env any more -- the " +
+                       "session root now travels as --runtime-dir/--state-dir argv words directly to the binary")
+        XCTAssertFalse(command.contains("HOME="),
+                       "The synthesized command must never contain a HOME= word anywhere -- stamping HOME " +
+                       "was the old mechanism the round-18 flags migration retires")
+        let expectedRoot = SessionRootResolver().resolve()
+        XCTAssertEqual(argv, ["--runtime-dir", expectedRoot + "/.calyx/run",
+                              "--state-dir", expectedRoot + "/.calyx/state",
+                              "attach", sessionID, "--create", "--cwd", "/Users/dev/repo"],
+                       "The synthesized command must prepend the two global directory flags ahead of the " +
+                       "attach subcommand, then attach/create the exact sessionID returned alongside it, " +
+                       "positionally (matching the P2 CLI's AttachArgs, not a --id flag), and carry the " +
                        "context's cwd intact through /bin/sh -c regardless of the escaping strategy used")
     }
 

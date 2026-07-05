@@ -321,23 +321,25 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
 
     private let binaryPath: String?
     private let commandRunner: LSPCommandRunner
-    /// The environment every `commandRunner.run(...)` call below passes
-    /// to the `calyx-session` subprocess: a full copy of
-    /// `ProcessInfo.processInfo.environment` with only `HOME` overridden
-    /// to `rootResolver`'s resolved value -- never a bare `["HOME": ...]`
-    /// dict, which would make that single-key dictionary the non-nil
-    /// `base` `SystemCommandRunner.augmentedEnvironment(base:)` builds
-    /// from, silently dropping every other ambient variable (LANG, USER,
-    /// TERM, ...) that passing `nil` currently preserves via its own
-    /// `?? ambient` fallback. Stamping `HOME` here keeps every query
-    /// against the daemon resolving the identical session root that
-    /// `SessionCommandSynthesizer`'s `HOME=` stamp gives the attach
-    /// process for the same `rootResolver` (see
-    /// `SessionRootResolver.swift`'s header comment) -- with no override
-    /// (the default, real production use), this resolves to the real
-    /// `$HOME` already ambiently inherited today, so this is
-    /// behaviorally invisible for normal users.
-    private let environment: [String: String]
+    /// The `["--runtime-dir", "<root>/.calyx/run"]` pair every
+    /// `commandRunner.run(...)` call below prepends before its own
+    /// subcommand arguments, so `ls`/`kill`/`meta` ask the same daemon
+    /// socket directory `SessionCommandSynthesizer`'s synthesized attach
+    /// command spawns the daemon into for the same `rootResolver` (see
+    /// `SessionRootResolver.swift`'s header comment). The Rust CLI's
+    /// global `--runtime-dir` flag (`calyx-session/crates/cli/src/cli.rs:15-16`,
+    /// `global = true`) is what each of these three subcommands actually
+    /// consults to find the daemon's socket (`main.rs`'s dispatch passes
+    /// only `runtime_dir` through to each; `commands/mod.rs`'s
+    /// `resolve_runtime_dir`/`socket_path`). `--state-dir` is
+    /// deliberately never part of this: `state_dir` is resolved once,
+    /// daemon-internally, inside the already-running daemon process
+    /// itself (`commands/mod.rs:74`'s `default_home_subdir`), so none of
+    /// `ls`/`kill`/`meta` ever need it as a client-side argument -- with
+    /// no override (the default, real production use), this resolves to
+    /// `<real $HOME>/.calyx/run`, identical to the Rust CLI's own
+    /// default, so this is behaviorally invisible for normal users.
+    private let runtimeDirArgument: [String]
 
     /// Exposes the resolved binary path for tests
     /// (`SessionBinaryResolverTests`) that need to confirm this client
@@ -355,8 +357,8 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     /// asserts on `resolvedBinaryPath`/`.unreachable` without ever
     /// actually spawning a process) can ignore it. `rootResolver`
     /// defaults to `SessionRootResolver()` (real production use); see
-    /// `environment`'s doc comment for why every query stamps its
-    /// resolved value as `HOME`.
+    /// `runtimeDirArgument`'s doc comment for why every query prepends
+    /// its resolved value as `--runtime-dir`.
     init(
         resolver: SessionBinaryResolverProtocol,
         commandRunner: LSPCommandRunner = SystemCommandRunner(),
@@ -364,15 +366,13 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     ) {
         self.binaryPath = resolver.resolve()
         self.commandRunner = commandRunner
-        var environment = ProcessInfo.processInfo.environment
-        environment["HOME"] = rootResolver.resolve()
-        self.environment = environment
+        self.runtimeDirArgument = ["--runtime-dir", rootResolver.resolve() + "/.calyx/run"]
     }
 
     func sessionState(id: String) async -> SessionQueryResult {
         guard let binaryPath else { return .unreachable }
         guard let result = try? await commandRunner.run(
-            executable: binaryPath, arguments: ["ls", "--all", "--json"], workingDirectory: nil, environment: environment
+            executable: binaryPath, arguments: runtimeDirArgument + ["ls", "--all", "--json"], workingDirectory: nil, environment: nil
         ), result.exitCode == 0 else {
             return .unreachable
         }
@@ -420,10 +420,10 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     func kill(id: String) async {
         guard let binaryPath else { return }
         let commandRunner = self.commandRunner
-        let environment = self.environment
+        let runtimeDirArgument = self.runtimeDirArgument
         await Task {
             _ = try? await commandRunner.run(
-                executable: binaryPath, arguments: ["kill", id], workingDirectory: nil, environment: environment
+                executable: binaryPath, arguments: runtimeDirArgument + ["kill", id], workingDirectory: nil, environment: nil
             )
         }.value
     }
@@ -436,7 +436,7 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     func listAll() async -> [SessionInfo] {
         guard let binaryPath else { return [] }
         guard let result = try? await commandRunner.run(
-            executable: binaryPath, arguments: ["ls", "--all", "--json"], workingDirectory: nil, environment: environment
+            executable: binaryPath, arguments: runtimeDirArgument + ["ls", "--all", "--json"], workingDirectory: nil, environment: nil
         ), result.exitCode == 0 else {
             return []
         }
@@ -465,10 +465,10 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     func setMeta(id: String, key: String, value: String) async {
         guard let binaryPath else { return }
         let commandRunner = self.commandRunner
-        let environment = self.environment
+        let runtimeDirArgument = self.runtimeDirArgument
         await Task {
             _ = try? await commandRunner.run(
-                executable: binaryPath, arguments: ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: environment
+                executable: binaryPath, arguments: runtimeDirArgument + ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: nil
             )
         }.value
     }

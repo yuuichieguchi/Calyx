@@ -101,28 +101,30 @@ final class SessionCommandSynthesizerTests: XCTestCase {
         let command = SessionCommandSynthesizer.attachCommand(
             binaryPath: binaryPath, sessionID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", cwd: "/Users/dev/repo"
         )
-        // Ghostty wraps whatever `command` string we configure ITSELF
-        // as `<shell> -c "exec <command>"` -- it supplies its own
-        // leading `exec`, so our OWN synthesized command must never
-        // start with a second `exec` of its own (PATH-searched as a
-        // literal nonexistent program, producing "exec: exec: not
-        // found" in a real pane) nor a bare non-absolute word like a
-        // leading `HOME=<root>` env-assignment (resolved against the
-        // pane's cwd instead of exec'd, producing "No such file or
-        // directory" in a real pane) -- see
-        // SessionCommandSynthesizerHomeStampTests for both verbatim
-        // field failures and the full ghostty-compatibility contract.
-        // `/usr/bin/env` is immune to both: it is already absolute and
-        // it is not a second `exec` word.
-        XCTAssertTrue(command.hasPrefix("/usr/bin/env HOME="),
-                     "The command's first word must be exactly \"/usr/bin/env\" -- ghostty already wraps " +
-                     "our command as `<shell> -c \"exec <command>\"` itself, so our own command must not " +
-                     "add a second `exec` of its own nor start with a bare env-assignment word")
+        // Round-18 flags migration: the session root travels as the
+        // Rust CLI's own global --runtime-dir/--state-dir argv flags
+        // now (calyx-session/crates/cli/src/cli.rs:15-20), prepended
+        // ahead of the attach subcommand, rather than as a leading
+        // /usr/bin/env HOME=<root> env-assignment word -- see
+        // SessionCommandSynthesizerRuntimeStateDirFlagsTests for the
+        // full migration rationale and the retired ghostty-exec-
+        // wrapping saga that motivated (and then obsoleted) that env
+        // stamp.
+        XCTAssertFalse(command.contains("/usr/bin/env"),
+                       "The command must never wrap itself in /usr/bin/env any more -- the session root " +
+                       "now travels as --runtime-dir/--state-dir argv words directly to the binary")
+        XCTAssertFalse(command.contains("HOME="),
+                       "The command must never contain a HOME= word anywhere -- stamping HOME was the old " +
+                       "mechanism the round-18 flags migration retires")
 
         let argv = try runAndCaptureArgv(command, outputPath: outputPath)
-        XCTAssertEqual(argv, ["attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", "/Users/dev/repo"],
-                       "attach must receive exactly these positional/flag arguments in order — sessionID " +
-                       "is positional (AttachArgs.id has no #[arg(long)]), not a --id flag")
+        let expectedRoot = SessionRootResolver().resolve()
+        XCTAssertEqual(argv, ["--runtime-dir", expectedRoot + "/.calyx/run",
+                              "--state-dir", expectedRoot + "/.calyx/state",
+                              "attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", "/Users/dev/repo"],
+                       "attach must receive exactly these flag/positional/flag arguments in order — the two " +
+                       "global directory flags ahead of the subcommand, then sessionID positional (AttachArgs.id " +
+                       "has no #[arg(long)]), not a --id flag")
     }
 
     // MARK: - cwd
@@ -141,8 +143,11 @@ final class SessionCommandSynthesizerTests: XCTestCase {
             binaryPath: binaryPath, sessionID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", cwd: cwd
         )
         let argv = try runAndCaptureArgv(command, outputPath: outputPath)
+        let expectedRoot = SessionRootResolver().resolve()
 
-        XCTAssertEqual(argv, ["attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", cwd],
+        XCTAssertEqual(argv, ["--runtime-dir", expectedRoot + "/.calyx/run",
+                              "--state-dir", expectedRoot + "/.calyx/state",
+                              "attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", cwd],
                        "cwd containing spaces, a single quote, and Japanese characters must survive " +
                        "/bin/sh -c parsing byte-for-byte, regardless of the escaping strategy used")
     }
@@ -163,10 +168,12 @@ final class SessionCommandSynthesizerTests: XCTestCase {
             binaryPath: binaryPath, sessionID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", cwd: "/Users/dev/repo", name: name
         )
         let argv = try runAndCaptureArgv(command, outputPath: outputPath)
+        let expectedRoot = SessionRootResolver().resolve()
 
         XCTAssertEqual(
             argv,
-            ["attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", "/Users/dev/repo", "--name", name],
+            ["--runtime-dir", expectedRoot + "/.calyx/run", "--state-dir", expectedRoot + "/.calyx/state",
+             "attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", "/Users/dev/repo", "--name", name],
             "A non-nil name must append --name <name> at the end, surviving /bin/sh -c intact"
         )
     }
@@ -200,8 +207,11 @@ final class SessionCommandSynthesizerTests: XCTestCase {
             binaryPath: binaryPath, sessionID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", cwd: "/Users/dev/repo"
         )
         let argv = try runAndCaptureArgv(command, outputPath: outputPath)
+        let expectedRoot = SessionRootResolver().resolve()
 
-        XCTAssertEqual(argv, ["attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", "/Users/dev/repo"],
+        XCTAssertEqual(argv, ["--runtime-dir", expectedRoot + "/.calyx/run",
+                              "--state-dir", expectedRoot + "/.calyx/state",
+                              "attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", "/Users/dev/repo"],
                        "A binaryPath containing a space must still be exec'd correctly as a single path " +
                        "— if escaping were dropped, /bin/sh would split it into two words and exec would " +
                        "fail to find anything, so the dumper script would never run and capture this argv at all")
@@ -229,8 +239,11 @@ final class SessionCommandSynthesizerTests: XCTestCase {
             binaryPath: binaryPath, sessionID: maliciousSessionID, cwd: "/Users/dev/repo"
         )
         let argv = try runAndCaptureArgv(command, outputPath: outputPath)
+        let expectedRoot = SessionRootResolver().resolve()
 
-        XCTAssertEqual(argv, ["attach", maliciousSessionID, "--create", "--cwd", "/Users/dev/repo"],
+        XCTAssertEqual(argv, ["--runtime-dir", expectedRoot + "/.calyx/run",
+                              "--state-dir", expectedRoot + "/.calyx/state",
+                              "attach", maliciousSessionID, "--create", "--cwd", "/Users/dev/repo"],
                        "sessionID containing shell metacharacters must survive /bin/sh -c parsing intact " +
                        "as a single argument, not be interpreted as separate shell tokens/commands — a " +
                        "freshly generated ULID never needs this, but a corrupted/malicious persisted " +

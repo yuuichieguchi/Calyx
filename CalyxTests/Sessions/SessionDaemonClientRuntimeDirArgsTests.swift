@@ -1,58 +1,45 @@
 //
-//  SessionDaemonClientHomeEnvironmentTests.swift
+//  SessionDaemonClientRuntimeDirArgsTests.swift
 //  CalyxTests
 //
-//  TDD Red phase (session-root-resolution fix round): SessionDaemonClient
-//  passes `environment: nil` to every LSPCommandRunner.run(...) call
-//  today (listAll/sessionState/kill/setMeta), so the calyx-session
-//  subprocess spawned for each query inherits whatever ambient HOME
-//  Calyx.app itself happens to have -- which the daemon's own CLI uses
-//  to resolve its state root ($HOME/.calyx, see
-//  calyx-session/crates/daemon/src/session.rs).
-//  SessionCommandSynthesizerHomeStampTests covers the OTHER half of
-//  this defect (the attach process's own HOME, stamped into the
-//  synthesized shell command); this file covers the daemon-QUERY half,
-//  so both halves resolve the IDENTICAL root via the same injectable
-//  `SessionRootResolverProtocol` seam (see SessionRootResolverTests),
-//  never independently -- which is the proven live failure mode this
-//  whole round fixes: with mismatched HOMEs, a query against a session
-//  that is genuinely alive and attached reports .unreachable.
+//  TDD Red phase (round 18, G5 flags migration): supersedes the former
+//  SessionDaemonClientHomeEnvironmentTests, which passed every
+//  commandRunner.run(...) call a full ProcessInfo-copy environment with
+//  only "HOME" overridden to the resolved session root -- see
+//  SessionCommandSynthesizerRuntimeStateDirFlagsTests's header for the
+//  full HOME-stamp-to-flags migration rationale shared by both halves
+//  of this fix. The Rust CLI's global `--runtime-dir` flag
+//  (calyx-session/crates/cli/src/cli.rs:15-16, `global = true`) is what
+//  `ls`/`kill`/`meta` actually consult to find the daemon's socket
+//  (`main.rs`'s dispatch at lines 21-24 passes only `parsed.runtime_dir`
+//  through to each; `commands/mod.rs`'s `resolve_runtime_dir` at lines
+//  60-64 and `socket_path` at lines 80-83) -- so the daemon-query half
+//  of this fix moves from an env override to an explicit
+//  `--runtime-dir <root>/.calyx/run` argument prepended before each
+//  subcommand's own arguments, exactly mirroring the synthesized attach
+//  command's own flags.
 //
-//  This file targets a new `rootResolver:` init parameter on
-//  `SessionDaemonClient`, which does NOT exist in the codebase yet.
-//  Following this codebase's established convention for new-API RED
-//  tests (see SessionDaemonClientBoundedListTests' header comment,
-//  itself citing CalyxWindowControllerFullScreenTests), this file is
-//  expected to FAIL TO COMPILE until the TDD Green phase adds it --
-//  that compile failure IS this contract's RED evidence.
+//  `--state-dir` is deliberately NOT part of any of these four calls:
+//  `ls`/`kill`/`meta` never receive it at all (`main.rs`'s dispatch
+//  passes only `runtime_dir` to each of those three); `state_dir` is
+//  resolved once, daemon-internally, inside the (already-running, for
+//  every one of these four calls) daemon process itself
+//  (`commands/mod.rs:74`'s `default_home_subdir`).
 //
-//  IMPORTANT FOR GREEN (verified by inspection of
-//  SystemCommandRunner.augmentedEnvironment(base:), which does
-//  `base ?? ProcessInfo.processInfo.environment` then overrides only
-//  "PATH"): passing a bare `["HOME": root]` as the `environment:`
-//  argument would make THAT single-key dictionary the non-nil `base`,
-//  silently dropping every other ambient variable (LANG, USER, TERM,
-//  ...) that `environment: nil` currently preserves via the `?? ambient`
-//  fallback -- PATH alone would still get re-added by
-//  augmentedEnvironment, but nothing else would. Green must build the
-//  environment dict by copying `ProcessInfo.processInfo.environment`
-//  and overriding just the "HOME" key (mirrring
-//  `SystemCommandRunner.augmentedEnvironment(base:)`'s own copy-and-
-//  override shape for PATH), not construct a bare single-key dict, so
-//  today's full-ambient-inheritance behavior is preserved for every key
-//  besides HOME.
-//
-//  Existing-behavior guard: with no HOME override (SessionRootResolver's
-//  default, real production use), the resolved root equals the real
-//  $HOME already ambiently inherited today, so normal users see no
-//  behavioral change to what the daemon queries observe -- only a
-//  mismatched-HOME environment (this fix's actual target) changes what
-//  gets passed.
+//  This file replaces SessionDaemonClientHomeEnvironmentTests (which
+//  asserted the OLD environment-copy-with-HOME-override contract, now
+//  retired).
 //
 //  Coverage:
-//  - listAll / sessionState / kill / setMeta ALL pass a non-nil
-//    environment dict whose "HOME" key is the injected rootResolver's
-//    resolved value, to the underlying commandRunner -- not nil
+//  - listAll / sessionState / kill / setMeta each prepend
+//    ["--runtime-dir", "<rootResolver's root>/.calyx/run"] before their
+//    own subcommand arguments
+//  - environment goes back to nil for all four -- no full-ProcessInfo-
+//    copy override needed any more, since the session root now travels
+//    as an argv word instead
+//  - with no rootResolver override, the composed --runtime-dir value
+//    equals <real $HOME>/.calyx/run (regression guard against the Rust
+//    CLI's own default)
 //
 
 import XCTest
@@ -68,14 +55,14 @@ private struct FakeRootResolver: SessionRootResolverProtocol {
     func resolve() -> String { root }
 }
 
-/// Records every environment dict `run(...)` was called with, standing
-/// in for the real calyx-session subprocess call so the test can
-/// inspect what SessionDaemonClient actually hands the command runner
-/// without spawning a real process. An actor (mirrors LSPInstaller's
-/// own `MockCommandRunner`) so the several awaited calls this test
-/// drives sequentially can safely append to shared state.
+/// Records every (arguments, environment) pair `run(...)` was called
+/// with, standing in for the real calyx-session subprocess call so the
+/// test can inspect what SessionDaemonClient actually hands the command
+/// runner without spawning a real process. An actor (mirrors
+/// LSPInstaller's own MockCommandRunner) so the several awaited calls
+/// this test drives sequentially can safely append to shared state.
 private actor RecordingCommandRunner: LSPCommandRunner {
-    private(set) var recordedEnvironments: [[String: String]?] = []
+    private(set) var recordedCalls: [(arguments: [String], environment: [String: String]?)] = []
 
     func run(
         executable: String,
@@ -83,38 +70,73 @@ private actor RecordingCommandRunner: LSPCommandRunner {
         workingDirectory: URL?,
         environment: [String: String]?
     ) async throws -> CommandResult {
-        recordedEnvironments.append(environment)
+        recordedCalls.append((arguments, environment))
         return CommandResult(exitCode: 0, stdout: "[]", stderr: "")
     }
 
     func locate(_ executable: String) async -> URL? { nil }
 }
 
-final class SessionDaemonClientHomeEnvironmentTests: XCTestCase {
+final class SessionDaemonClientRuntimeDirArgsTests: XCTestCase {
 
-    func test_allFourOperations_passResolvedRootAsHOMEInEnvironment_notNil() async {
+    func test_allFourOperations_prependRuntimeDirFlagBeforeSubcommand_environmentStaysNil() async {
         let runner = RecordingCommandRunner()
         let client = SessionDaemonClient(
             resolver: FixedBinaryResolver(path: "/opt/calyx-fixture/bin/calyx-session"),
             commandRunner: runner,
             rootResolver: FakeRootResolver(root: "/opt/calyx-fixture/custom-home")
         )
+        let runtimeDirFlag = ["--runtime-dir", "/opt/calyx-fixture/custom-home/.calyx/run"]
 
         _ = await client.listAll()
         _ = await client.sessionState(id: "01ARZ3NDEKTSV4RRFFQ69G5FAV")
         await client.kill(id: "01ARZ3NDEKTSV4RRFFQ69G5FAV")
         await client.setMeta(id: "01ARZ3NDEKTSV4RRFFQ69G5FAV", key: "k", value: "v")
 
-        let recorded = await runner.recordedEnvironments
+        let recorded = await runner.recordedCalls
         XCTAssertEqual(recorded.count, 4,
                        "listAll, sessionState, kill, and setMeta must each invoke the command runner exactly " +
                        "once for this test to have observed all four operations")
-        for (index, env) in recorded.enumerated() {
-            XCTAssertEqual(env?["HOME"], "/opt/calyx-fixture/custom-home",
-                          "Call #\(index) must pass an explicit, non-nil environment carrying the injected " +
-                          "rootResolver's resolved root as HOME -- an implicit-inherit nil risks disagreeing " +
-                          "with whatever HOME the attach process on the other side of the same session was " +
-                          "stamped with (see SessionCommandSynthesizerHomeStampTests)")
+
+        XCTAssertEqual(recorded[0].arguments, runtimeDirFlag + ["ls", "--all", "--json"],
+                       "listAll must prepend --runtime-dir <root>/.calyx/run before its ls --all --json " +
+                       "subcommand arguments")
+        XCTAssertEqual(recorded[1].arguments, runtimeDirFlag + ["ls", "--all", "--json"],
+                       "sessionState must prepend --runtime-dir <root>/.calyx/run before the same ls --all " +
+                       "--json subcommand it shares with listAll")
+        XCTAssertEqual(recorded[2].arguments, runtimeDirFlag + ["kill", "01ARZ3NDEKTSV4RRFFQ69G5FAV"],
+                       "kill must prepend --runtime-dir <root>/.calyx/run before its kill <id> subcommand " +
+                       "arguments")
+        XCTAssertEqual(recorded[3].arguments, runtimeDirFlag + ["meta", "set", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "k=v"],
+                       "setMeta must prepend --runtime-dir <root>/.calyx/run before its meta set <id> " +
+                       "<key>=<value> subcommand arguments")
+
+        for (index, call) in recorded.enumerated() {
+            XCTAssertNil(call.environment,
+                         "Call #\(index) must pass a nil environment -- the session root is now conveyed via " +
+                         "the --runtime-dir argument, not an env override, so this client no longer needs its " +
+                         "own full-ProcessInfo-copy environment at all")
         }
+    }
+
+    func test_defaultRootResolver_composesRealHOMECalyxRunDir() async {
+        let runner = RecordingCommandRunner()
+        // No rootResolver override: exercises the real production
+        // default (SessionRootResolver()).
+        let client = SessionDaemonClient(
+            resolver: FixedBinaryResolver(path: "/opt/calyx-fixture/bin/calyx-session"),
+            commandRunner: runner
+        )
+
+        _ = await client.listAll()
+
+        let recorded = await runner.recordedCalls
+        let expectedRoot = SessionRootResolver().resolve()
+        XCTAssertEqual(recorded.first?.arguments,
+                       ["--runtime-dir", expectedRoot + "/.calyx/run", "ls", "--all", "--json"],
+                       "With no rootResolver override (real production use), the composed --runtime-dir " +
+                       "value must equal <real $HOME>/.calyx/run -- identical to the Rust CLI's own " +
+                       "default_home_subdir fallback (calyx-session/crates/cli/src/commands/mod.rs:74), so " +
+                       "behavior is unchanged from today for every normal user")
     }
 }
