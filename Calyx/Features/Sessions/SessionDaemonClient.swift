@@ -321,6 +321,23 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
 
     private let binaryPath: String?
     private let commandRunner: LSPCommandRunner
+    /// The environment every `commandRunner.run(...)` call below passes
+    /// to the `calyx-session` subprocess: a full copy of
+    /// `ProcessInfo.processInfo.environment` with only `HOME` overridden
+    /// to `rootResolver`'s resolved value -- never a bare `["HOME": ...]`
+    /// dict, which would make that single-key dictionary the non-nil
+    /// `base` `SystemCommandRunner.augmentedEnvironment(base:)` builds
+    /// from, silently dropping every other ambient variable (LANG, USER,
+    /// TERM, ...) that passing `nil` currently preserves via its own
+    /// `?? ambient` fallback. Stamping `HOME` here keeps every query
+    /// against the daemon resolving the identical session root that
+    /// `SessionCommandSynthesizer`'s `HOME=` stamp gives the attach
+    /// process for the same `rootResolver` (see
+    /// `SessionRootResolver.swift`'s header comment) -- with no override
+    /// (the default, real production use), this resolves to the real
+    /// `$HOME` already ambiently inherited today, so this is
+    /// behaviorally invisible for normal users.
+    private let environment: [String: String]
 
     /// Exposes the resolved binary path for tests
     /// (`SessionBinaryResolverTests`) that need to confirm this client
@@ -336,16 +353,26 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     /// defaults to the real `SystemCommandRunner`; tests that don't
     /// need this seam (e.g. `SessionBinaryResolverTests`, which only
     /// asserts on `resolvedBinaryPath`/`.unreachable` without ever
-    /// actually spawning a process) can ignore it.
-    init(resolver: SessionBinaryResolverProtocol, commandRunner: LSPCommandRunner = SystemCommandRunner()) {
+    /// actually spawning a process) can ignore it. `rootResolver`
+    /// defaults to `SessionRootResolver()` (real production use); see
+    /// `environment`'s doc comment for why every query stamps its
+    /// resolved value as `HOME`.
+    init(
+        resolver: SessionBinaryResolverProtocol,
+        commandRunner: LSPCommandRunner = SystemCommandRunner(),
+        rootResolver: SessionRootResolverProtocol = SessionRootResolver()
+    ) {
         self.binaryPath = resolver.resolve()
         self.commandRunner = commandRunner
+        var environment = ProcessInfo.processInfo.environment
+        environment["HOME"] = rootResolver.resolve()
+        self.environment = environment
     }
 
     func sessionState(id: String) async -> SessionQueryResult {
         guard let binaryPath else { return .unreachable }
         guard let result = try? await commandRunner.run(
-            executable: binaryPath, arguments: ["ls", "--all", "--json"], workingDirectory: nil, environment: nil
+            executable: binaryPath, arguments: ["ls", "--all", "--json"], workingDirectory: nil, environment: environment
         ), result.exitCode == 0 else {
             return .unreachable
         }
@@ -393,9 +420,10 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     func kill(id: String) async {
         guard let binaryPath else { return }
         let commandRunner = self.commandRunner
+        let environment = self.environment
         await Task {
             _ = try? await commandRunner.run(
-                executable: binaryPath, arguments: ["kill", id], workingDirectory: nil, environment: nil
+                executable: binaryPath, arguments: ["kill", id], workingDirectory: nil, environment: environment
             )
         }.value
     }
@@ -408,7 +436,7 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     func listAll() async -> [SessionInfo] {
         guard let binaryPath else { return [] }
         guard let result = try? await commandRunner.run(
-            executable: binaryPath, arguments: ["ls", "--all", "--json"], workingDirectory: nil, environment: nil
+            executable: binaryPath, arguments: ["ls", "--all", "--json"], workingDirectory: nil, environment: environment
         ), result.exitCode == 0 else {
             return []
         }
@@ -437,9 +465,10 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
     func setMeta(id: String, key: String, value: String) async {
         guard let binaryPath else { return }
         let commandRunner = self.commandRunner
+        let environment = self.environment
         await Task {
             _ = try? await commandRunner.run(
-                executable: binaryPath, arguments: ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: nil
+                executable: binaryPath, arguments: ["meta", "set", id, "\(key)=\(value)"], workingDirectory: nil, environment: environment
             )
         }.value
     }

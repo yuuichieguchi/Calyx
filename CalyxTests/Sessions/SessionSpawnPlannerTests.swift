@@ -152,8 +152,15 @@ final class SessionSpawnPlannerTests: XCTestCase {
         }
 
         XCTAssertTrue(isValidULID(sessionID), "sessionID must be a 26-character Crockford base32 ULID, got \(sessionID)")
-        XCTAssertTrue(command.hasPrefix("exec "),
-                     "The synthesized command must exec into calyx-session directly (SessionCommandSynthesizer's contract)")
+        // Since the session-root-resolution fix round, the command
+        // gained a leading `HOME=<root>` env-assignment word ahead of
+        // `exec` (see SessionCommandSynthesizerHomeStampTests), so the
+        // direct-exec invariant this test protects is now checked as
+        // "starts with the env-assignment word, immediately followed by
+        // exec" rather than a bare `hasPrefix("exec ")`.
+        XCTAssertTrue(command.hasPrefix("HOME=") && command.contains(" exec "),
+                     "The synthesized command must stamp a leading HOME= env-assignment word, then exec into " +
+                     "calyx-session directly (SessionCommandSynthesizer's contract)")
         XCTAssertEqual(argv, ["attach", sessionID, "--create", "--cwd", "/Users/dev/repo"],
                        "The synthesized command must attach/create the exact sessionID returned alongside " +
                        "it, positionally (matching the P2 CLI's AttachArgs, not a --id flag), and carry the " +

@@ -63,12 +63,23 @@ enum SessionCommandSynthesizer {
         return String(decoding: bytes, as: UTF8.self)
     }
 
-    /// Builds `exec <binaryPath> attach <sessionID> --create --cwd
-    /// <cwd> [--name <name>]`. `sessionID` is positional, matching the
-    /// P2 CLI's `AttachArgs` (`calyx-session/crates/cli/src/cli.rs`),
+    /// Builds `HOME=<root> exec <binaryPath> attach <sessionID> --create
+    /// --cwd <cwd> [--name <name>]`. `sessionID` is positional, matching
+    /// the P2 CLI's `AttachArgs` (`calyx-session/crates/cli/src/cli.rs`),
     /// which has no `--id` flag.
     ///
-    /// The leading `exec` replaces the intermediate `/bin/sh` process
+    /// The leading `HOME=<root>` env-assignment word stamps
+    /// `rootResolver`'s resolved session root explicitly as the exec'd
+    /// process's own `$HOME`, so the attach process's state-root
+    /// resolution (`calyx-session/crates/daemon/src/session.rs`'s
+    /// `default_home_subdir`, which reads the literal `HOME` env var)
+    /// can never disagree with whatever `SessionDaemonClient` resolved
+    /// for the same `rootResolver` -- the pane command must not depend
+    /// on whatever ambient env ghostty chooses to pass its `/bin/sh -c`
+    /// invocation. `shSafeToken(_:)` applies here exactly like every
+    /// other user/attacker-influenced token below.
+    ///
+    /// The following `exec` replaces the intermediate `/bin/sh` process
     /// with `calyx-session` itself (rather than leaving `sh` as a
     /// surviving parent), so the ghostty surface's child process *is*
     /// `calyx-session attach`, not a shell wrapping it — required for
@@ -90,9 +101,10 @@ enum SessionCommandSynthesizer {
         binaryPath: String,
         sessionID: String,
         cwd: String,
-        name: String? = nil
+        name: String? = nil,
+        rootResolver: SessionRootResolverProtocol = SessionRootResolver()
     ) -> String {
-        var command = "exec \(shSafeToken(binaryPath)) attach \(shSafeToken(sessionID)) --create --cwd \(shSafeToken(cwd))"
+        var command = "HOME=\(shSafeToken(rootResolver.resolve())) exec \(shSafeToken(binaryPath)) attach \(shSafeToken(sessionID)) --create --cwd \(shSafeToken(cwd))"
         if let name {
             command += " --name \(shSafeToken(name))"
         }
@@ -110,12 +122,17 @@ enum SessionCommandSynthesizer {
     /// binary-path-then-command-synthesis copies in
     /// `AppDelegate.createSurfaceWithPwd` and
     /// `CalyxWindowController.performReconnect`.
+    ///
+    /// `rootResolver` defaults to `SessionRootResolver()` (real
+    /// production use); see `attachCommand(binaryPath:sessionID:cwd:
+    /// name:rootResolver:)`'s doc comment for why the stamp exists.
     static func reattachCommand(
         sessionID: String,
         cwd: String,
-        resolver: SessionBinaryResolverProtocol = SessionBinaryResolver()
+        resolver: SessionBinaryResolverProtocol = SessionBinaryResolver(),
+        rootResolver: SessionRootResolverProtocol = SessionRootResolver()
     ) -> String? {
         guard let binaryPath = resolver.resolve() else { return nil }
-        return attachCommand(binaryPath: binaryPath, sessionID: sessionID, cwd: cwd)
+        return attachCommand(binaryPath: binaryPath, sessionID: sessionID, cwd: cwd, rootResolver: rootResolver)
     }
 }

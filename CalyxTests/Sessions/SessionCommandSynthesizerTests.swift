@@ -101,8 +101,15 @@ final class SessionCommandSynthesizerTests: XCTestCase {
         let command = SessionCommandSynthesizer.attachCommand(
             binaryPath: binaryPath, sessionID: "01ARZ3NDEKTSV4RRFFQ69G5FAV", cwd: "/Users/dev/repo"
         )
-        XCTAssertTrue(command.hasPrefix("exec "),
-                     "The command must exec into calyx-session directly, not run it as a plain subcommand")
+        // Since the session-root-resolution fix round, the command
+        // gained a leading `HOME=<root>` env-assignment word ahead of
+        // `exec` (see SessionCommandSynthesizerHomeStampTests), so the
+        // direct-exec invariant this test protects is now checked as
+        // "starts with the env-assignment word, immediately followed by
+        // exec" rather than a bare `hasPrefix("exec ")`.
+        XCTAssertTrue(command.hasPrefix("HOME=") && command.contains(" exec "),
+                     "The command must stamp a leading HOME= env-assignment word, then exec into " +
+                     "calyx-session directly, not run it as a plain subcommand")
 
         let argv = try runAndCaptureArgv(command, outputPath: outputPath)
         XCTAssertEqual(argv, ["attach", "01ARZ3NDEKTSV4RRFFQ69G5FAV", "--create", "--cwd", "/Users/dev/repo"],
