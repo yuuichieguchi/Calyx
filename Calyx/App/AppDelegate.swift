@@ -1278,12 +1278,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
 
-        if let oldLeafID, let sessionRef = tab.sessionRefs[oldLeafID],
-           let command = SessionCommandSynthesizer.reattachCommand(sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()) {
-            guard let surfaceID = createRegistrySurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: command, oldLeafID: oldLeafID) else {
-                return nil
+        if let oldLeafID, let sessionRef = tab.sessionRefs[oldLeafID] {
+            let command: String?
+            if let host = sessionRef.host {
+                command = SessionCommandSynthesizer.remoteAttachCommand(
+                    host: host, sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()
+                )
+            } else {
+                command = SessionCommandSynthesizer.reattachCommand(
+                    sessionID: sessionRef.sessionID, cwd: tab.pwd ?? NSHomeDirectory()
+                )
             }
-            return (surfaceID, sessionRef.sessionID)
+            #if DEBUG
+            _createSurfaceWithPwdCommandObserverForTesting?(oldLeafID, command)
+            #endif
+            if let command {
+                guard let surfaceID = createRegistrySurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: command, oldLeafID: oldLeafID) else {
+                    return nil
+                }
+                return (surfaceID, sessionRef.sessionID)
+            }
+        } else {
+            #if DEBUG
+            _createSurfaceWithPwdCommandObserverForTesting?(oldLeafID, nil)
+            #endif
         }
         guard let surfaceID = createRegistrySurface(tab: tab, app: app, config: config, pwd: tab.pwd, command: nil, oldLeafID: oldLeafID) else {
             return nil
@@ -1323,6 +1341,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// await from a test. `nil` (the default) leaves production
     /// behavior unchanged. DO NOT use from production code.
     var _createSurfaceWithPwdOfferAgentResumeCompletedHookForTesting: (() -> Void)?
+
+    /// Test seam (P5, remote sessions, contract R2): when non-nil,
+    /// called with `(oldLeafID, command)` from inside
+    /// `createSurfaceWithPwd`, immediately before `createRegistrySurface`
+    /// is invoked, in both of that method's branches -- the
+    /// `sessionRef`-carrying branch (with its local `reattachCommand` or
+    /// remote `remoteAttachCommand` result, either of which may itself be
+    /// `nil`) and the plain-passthrough branch (`command` always `nil`).
+    /// Added as a second, independent observer alongside
+    /// `_createSurfaceWithPwdHookForTesting` rather than changing that
+    /// hook's signature, since every existing caller of it only needs the
+    /// resulting surfaceID, never the command string. `nil` (the default)
+    /// leaves production behavior unchanged. DO NOT use from production
+    /// code.
+    var _createSurfaceWithPwdCommandObserverForTesting: ((UUID?, String?) -> Void)?
     #endif
 
     /// Thin wrapper around the one actually-unsafe-to-test call

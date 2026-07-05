@@ -145,6 +145,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// NOT use from production code.
     var _performReconnectSurfaceCreationHookForTesting: (() -> UUID?)?
 
+    /// Test seam (P5, remote sessions, contract R3): when non-nil, called
+    /// with the synthesized `command` from inside `performReconnect`,
+    /// immediately after it is computed and before `createReconnectSurface`
+    /// is invoked. Mirrors `AppDelegate
+    /// ._createSurfaceWithPwdCommandObserverForTesting`'s identical
+    /// reasoning: `_performReconnectSurfaceCreationHookForTesting` only
+    /// ever needs the resulting surfaceID, never the command string, so
+    /// this is a second, independent observer rather than a change to
+    /// that hook's signature. `nil` (the default) leaves production
+    /// behavior unchanged. DO NOT use from production code.
+    var _performReconnectCommandObserverForTesting: ((String?) -> Void)?
+
     /// Test seam (round-18 G6 RED phase): when non-nil, called INSTEAD of
     /// the real `SessionDaemonClient.shared.listAllBounded()` daemon query
     /// inside `reconnectGraceProbe(sessionID:)`, mirroring
@@ -2378,10 +2390,27 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private func performReconnect(oldSurfaceID: UUID, sessionID: String) {
         guard let tab = findTab(surfaceID: oldSurfaceID) else { return }
         guard let app = GhosttyAppController.shared.app, let window = self.window else { return }
-        guard let command = SessionCommandSynthesizer.reattachCommand(sessionID: sessionID, cwd: tab.pwd ?? NSHomeDirectory()) else {
-            logger.error("No calyx-session binary resolvable; cannot reconnect session \(sessionID, privacy: .public)")
-            return
+
+        // Read BEFORE the leaf remap below overwrites tab.sessionRefs'
+        // old key -- tab.sessionRefs is keyed by leaf (== surface) UUID,
+        // the same convention AppDelegate.restoreTabSurfaces/
+        // createSurfaceWithPwd already rely on.
+        let host = tab.sessionRefs[oldSurfaceID]?.host
+        let command: String
+        if let host {
+            command = SessionCommandSynthesizer.remoteAttachCommand(
+                host: host, sessionID: sessionID, cwd: tab.pwd ?? NSHomeDirectory()
+            )
+        } else {
+            guard let localCommand = SessionCommandSynthesizer.reattachCommand(sessionID: sessionID, cwd: tab.pwd ?? NSHomeDirectory()) else {
+                logger.error("No calyx-session binary resolvable; cannot reconnect session \(sessionID, privacy: .public)")
+                return
+            }
+            command = localCommand
         }
+        #if DEBUG
+        _performReconnectCommandObserverForTesting?(command)
+        #endif
 
         var config = GhosttyFFI.surfaceConfigNew()
         config.scale_factor = Double(window.backingScaleFactor)
@@ -2444,12 +2473,42 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // equals newSurfaceID, so that second attempt now owns the
         // attempt count, and this stale confirmation must not wrongly
         // reset it out from under an unrelated, still-in-progress retry.
+        //
+        // P5 (remote sessions): `reconnectGraceProbe` queries the LOCAL
+        // calyx-session daemon, which can never have a matching
+        // SessionInfo for a REMOTE session (its daemon lives entirely on
+        // the remote host) -- the probe would forever report
+        // `.notEstablished`, so a remote pane's attempt count would never
+        // reset, and independent ssh disconnects occurring days apart
+        // would wrongly accumulate toward the same permanent
+        // `maxReconnectAttempts` give-up cap instead of each recovering
+        // independently. For a remote session (`isRemote`, captured from
+        // the same `host` read above before the leaf remap), establishment
+        // therefore falls back to the surface-survival check ALONE --
+        // exactly the pre-G6 semantics -- without ever consulting
+        // `reconnectGraceProbe`. Local semantics are unchanged: the probe
+        // is still required. ACCEPTED TRADEOFF: a positive LOCAL probe of
+        // a REMOTE session is structurally impossible in v1 (no local
+        // knowledge of remote daemon state), so the G6 unbounded-slow-loop
+        // risk (an attach process dying slower than the grace window keeps
+        // resetting the attempt count every cycle) is knowingly accepted,
+        // unmitigated, for remote panes -- bounded in practice by ssh's
+        // own connection failures being comparatively slow (seconds, not
+        // the sub-second churn G6's local-daemon scenario produced). A
+        // second, adjacent v1 limitation follows from the same root cause:
+        // see `SessionReconnectCoordinator.childExited`'s doc comment for
+        // why a genuinely-exited remote session takes the reconnect-
+        // attempts-then-giveUp route instead of the clean `.closePane`.
+        let isRemote = host != nil
         reconnectEstablishGraceTasks.insert(newSurfaceID, task: Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(Self.reconnectEstablishGraceMilliseconds))
             guard let self else { return }
-            if !Task.isCancelled, SessionSurfaceMap.shared.surfaceID(for: sessionID) == newSurfaceID,
-               await self.reconnectGraceProbe(sessionID: sessionID) == .established {
-                self.sessionReconnectCoordinator.markEstablished(sessionID: sessionID)
+            if !Task.isCancelled, SessionSurfaceMap.shared.surfaceID(for: sessionID) == newSurfaceID {
+                if isRemote {
+                    self.sessionReconnectCoordinator.markEstablished(sessionID: sessionID)
+                } else if await self.reconnectGraceProbe(sessionID: sessionID) == .established {
+                    self.sessionReconnectCoordinator.markEstablished(sessionID: sessionID)
+                }
             }
             self.reconnectEstablishGraceTasks.removeValue(forKey: newSurfaceID)
         })

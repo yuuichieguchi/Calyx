@@ -96,6 +96,19 @@ final class SessionReconnectCoordinator {
     /// being managed for reconnect purposes regardless of
     /// `SessionSettings.persistentSessionsEnabled`, which only affects
     /// `SessionSpawnPlanner`'s decision for *new* surfaces.
+    ///
+    /// P5 (remote sessions) ACCEPTED V1 LIMITATION: `daemonClient
+    /// .sessionStateBounded(id:)` queries the LOCAL calyx-session daemon
+    /// only, so it can never return `.exited` for a REMOTE session --
+    /// the local daemon simply has no record of a session whose daemon
+    /// lives entirely on the remote host (see `CalyxWindowController
+    /// .performReconnect`'s grace-Task doc comment for the same root
+    /// cause affecting establishment). A genuinely-exited remote session
+    /// therefore always falls into the `.running, .unreachable` branch
+    /// below and takes the reconnect-attempts-then-`.giveUp` route
+    /// (`maxReconnectAttempts`, currently 5) instead of the clean,
+    /// immediate `.closePane` a local exited session gets. No behavior
+    /// change this round; documented as a known gap for a later cycle.
     func childExited(surfaceID: UUID) async {
         guard let sessionID = surfaceMap.sessionID(for: surfaceID) else { return }
         guard !inFlightSurfaceIDs.contains(surfaceID) else { return }
