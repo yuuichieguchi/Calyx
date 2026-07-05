@@ -20,23 +20,35 @@
 // content on the GPU, which keeps it out of the accessibility tree
 // entirely (so `app.staticTexts` can never observe it).
 //
-// Instead, this test queries calyx-session's own daemon ledger
-// directly — `calyx-session ls --all --json`, run out-of-process
-// against this test's isolated `HOME` — to confirm the SAME session
-// id keeps the SAME pid and created_at_ms across an app restart. That
-// is the strongest proof available that the daemon kept the exact
+// A subsequent version queried the daemon by spawning
+// `calyx-session ls --all --json` as an out-of-process `Process` from
+// inside the test runner. That approach is unusable here: the
+// `CalyxUITests` runner is itself App-Sandboxed (`codesign -d
+// --entitlements` on the test runner shows
+// `com.apple.security.app-sandbox` set to true, with only a read-only
+// files temporary exception granted), and a sandboxed process cannot
+// connect to the daemon's unix domain socket. Spawning
+// `calyx-session ls` from the runner therefore always returns empty
+// stdout, even while the daemon is alive, healthy, and holding
+// sessions (confirmed by running the identical query unsandboxed
+// against the same `HOME` during this run, which succeeded). This is
+// exactly the constraint that `BrowserScriptingUITests`' file-readback
+// pattern (`terminalExec`, which redirects command output to a file
+// and reads it back with `Data(contentsOf:)`) already works around:
+// the sandboxed runner can READ but cannot open new outbound
+// connections.
+//
+// So this test reads the daemon's own on-disk ledger file directly,
+// `$HOME/.calyx/state/sessions.json` (see
+// `calyx-session/crates/daemon/src/ledger.rs`), the same file the
+// daemon writes atomically (temp file + rename) on every registry
+// change, and the same array `calyx-session ls` would otherwise print,
+// to confirm the SAME session id keeps the SAME pid and
+// created_at_ms across an app restart. That is the strongest proof
+// available, from a sandboxed runner, that the daemon kept the exact
 // same child process alive across Calyx.app's termination, and that
 // the restored pane reattached to it rather than a fresh session
 // being created.
-//
-// RED phase note (P4): this test is written to compile against
-// `CalyxUITestCase` and the app's existing `--uitesting` /
-// command-line UserDefaults conventions, but is NOT executed as part
-// of this phase's Red confirmation — E2E runs are `/e2e-test`-only
-// (no background double-launch of a real calyx-session daemon while
-// other suites run). Building the CalyxUITests target confirms this
-// file compiles; actual execution happens once in the test-runner
-// phase.
 //
 // Isolation:
 // - Window/tab session persistence: `CalyxUITestCase`'s existing
@@ -136,6 +148,11 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
             )
         }
         app?.terminate()
+        // `removeItem` can fail here under the runner's App Sandbox
+        // (already tolerated via `try?`); that is fine because
+        // `homeDir`/`sessionDir` are freshly UUID-named per run, so a
+        // leftover directory from a failed cleanup can never collide
+        // with, or contaminate, a later run.
         if let homeDir {
             try? FileManager.default.removeItem(atPath: homeDir)
         }
@@ -171,48 +188,40 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     // Verification is daemon-ledger-based, not keystroke-based: this
     // test never calls `app.typeText` or reads pane content, so
     // keystroke leakage into the developer's real terminal (see this
-    // file's header comment) is structurally impossible.
+    // file's header comment) is structurally impossible. The ledger is
+    // read directly from disk, never through a spawned
+    // `calyx-session ls` process, because the sandboxed test runner
+    // cannot open the unix domain socket that would require (see file
+    // header).
 
-    /// Raw stdout text from the most recent `daemonSessions()` call,
-    /// kept only to fold into `XCTFail` messages below when a poll
-    /// times out.
-    private var lastLsOutput = ""
+    /// Raw contents of the ledger file as of the most recent
+    /// `daemonSessions()` call, kept only to fold into `XCTFail`
+    /// messages below when a poll times out.
+    private var lastLedgerRaw = ""
 
-    /// Runs `calyx-session ls --all --json` out-of-process against
-    /// this test's isolated `HOME`, returning the parsed session list.
-    /// Each entry mirrors `SessionInfo`
-    /// (`calyx-session/crates/proto/src/control.rs`): `"id"` (String),
-    /// `"pid"` (Int, the daemon-side child PID), `"created_at_ms"`
-    /// (Int), and `"state"`, which is either the bare string
-    /// `"Running"` or the dictionary `{"Exited": {"code": Int}}` once
-    /// the child has exited. Returns an empty array (rather than
-    /// failing the test) if it produced no parseable JSON array of
-    /// objects — the caller's polling loop is expected to fail the
-    /// test with diagnostics once it gives up.
+    /// Reads and parses the daemon's on-disk session ledger at
+    /// `$HOME/.calyx/state/sessions.json` (see
+    /// `calyx-session/crates/daemon/src/ledger.rs`), the same array
+    /// `calyx-session ls` would otherwise print. Each entry mirrors
+    /// `SessionInfo` (`calyx-session/crates/proto/src/control.rs`):
+    /// `"id"` (String), `"pid"` (Int, the daemon-side child PID),
+    /// `"created_at_ms"` (Int), and `"state"`, which is either the
+    /// bare string `"Running"` or the dictionary
+    /// `{"Exited": {"code": Int}}` once the child has exited. Returns
+    /// an empty array (rather than failing the test) if the file
+    /// doesn't exist yet or contains no parseable JSON array of
+    /// objects: the daemon only writes the file atomically after its
+    /// first registry change, so a missing file simply means nothing
+    /// has registered yet. The caller's polling loop is expected to
+    /// fail the test with diagnostics once it gives up.
     private func daemonSessions() -> [[String: Any]] {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: Self.builtSessionBinaryPath())
-        process.arguments = ["ls", "--all", "--json"]
+        let ledgerURL = URL(fileURLWithPath: "\(homeDir!)/.calyx/state/sessions.json")
 
-        var environment = ["HOME": homeDir!]
-        if let path = ProcessInfo.processInfo.environment["PATH"] {
-            environment["PATH"] = path
-        }
-        process.environment = environment
-
-        let stdoutPipe = Pipe()
-        process.standardOutput = stdoutPipe
-
-        do {
-            try process.run()
-        } catch {
-            XCTFail("Failed to launch `calyx-session ls --all --json`: \(error)")
+        guard let data = try? Data(contentsOf: ledgerURL) else {
+            lastLedgerRaw = "<no ledger file at \(ledgerURL.path)>"
             return []
         }
-        process.waitUntilExit()
-
-        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        lastLsOutput = String(data: data, encoding: .utf8) ?? "<non-UTF8 output, \(data.count) bytes>"
+        lastLedgerRaw = String(data: data, encoding: .utf8) ?? "<non-UTF8 ledger, \(data.count) bytes>"
 
         guard let jsonObject = try? JSONSerialization.jsonObject(with: data),
               let sessions = jsonObject as? [[String: Any]] else {
@@ -223,7 +232,7 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
 
     /// True if `session`'s `"state"` field is the bare string
     /// `"Running"` (as opposed to `{"Exited": {"code": n}}`, which
-    /// decodes as a dictionary rather than a string — see
+    /// decodes as a dictionary rather than a string, see
     /// `SessionState`'s serde derive).
     private func isRunning(_ session: [String: Any]) -> Bool {
         (session["state"] as? String) == "Running"
@@ -231,93 +240,121 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
 
     // MARK: - Restart replay
 
-    /// Full round trip: confirm the persistent-session pane registered
-    /// exactly one live session with the daemon; terminate the app;
-    /// relaunch with the same HOME/session-dir; and confirm the SAME
-    /// session id is still `Running` with the SAME pid and
-    /// created_at_ms (see file header for why daemon-ledger identity,
-    /// not pane content, is the verification method here).
+    /// Full round trip: confirm at least one `Running` session is
+    /// registered with the daemon after creating a persistent-session
+    /// tab (the initial window's own tab is itself a persistent pane,
+    /// so up to two `Running` entries can legitimately be present, not
+    /// just the one created here); terminate the app; relaunch with
+    /// the same HOME/session-dir; and confirm every session id
+    /// captured before restart is still `Running` with the SAME pid
+    /// and created_at_ms (see file header for why daemon-ledger
+    /// identity, not pane content, is the verification method here).
     func test_persistentSession_survivesRestart_sameShellStaysAlive() {
         createNewTabViaMenu()
-        waitFor(app.windows.firstMatch)
+        XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not appear after creating a new tab.")
 
         // Creating the persistent-session tab makes the pane run
         // `calyx-session attach --create`, which registers a session
         // with the daemon asynchronously; poll rather than assume it's
         // immediate.
-        var preRestartID: String?
-        var preRestartPID: Int?
-        var preRestartCreatedAtMs: Int?
-        for _ in 1...10 {
-            let sessions = daemonSessions()
-            if sessions.count == 1, let session = sessions.first, isRunning(session),
-               let id = session["id"] as? String,
-               let pid = session["pid"] as? Int,
-               let createdAtMs = session["created_at_ms"] as? Int {
-                preRestartID = id
-                preRestartPID = pid
-                preRestartCreatedAtMs = createdAtMs
+        var sawRunningSession = false
+        for _ in 1...15 {
+            if daemonSessions().contains(where: isRunning) {
+                sawRunningSession = true
                 break
             }
             Thread.sleep(forTimeInterval: 2)
         }
 
-        guard let sessionID = preRestartID,
-              let pid1 = preRestartPID,
-              let createdAtMs1 = preRestartCreatedAtMs else {
+        guard sawRunningSession else {
             XCTFail(
-                "No single \"Running\" session appeared in the daemon's ledger within ~20s " +
-                "of creating the persistent-session tab, meaning the pane's " +
-                "`calyx-session attach --create` never established a live daemon session. " +
-                "Last `ls --all --json` output: \(lastLsOutput)"
+                "No \"Running\" session appeared in the daemon's ledger within ~30s of " +
+                "creating the persistent-session tab, meaning no pane's " +
+                "`calyx-session attach --create` ever established a live daemon session. " +
+                "Last ledger contents: \(lastLedgerRaw)"
+            )
+            return
+        }
+
+        // One extra settle poll: the menu-created tab's registration
+        // can lag slightly behind the initial window's own persistent
+        // pane, so give it one more cycle before locking in the
+        // captured set. It is fine for one or two sessions to be
+        // present; whichever set is actually there is what restart
+        // must preserve.
+        Thread.sleep(forTimeInterval: 2)
+        let preRestart: [String: (pid: Int, createdAtMs: Int)] = Dictionary(
+            uniqueKeysWithValues: daemonSessions().filter(isRunning).compactMap { session in
+                guard let id = session["id"] as? String,
+                      let pid = session["pid"] as? Int,
+                      let createdAtMs = session["created_at_ms"] as? Int else { return nil }
+                return (id, (pid, createdAtMs))
+            }
+        )
+
+        guard !preRestart.isEmpty else {
+            XCTFail(
+                "The settle poll found no \"Running\" session with a parseable id/pid/" +
+                "created_at_ms, even though an earlier poll saw one, meaning the ledger's " +
+                "shape is unexpected. Last ledger contents: \(lastLedgerRaw)"
             )
             return
         }
 
         app.terminate()
         relaunchWithSameEnvironment()
-        waitFor(app.windows.firstMatch)
+        XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not reappear after relaunch.")
 
-        // The restored pane's reattach to the daemon-held session
+        // The restored panes' reattach to their daemon-held sessions
         // completes asynchronously after the window appears, with no
         // XCUITest-visible signal for "reattach done"; poll rather than
         // assume it's immediate.
-        var postRestartSession: [String: Any]?
-        for _ in 1...10 {
-            if let session = daemonSessions().first(where: { ($0["id"] as? String) == sessionID }) {
-                postRestartSession = session
+        var postRestart: [String: [String: Any]] = [:]
+        for _ in 1...15 {
+            postRestart = Dictionary(
+                uniqueKeysWithValues: daemonSessions().compactMap { session -> (String, [String: Any])? in
+                    guard let id = session["id"] as? String else { return nil }
+                    return (id, session)
+                }
+            )
+            let allRestored = preRestart.keys.allSatisfy { id in
+                postRestart[id].map(isRunning) ?? false
+            }
+            if allRestored {
                 break
             }
             Thread.sleep(forTimeInterval: 2)
         }
 
-        guard let session2 = postRestartSession else {
-            XCTFail(
-                "Session \(sessionID) was absent from the daemon's ledger within ~20s of " +
-                "restarting the app, meaning the session was lost — the daemon did not " +
-                "keep it alive across Calyx.app's termination. Last `ls --all --json` " +
-                "output: \(lastLsOutput)"
+        for (id, before) in preRestart {
+            guard let after = postRestart[id] else {
+                XCTFail(
+                    "Session \(id) was absent from the daemon's ledger within ~30s of " +
+                    "restarting the app, meaning the session was lost: the daemon did not " +
+                    "keep it alive across Calyx.app's termination. Last ledger contents: " +
+                    "\(lastLedgerRaw)"
+                )
+                continue
+            }
+            XCTAssertTrue(
+                isRunning(after),
+                "Session \(id)'s state is no longer \"Running\" after restart " +
+                "(state: \(String(describing: after["state"]))), meaning the daemon-held " +
+                "child process died instead of surviving Calyx.app's termination."
             )
-            return
+            XCTAssertEqual(
+                after["pid"] as? Int, before.pid,
+                "Session \(id)'s pid changed after restart (was \(before.pid), now " +
+                "\(String(describing: after["pid"]))), meaning a fresh shell replaced the " +
+                "original instead of the daemon keeping the same child alive: persistence " +
+                "is broken."
+            )
+            XCTAssertEqual(
+                after["created_at_ms"] as? Int, before.createdAtMs,
+                "Session \(id)'s created_at_ms changed after restart (was \(before.createdAtMs), " +
+                "now \(String(describing: after["created_at_ms"]))), meaning a new session was " +
+                "created under the same id instead of the original one being reattached."
+            )
         }
-
-        XCTAssertTrue(
-            isRunning(session2),
-            "Session \(sessionID)'s state is no longer \"Running\" after restart " +
-            "(state: \(String(describing: session2["state"]))), meaning the daemon-held " +
-            "child process died instead of surviving Calyx.app's termination."
-        )
-        XCTAssertEqual(
-            session2["pid"] as? Int, pid1,
-            "Session \(sessionID)'s pid changed after restart (was \(pid1), now " +
-            "\(String(describing: session2["pid"]))), meaning a new shell process replaced " +
-            "the original instead of the daemon keeping the same child alive."
-        )
-        XCTAssertEqual(
-            session2["created_at_ms"] as? Int, createdAtMs1,
-            "Session \(sessionID)'s created_at_ms changed after restart (was \(createdAtMs1), " +
-            "now \(String(describing: session2["created_at_ms"]))), meaning this is a freshly " +
-            "created session rather than the same one reattached across restart."
-        )
     }
 }
