@@ -5,23 +5,29 @@
 // process running in a persistent-session pane must survive an app
 // restart (calyx-session's daemon keeps the child process running
 // independent of Calyx.app's lifetime), and the pane restored after
-// relaunch must reattach to that SAME shell with working I/O, rather
-// than a fresh replacement shell being spawned.
+// relaunch must reattach to that SAME shell, rather than a fresh
+// replacement shell being spawned.
 //
-// Verification method: Ghostty renders terminal content on the GPU,
-// so anything echoed into a pane is never exposed through the
-// accessibility tree; `app.staticTexts` can never observe it, no
-// matter how the persistent-session pipeline actually behaves.
-// `BrowserScriptingUITests.terminalExec` already establishes the
-// precedent for working around this: it redirects a command's output
-// to a file and reads that file back from disk, instead of reading
-// `app.staticTexts`. This test follows the same precedent: each phase
-// has the shell write its own PID (`echo $$`) to a file under this
-// test's session temp dir, and the file is read back from disk. The
-// two PIDs matching before and after restart is the strongest proof
-// available to XCUITest that calyx-session's daemon kept the exact
-// same shell process alive across Calyx.app's termination, and that
-// the restored pane reattached to it with working I/O.
+// Verification method: this test never types into the app and never
+// reads pane content, so keystroke leakage is structurally
+// impossible. An earlier version of this test drove the pane with
+// `app.typeText`, but that API synthesizes global key events that
+// land on whatever window is truly frontmost system-wide, not
+// something scoped to the app under test — an xctest-launched app
+// cannot reliably hold focus, so a stray keystroke could leak into
+// whatever the developer running this suite had focused on their
+// real desktop. It also had to work around Ghostty rendering terminal
+// content on the GPU, which keeps it out of the accessibility tree
+// entirely (so `app.staticTexts` can never observe it).
+//
+// Instead, this test queries calyx-session's own daemon ledger
+// directly — `calyx-session ls --all --json`, run out-of-process
+// against this test's isolated `HOME` — to confirm the SAME session
+// id keeps the SAME pid and created_at_ms across an app restart. That
+// is the strongest proof available that the daemon kept the exact
+// same child process alive across Calyx.app's termination, and that
+// the restored pane reattached to it rather than a fresh session
+// being created.
 //
 // RED phase note (P4): this test is written to compile against
 // `CalyxUITestCase` and the app's existing `--uitesting` /
@@ -76,9 +82,9 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
     /// the `CalyxUITests` scheme's test action (see project.yml) —
     /// deliberately distinct from production's `com.calyx.terminal` so
     /// LaunchServices can never conflate a locally-installed production
-    /// Calyx.app with the app-under-test. Used below to independently
-    /// confirm the frontmost app is actually this test's own
-    /// app-under-test before any keystroke is sent.
+    /// Calyx.app with the app-under-test. Used in `tearDown()` to
+    /// confirm the app-under-test was still the actual frontmost app
+    /// immediately before termination.
     private static let testAppBundleIdentifier = "com.calyx.terminal.e2e"
 
     /// Does NOT call `super.setUp()`: the base class's `setUp()`
@@ -160,122 +166,110 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         app.launch()
     }
 
-    // MARK: - Keystroke-leak guards
+    // MARK: - Daemon-ledger polling
     //
-    // Layer-2 defense (see incident writeup in this file's header
-    // comment): even with bundle-ID isolation (project.yml's
-    // `DebugUITesting` config), these guards independently re-verify
-    // the app-under-test is actually frontmost immediately before any
-    // keystroke is sent, and fail the test rather than type blindly.
+    // Verification is daemon-ledger-based, not keystroke-based: this
+    // test never calls `app.typeText` or reads pane content, so
+    // keystroke leakage into the developer's real terminal (see this
+    // file's header comment) is structurally impossible.
 
-    /// Activates `app` and fails the test immediately if it cannot be
-    /// confirmed as the actual frontmost app. Call before any action
-    /// that will send keyboard events.
-    private func ensureAppIsFrontmost(file: StaticString = #filePath, line: UInt = #line) {
-        app.activate()
-        let isFrontmost = NSPredicate { _, _ in
-            NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.testAppBundleIdentifier
+    /// Raw stdout text from the most recent `daemonSessions()` call,
+    /// kept only to fold into `XCTFail` messages below when a poll
+    /// times out.
+    private var lastLsOutput = ""
+
+    /// Runs `calyx-session ls --all --json` out-of-process against
+    /// this test's isolated `HOME`, returning the parsed session list.
+    /// Each entry mirrors `SessionInfo`
+    /// (`calyx-session/crates/proto/src/control.rs`): `"id"` (String),
+    /// `"pid"` (Int, the daemon-side child PID), `"created_at_ms"`
+    /// (Int), and `"state"`, which is either the bare string
+    /// `"Running"` or the dictionary `{"Exited": {"code": Int}}` once
+    /// the child has exited. Returns an empty array (rather than
+    /// failing the test) if it produced no parseable JSON array of
+    /// objects — the caller's polling loop is expected to fail the
+    /// test with diagnostics once it gives up.
+    private func daemonSessions() -> [[String: Any]] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: Self.builtSessionBinaryPath())
+        process.arguments = ["ls", "--all", "--json"]
+
+        var environment = ["HOME": homeDir!]
+        if let path = ProcessInfo.processInfo.environment["PATH"] {
+            environment["PATH"] = path
         }
-        let expectation = XCTNSPredicateExpectation(predicate: isFrontmost, object: nil)
-        let result = XCTWaiter().wait(for: [expectation], timeout: 5)
-        guard result == .completed, app.state == .runningForeground else {
-            XCTFail(
-                "Refusing to proceed: could not confirm the app-under-test as frontmost " +
-                "(frontmost bundle ID: \(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "nil"), " +
-                "expected: \(Self.testAppBundleIdentifier), app.state: \(app.state)). " +
-                "Aborting to avoid leaking keystrokes to another app.",
-                file: file,
-                line: line
-            )
-            return
+        process.environment = environment
+
+        let stdoutPipe = Pipe()
+        process.standardOutput = stdoutPipe
+
+        do {
+            try process.run()
+        } catch {
+            XCTFail("Failed to launch `calyx-session ls --all --json`: \(error)")
+            return []
         }
+        process.waitUntilExit()
+
+        let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        lastLsOutput = String(data: data, encoding: .utf8) ?? "<non-UTF8 output, \(data.count) bytes>"
+
+        guard let jsonObject = try? JSONSerialization.jsonObject(with: data),
+              let sessions = jsonObject as? [[String: Any]] else {
+            return []
+        }
+        return sessions
     }
 
-    /// Sends `text` via `app.typeText` only after re-confirming,
-    /// immediately beforehand, that `app` is both running in the
-    /// foreground and the actual frontmost app system-wide. If either
-    /// check fails, fails the test instead of typing.
-    private func typeTextSafely(_ text: String, file: StaticString = #filePath, line: UInt = #line) {
-        guard app.state == .runningForeground else {
-            XCTFail(
-                "Refusing to type: app-under-test is not running in the foreground " +
-                "(state: \(app.state)). Aborting to avoid leaking keystrokes.",
-                file: file,
-                line: line
-            )
-            return
-        }
-        guard NSWorkspace.shared.frontmostApplication?.bundleIdentifier == Self.testAppBundleIdentifier else {
-            XCTFail(
-                "Refusing to type: frontmost app is " +
-                "\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "nil"), " +
-                "expected \(Self.testAppBundleIdentifier). Aborting to avoid leaking keystrokes.",
-                file: file,
-                line: line
-            )
-            return
-        }
-        app.typeText(text)
-    }
-
-    // MARK: - PID-file polling
-
-    /// Polls `path` until its contents parse as a bare integer PID, or
-    /// `timeout` elapses, returning the parsed PID or nil on timeout.
-    /// The shell's `echo $$ > path` redirection is not synchronous with
-    /// respect to XCUITest's `typeText`, so the file may not exist yet
-    /// (or may still be mid-write) for a short while after the
-    /// keystrokes are sent.
-    private func waitForPID(atPath path: String, timeout: TimeInterval) -> Int? {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if let contents = try? String(contentsOfFile: path, encoding: .utf8) {
-                let trimmed = contents.trimmingCharacters(in: .whitespacesAndNewlines)
-                if let pid = Int(trimmed) {
-                    return pid
-                }
-            }
-            Thread.sleep(forTimeInterval: 0.25)
-        }
-        return nil
+    /// True if `session`'s `"state"` field is the bare string
+    /// `"Running"` (as opposed to `{"Exited": {"code": n}}`, which
+    /// decodes as a dictionary rather than a string — see
+    /// `SessionState`'s serde derive).
+    private func isRunning(_ session: [String: Any]) -> Bool {
+        (session["state"] as? String) == "Running"
     }
 
     // MARK: - Restart replay
 
-    /// Full round trip: confirm a persistent-session pane hosts a live,
-    /// input-accepting shell by reading that shell's own PID back from
-    /// a file; terminate the app; relaunch with the same
-    /// HOME/session-dir; and confirm the restored pane's shell reports
-    /// the SAME PID (see file header for why PID identity, not
-    /// `app.staticTexts`, is the verification method here).
+    /// Full round trip: confirm the persistent-session pane registered
+    /// exactly one live session with the daemon; terminate the app;
+    /// relaunch with the same HOME/session-dir; and confirm the SAME
+    /// session id is still `Running` with the SAME pid and
+    /// created_at_ms (see file header for why daemon-ledger identity,
+    /// not pane content, is the verification method here).
     func test_persistentSession_survivesRestart_sameShellStaysAlive() {
-        let pidFile1 = "\(sessionDir!)/pid1.txt"
-        let pidFile2 = "\(sessionDir!)/pid2.txt"
-
         createNewTabViaMenu()
         waitFor(app.windows.firstMatch)
 
-        // The daemon-spawned shell's PTY isn't necessarily draining input
-        // the instant the pane appears, the same asynchrony phase 2
-        // already accounts for after restart. A single early keystroke
-        // can land before the shell is ready and be lost, so retry the
-        // echo up to 4 times over ~20s rather than relying on one attempt.
-        var pid1: Int?
-        for _ in 1...4 {
-            ensureAppIsFrontmost()
-            typeTextSafely("echo $$ > \(pidFile1)\n")
-            if let pid = waitForPID(atPath: pidFile1, timeout: 5) {
-                pid1 = pid
+        // Creating the persistent-session tab makes the pane run
+        // `calyx-session attach --create`, which registers a session
+        // with the daemon asynchronously; poll rather than assume it's
+        // immediate.
+        var preRestartID: String?
+        var preRestartPID: Int?
+        var preRestartCreatedAtMs: Int?
+        for _ in 1...10 {
+            let sessions = daemonSessions()
+            if sessions.count == 1, let session = sessions.first, isRunning(session),
+               let id = session["id"] as? String,
+               let pid = session["pid"] as? Int,
+               let createdAtMs = session["created_at_ms"] as? Int {
+                preRestartID = id
+                preRestartPID = pid
+                preRestartCreatedAtMs = createdAtMs
                 break
             }
+            Thread.sleep(forTimeInterval: 2)
         }
 
-        guard let confirmedPID1 = pid1 else {
+        guard let sessionID = preRestartID,
+              let pid1 = preRestartPID,
+              let createdAtMs1 = preRestartCreatedAtMs else {
             XCTFail(
-                "The pane's shell never wrote its PID to \(pidFile1) after 4 attempts " +
-                "over ~20s, meaning the persistent-session pane never became an " +
-                "interactive shell that accepts input, so there is nothing to compare " +
-                "after restart."
+                "No single \"Running\" session appeared in the daemon's ledger within ~20s " +
+                "of creating the persistent-session tab, meaning the pane's " +
+                "`calyx-session attach --create` never established a live daemon session. " +
+                "Last `ls --all --json` output: \(lastLsOutput)"
             )
             return
         }
@@ -284,38 +278,46 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         relaunchWithSameEnvironment()
         waitFor(app.windows.firstMatch)
 
-        // The restored pane's reattach to the daemon-held shell completes
-        // asynchronously after the window appears, with no XCUITest-visible
-        // signal for "reattach done." Keystrokes sent immediately after
-        // relaunch can land before the reattach completes and be dropped,
-        // so retry the echo up to 3 times over ~15s rather than relying on
-        // a single fixed sleep before the first attempt.
-        var pid2: Int?
-        for _ in 1...3 {
-            ensureAppIsFrontmost()
-            typeTextSafely("echo $$ > \(pidFile2)\n")
-            if let pid = waitForPID(atPath: pidFile2, timeout: 5) {
-                pid2 = pid
+        // The restored pane's reattach to the daemon-held session
+        // completes asynchronously after the window appears, with no
+        // XCUITest-visible signal for "reattach done"; poll rather than
+        // assume it's immediate.
+        var postRestartSession: [String: Any]?
+        for _ in 1...10 {
+            if let session = daemonSessions().first(where: { ($0["id"] as? String) == sessionID }) {
+                postRestartSession = session
                 break
             }
+            Thread.sleep(forTimeInterval: 2)
         }
 
-        guard let confirmedPID2 = pid2 else {
+        guard let session2 = postRestartSession else {
             XCTFail(
-                "The restored pane never wrote its PID to \(pidFile2) after 3 attempts " +
-                "over ~15s, meaning the restored pane never reattached to a working, " +
-                "input-accepting shell after restart."
+                "Session \(sessionID) was absent from the daemon's ledger within ~20s of " +
+                "restarting the app, meaning the session was lost — the daemon did not " +
+                "keep it alive across Calyx.app's termination. Last `ls --all --json` " +
+                "output: \(lastLsOutput)"
             )
             return
         }
 
+        XCTAssertTrue(
+            isRunning(session2),
+            "Session \(sessionID)'s state is no longer \"Running\" after restart " +
+            "(state: \(String(describing: session2["state"]))), meaning the daemon-held " +
+            "child process died instead of surviving Calyx.app's termination."
+        )
         XCTAssertEqual(
-            confirmedPID2, confirmedPID1,
-            "The restored pane's shell PID (\(confirmedPID2)) must equal the original " +
-            "pane's shell PID (\(confirmedPID1)); this proves calyx-session's daemon kept the " +
-            "SAME shell process alive across Calyx.app's termination and the restored " +
-            "pane reattached to it with working I/O, rather than a fresh replacement " +
-            "shell being spawned."
+            session2["pid"] as? Int, pid1,
+            "Session \(sessionID)'s pid changed after restart (was \(pid1), now " +
+            "\(String(describing: session2["pid"]))), meaning a new shell process replaced " +
+            "the original instead of the daemon keeping the same child alive."
+        )
+        XCTAssertEqual(
+            session2["created_at_ms"] as? Int, createdAtMs1,
+            "Session \(sessionID)'s created_at_ms changed after restart (was \(createdAtMs1), " +
+            "now \(String(describing: session2["created_at_ms"]))), meaning this is a freshly " +
+            "created session rather than the same one reattached across restart."
         )
     }
 }
