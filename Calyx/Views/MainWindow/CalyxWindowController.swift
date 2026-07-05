@@ -175,6 +175,36 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// ._testSeedAttemptCount(sessionID:count:)`, seed it) without a
     /// live daemon round-trip. DO NOT use from production code.
     var _sessionReconnectCoordinatorForTesting: SessionReconnectCoordinator { sessionReconnectCoordinator }
+
+    /// Test seam (P5, remote sessions, contract 3b): when non-nil,
+    /// called INSTEAD of the real `tab.registry.createSurface(...)` FFI
+    /// call inside `createManagedSurface`, mirroring
+    /// `_performReconnectSurfaceCreationHookForTesting`'s/`AppDelegate
+    /// ._createSurfaceWithPwdHookForTesting`'s exact intercept-right-
+    /// before-the-unsafe-FFI-call style (a real ghostty surface is
+    /// confirmed unsafe to construct in this test host, see
+    /// `AppDelegateAttachWindowTests`'s header comment). Returns the
+    /// UUID to report as the newly created surface (simulating success),
+    /// or `nil` to simulate surface-creation failure. `nil` (the
+    /// default) leaves production behavior unchanged: every guard/step
+    /// around this call, including the `sessionRefs`/`SessionSurfaceMap`
+    /// bookkeeping under test, remains real, unmodified production code.
+    /// DO NOT use from production code.
+    var _createManagedSurfaceHookForTesting: (() -> UUID?)?
+
+    /// Test seam (P5, remote sessions, contract 1b): when non-nil,
+    /// called with `(sessionID, host)` immediately before
+    /// `killSessionIfPersistent`'s `SessionKillTracker.track` dispatch --
+    /// `host` is `nil` for a local kill, non-nil for a remote kill.
+    /// `SessionDaemonClient.shared` is a real singleton, so a controller-
+    /// level test cannot otherwise distinguish "kill(id:) was dispatched"
+    /// from "killRemote(host:sessionID:) was dispatched" by inspecting
+    /// the daemon client itself; this seam mirrors
+    /// `_performReconnectCommandObserverForTesting`'s exact "observe
+    /// right before the real (tracked, fire-and-forget) work; the real
+    /// work still runs unmodified" style. `nil` (the default) leaves
+    /// production behavior unchanged. DO NOT use from production code.
+    var _killSessionIfPersistentRouteObserverForTesting: ((String, String?) -> Void)?
     #endif
     /// Surface UUIDs currently being destroyed as part of
     /// `performReconnect`'s surface swap (populated right before, and
@@ -644,25 +674,53 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// `tab.pwd`), so `tab.pwd` is the best available approximation of
     /// the split's specific origin surface, not necessarily its exact
     /// live cwd if the tab has multiple panes in different directories.
-    private func createManagedSurface(
+    /// `host` (P5, remote sessions): the remote ssh host to spawn this
+    /// surface's session against, `nil` for every existing call site
+    /// (unchanged, all still local). Passed into the
+    /// `SessionSpawnContext` this method builds; the `SessionRef` it
+    /// stores reads the resulting plan's OWN `host` (not this parameter
+    /// directly — see `SessionSpawnPlannerHostPropagationTests` for why
+    /// the plan itself is the source of truth for a caller applying it).
+    ///
+    /// Not `private` any more (P5; mirrors `closeAllTabsInGroup(id:)`'s/
+    /// `processChildExited`'s/`handleSessionReconnectDecision`'s own
+    /// identical "un-privated for direct test access" precedent):
+    /// `CalyxWindowControllerCreateManagedSurfaceRemoteHostTests` drives
+    /// this directly with a dummy `ghostty_app_t` pointer, exactly like
+    /// `AppDelegateRestoreRemoteSessionTests` drives `restoreTabSurfaces`.
+    func createManagedSurface(
         tab: Tab,
         app: ghostty_app_t,
         config: ghostty_surface_config_s,
         passthroughPwd: String?,
         spawnCwd: String,
         inheritedCwd: String? = nil,
-        origin: SessionSpawnOrigin
+        origin: SessionSpawnOrigin,
+        host: String? = nil
     ) -> UUID? {
-        let context = SessionSpawnContext(cwd: spawnCwd, inheritedCwd: inheritedCwd, origin: origin)
+        let context = SessionSpawnContext(cwd: spawnCwd, inheritedCwd: inheritedCwd, host: host, origin: origin)
         switch SessionSpawnPlanner.plan(for: context) {
         case .passthrough:
+            #if DEBUG
+            if let hook = _createManagedSurfaceHookForTesting {
+                return hook()
+            }
+            #endif
             return tab.registry.createSurface(app: app, config: config, pwd: passthroughPwd)
-        case .persistent(let sessionID, let command):
+        case .persistent(let sessionID, let command, let planHost):
             let ghosttyPwd = inheritedCwd ?? spawnCwd
+            #if DEBUG
+            if let hook = _createManagedSurfaceHookForTesting {
+                guard let surfaceID = hook() else { return nil }
+                tab.sessionRefs[surfaceID] = SessionRef(sessionID: sessionID, host: planHost)
+                SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: surfaceID)
+                return surfaceID
+            }
+            #endif
             guard let surfaceID = tab.registry.createSurface(app: app, config: config, pwd: ghosttyPwd, command: command) else {
                 return nil
             }
-            tab.sessionRefs[surfaceID] = SessionRef(sessionID: sessionID)
+            tab.sessionRefs[surfaceID] = SessionRef(sessionID: sessionID, host: planHost)
             SessionSurfaceMap.shared.register(sessionID: sessionID, surfaceID: surfaceID)
             return surfaceID
         }
@@ -705,6 +763,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// too, so the outer "is the app actually terminating" gate and this
     /// policy call always visibly agree, with no caller left relying on
     /// an implicit default.
+    /// `host` (P5, remote sessions): read from `tab.sessionRefs[surfaceID]
+    /// ?.host` BEFORE this method's own `tab.sessionRefs[surfaceID] = nil`
+    /// clears the entry two lines later -- exactly like `performReconnect`'s
+    /// own identical read of the same storage (see that method's doc
+    /// comment). `nil` routes through the LOCAL-only `kill(id:)` exactly
+    /// as before this fix; non-nil routes through `killRemote(host:
+    /// sessionID:)` instead, so closing a remote pane no longer silently
+    /// orphans the calyx-session running entirely on the remote host.
     private func killSessionIfPersistent(tab: Tab, surfaceID: UUID, isTerminating: Bool) {
         let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID)
         guard SessionCloseKillPolicy.shouldKill(
@@ -714,11 +780,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ), let sessionID else {
             return
         }
+        let host = tab.sessionRefs[surfaceID]?.host
         SessionSurfaceMap.shared.unregister(sessionID: sessionID)
         tab.sessionRefs[surfaceID] = nil
         sessionReconnectCoordinator.markClosed(sessionID: sessionID)
+        #if DEBUG
+        _killSessionIfPersistentRouteObserverForTesting?(sessionID, host)
+        #endif
         SessionKillTracker.track {
-            await SessionDaemonClient.shared.kill(id: sessionID)
+            if let host {
+                await SessionDaemonClient.shared.killRemote(host: host, sessionID: sessionID)
+            } else {
+                await SessionDaemonClient.shared.kill(id: sessionID)
+            }
         }
     }
 
@@ -2026,7 +2100,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// guard would otherwise require).
     func processChildExited(surfaceView: SurfaceView) {
         guard !isShuttingDown else { return }
-        guard let surfaceID = findTab(for: surfaceView)?.0.registry.id(for: surfaceView) else { return }
+        guard let tab = findTab(for: surfaceView)?.0,
+              let surfaceID = tab.registry.id(for: surfaceView) else { return }
+
+        // P5 (remote sessions): a remote SessionRef's host means the
+        // LOCAL daemon has no record of this session at all, so
+        // `sessionReconnectCoordinator.childExited` must skip its local
+        // daemon query entirely rather than misreading that absence as
+        // "exited" -- see `isRemote`'s own doc comment on that method.
+        let isRemote = tab.sessionRefs[surfaceID]?.host != nil
 
         // R14-B sweep addendum item 2 (r14-fix-spec.md): tracked in
         // `childExitedTasks`, cancelled alongside its `diffTasks`/
@@ -2042,7 +2124,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // retained forever.
         childExitedTasks.insert(surfaceID, task: Task { [weak self] in
             guard let self else { return }
-            await self.sessionReconnectCoordinator.childExited(surfaceID: surfaceID)
+            await self.sessionReconnectCoordinator.childExited(surfaceID: surfaceID, isRemote: isRemote)
             self.childExitedTasks.removeValue(forKey: surfaceID)
         })
     }

@@ -120,7 +120,7 @@ final class SessionSpawnPlannerRemoteHostTests: XCTestCase {
         // on the local binary at all.
         let plan = SessionSpawnPlanner.plan(for: context, resolver: FakeBinaryResolver(path: nil))
 
-        guard case .persistent(let sessionID, let command) = plan else {
+        guard case .persistent(let sessionID, let command, _) = plan else {
             XCTFail("A remote-host context must produce .persistent even when no local calyx-session binary is resolvable")
             return
         }
@@ -144,8 +144,8 @@ final class SessionSpawnPlannerRemoteHostTests: XCTestCase {
         let context = SessionSpawnContext(cwd: "/home/dev/repo", host: "devbox.example.com", origin: .tab)
         let resolver = FakeBinaryResolver(path: nil)
 
-        guard case .persistent(let firstID, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver),
-              case .persistent(let secondID, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver) else {
+        guard case .persistent(let firstID, _, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver),
+              case .persistent(let secondID, _, _) = SessionSpawnPlanner.plan(for: context, resolver: resolver) else {
             XCTFail("Both calls must produce .persistent for a remote-host context")
             return
         }
@@ -158,7 +158,7 @@ final class SessionSpawnPlannerRemoteHostTests: XCTestCase {
             cwd: "/home/dev/stale-repo", inheritedCwd: "/home/dev/split-origin", host: "devbox.example.com", origin: .tab
         )
 
-        guard case .persistent(_, let command) = SessionSpawnPlanner.plan(for: context, resolver: FakeBinaryResolver(path: nil)) else {
+        guard case .persistent(_, let command, _) = SessionSpawnPlanner.plan(for: context, resolver: FakeBinaryResolver(path: nil)) else {
             XCTFail("A remote-host context must produce .persistent")
             return
         }

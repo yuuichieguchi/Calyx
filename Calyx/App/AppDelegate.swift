@@ -364,9 +364,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// still runs for real, unmodified. DO NOT use from production
     /// code.
     var _attachWindowCreationHookForTesting: (() -> Void)?
+
+    /// Test seam (P5, remote sessions, contract 3c): called with the
+    /// constructed placeholder `tab`, immediately before
+    /// `_attachWindowCreationHookForTesting`'s own check -- today's hook
+    /// fires and returns BEFORE the placeholder tab is even constructed,
+    /// so no existing seam can observe the `SessionRef` it would have
+    /// produced. A second, independent, purely additive observer instead
+    /// of changing that hook's signature, mirroring `AppDelegate
+    /// ._createSurfaceWithPwdCommandObserverForTesting`'s/
+    /// `CalyxWindowController._performReconnectCommandObserverForTesting`'s
+    /// identical reasoning. `nil` (the default) leaves production
+    /// behavior unchanged; every existing test using
+    /// `_attachWindowCreationHookForTesting` alone is unaffected. DO NOT
+    /// use from production code.
+    var _attachWindowPlaceholderTabObserverForTesting: ((Tab) -> Void)?
     #endif
 
-    func attachWindow(sessionID: String, cwd: String?) {
+    func attachWindow(sessionID: String, cwd: String?, host: String? = nil) {
         guard let app = GhosttyAppController.shared.app else { return }
 
         // F6 (S1, HIGH, r4-fix-spec.md): a sessionID already registered
@@ -391,19 +406,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        let placeholderLeafID = UUID()
+        let tab = Tab(
+            pwd: cwd,
+            splitTree: SplitTree(leafID: placeholderLeafID),
+            sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID, host: host)]
+        )
+
+        // P5 (remote sessions): Tab's own init has no side effects (no
+        // FFI, no SessionSurfaceMap/global registration), so constructing
+        // it ahead of the creation hook below is behaviorally inert for
+        // every existing caller -- the hook still fires (and still
+        // returns early) at exactly the same decision point relative to
+        // every OTHER guard, just after this (side-effect-free) tab value
+        // now exists to observe.
         #if DEBUG
+        _attachWindowPlaceholderTabObserverForTesting?(tab)
         if let hook = _attachWindowCreationHookForTesting {
             hook()
             return
         }
         #endif
 
-        let placeholderLeafID = UUID()
-        let tab = Tab(
-            pwd: cwd,
-            splitTree: SplitTree(leafID: placeholderLeafID),
-            sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID)]
-        )
         let windowSession = WindowSession(initialTab: tab)
         let (window, wc) = makeRestoringWindowController(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),

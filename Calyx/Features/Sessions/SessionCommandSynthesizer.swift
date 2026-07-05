@@ -30,6 +30,14 @@ enum SessionCommandSynthesizer {
     /// drag-and-drop keystroke quoting — and deliberately left
     /// untouched).
     ///
+    /// Internal, not `private` (P5 remote sessions):
+    /// `SessionDaemonClient.killRemote(host:sessionID:)` reuses this
+    /// exact escaping for the sessionID word in the remote `kill`
+    /// command line it shells over `ssh`, rather than reimplementing a
+    /// third copy of the same battle-tested logic (see this function's
+    /// own "two earlier versions" history right below) — widened for
+    /// reuse only, not for general-purpose shell escaping elsewhere.
+    ///
     /// Two earlier versions of this function were built on `Character`
     /// (extended-grapheme-cluster) string APIs and were each bypassed in
     /// turn: a conditional `token.contains("\n") || token.contains("\r")`
@@ -50,7 +58,7 @@ enum SessionCommandSynthesizer {
     /// point, so there is no grapheme-cluster boundary left for an
     /// adjacent combining mark (or any other combining sequence) to hide
     /// behind.
-    private static func shSafeToken(_ token: String) -> String {
+    static func shSafeToken(_ token: String) -> String {
         var bytes: [UInt8] = [0x27] // opening '
         for byte in token.utf8 {
             if byte == 0x27 { // '

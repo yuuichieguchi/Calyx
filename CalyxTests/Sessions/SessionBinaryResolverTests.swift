@@ -47,7 +47,7 @@ final class SessionBinaryResolverTests: XCTestCase {
                        "SessionDaemonClient must store exactly what the injected resolver resolves")
 
         let plan = SessionSpawnPlanner.plan(for: SessionSpawnContext(cwd: "/tmp"), resolver: resolver)
-        guard case .persistent(_, let command) = plan else {
+        guard case .persistent(_, let command, _) = plan else {
             XCTFail("With persistent sessions enabled, plan(for:) must produce .persistent, got \(plan)")
             return
         }

@@ -97,23 +97,39 @@ final class SessionReconnectCoordinator {
     /// `SessionSettings.persistentSessionsEnabled`, which only affects
     /// `SessionSpawnPlanner`'s decision for *new* surfaces.
     ///
-    /// P5 (remote sessions) ACCEPTED V1 LIMITATION: `daemonClient
+    /// `isRemote` (P5 remote sessions, retires the former "ACCEPTED V1
+    /// LIMITATION" this comment used to document): `daemonClient
     /// .sessionStateBounded(id:)` queries the LOCAL calyx-session daemon
-    /// only, so it can never return `.exited` for a REMOTE session --
+    /// only, so it can never meaningfully answer for a REMOTE session --
     /// the local daemon simply has no record of a session whose daemon
     /// lives entirely on the remote host (see `CalyxWindowController
     /// .performReconnect`'s grace-Task doc comment for the same root
-    /// cause affecting establishment). A genuinely-exited remote session
-    /// therefore always falls into the `.running, .unreachable` branch
-    /// below and takes the reconnect-attempts-then-`.giveUp` route
-    /// (`maxReconnectAttempts`, currently 5) instead of the clean,
-    /// immediate `.closePane` a local exited session gets. No behavior
-    /// change this round; documented as a known gap for a later cycle.
-    func childExited(surfaceID: UUID) async {
+    /// cause affecting establishment). `isRemote: true` therefore SKIPS
+    /// the local daemon query entirely and treats the disconnect as
+    /// retryable exactly like today's `.running`/`.unreachable` branch:
+    /// increment the attempt counter, `.reconnect` while under
+    /// `maxReconnectAttempts`, `.giveUp` once exceeded. `isRemote: false`
+    /// (the default) behaves IDENTICALLY to before this parameter
+    /// existed: query the daemon, branch on `.exited`/`.running`/
+    /// `.unreachable` exactly as before -- every existing call site
+    /// (production and test) keeps compiling and behaving unchanged.
+    func childExited(surfaceID: UUID, isRemote: Bool = false) async {
         guard let sessionID = surfaceMap.sessionID(for: surfaceID) else { return }
         guard !inFlightSurfaceIDs.contains(surfaceID) else { return }
         inFlightSurfaceIDs.insert(surfaceID)
         defer { inFlightSurfaceIDs.remove(surfaceID) }
+
+        if isRemote {
+            let attempt = (attemptCounts[sessionID] ?? 0) + 1
+            guard attempt <= Self.maxReconnectAttempts else {
+                attemptCounts[sessionID] = nil
+                onDecision(surfaceID, .giveUp)
+                return
+            }
+            attemptCounts[sessionID] = attempt
+            onDecision(surfaceID, .reconnect(sessionID: sessionID, attempt: attempt))
+            return
+        }
 
         switch await daemonClient.sessionStateBounded(id: sessionID) {
         case .exited:

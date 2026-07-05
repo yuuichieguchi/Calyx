@@ -58,8 +58,13 @@ enum SpawnPlan: Sendable, Equatable {
     /// Launch the surface's default shell directly, exactly as today.
     case passthrough
     /// Launch `calyx-session attach --create` for `sessionID`, running
-    /// `command` (built by `SessionCommandSynthesizer`).
-    case persistent(sessionID: String, command: String)
+    /// `command` (built by `SessionCommandSynthesizer`). `host` mirrors
+    /// `SessionSpawnContext.host` -- `nil` for a local plan, the given
+    /// remote host for one synthesized via `remoteAttachCommand` -- so a
+    /// caller applying the plan (see `CalyxWindowController
+    /// .createManagedSurface`) can build `SessionRef(sessionID:host:)`
+    /// without separately remembering the context it came from.
+    case persistent(sessionID: String, command: String, host: String?)
 }
 
 enum SessionSpawnPlanner {
@@ -104,7 +109,7 @@ enum SessionSpawnPlanner {
                 cwd: effectiveCwd,
                 name: context.name
             )
-            return .persistent(sessionID: sessionID, command: command)
+            return .persistent(sessionID: sessionID, command: command, host: host)
         }
 
         guard let binaryPath = resolver.resolve() else {
@@ -116,7 +121,7 @@ enum SessionSpawnPlanner {
             cwd: effectiveCwd,
             name: context.name
         )
-        return .persistent(sessionID: sessionID, command: command)
+        return .persistent(sessionID: sessionID, command: command, host: nil)
     }
 }
 
