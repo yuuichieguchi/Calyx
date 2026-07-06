@@ -111,6 +111,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // The CalyxTests scheme runs this app itself as its unit-test
+        // HOST, so this method runs for real, unguarded, against the
+        // developer's own ~/.calyx before a single test method executes.
+        // That already caused a live incident on 2026-03-20 (commit
+        // 8a0a76bcc, "Skip global event tap in unit test host
+        // environment"): the global event tap was installed for real
+        // from the test host. Left ungated, the rest of this method is
+        // worse -- it increments the real crash-loop recovery counter
+        // and, on terminate, overwrites the real sessions.json (see
+        // applicationWillTerminate's own matching gate below); with
+        // persistentSessionsEnabled == true in the developer's real
+        // UserDefaults, restoreSession()/createNewWindow() would also
+        // spawn real persistent calyx-session daemons; it starts
+        // BrowserServer's real loopback listener; and setupMainMenu()
+        // transitively initializes UpdateController.shared, pulling in
+        // Sparkle. CalyxUITests launches the app-under-test as a
+        // separate process with "--uitesting" and no XCTest loaded, so
+        // it always evaluates false here and keeps running the full
+        // launch unchanged.
+        if LaunchEnvironmentPolicy.isUnitTestHost() { return }
+
         // Must run before GhosttyAppController.shared's first access below:
         // ghostty forwards shell-integration scripts to surface children
         // only when GHOSTTY_RESOURCES_DIR is already set in this process's
@@ -233,6 +254,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Mirrors applicationDidFinishLaunching's own gate (see that
+        // method's doc comment for the full incident narrative): a
+        // unit-test host's applicationDidFinishLaunching already
+        // returned early and never populated windowControllers or
+        // appSession, but this notification still fires for real at
+        // host process teardown regardless. Without this gate,
+        // saveAtTermination/resetRecoveryCounter below would still run
+        // against SessionPersistenceActor.shared and write to the
+        // developer's real ~/.calyx even though nothing in this launch
+        // was ever gated by a window/session-emptiness check alone.
+        if LaunchEnvironmentPolicy.isUnitTestHost() { return }
+
         // R6-A/R6-D (r6-fix-spec.md): belt-and-suspenders alongside
         // applicationShouldTerminate's own set, in case this notification
         // ever fires without that method having run first (see
