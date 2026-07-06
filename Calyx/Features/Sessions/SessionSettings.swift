@@ -79,7 +79,7 @@ struct SessionSettings: Sendable {
     /// Opt-in switch for on-disk history persistence
     /// (`ControlMsg::SetHistoryEnabled`'s daemon-wide default). Defaults
     /// OFF, same rationale as `persistentSessionsEnabled` and
-    /// `agentResumeEnabled` — capturing pane history to disk should
+    /// `agentResumeEnabled` -- capturing pane history to disk should
     /// never start without the user turning it on. Setting this does not
     /// itself reach a running daemon; see
     /// `HistoryPersistenceToggleCoordinator` (propagates a live toggle)

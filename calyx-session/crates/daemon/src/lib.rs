@@ -143,7 +143,8 @@ impl Daemon {
         install_handoff_env(&shared, &self.config.runtime_dir, &self.listener)?;
 
         let socket = self.socket_path();
-        serve(shared, self.listener, socket)
+        start_accepting(&shared, self.listener);
+        block_until_idle(shared, socket)
     }
 }
 
@@ -193,6 +194,25 @@ pub fn run_handoff_receiver(
     ));
     shared.lock_state().ledger = ledger::load(&config.state_dir);
 
+    // Adopt the whole manifest into a local staging vec before touching
+    // the live registry or the ledger (P6 review H8): a failure partway
+    // through must never leave a half-populated `sessions` map or a
+    // ledger persisted under a daemon generation that then dies. On
+    // error the staged entries drop here and this process `_exit`s (see
+    // `cli::commands::daemon`), promptly and well within the old
+    // daemon's HANDOFF_ACK_TIMEOUT before it resumes.
+    //
+    // Known bounded residual: `adopt_session` starts each session thread
+    // reading its inherited PTY immediately (its pre-release contract,
+    // which the adopt/H7 unit tests rely on), so entries adopted before
+    // a later failure do read a little from their (duplicated) PTY
+    // masters before the process exits. The old daemon's own copies of
+    // those sessions stay paused until its ack timeout, so this can at
+    // worst drop a few bytes of one paused session's output, never split
+    // the registry or the on-disk ledger. Fully preventing even that
+    // would require deferring PTY consumption past the ack, which the
+    // pre-release contract does not currently allow.
+    let mut adopted: Vec<state::SessionEntry> = Vec::with_capacity(manifest.sessions.len());
     for (entry, master_fd) in manifest.sessions.into_iter().zip(fds) {
         let id = entry.id.clone();
         let entry = handoff::adopt_session(&shared, entry, master_fd).map_err(|msg| {
@@ -200,27 +220,48 @@ pub fn run_handoff_receiver(
                 "adopting session {id:?} failed: {msg}"
             )))
         })?;
-        // Register the way conn.rs's create_session does; the start
-        // gate is already released by adopt_session, and no client can
-        // race this loop (accepting starts below).
-        let mut state = shared.lock_state();
-        state.ledger.insert(entry.id.clone(), entry.info());
-        state.sessions.insert(entry.id.clone(), entry);
-        state.touch();
+        adopted.push(entry);
     }
+    // Whole manifest adopted: register every session together and
+    // persist once. The start gate is already released by adopt_session,
+    // and no client can race this (accepting starts below).
     {
-        let state = shared.lock_state();
+        let mut state = shared.lock_state();
+        for entry in adopted {
+            state.ledger.insert(entry.id.clone(), entry.info());
+            state.sessions.insert(entry.id.clone(), entry);
+        }
+        state.touch();
         shared.persist_ledger(&state);
     }
     // Arm PrepareHandoff on this generation too, so the next upgrade
     // can hand off again.
     install_handoff_env(&shared, &config.runtime_dir, &listener)?;
 
-    // The ack is the old daemon's point of no return: it exits without
-    // teardown on receipt. Everything destructive stays after this
-    // write on this side too (nothing above touched shared on-disk
-    // state beyond the ledger snapshot, which the old daemon would
-    // rewrite identically on resume).
+    // Start serving the transferred socket, then take the single-daemon
+    // lock, and only then ack (P6 review H5 / E#4). The ack is the old
+    // daemon's unconditional point of no return: it `_exit`s on receipt.
+    // Doing both of those first means that by the time the old daemon
+    // exits, this process is already accepting on the transferred
+    // listener (no window with nobody serving it) and has attempted the
+    // lock takeover, so the ack is genuinely the last thing that can go
+    // wrong before it is committed. If this process instead dies or
+    // errors before the ack, the old daemon never exits: it resumes on
+    // its ack timeout and keeps every session.
+    //
+    // Nothing above this ack touched shared on-disk state beyond the
+    // ledger snapshot, which the old daemon would rewrite identically on
+    // resume, so an error path here leaves the old daemon's world intact.
+    start_accepting(&shared, listener);
+
+    // The old daemon releases the single-daemon flock only by exiting,
+    // which its receipt of the ack (below) triggers; this bounded
+    // takeover attempt runs first regardless so the ack is strictly the
+    // final step. If the old daemon is slow to release, this serves
+    // without the flock rather than blocking the ack forever (see
+    // `acquire_daemon_lock`).
+    acquire_daemon_lock(&config.runtime_dir);
+
     {
         use std::io::Write;
         let mut writer: &UnixStream = &stream;
@@ -228,13 +269,8 @@ pub fn run_handoff_receiver(
     }
     drop(stream);
 
-    // The old daemon held the single-daemon flock until its exit;
-    // claim it now so concurrent plain `daemon` starts keep collapsing
-    // into this process.
-    acquire_daemon_lock(&config.runtime_dir);
-
     let socket = config.runtime_dir.join(SOCKET_FILE);
-    serve(shared, listener, socket)
+    block_until_idle(shared, socket)
 }
 
 /// Arms `ControlMsg::PrepareHandoff` (Live Handoff, EXPERIMENTAL) with
@@ -299,15 +335,24 @@ fn acquire_daemon_lock(runtime_dir: &Path) {
     }
 }
 
-/// The serving half shared by `Daemon::run_until_idle` and
-/// `run_handoff_receiver`: accept loop plus the idle-linger watcher,
-/// then persister flush and socket-file cleanup.
-fn serve(shared: Arc<Shared>, listener: UnixListener, socket: PathBuf) -> Result<(), DaemonError> {
-    {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || accept_loop(listener, shared));
-    }
+/// Spawns the accept loop for `listener` on a background thread. Split
+/// from `block_until_idle` (they were one `serve` function) so the
+/// handoff receiver can begin accepting on the transferred socket
+/// *before* it acks the old daemon into exiting (P6 review H5): the old
+/// daemon's post-ack exit then never leaves a window with the
+/// transferred socket bound but unserved. `Daemon::run_until_idle` calls
+/// this and `block_until_idle` back to back, preserving its old
+/// behavior exactly.
+fn start_accepting(shared: &Arc<Shared>, listener: UnixListener) {
+    let shared = Arc::clone(shared);
+    thread::spawn(move || accept_loop(listener, shared));
+}
 
+/// Blocks until the daemon is idle (zero sessions, zero clients) for
+/// `IDLE_LINGER`, then flushes the persister and removes the socket
+/// file. The accept loop spawned by `start_accepting` keeps running on
+/// its own thread until this process exits.
+fn block_until_idle(shared: Arc<Shared>, socket: PathBuf) -> Result<(), DaemonError> {
     let mut state = shared.lock_state();
     loop {
         let idle = state.sessions.is_empty() && state.total_clients == 0;
@@ -372,4 +417,124 @@ fn create_private_dir(dir: &Path) -> Result<(), DaemonError> {
     builder.recursive(true).mode(0o700);
     builder.create(dir)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::os::fd::{AsFd, AsRawFd};
+
+    use handoff::{encode_manifest, HandoffManifest};
+
+    use super::*;
+
+    /// H5 (P6 review, lib.rs:227 / E#4 + C+D#2): `run_handoff_receiver`
+    /// writes `HANDOFF_ACK` -- the old daemon's unconditional point of
+    /// no return (`crate::handoff`'s module doc) -- *before* it takes
+    /// over the single-daemon lock (`acquire_daemon_lock`), let alone
+    /// before it is actually serving. If the receiver dies or wedges in
+    /// that gap, the old daemon has already been told to exit, and
+    /// every adopted session is orphaned.
+    ///
+    /// Proven here without spinning up two real daemon processes: this
+    /// test plays the "old daemon" offering role itself (an empty
+    /// manifest, no sessions to keep this test simple; H5 is about
+    /// ordering, not adoption content) against a real
+    /// `run_handoff_receiver`, and pre-holds the single-daemon lock
+    /// file exclusively for a fixed window standing in for a
+    /// slow-releasing previous holder. `acquire_daemon_lock`'s own
+    /// retry loop cannot succeed before that window elapses; if the
+    /// ack byte arrives before it does, that proves `run_handoff_receiver`
+    /// sent it before completing the lock takeover attempt, which is
+    /// exactly the bug.
+    #[test]
+    fn handoff_receiver_sends_ack_only_after_the_daemon_lock_takeover_attempt_resolves() {
+        let runtime_tmp = tempfile::tempdir().expect("scratch runtime dir");
+        let state_tmp = tempfile::tempdir().expect("scratch state dir");
+        let runtime_dir = runtime_tmp.path().to_path_buf();
+
+        // Pre-hold the single-daemon lock file exclusively: stands in
+        // for a slow-releasing old daemon / concurrent lock holder.
+        // Released after a fixed window from a background thread
+        // rather than immediately, so `acquire_daemon_lock`'s retry
+        // loop (20ms polls, bounded at LOCK_TAKEOVER_WAIT = 5s) cannot
+        // possibly succeed before that window elapses.
+        let lock_path = runtime_dir.join(LOCK_FILE);
+        std::fs::create_dir_all(&runtime_dir).expect("create scratch runtime dir");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .expect("open scratch lock file");
+        let held_lock =
+            nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .expect("test should be able to pre-acquire the scratch lock file");
+        const HOLD: Duration = Duration::from_secs(2);
+        std::thread::spawn(move || {
+            std::thread::sleep(HOLD);
+            drop(held_lock);
+        });
+
+        // A real bound listener stands in for the transferred control
+        // listener: run_handoff_receiver only ever wraps whatever fd
+        // it is handed, it never inspects its origin.
+        let control_listener =
+            std::os::unix::net::UnixListener::bind(runtime_dir.join("control-stand-in.sock"))
+                .expect("bind stand-in control listener");
+
+        // The dedicated handoff endpoint run_handoff_receiver connects
+        // to, played by this test as the offering ("old daemon") side.
+        let handoff_socket = runtime_dir.join("handoff-stand-in.sock");
+        let handoff_listener = std::os::unix::net::UnixListener::bind(&handoff_socket)
+            .expect("bind stand-in handoff listener");
+
+        let config = DaemonConfig {
+            runtime_dir: runtime_dir.clone(),
+            state_dir: state_tmp.path().to_path_buf(),
+            history_enabled: false,
+        };
+
+        let receiver_thread = std::thread::spawn(move || {
+            // The subject under test, entirely unmodified. Its
+            // eventual `block_until_idle()` call blocks until idle (up to
+            // 30s with no sessions/clients); this thread is intentionally
+            // left detached rather than joined; the process ends at
+            // the end of the whole test binary run.
+            let _ = run_handoff_receiver(config, &handoff_socket);
+        });
+
+        let (offerer_stream, _) = handoff_listener
+            .accept()
+            .expect("accept the receiver's connection to the handoff endpoint");
+        let manifest = HandoffManifest { sessions: vec![] };
+        let sidecar = encode_manifest(&manifest).expect("encode an empty manifest");
+        let listener_fd = control_listener
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("dup the stand-in control listener");
+        fdpass::send_fds(&offerer_stream, &sidecar, &[listener_fd.as_raw_fd()])
+            .expect("send the manifest and control listener fd to the receiver");
+
+        let start = std::time::Instant::now();
+        offerer_stream
+            .set_read_timeout(Some(HOLD + Duration::from_secs(4)))
+            .expect("set ack read timeout");
+        let mut ack_byte = [0u8; 1];
+        (&offerer_stream)
+            .read_exact(&mut ack_byte)
+            .expect("the receiver should eventually send its ack");
+        let ack_arrived_after = start.elapsed();
+
+        let _ = receiver_thread; // intentionally left running; see above.
+
+        assert!(
+            ack_arrived_after >= HOLD,
+            "HANDOFF_ACK arrived after {ack_arrived_after:?}, before the {HOLD:?} window \
+             this test still held the single-daemon lock exclusively: \
+             run_handoff_receiver must not send the ack until after its own lock \
+             takeover attempt (acquire_daemon_lock) has resolved, let alone before it \
+             is actually serving"
+        );
+    }
 }

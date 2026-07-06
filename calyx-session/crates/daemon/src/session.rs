@@ -64,7 +64,7 @@ pub(crate) enum SessionRequest {
     /// `PausedSession::resume_tx` fires or is dropped. Only ever sent
     /// by `handoff::offer_handoff`.
     PauseForHandoff {
-        reply: mpsc::SyncSender<Result<PausedSession, String>>,
+        reply: mpsc::SyncSender<Result<PausedSession, PauseError>>,
     },
 }
 
@@ -82,6 +82,21 @@ pub(crate) struct PausedSession {
     pub(crate) cols: u16,
     pub(crate) rows: u16,
     pub(crate) resume_tx: mpsc::SyncSender<()>,
+}
+
+/// Why a `PauseForHandoff` did not park the session. Distinguishing
+/// `ExitedDuringPause` (the session's child died mid-pause, so its
+/// thread is tearing down) from an ordinary failure lets
+/// `handoff::offer_handoff` record the terminal state rather than
+/// restore a dead-thread zombie into the live registry (P6 review H3).
+#[derive(Debug)]
+pub(crate) enum PauseError {
+    /// The session's child exited during the handoff pause window; its
+    /// thread caught this request only in its final teardown drain, and
+    /// there is nothing left to migrate.
+    ExitedDuringPause,
+    /// Rendering the replay snapshot for the pause failed.
+    RenderFailed(String),
 }
 
 /// Request channel into a session thread, woken via a self-pipe so the
@@ -211,6 +226,56 @@ pub(crate) enum SessionChild {
 /// merely closed its tty and lives on must not stall teardown forever.
 const ADOPTED_EXIT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Test-only override for `ADOPTED_EXIT_POLL` (H7, P6 review): 0 means
+/// "no override, use the real bound". `#[cfg(test)]` only, so this
+/// atomic and everything below it do not exist at all in a non-test
+/// build and cannot affect production behavior. A real 5s bound has no
+/// other seam a test could reach without actually waiting out 5s.
+#[cfg(test)]
+static ADOPTED_EXIT_POLL_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The bound `SessionChild::Adopted`'s `reap` actually polls against:
+/// `ADOPTED_EXIT_POLL` normally, or a test override installed via
+/// `set_adopted_exit_poll_for_test` while its guard is alive.
+fn adopted_exit_poll_bound() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let override_ms = ADOPTED_EXIT_POLL_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if override_ms != 0 {
+            return std::time::Duration::from_millis(override_ms);
+        }
+    }
+    ADOPTED_EXIT_POLL
+}
+
+/// Installs a test-only override for the adopted-exit liveness-poll
+/// bound. The override is process-wide (the bound is read from a
+/// spawned session thread, not the calling test thread, so a
+/// thread-local could not reach it), so the returned guard restores it
+/// to "no override" on drop, keeping one test's override from leaking
+/// into another test running later in the same test binary process.
+#[cfg(test)]
+pub(crate) fn set_adopted_exit_poll_for_test(
+    bound: std::time::Duration,
+) -> AdoptedExitPollOverrideGuard {
+    ADOPTED_EXIT_POLL_OVERRIDE_MS.store(
+        bound.as_millis().max(1) as u64,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    AdoptedExitPollOverrideGuard
+}
+
+#[cfg(test)]
+pub(crate) struct AdoptedExitPollOverrideGuard;
+
+#[cfg(test)]
+impl Drop for AdoptedExitPollOverrideGuard {
+    fn drop(&mut self) {
+        ADOPTED_EXIT_POLL_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl SessionChild {
     /// Best-effort abort when the session thread fails before its main
     /// loop (terminal init). A forked child is this daemon's to kill
@@ -228,34 +293,49 @@ impl SessionChild {
         }
     }
 
-    /// Waits out the child's end and returns the exit code to record
-    /// in the ledger.
-    fn reap(&mut self, id: &str) -> i32 {
+    /// Waits out the child's end and returns the exit code to record in
+    /// the ledger, or `None` when an adopted process is still alive once
+    /// its liveness-poll bound elapses (P6 review H7). `None` means "do
+    /// not record an exit": the process only closed its PTY, it did not
+    /// end, so the caller must not flip the ledger to `Exited` or delete
+    /// the session's history. A forked child always yields `Some` (a
+    /// real `waitpid` is available).
+    fn reap(&mut self, id: &str) -> Option<i32> {
         match self {
             SessionChild::Forked(child) => match child.wait() {
-                Ok(status) => status
-                    .code()
-                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+                Ok(status) => Some(
+                    status
+                        .code()
+                        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+                ),
                 Err(e) => {
                     eprintln!("calyx-sessiond: waitpid failed for {id}: {e}");
-                    -1
+                    Some(-1)
                 }
             },
             SessionChild::Adopted { pid } => {
                 // Known limitation (crate::handoff module doc): this
                 // daemon never forked `pid`, so there is no status to
                 // collect. Poll liveness until the process is gone or
-                // the bound elapses, then record the unknowable exit
-                // code as -1, the same value the waitpid-failure path
-                // above uses.
-                let deadline = std::time::Instant::now() + ADOPTED_EXIT_POLL;
+                // the bound elapses.
+                let deadline = std::time::Instant::now() + adopted_exit_poll_bound();
                 let pid = nix::unistd::Pid::from_raw(*pid as i32);
                 while nix::sys::signal::kill(pid, None).is_ok()
                     && std::time::Instant::now() < deadline
                 {
                     thread::sleep(std::time::Duration::from_millis(20));
                 }
-                -1
+                // Distinguish "confirmed gone" (ESRCH: record the
+                // unknowable exit code as -1, the waitpid-failure
+                // sentinel) from "still alive at the bound" (None: the
+                // process merely detached from its PTY; recording an
+                // exit would lose its Running record and its history
+                // with no way left to kill or reattach it).
+                if nix::sys::signal::kill(pid, None).is_err() {
+                    Some(-1)
+                } else {
+                    None
+                }
             }
         }
     }
@@ -556,6 +636,21 @@ fn session_thread(ctx: SessionThread) {
         // already contains the pre-crash scrollback; then delete the
         // files so the live appends below start from a clean slate.
         //
+        // Accepted experimental residual (P6 review H10): the delete
+        // below happens before this generation durably re-appends any
+        // byte, so a *second* daemon crash landing in that narrow
+        // window (seeded terminal, files already deleted, nothing new
+        // written yet) loses the pre-first-crash prefix for good; the
+        // recreated terminal after that second crash starts blank. Not
+        // fixed by keeping the bytes until the first append: that would
+        // change the file's "what this generation's own PTY produced"
+        // meaning, double-store the seed alongside the live appends
+        // until the first rotation evicts it, and entangle this path
+        // with the rotation/cleanup contract and its tests. For an
+        // opt-in, best-effort, experimental history feature the
+        // one-in-a-double-crash prefix loss is accepted rather than
+        // paying that complexity.
+        //
         // Never for an adopted session: its leftover file means
         // continuation, not a crash (the previous generation's exit
         // deliberately skipped teardown), the handoff replay above is
@@ -689,8 +784,9 @@ fn session_thread(ctx: SessionThread) {
                             }
                         }
                         Err(e) => {
-                            let _ =
-                                reply.send(Err(format!("render_replay for handoff failed: {e}")));
+                            let _ = reply.send(Err(PauseError::RenderFailed(format!(
+                                "render_replay for handoff failed: {e}"
+                            ))));
                         }
                     }
                 }
@@ -803,20 +899,22 @@ fn session_thread(ctx: SessionThread) {
     //    (create-race losers must not delete a same-id winner's).
     //    Removal precedes the reap so `Kill` can rely on "entry
     //    present => child not yet reaped => pid not reused".
-    // 2. Delete this session's on-disk history, when it was ours and
-    //    history was on: history exists to survive a daemon crash,
-    //    not a session's own end (kill and natural exit both land
-    //    here; this is the single teardown point). Before step 4's
-    //    ledger flip on purpose, so `KillOk` (gated on that flip)
-    //    implies the files are already gone.
-    // 3. Reap the child (this is what frees the pid).
-    // 4. Record the exit code in the ledger (this is what `Kill` waits
-    //    for before `KillOk`, making its `kill -0` probe determinate).
-    // 5. Drain the mailbox one final time: an Attach could only have
+    // 2. Reap the child (this is what frees the pid). Reap runs
+    //    *before* the history delete and the ledger flip because an
+    //    adopted process may still be alive at its liveness-poll bound
+    //    (`reap` returns `None`, P6 review H7): that is not an exit, so
+    //    its history and its `Running` ledger record must both survive.
+    // 3. On a confirmed exit (`Some(code)`) only: delete this session's
+    //    on-disk history (when it was ours and history was on: history
+    //    exists to survive a daemon crash, not a session's own end),
+    //    then flip the ledger to `Exited`. History is deleted before
+    //    the flip on purpose, so `KillOk` (gated on that flip) implies
+    //    the files are already gone.
+    // 4. Drain the mailbox one final time: an Attach could only have
     //    been enqueued while the entry was still present (conn.rs
     //    sends under the registry lock), so admitting stragglers here
     //    closes the "attached into silence" race.
-    // 6. Deliver Replay (for stragglers) + Exited to every client and
+    // 5. Deliver Replay (for stragglers) + Exited to every client and
     //    finish their queues so their connections close promptly.
     let mine = {
         let mut state = shared.lock_state();
@@ -832,33 +930,49 @@ fn session_thread(ctx: SessionThread) {
         mine
     };
 
-    // Step 2: close the writer's fd before unlinking (not required on
-    // Unix, just tidy), then delete both generations. `mine` implies
-    // `registered`, so a create-race loser never gets here with files
-    // a winner owns; the check on `history_enabled` (not on the
-    // writer, which an append error may have dropped) keeps the
-    // cleanup running even when persisting stopped mid-session, and
-    // keeps a history-off session from ever touching the paths.
+    // Close the writer's fd (does not delete files): the delete, if
+    // any, happens below only once the child is confirmed gone.
     drop(history);
-    if mine && history_enabled {
-        if let Err(e) = history::HistoryWriter::remove_all(&state_dir, &id) {
-            eprintln!("calyx-sessiond: removing history for {id} failed: {e}");
-        }
-    }
 
-    let exit_code = child.reap(&id);
+    let reaped = child.reap(&id);
 
     if mine {
-        let mut state = shared.lock_state();
-        if let Some(info) = state.ledger.get_mut(&id) {
-            info.state = SessionState::Exited { code: exit_code };
-            info.pid = 0;
-            info.attached_clients = 0;
+        if let Some(exit_code) = reaped {
+            // Confirmed exit. Delete both history generations first (see
+            // the ordering note above); the `history_enabled` check,
+            // not the writer (which an append error may have dropped),
+            // keeps cleanup running even when persisting stopped
+            // mid-session, and keeps a history-off session from ever
+            // touching the paths. `mine` implies `registered`, so a
+            // create-race loser never gets here with a winner's files.
+            if history_enabled {
+                if let Err(e) = history::HistoryWriter::remove_all(&state_dir, &id) {
+                    eprintln!("calyx-sessiond: removing history for {id} failed: {e}");
+                }
+            }
+            let mut state = shared.lock_state();
+            if let Some(info) = state.ledger.get_mut(&id) {
+                info.state = SessionState::Exited { code: exit_code };
+                info.pid = 0;
+                info.attached_clients = 0;
+            }
+            state.touch();
+            shared.persist_ledger(&state);
+            shared.cond.notify_all();
         }
-        state.touch();
-        shared.persist_ledger(&state);
-        shared.cond.notify_all();
+        // `reaped == None`: an adopted process still alive at its
+        // liveness-poll bound (H7). Its PTY has ended (this thread is
+        // tearing down) so it is already out of the live registry and
+        // the daemon can no longer serve it, but it did not exit: keep
+        // its history and leave its ledger record `Running` rather than
+        // fabricating an `Exited`. Reattaching it is not possible (the
+        // handoff module doc's known limitation).
     }
+
+    // Stragglers and the terminal event still use a concrete code; an
+    // adopted process whose exit is unknown reports -1, the same
+    // sentinel a failed waitpid uses.
+    let exit_code = reaped.unwrap_or(-1);
 
     for request in lock_unpoisoned(&mailbox.requests).drain(..) {
         match request {
@@ -871,11 +985,12 @@ fn session_thread(ctx: SessionThread) {
             }
             SessionRequest::Resize { .. } | SessionRequest::Pump => {}
             SessionRequest::PauseForHandoff { reply } => {
-                // Exit raced the handoff attempt: report it so the
-                // offerer fails the whole attempt (and resumes the
-                // sessions that did pause) instead of waiting out its
-                // reply timeout.
-                let _ = reply.send(Err(format!("session {id:?} exited during handoff pause")));
+                // Exit raced the handoff attempt: report it (typed, so
+                // the offerer records the terminal state instead of
+                // restoring this dead-thread entry as a zombie, H3)
+                // rather than making the offerer wait out its reply
+                // timeout, and resume the sessions that did pause.
+                let _ = reply.send(Err(PauseError::ExitedDuringPause));
             }
         }
     }

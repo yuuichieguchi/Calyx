@@ -69,12 +69,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use proto::SessionState;
+
 use crate::error::DaemonError;
 use crate::fdpass;
 use crate::history;
 use crate::outq::{lock_unpoisoned, OutQueue};
 use crate::session::{
-    make_wake_pipe, start_session_thread, PausedSession, SessionChild, SessionInput,
+    make_wake_pipe, start_session_thread, PauseError, PausedSession, SessionChild, SessionInput,
     SessionMailbox, SessionRequest, SessionThread,
 };
 use crate::state::{SessionEntry, Shared};
@@ -84,17 +86,36 @@ use crate::state::{SessionEntry, Shared};
 /// is armed: the old daemon's point of no return (module doc).
 pub(crate) const HANDOFF_ACK: u8 = 0x06;
 
-/// Upper bound on fds in one handoff (sessions + the control
-/// listener), used to size the receiver's `SCM_RIGHTS` buffer. 253 is
-/// Linux's per-message `SCM_MAX_FD`; staying at it keeps the protocol
-/// portable, and a daemon with more live sessions than that simply
-/// cannot hand off (EXPERIMENTAL limitation).
+/// Upper bound on fds in one handoff (every session's PTY master plus
+/// the control listener), used to size the receiver's `SCM_RIGHTS`
+/// control buffer. This is a self-imposed protocol cap, not a kernel
+/// limit: it is deliberately *not* Linux's per-message `SCM_MAX_FD`
+/// (253), because this daemon targets macOS, which has no such fixed
+/// per-message constant. The value is chosen to stay comfortably under
+/// a typical macOS default `RLIMIT_NOFILE` soft limit of 256 (leaving
+/// headroom for the daemon's own sockets, pipes, and history files) and
+/// to keep the receiver's `CMSG_SPACE` allocation bounded. A daemon
+/// with more live sessions than this simply cannot hand off
+/// (EXPERIMENTAL limitation).
 pub(crate) const MAX_HANDOFF_FDS: usize = 253;
 
 /// How long `offer_handoff` waits for each session thread to
 /// acknowledge its pause: bounded so a wedged (or already-exited)
 /// session thread fails the attempt instead of hanging the daemon.
 const PAUSE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Bounds the manifest/fd send in `offer_handoff` (P6 review H6). A
+/// receiver that connects and then stalls without draining its end
+/// would otherwise block the `SCM_RIGHTS` send forever, freezing every
+/// already-paused session; on this bound tripping, the send fails and
+/// every paused session is resumed. This is `SO_SNDTIMEO`, so it bounds
+/// how long a single blocking write waits for buffer space, never the
+/// whole transfer: a receiver that keeps draining never trips it,
+/// however large the manifest, while one that has not accepted a single
+/// byte for this long is wedged. One second is a generous "the receiver
+/// is a fresh local daemon that has gone unresponsive" threshold (a
+/// healthy `recv_fds` drains in milliseconds).
+const HANDOFF_SEND_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How long the handoff host waits for the spawned receiver to connect
 /// to the dedicated endpoint before giving up and resuming service.
@@ -319,6 +340,23 @@ pub(crate) fn offer_handoff(
     // Detach and pause every live session. Both halves are reversible
     // (re-insert; resume) until the ack lands.
     let ids: Vec<String> = shared.lock_state().sessions.keys().cloned().collect();
+
+    // Fail fast before pausing/rendering anything (P6 review H9): the
+    // receiver's SCM_RIGHTS buffer is sized for MAX_HANDOFF_FDS (one fd
+    // per session plus the control listener), and an over-count is only
+    // caught at recv time otherwise, after a full pause/render/resume
+    // cycle has already been wasted. `+ 1` for the listener is an upper
+    // bound (a unit-test context with no installed listener sends one
+    // fewer), which only ever makes this check stricter, never laxer.
+    if ids.len() + 1 > MAX_HANDOFF_FDS {
+        return Err(format!(
+            "cannot hand off {} live sessions: exceeds the {}-fd-per-handoff limit \
+             (one PTY master per session plus the control listener)",
+            ids.len(),
+            MAX_HANDOFF_FDS
+        ));
+    }
+
     let mut candidates: Vec<HandoffCandidate> = Vec::new();
     for id in ids {
         let Some(entry) = detach_for_handoff(shared, &id) else {
@@ -331,18 +369,30 @@ pub(crate) fn offer_handoff(
             .send(SessionRequest::PauseForHandoff { reply: reply_tx });
         match reply_rx.recv_timeout(PAUSE_REPLY_TIMEOUT) {
             Ok(Ok(paused)) => candidates.push(HandoffCandidate { entry, paused }),
-            Ok(Err(e)) => {
-                // This entry never parked (the thread replied Err
-                // instead), so it only needs re-inserting.
+            Ok(Err(PauseError::ExitedDuringPause)) => {
+                // The child exited during the pause window; this entry's
+                // thread is tearing down and there is nothing left to
+                // migrate. Record the terminal state (never a restored
+                // zombie: its thread is already gone -- P6 review H3),
+                // resume the sessions that did pause, and fail.
+                finalize_exited(shared, entry);
+                resume_all(shared, candidates);
+                return Err(format!("session {id:?} exited during the handoff pause"));
+            }
+            Ok(Err(PauseError::RenderFailed(e))) => {
+                // The thread replied a render failure and keeps running,
+                // so it only needs re-inserting.
                 restore_entry(shared, entry);
                 resume_all(shared, candidates);
                 return Err(format!("pausing session {id:?} failed: {e}"));
             }
             Err(_) => {
-                // The thread never replied. Its stale pause request
-                // can no longer park it: the reply sender is dropped
-                // here, and the session thread only parks after a
-                // successful reply send.
+                // The thread never replied within the bound. Its stale
+                // pause request can no longer park it: the reply sender
+                // is dropped here, and the session thread only parks
+                // after a successful reply send. `restore_entry` decides
+                // between reinserting a still-live (wedged) thread and
+                // finalizing one that already exited (H3).
                 restore_entry(shared, entry);
                 resume_all(shared, candidates);
                 return Err(format!(
@@ -400,6 +450,15 @@ pub(crate) fn offer_handoff(
             return Err(format!("encoding handoff manifest failed: {e}"));
         }
     };
+    // Bound the send (P6 review H6): without a write timeout a receiver
+    // that connects and then stalls without draining freezes this
+    // sendmsg forever, leaving every paused session parked indefinitely.
+    // On the bound tripping, `send_fds` returns an error and the resume
+    // path below runs, exactly as for any other send failure.
+    if let Err(e) = peer.set_write_timeout(Some(HANDOFF_SEND_TIMEOUT)) {
+        resume_all(shared, candidates);
+        return Err(format!("setting handoff send timeout failed: {e}"));
+    }
     if let Err(e) = fdpass::send_fds(peer, &sidecar, &fds) {
         resume_all(shared, candidates);
         return Err(format!("sending handoff manifest and fds failed: {e}"));
@@ -437,12 +496,55 @@ struct HandoffCandidate {
     paused: PausedSession,
 }
 
-/// Failure-path half of `detach_for_handoff`: puts a (non-parked)
-/// entry back into the live registry.
+/// Failure-path half of `detach_for_handoff`: puts a (non-parked) entry
+/// back into the live registry, unless its session thread has already
+/// exited.
+///
+/// A session whose child died during the pause window (before it could
+/// park) has a thread that ran its own teardown and returned, dropping
+/// its clone of the mailbox `Arc` and leaving this detached entry as the
+/// sole owner. Reinserting it then would publish a live-looking zombie
+/// backed by a dead thread: every future `Attach` would hang and every
+/// `Kill` would time out, needing a daemon restart to clear (P6 review
+/// H3 / E#2). Detect that here by the mailbox's strong count -- the entry
+/// and its thread are the only two possible holders while it is detached
+/// (it is out of the registry, so no request path can hold a transient
+/// clone) -- and record the terminal state instead of reinserting.
+///
+/// A count above one means the thread is still alive (wedged, or it
+/// replied a render failure and kept running); reinserting is correct,
+/// and if it does exit later, its own teardown finds this reinserted
+/// entry by mailbox identity and cleans it up.
 fn restore_entry(shared: &Arc<Shared>, entry: SessionEntry) {
+    if Arc::strong_count(&entry.mailbox) == 1 {
+        finalize_exited(shared, entry);
+        return;
+    }
     let mut state = shared.lock_state();
     state.sessions.insert(entry.id.clone(), entry);
     state.touch();
+    shared.cond.notify_all();
+}
+
+/// Records the terminal state for a handoff-detached session whose
+/// thread has already exited (its child died during the pause window):
+/// flip its ledger record to `Exited` and drop the entry, never
+/// republishing a dead-thread zombie into the live registry (P6 review
+/// H3). The exit code is unknowable here -- a detached entry's own
+/// teardown skips the ledger flip (its `mine` check finds the entry
+/// already gone), so it reaped the child and discarded the code -- so
+/// -1, the same sentinel `SessionChild::reap` uses when no status is
+/// available.
+fn finalize_exited(shared: &Arc<Shared>, entry: SessionEntry) {
+    let mut state = shared.lock_state();
+    state.sessions.remove(&entry.id);
+    if let Some(info) = state.ledger.get_mut(&entry.id) {
+        info.state = SessionState::Exited { code: -1 };
+        info.pid = 0;
+        info.attached_clients = 0;
+    }
+    state.touch();
+    shared.persist_ledger(&state);
     shared.cond.notify_all();
 }
 
@@ -829,6 +931,373 @@ mod tests {
             state.ledger.get(id).map(|info| info.state),
             Some(SessionState::Running),
             "a failed handoff attempt must not have changed the session's ledger state"
+        );
+    }
+
+    /// H3 (P6 review, handoff.rs:334 / E#2): if a session's child
+    /// exits during the handoff pause window (the poll cycle that
+    /// notices PTY EOF can race the very `PauseForHandoff` request
+    /// that just detached it), `offer_handoff`'s failure path must not
+    /// reinsert a zombie: a `SessionEntry` whose session thread has
+    /// already torn down, present in the live registry, with the
+    /// ledger still saying `Running`. That entry would hang every
+    /// future `Attach` and time out every future `Kill` (5s), needing a
+    /// daemon restart to clear.
+    ///
+    /// Reproduced deterministically (not via a poll-cycle timing race)
+    /// by killing the real child after detaching, letting the session
+    /// thread's own teardown fully complete, and only then sending a
+    /// `PauseForHandoff`: `offer_handoff`'s real failure path treats
+    /// both an `Err` reply (caught by the thread's final mailbox
+    /// drain) and a timeout (thread already fully exited, no reply
+    /// ever) identically by calling `restore_entry`, so either
+    /// sub-case reproduces the same bug without needing to win a
+    /// nanosecond-scale race.
+    #[test]
+    fn restore_entry_after_child_exits_during_pause_never_reinserts_a_zombie() {
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        let id = "01J-p6-h3-zombie-restore-test";
+        let spec = cat_spec(id);
+        let entry = spawn_session(&shared, &spec).expect("spawn_session should succeed");
+        entry.release_start();
+        let pid = entry.pid;
+        {
+            let mut state = shared.lock_state();
+            state.ledger.insert(entry.id.clone(), entry.info());
+            state.sessions.insert(entry.id.clone(), entry);
+        }
+
+        // Step 1 of a real offer_handoff attempt: detach for handoff.
+        let detached = detach_for_handoff(&shared, id)
+            .expect("detach_for_handoff should return the live entry");
+
+        // The finding's interleaving: the child exits (EOF) in the
+        // same window the pause request is in flight. Killing the
+        // real child directly and waiting for it to be fully reaped
+        // reaches the identical post-condition (the session thread's
+        // teardown has run, its `mine` check saw the entry already
+        // gone, and it has reaped the child) without depending on a
+        // specific poll-cycle timing.
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("killpg the real donor child");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err(),
+            "the killed donor child should be reaped within 3s (test setup precondition); \
+             kill(pid, 0) still succeeded"
+        );
+        // Headroom for the session thread's own final mailbox drain /
+        // thread exit to complete right after the reap.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Step 2 of a real offer_handoff attempt: send the pause
+        // request to the now-detached (and by now dead-threaded) entry,
+        // exactly like offer_handoff's own loop does.
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        detached
+            .mailbox
+            .send(SessionRequest::PauseForHandoff { reply: reply_tx });
+        // `PausedSession` (the `Ok(Ok(_))` payload) has no `Debug` impl
+        // (it carries live channel/replay state, not meant for
+        // printing); describe the outcome instead of the raw value.
+        let pause_result: String = match reply_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Ok(_paused)) => "Ok(Ok(paused))".to_string(),
+            Ok(Err(e)) => format!("Ok(Err({e:?}))"),
+            Err(e) => format!("Err({e:?})"),
+        };
+
+        // Step 3: offer_handoff's real failure path for either arm (an
+        // `Err` reply, or a timeout because the thread already fully
+        // exited) is to call restore_entry unconditionally.
+        restore_entry(&shared, detached);
+
+        let state = shared.lock_state();
+        let in_registry = state.sessions.contains_key(id);
+        let ledger_state = state.ledger.get(id).map(|info| info.state);
+        drop(state);
+
+        let cleanly_gone_or_exited =
+            !in_registry && matches!(ledger_state, Some(SessionState::Exited { .. }));
+        assert!(
+            cleanly_gone_or_exited,
+            "a session whose child exited during the handoff pause window must end up \
+             cleanly gone from the live registry with an Exited ledger record after a \
+             failed pause/restore, never a live-looking zombie entry backed by an \
+             already-dead session thread (in_registry={in_registry}, \
+             ledger_state={ledger_state:?}, pause_result={pause_result:?})"
+        );
+    }
+
+    /// H6 (P6 review, handoff.rs:403 / C+D#4): `offer_handoff` sends
+    /// the manifest and fds with no write timeout at all (a read
+    /// timeout is only set afterward, for the ack wait). A receiver
+    /// that connects and then stalls (never drains its end) must not
+    /// freeze `offer_handoff` -- and therefore every paused session --
+    /// indefinitely: the send must be bounded, and on that bound
+    /// tripping, every paused session must be resumed.
+    ///
+    /// The peer here is a real, still-connected `UnixStream` that
+    /// simply never reads: standing in for a wedged receiver, not a
+    /// closed one (a closed peer already fails fast via EPIPE, a
+    /// different and already-handled case). To force a real kernel write
+    /// to block against it reliably, the offerer socket's send buffer
+    /// and the peer socket's receive buffer are both shrunk (via
+    /// `SO_SNDBUF`/`SO_RCVBUF`) below the manifest size, so the send
+    /// cannot be fully queued with nobody draining the other end. This
+    /// is deliberately independent of the replay's own size: a live
+    /// `cat` session on this platform's default (canonical-mode) PTY
+    /// truncates newline-free input to `MAX_CANON`, so a session's
+    /// `render_replay` here is only a couple of KiB, comfortably under
+    /// the default 8 KiB AF_UNIX buffer -- shrinking the buffers is the
+    /// robust way to guarantee the blocking send this test needs.
+    #[test]
+    fn offer_handoff_bounds_the_fd_send_with_a_write_timeout_and_resumes_on_stall() {
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        let id = "01J-p6-h6-write-timeout-test";
+        let spec = cat_spec(id);
+        let entry = spawn_session(&shared, &spec).expect("spawn_session should succeed");
+        entry.release_start();
+        let pid = entry.pid;
+        let _kill_on_drop = KillOnDrop(pid);
+        {
+            let mut state = shared.lock_state();
+            state.ledger.insert(entry.id.clone(), entry.info());
+            state.sessions.insert(entry.id.clone(), entry);
+        }
+
+        let (offerer_side, peer_side) = UnixStream::pair().expect("create scratch socketpair");
+        // peer_side is intentionally never read from and kept open for
+        // the whole attempt below (a stalled, not closed, receiver).
+        //
+        // Shrink both buffers well under the manifest size so the very
+        // first manifest write blocks with nobody draining, regardless
+        // of how small a real cat session's replay is on this platform
+        // (see the doc comment). setsockopt is the only way to reach
+        // SO_SNDBUF/SO_RCVBUF from a std UnixStream.
+        fn shrink_buf(stream: &UnixStream, opt: libc::c_int) {
+            let val: libc::c_int = 256;
+            // SAFETY: a plain setsockopt with a valid fd, level, option,
+            // and a correctly sized c_int argument.
+            let rc = unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    &val as *const libc::c_int as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(
+                rc, 0,
+                "setsockopt to shrink the scratch socket buffer should succeed"
+            );
+        }
+        shrink_buf(&offerer_side, libc::SO_SNDBUF);
+        shrink_buf(&peer_side, libc::SO_RCVBUF);
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let shared_for_thread = Arc::clone(&shared);
+        std::thread::spawn(move || {
+            let result = offer_handoff(&shared_for_thread, &offerer_side, Duration::from_secs(30));
+            let _ = result_tx.send(result);
+        });
+
+        match result_rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(result) => {
+                assert!(
+                    result.is_err(),
+                    "offer_handoff must report failure when the peer never reads its \
+                     manifest/fd send, got {result:?}"
+                );
+            }
+            Err(_) => panic!(
+                "offer_handoff did not return within 3s against a peer that connects but \
+                 never reads: send_fds has no write timeout, so a stalled/wedged receiver \
+                 freezes every paused session indefinitely (H6)"
+            ),
+        }
+
+        let state = shared.lock_state();
+        assert!(
+            state.sessions.contains_key(id),
+            "a stalled handoff send must resume the paused session back into the live \
+             registry (resume_all), not leave it parked forever"
+        );
+        drop(state);
+        drop(peer_side);
+    }
+
+    /// H7 (P6 review, session.rs:244 / A#? + C+D#3): an adopted
+    /// session's `reap` cannot `waitpid` its process (it was never this
+    /// daemon's own child), so it degrades to polling `kill(pid, 0)`
+    /// for up to the adopted-exit liveness-poll bound after PTY EOF.
+    /// Today it returns the same `-1` exit code whether the process is
+    /// confirmed gone (`ESRCH`) or merely still alive when the poll
+    /// bound elapses -- and the caller unconditionally flips the
+    /// ledger to `Exited` and (earlier still, unconditionally on
+    /// `mine && history_enabled`, *before* `reap` is even called)
+    /// deletes the session's history. A process that only detached
+    /// from its PTY without exiting must not lose its Running record
+    /// or its history this way: there would be no way left to kill or
+    /// reattach it.
+    ///
+    /// Deterministic by construction, no PTY involved at all:
+    ///
+    /// - The "master" fd `adopt_session` is handed is one end of a
+    ///   plain `pipe()`, not a PTY. `adopt_session`/the session
+    ///   thread's read loop are fd-type-agnostic (plain `fcntl` +
+    ///   `poll` + `read`; PTY-only operations like `TIOCSWINSZ` only
+    ///   fire on a `Resize` request, never sent here), so this reaches
+    ///   the exact same code path a real adopted session would. It
+    ///   sidesteps the platform-specific PTY hangup quirk entirely (a
+    ///   session leader closing its own tty-referencing fds does *not*
+    ///   generate a master-side EOF while it stays alive on this
+    ///   platform -- verified empirically while developing this test):
+    ///   closing this test's own write end of the pipe generates a
+    ///   real, instant `Ok(0)` EOF on the read side, deterministically,
+    ///   with no session-leader/controlling-terminal semantics
+    ///   involved.
+    /// - The manifest's `pid` is a separate sentinel process (`sleep
+    ///   30`, confirmed alive throughout) wholly unrelated to the
+    ///   pipe -- exactly mirroring the real bug surface
+    ///   (`SessionChild::Adopted`'s `reap` only ever has a bare `pid`
+    ///   value to poll, with no way to verify it still names the
+    ///   process that actually owned the terminal; the module doc's
+    ///   "known limitation").
+    /// - `session::set_adopted_exit_poll_for_test` shrinks the 5s
+    ///   liveness-poll bound to 50ms for this test only (guard-scoped,
+    ///   restored on drop), so the whole test runs in well under a
+    ///   second instead of needing to sleep past a real 5s bound.
+    #[test]
+    fn adopted_reap_does_not_flip_ledger_or_delete_history_when_still_alive_at_poll_timeout() {
+        let _poll_override =
+            crate::session::set_adopted_exit_poll_for_test(Duration::from_millis(50));
+
+        let mut donor_terminal = vt::Terminal::new(80, 24, 8 * 1024 * 1024)
+            .expect("create scratch terminal for replay bytes");
+        donor_terminal
+            .feed(b"H7_PRE_ADOPT_MARKER\r\n")
+            .expect("feed marker into scratch terminal");
+        let replay_bytes = donor_terminal
+            .render_replay()
+            .expect("render_replay on scratch terminal");
+
+        // Stands in for the SCM_RIGHTS-received PTY master fd: only
+        // its read end travels into adopt_session; this test keeps the
+        // write end so it can produce EOF (via a plain close) at a
+        // moment of its own choosing, deterministically.
+        let (master_read, master_write) =
+            nix::unistd::pipe().expect("create scratch pipe standing in for the PTY master fd");
+        // CLOEXEC on both ends immediately, mirroring spawn_session's
+        // own openpty fds: without it, a *different* test's
+        // concurrently-forked child (this test binary runs tests in
+        // parallel by default) can inherit master_write and keep it
+        // open in a process this test knows nothing about, so this
+        // test's own close of its write end would never actually drop
+        // the pipe's last reference and EOF would never arrive.
+        for fd in [&master_read, &master_write] {
+            nix::fcntl::fcntl(
+                fd.as_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .expect("set scratch pipe fd cloexec");
+        }
+
+        // A sentinel process wholly unrelated to the pipe, confirmed
+        // alive for the whole test: stands in for the manifest's `pid`
+        // field (see the doc comment above).
+        let mut sentinel = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sentinel process");
+        let sentinel_pid = sentinel.id();
+
+        let manifest_entry = HandoffSessionEntry {
+            id: "01J-p6-h7-adopt-test".to_string(),
+            name: None,
+            cwd: None,
+            created_at_ms: 0,
+            pid: sentinel_pid,
+            meta: BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            replay: replay_bytes,
+        };
+
+        let receiver_tmp = tempfile::tempdir().expect("scratch state dir for receiver");
+        // History enabled for this id (a file already present, as a
+        // real Live Handoff continuation would find), so history
+        // deletion is actually meaningful to assert on: adopt_session
+        // derives history_enabled from history::has_persisted.
+        let history_dir = receiver_tmp.path().join("history");
+        std::fs::create_dir_all(&history_dir).expect("create scratch history dir");
+        let history_path = history_dir.join(format!("{}.raw", manifest_entry.id));
+        std::fs::write(&history_path, b"pre-handoff-history-bytes\n")
+            .expect("seed a pre-existing history file for the adopted id");
+
+        let receiver_shared = Arc::new(Shared::new(receiver_tmp.path().to_path_buf(), false));
+
+        let id = manifest_entry.id.clone();
+        let adopted = adopt_session(&receiver_shared, manifest_entry, master_read).expect(
+            "adopt_session should construct a running session from a manifest entry + \
+             inherited fd",
+        );
+        {
+            let mut state = receiver_shared.lock_state();
+            state.ledger.insert(adopted.id.clone(), adopted.info());
+            state.sessions.insert(adopted.id.clone(), adopted);
+        }
+
+        // Produce a real, instant EOF on the adopted thread's read
+        // side: this is the only thing that starts its teardown.
+        drop(master_write);
+
+        // Bounded wait comfortably longer than the overridden 50ms
+        // poll bound, for the whole teardown (EOF -> history delete ->
+        // reap's now-short poll -> ledger flip) to run to completion.
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Test-setup precondition: the sentinel (the manifest's `pid`)
+        // must still be genuinely alive right now (it is sleeping for
+        // up to 30s total), so this really exercises the "poll timed
+        // out while still alive" branch, not a coincidental real exit.
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_ok(),
+            "the sentinel process must still be alive when the ledger/history are checked \
+             (test setup precondition)"
+        );
+
+        let ledger_state = receiver_shared
+            .lock_state()
+            .ledger
+            .get(&id)
+            .map(|info| info.state);
+        let history_still_present = history_path.exists();
+
+        let _ = sentinel.kill();
+        let _ = sentinel.wait();
+
+        assert!(
+            !matches!(ledger_state, Some(SessionState::Exited { .. })),
+            "an adopted session must not be flipped to Exited when its process is \
+             confirmed still alive after the adopted-exit liveness-poll bound elapses \
+             (kill(pid, 0) still succeeds), got ledger state {ledger_state:?}"
+        );
+        assert!(
+            history_still_present,
+            "an adopted session's history file must not be deleted when its process is \
+             confirmed still alive after the adopted-exit liveness-poll bound elapses"
         );
     }
 }

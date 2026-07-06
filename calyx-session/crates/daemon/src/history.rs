@@ -46,6 +46,15 @@
 //! as the seed, once re-echoed by whatever the recreated session
 //! prints), so the reset keeps "what is on disk" meaning exactly "what
 //! this session's own PTY produced".
+//!
+//! Accepted experimental residual (P6 review H10): the delete happens
+//! before the recreated session durably appends its first new byte, so
+//! a *second* daemon crash in that narrow window (terminal seeded,
+//! files already gone, nothing new written yet) loses the pre-first-crash
+//! scrollback for good. The decision site in `session.rs` documents why
+//! this is accepted rather than fixed by keeping the bytes until the
+//! first append (it would change the file's per-generation meaning and
+//! entangle this path with the rotation/cleanup contract).
 
 use std::fs;
 use std::io::{self, Write};

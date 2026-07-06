@@ -105,7 +105,7 @@ final class SessionSettingsTests: XCTestCase {
 
     func test_historyPersistenceEnabled_defaultsToFalse() {
         XCTAssertFalse(SessionSettings.historyPersistenceEnabled,
-                       "historyPersistenceEnabled must default to false — on-disk history capture is opt-in")
+                       "historyPersistenceEnabled must default to false -- on-disk history capture is opt-in")
     }
 
     func test_historyPersistenceEnabled_setTrue_persistsAcrossReads() {
