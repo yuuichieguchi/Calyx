@@ -104,11 +104,15 @@ private struct RemoteHostRowView: View {
 
             Button("Attach") { model.attachToRemoteHost(host) }
                 .buttonStyle(.bordered)
+                .accessibilityIdentifier(AccessibilityID.SessionBrowser.remoteHostAttachButton(host))
             Button("Install") { Task { await model.installRemote(host: host) } }
                 .buttonStyle(.bordered)
+                .accessibilityIdentifier(AccessibilityID.SessionBrowser.remoteHostInstallButton(host))
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(AccessibilityID.SessionBrowser.remoteHostRow(host))
     }
 }
 
@@ -186,11 +190,15 @@ private struct SessionBrowserRowView: View {
             if isRunning {
                 Button("Attach") { model.attach(row) }
                     .buttonStyle(.bordered)
+                    .accessibilityIdentifier(AccessibilityID.SessionBrowser.attachButton(row.id))
                 Button("Kill") { Task { await model.kill(row) } }
                     .buttonStyle(.bordered)
+                    .accessibilityIdentifier(AccessibilityID.SessionBrowser.killButton(row.id))
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(AccessibilityID.SessionBrowser.row(row.id))
     }
 }

@@ -258,6 +258,13 @@ schemes:
       config: DebugUITesting
       targets:
         - CalyxUITests
+      # Propagates the invoking shell's CALYX_SESSION_BIN (a pre-built
+      # calyx-session path pinned by E2E suites, e.g.
+      # SessionBrowserAttachKillE2ETests.swift) into the .xctestrun's own
+      # environment, so the test runner process sees it without a
+      # manual PlistBuddy patch of the generated .xctestrun afterward.
+      environmentVariables:
+        CALYX_SESSION_BIN: $(CALYX_SESSION_BIN)
 
 fileGroups:
   - Calyx-Bridging-Header.h

@@ -16,40 +16,17 @@
 // rather than inventing a new one -- see that file's own setUp() doc
 // comment for the full rationale of each piece.
 //
-// ACCESSIBILITY-IDENTIFIER GAP (reported, not fixed here; this task's
-// brief explicitly says to stop short of editing production and report
-// this instead):
-//
-// `SessionBrowserRowView` (Calyx/Features/SessionBrowser/
-// SessionBrowserView.swift:115-196) and `RemoteHostRowView` (same
-// file, lines 89-113) assign NO `.accessibilityIdentifier` to the row
-// itself or to either of its "Attach"/"Kill" buttons. Compare
-// `SidebarContentView`'s tab/group rows (Calyx/Views/Sidebar/
-// SidebarContentView.swift), which DO carry per-row identifiers via
-// `AccessibilityID.Sidebar.tab(_:)`/`.tabCloseButton(_:)` etc
-// (Calyx/Helpers/AccessibilityID.swift:9-25) -- the session browser is
-// the one list in this codebase still missing that pattern. With two
-// or more simultaneously-Running sessions (the normal case: this
-// suite's own session A + session B), the browser renders two
-// identically-labeled "Attach" buttons and two identically-labeled
-// "Kill" buttons with no structural way to ask XCUITest for "row B's
-// Attach button" specifically -- `app.buttons["Attach"]` matches
-// EVERY row's button, not one.
-//
-// Proposed fix (would let this whole file drop `closestButton
-// (labeled:toVerticalCenterOf:)` below entirely and query by
-// identifier instead, the same way `SidebarUITests` already does):
-// add, to `AccessibilityID.swift`, a new `SessionBrowser` enum with
-//   static func row(_ id: String) -> String
-//   static func attachButton(_ id: String) -> String
-//   static func killButton(_ id: String) -> String
-// and apply them in `SessionBrowserRowView.body`
-// (SessionBrowserView.swift:152-195) via
-// `.accessibilityIdentifier(AccessibilityID.SessionBrowser.row(row.id))`
-// on the outer `HStack`, and on each `Button` respectively. This task's
-// tests below use a geometry-based heuristic (closest button by
-// vertical position to the row's own identifying text) as a
-// best-effort stand-in, documented at its own declaration.
+// Row/button lookup: `SessionBrowserRowView` and `RemoteHostRowView`
+// (Calyx/Features/SessionBrowser/SessionBrowserView.swift) each carry
+// per-row `.accessibilityIdentifier`s from `AccessibilityID.SessionBrowser`
+// (Calyx/Helpers/AccessibilityID.swift), the same pattern
+// `SidebarContentView`'s tab/group rows use via
+// `AccessibilityID.Sidebar`. With two or more simultaneously-Running
+// sessions (the normal case: this suite's own session A + session B),
+// the browser renders two identically-labeled "Attach" buttons and two
+// identically-labeled "Kill" buttons, so tests below look each button
+// up by its row-scoped identifier (`calyx.sessionBrowser.row.<id>
+// .attachButton` / `.killButton`) rather than by label.
 
 import XCTest
 
@@ -123,42 +100,6 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         searchField.typeText("Attach Session")
         Thread.sleep(forTimeInterval: 0.3)
         searchField.typeKey(.enter, modifierFlags: [])
-    }
-
-    /// Best-effort stand-in for a per-row accessibility identifier
-    /// (see this file's header comment for the gap report): among
-    /// every button matching `label` currently in the accessibility
-    /// tree, returns whichever one's vertical center is closest to
-    /// `reference`'s -- `reference` is expected to be the row's own
-    /// identifying static text (session id or name), which IS visible
-    /// in the tree today (`SessionBrowserRowView`'s `Text`, unlike
-    /// Ghostty's GPU-rendered pane content, is a plain SwiftUI view
-    /// hosted via `NSHostingView` and so appears as an ordinary
-    /// `staticText`). A wrong match would silently act on a different
-    /// row's control rather than failing cleanly -- acceptable ONLY
-    /// because this suite's own assertions afterward verify the
-    /// daemon-ledger side effect against the SPECIFIC session id this
-    /// test intended to act on, so a misfire is still caught, just
-    /// with a less direct failure message than a real identifier would
-    /// give.
-    ///
-    /// Uses `.matching(identifier:)`, NOT an explicit `NSPredicate
-    /// (format: "label == %@", ...)`, to find candidates: field-verified
-    /// on this exact app that a plain `label`-attribute predicate finds
-    /// NOTHING for `SessionBrowserRowView`'s hosted-SwiftUI text/buttons
-    /// (a diagnostic dump showed every `staticText.label` in the
-    /// Sessions window as an empty string, even for rows whose content
-    /// WAS findable via the subscript form `app.staticTexts[sessionID]`)
-    /// -- the actual text surfaces through a different accessibility
-    /// attribute that only the identifier-matching resolution path (the
-    /// same one the string-subscript operator uses, matching every
-    /// other button lookup already used throughout this codebase, e.g.
-    /// `BrowserScriptingUITests`' `dlg.buttons["Open"]`) checks.
-    private func closestButton(labeled label: String, toVerticalCenterOf reference: XCUIElement) -> XCUIElement? {
-        let candidates = app.buttons.matching(identifier: label).allElementsBoundByIndex
-        guard !candidates.isEmpty else { return nil }
-        let referenceMidY = reference.frame.midY
-        return candidates.min { abs($0.frame.midY - referenceMidY) < abs($1.frame.midY - referenceMidY) }
     }
 
     /// Full Attach/Kill round trip: session A (the initial window's
@@ -256,10 +197,9 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         // still the live main-window pane). SessionBrowserRow
         // .orphanBadgeLabel is the literal string this asserts against.
         // `.matching(identifier:)`, NOT a `label`-attribute predicate --
-        // see `closestButton(labeled:toVerticalCenterOf:)`'s own doc
-        // comment for why (field-verified: this app's hosted-SwiftUI
+        // field-verified on this exact app that this hosted-SwiftUI
         // text exposes its string through a different accessibility
-        // attribute than plain `label`). Polled (SessionBrowserView's
+        // attribute than plain `label`. Polled (SessionBrowserView's
         // `.task` refreshes every 1s, and B's row can render on an
         // earlier pass than the one where SessionSurfaceMap's orphan
         // check has settled) rather than checked once immediately
@@ -276,12 +216,11 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
             "pane and should not show one."
         )
 
-        // Attach B: best-effort row-scoped click (see this file's
-        // header for the identifier gap this works around).
-        guard let attachButtonForB = closestButton(labeled: "Attach", toVerticalCenterOf: rowBText) else {
-            XCTFail("No \"Attach\" button found in the session browser at all.")
-            return
-        }
+        // Attach B: row-scoped lookup via its own accessibility
+        // identifier (AccessibilityID.SessionBrowser.attachButton),
+        // not the shared "Attach" label every row's button carries.
+        let attachButtonForB = app.buttons["calyx.sessionBrowser.row.\(sessionBID).attachButton"]
+        XCTAssertTrue(waitFor(attachButtonForB), "Session B's \"Attach\" button (id \(sessionBID)) did not appear in the browser.")
         attachButtonForB.click()
 
         let afterAttachPoll = ledger.poll(
@@ -313,11 +252,10 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         // Kill A: a currently-attached (not just Running) session,
         // exercising the browser's Kill action against the more
         // demanding case (see this test's own doc comment for why A,
-        // not B, is killed here).
-        guard let killButtonForA = closestButton(labeled: "Kill", toVerticalCenterOf: rowAText) else {
-            XCTFail("No \"Kill\" button found in the session browser at all.")
-            return
-        }
+        // not B, is killed here). Row-scoped lookup via its own
+        // accessibility identifier, same as the Attach button above.
+        let killButtonForA = app.buttons["calyx.sessionBrowser.row.\(sessionAID).killButton"]
+        XCTAssertTrue(waitFor(killButtonForA), "Session A's \"Kill\" button (id \(sessionAID)) did not appear in the browser.")
         killButtonForA.click()
 
         let afterKillPoll = ledger.poll(

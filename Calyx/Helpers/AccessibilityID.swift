@@ -68,6 +68,14 @@ enum AccessibilityID {
         static func fileEntry(_ path: String) -> String { "calyx.git.file.\(path)" }
         static func commitRow(_ hash: String) -> String { "calyx.git.commit.\(hash)" }
     }
+    enum SessionBrowser {
+        static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }
+        static func attachButton(_ id: String) -> String { "calyx.sessionBrowser.row.\(id).attachButton" }
+        static func killButton(_ id: String) -> String { "calyx.sessionBrowser.row.\(id).killButton" }
+        static func remoteHostRow(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host)" }
+        static func remoteHostAttachButton(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host).attachButton" }
+        static func remoteHostInstallButton(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host).installButton" }
+    }
     enum Diff {
         static let container = "calyx.diff"
         static let toolbar = "calyx.diff.toolbar"
