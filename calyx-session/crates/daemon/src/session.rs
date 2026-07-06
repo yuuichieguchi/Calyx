@@ -33,6 +33,7 @@ use nix::pty::Winsize;
 use proto::{encode_control, ControlMsg, FrameType, SessionEvent, SessionSpec, SessionState};
 
 use crate::history;
+use crate::ledger;
 use crate::outq::{lock_unpoisoned, OutQueue};
 use crate::state::{SessionEntry, Shared};
 
@@ -981,6 +982,7 @@ fn session_thread(ctx: SessionThread) {
                 info.state = SessionState::Exited { code: exit_code };
                 info.pid = 0;
                 info.attached_clients = 0;
+                info.exited_at_ms = Some(ledger::now_unix_ms());
             }
             state.touch();
             shared.persist_ledger(&state);

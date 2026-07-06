@@ -198,6 +198,17 @@ pub struct SessionInfo {
     /// isn't otherwise observable through the protocol.
     pub pid: u32,
     pub meta: BTreeMap<String, String>,
+    /// Wall-clock time (Unix epoch ms) this record's `state` last
+    /// flipped to `Exited`; `None` while `Running`. Also `None` for a
+    /// ledger record written by a daemon build that predates this
+    /// field, which the ledger's retention GC (`daemon::ledger::gc`)
+    /// treats as already past its retention window rather than kept
+    /// forever, since such a record cannot be freshly exited (`#[serde(default)]`
+    /// is redundant for an `Option` field under serde's own derive, but
+    /// spelled out here so the "old ledger files keep loading" contract
+    /// this field must uphold is not left implicit).
+    #[serde(default)]
+    pub exited_at_ms: Option<u64>,
 }
 
 /// Encodes a `ControlMsg` to CBOR bytes suitable for a

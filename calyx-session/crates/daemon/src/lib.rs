@@ -161,7 +161,8 @@ impl Daemon {
             self.config.state_dir.clone(),
             self.config.history_enabled,
         ));
-        shared.lock_state().ledger = ledger::load(&self.config.state_dir);
+        shared.lock_state().ledger =
+            ledger::load_and_gc(&self.config.state_dir, ledger::now_unix_ms());
         install_handoff_env(
             &shared,
             &self.config.runtime_dir,
@@ -235,7 +236,7 @@ pub fn run_handoff_receiver(
         config.state_dir.clone(),
         config.history_enabled,
     ));
-    shared.lock_state().ledger = ledger::load(&config.state_dir);
+    shared.lock_state().ledger = ledger::load_and_gc(&config.state_dir, ledger::now_unix_ms());
 
     // Adopt the whole manifest into a local staging vec before touching
     // the live registry or the ledger (P6 review H8): a failure partway

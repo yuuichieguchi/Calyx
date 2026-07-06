@@ -201,6 +201,9 @@ impl SessionEntry {
             attached_clients: self.attached_clients,
             pid: self.pid,
             meta: self.meta.clone(),
+            // A live entry reporting its own state is, by construction,
+            // never `Exited`; see `proto::SessionInfo::exited_at_ms`.
+            exited_at_ms: None,
         }
     }
 }

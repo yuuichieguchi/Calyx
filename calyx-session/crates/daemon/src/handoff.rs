@@ -77,6 +77,7 @@ use proto::SessionState;
 use crate::error::DaemonError;
 use crate::fdpass;
 use crate::history;
+use crate::ledger;
 use crate::outq::{lock_unpoisoned, OutQueue};
 use crate::session::{
     make_wake_pipe, start_session_thread, PauseError, PausedSession, SessionChild, SessionInput,
@@ -586,6 +587,7 @@ fn finalize_exited(shared: &Arc<Shared>, entry: SessionEntry) {
         info.state = SessionState::Exited { code: -1 };
         info.pid = 0;
         info.attached_clients = 0;
+        info.exited_at_ms = Some(ledger::now_unix_ms());
     }
     state.touch();
     shared.persist_ledger(&state);
@@ -642,6 +644,7 @@ pub(crate) fn reconcile_adopted_ghost(shared: &Arc<Shared>, id: &str) -> bool {
         info.state = SessionState::Exited { code: -1 };
         info.pid = 0;
         info.attached_clients = 0;
+        info.exited_at_ms = Some(ledger::now_unix_ms());
     }
     state.touch();
     shared.persist_ledger(&state);

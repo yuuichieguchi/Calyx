@@ -3,7 +3,11 @@
 //
 // UI-independent logic layer behind the session browser window:
 // fetches the daemon's full session ledger
-// (`SessionDaemonClient.listAll()`), flags orphaned running sessions
+// (`SessionDaemonClient.listAll()`), keeps only its Running sessions
+// (an Exited entry has no affordances here -- nothing to attach to,
+// nothing to reconnect -- and the daemon ledger's own GC handles its
+// eventual removal, so the browser is a view of attachable/killable
+// sessions, not the raw ledger), flags orphaned running sessions
 // (a session with no live ghostty surface attached in this Calyx
 // process — `SessionSurfaceMap` has no entry for it), and exposes
 // attach/kill actions. Kept separate from
@@ -16,13 +20,14 @@ import Foundation
 struct SessionBrowserRow: Identifiable, Equatable, Sendable {
     var id: String { info.id }
     let info: SessionInfo
-    /// `true` only for a *running* session with no current
-    /// `SessionSurfaceMap` entry — i.e. the daemon still has its child
-    /// process alive, but no ghostty surface in this Calyx process is
-    /// attached to it (orphaned by a crash, a `kill -9`'d Calyx
-    /// process, or a session started by a different Calyx launch).
-    /// Always `false` for an exited session — there is nothing to
-    /// reconnect to.
+    /// `true` for a running session with no current `SessionSurfaceMap`
+    /// entry -- i.e. the daemon still has its child process alive, but
+    /// no ghostty surface in this Calyx process is attached to it
+    /// (orphaned by a crash, a `kill -9`'d Calyx process, or a session
+    /// started by a different Calyx launch). Every `SessionBrowserRow`
+    /// wraps a running session (`SessionBrowserModel.refresh()` never
+    /// produces a row for an exited one), so this is the only case
+    /// `isOrphan` distinguishes.
     let isOrphan: Bool
     /// `true` when `SessionSurfaceMap` currently has a surface for
     /// this session in this Calyx process — i.e. it's already visibly
@@ -81,7 +86,19 @@ final class SessionBrowserModel {
         self.hostCandidateProvider = hostCandidateProvider
     }
 
-    /// Refreshes `rows` from `daemonClient.listAll()`.
+    /// Refreshes `rows` from `daemonClient.listAll()`, for Running
+    /// sessions only.
+    ///
+    /// The daemon ledger never removes `Exited` entries on its own (its
+    /// retention GC runs on its own schedule); a `listAll()` result
+    /// mixing Running and Exited sessions is the ledger's normal shape,
+    /// not an edge case. An Exited session has zero affordances here --
+    /// nothing to attach to, nothing to reconnect -- so keeping a row
+    /// for one would accumulate as a permanent dead row in the browser
+    /// (observed in production: 7 stale `Exited(137)` rows) rather than
+    /// disappearing once the ledger eventually GCs it. Filtering here
+    /// keeps the browser a view of sessions you can actually attach to
+    /// or kill.
     ///
     /// R10-C item 2 (r10-fix-spec.md): routed through `listAllBounded()`
     /// rather than `listAll()` directly, since a hung daemon used to
@@ -104,11 +121,11 @@ final class SessionBrowserModel {
         defer { isRefreshing = false }
         let sessions = await daemonClient.listAllBounded()
         guard !Task.isCancelled else { return }
-        rows = sessions.map { info in
+        rows = sessions.filter { $0.state == .running }.map { info in
             let isAttached = surfaceMap.surfaceID(for: info.id) != nil
             return SessionBrowserRow(
                 info: info,
-                isOrphan: info.state == .running && !isAttached,
+                isOrphan: !isAttached,
                 isAttachedHere: isAttached
             )
         }

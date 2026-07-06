@@ -43,6 +43,7 @@ fn sample_info() -> SessionInfo {
         attached_clients: 2,
         pid: 12345,
         meta,
+        exited_at_ms: None,
     }
 }
 
