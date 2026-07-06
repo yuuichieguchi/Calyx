@@ -9,6 +9,7 @@ pub mod ls;
 pub mod meta;
 pub mod new;
 pub mod remote_install;
+pub(crate) mod shell_integration;
 pub mod upgrade;
 
 use std::fmt;

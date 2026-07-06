@@ -17,6 +17,9 @@ pub fn run(runtime_dir: &Option<PathBuf>, args: NewArgs) -> Result<u8, CommandEr
         name: args.name,
         cwd: args.cwd,
         argv: (!args.argv.is_empty()).then_some(args.argv),
+        // Unlike attach.rs, no resolve_shell_integration_env here: no
+        // production caller synthesizes sessions via `new`, so wiring
+        // the ghostty shell-integration env in is deferred.
         env: vec![],
         cols,
         rows,

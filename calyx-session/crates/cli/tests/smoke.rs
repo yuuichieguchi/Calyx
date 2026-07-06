@@ -293,6 +293,15 @@ fn attach_to_an_immediately_exiting_session_returns_exit_code_0() {
             "--argv",
             "exit 0",
         ])
+        // Isolates this test from the ambient environment `cargo test`
+        // happens to run under: if the calling shell is itself
+        // ghostty-integrated (e.g. a real Ghostty tab), it already has
+        // GHOSTTY_RESOURCES_DIR set, which the attach client now reads
+        // to compute a zsh shell-integration env (see
+        // crates/cli/src/commands/shell_integration.rs). That would
+        // make this exit-code-only test's outcome depend on where it's
+        // run rather than only on `/bin/sh -c exit 0`'s exit code.
+        .env_remove("GHOSTTY_RESOURCES_DIR")
         .stdin(Stdio::null())
         .output()
         .expect("run `calyx-session attach`");

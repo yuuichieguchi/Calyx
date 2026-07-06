@@ -20,6 +20,7 @@ use proto::{
 
 use crate::cli::AttachArgs;
 use crate::commands::client::{server_err, unexpected, DaemonClient};
+use crate::commands::shell_integration::resolve_shell_integration_env;
 use crate::commands::{resolve_runtime_dir, resolve_state_dir, socket_path, CommandError};
 
 /// Exit code for "the connection or the daemon went away".
@@ -44,7 +45,7 @@ pub fn run(
         name: args.name.clone(),
         cwd: args.cwd.clone(),
         argv: (!args.argv.is_empty()).then(|| args.argv.clone()),
-        env: vec![],
+        env: resolve_shell_integration_env(|k| std::env::var(k).ok()),
         cols,
         rows,
     });

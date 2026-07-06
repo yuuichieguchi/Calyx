@@ -87,9 +87,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     #endif
 
+    #if DEBUG
+    /// Test seam: overrides the resources root
+    /// `applyGhosttyResourcesDirEnvironmentIfNeeded()` resolves against,
+    /// instead of `Bundle.main.resourceURL`. DO NOT use from production
+    /// code.
+    var _ghosttyResourcesRootForTesting: URL?
+    #endif
+
+    /// Sets `GHOSTTY_RESOURCES_DIR` in this process's environment to
+    /// Calyx's own bundled ghostty resources directory, if the bundle
+    /// actually contains shell-integration scripts (via
+    /// `GhosttyResourcesDirResolver`), overwriting any inherited value
+    /// (via `GhosttyResourcesDirEnvironment.apply(_:)`). Must run before
+    /// `GhosttyAppController.shared` is ever touched, since ghostty reads
+    /// this variable from its own process environment at engine init.
+    func applyGhosttyResourcesDirEnvironmentIfNeeded() {
+        let root = _ghosttyResourcesRootForTesting ?? Bundle.main.resourceURL ?? Bundle.main.bundleURL
+        let resolvedPath = GhosttyResourcesDirResolver(resourcesRoot: root).resolve()
+        GhosttyResourcesDirEnvironment.apply(resolvedPath)
+    }
+
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Must run before GhosttyAppController.shared's first access below:
+        // ghostty forwards shell-integration scripts to surface children
+        // only when GHOSTTY_RESOURCES_DIR is already set in this process's
+        // own environment at engine init.
+        applyGhosttyResourcesDirEnvironmentIfNeeded()
+
         // Add CLI to PATH for terminals launched within Calyx
         if let binPath = Bundle.main.resourceURL?.appendingPathComponent("bin").path {
             let currentPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
