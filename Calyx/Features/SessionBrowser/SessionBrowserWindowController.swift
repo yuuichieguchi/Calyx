@@ -62,7 +62,7 @@ final class SessionBrowserWindowController: NSWindowController {
             )
             return
         }
-        (NSApp.delegate as? AppDelegate)?.attachWindow(sessionID: row.id, cwd: row.info.cwd)
+        (NSApp.delegate as? AppDelegate)?.attachSessionAsTab(sessionID: row.id, cwd: row.info.cwd)
     }
 
     private func attachRemote(_ context: SessionSpawnContext) {

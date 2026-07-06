@@ -117,6 +117,28 @@ final class SessionCommandPaletteTests: XCTestCase {
         _ = try command("session.attach", in: controller)
     }
 
+    /// User-reported naming confusion (same round as the attach-as-tab
+    /// routing fix and the new "Session Browser" menu item): `id:
+    /// "session.attach"` was titled "Attach Session…", but its handler
+    /// only ever opens the session browser (SessionBrowserWindowController
+    /// .shared.showBrowser(), CalyxWindowController.swift ~541) -- from
+    /// inside an already-attached tab, "Attach Session…" reads as
+    /// "attach THIS tab (again)", not "open the browser to attach
+    /// something". Renamed to align with the new menu item's title
+    /// (team decision, not an implementer choice): exactly "Session
+    /// Browser…" (the ellipsis matches this picker's own convention --
+    /// contrast the plain menu item title, which has none). The `id`
+    /// stays "session.attach" unchanged for stability (nothing besides
+    /// this test reads the title as a stored value).
+    func test_sessionAttachCommand_titleIsSessionBrowserEllipsis() throws {
+        let controller = makeController()
+        let attachCommand = try command("session.attach", in: controller)
+
+        XCTAssertEqual(attachCommand.title, "Session Browser…",
+                       "session.attach's title must read as opening the Session Browser -- its handler " +
+                       "only ever opens the browser, never attaches the current tab")
+    }
+
     func test_sessionDetachCommand_isRegistered() throws {
         let controller = makeController()
         _ = try command("session.detach", in: controller)

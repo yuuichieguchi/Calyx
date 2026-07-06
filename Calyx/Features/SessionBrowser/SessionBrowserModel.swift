@@ -41,6 +41,22 @@ struct SessionBrowserRow: Identifiable, Equatable, Sendable {
     /// (`isOrphan`) is unchanged this cycle -- only the user-visible
     /// wording moves from "Orphaned" to "Detached".
     static let orphanBadgeLabel = "Detached"
+
+    /// User-visible label for the row's Attach/Show button
+    /// (`SessionBrowserRowView`, `Button("Attach") { model.attach(row) }`
+    /// today -- a literal, unconditional string, same one-line pattern
+    /// as the `isOrphan` badge before `orphanBadgeLabel` existed). An
+    /// already-attached row's button currently still reads "Attach",
+    /// which is meaningless -- attaching a session that's already
+    /// visibly attached somewhere in this process makes no sense; the
+    /// action it actually performs (via `SessionAttachRoutingPolicy`'s
+    /// `.focusExistingSurface` routing) is revealing/focusing that pane,
+    /// so the label must read a focus verb instead. Exactly "Show" (team
+    /// decision, not an implementer choice) once `isAttachedHere`;
+    /// unchanged "Attach" otherwise.
+    var attachButtonLabel: String {
+        isAttachedHere ? "Show" : "Attach"
+    }
 }
 
 @MainActor

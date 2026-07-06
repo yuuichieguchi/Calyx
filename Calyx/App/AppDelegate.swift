@@ -407,6 +407,34 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         wc.showWindow(nil)
     }
 
+    #if DEBUG
+    /// Test seam (spawnRemoteSessionTab latent-bug RED phase, confirmed
+    /// in scope): called with the chosen target controller immediately
+    /// before `spawnRemoteSessionTab` calls `keyWC.createNewTab(host:)`.
+    /// Needed because `createNewTab` itself would silently no-op if
+    /// driven for real here: it guards on `GhosttyAppController.shared.app`,
+    /// which is `nil` in this test host (see
+    /// `CalyxWindowControllerCreateManagedSurfaceRemoteHostTests`'s own
+    /// dummy-app workaround for the identical constraint) -- so there is
+    /// no observable effect to assert on without this hook. `nil` (the
+    /// default) leaves production behavior unchanged: `createNewTab`
+    /// still runs for real when this hook is nil. DO NOT use from
+    /// production code.
+    var _spawnRemoteSessionTabAddTabHookForTesting: ((CalyxWindowController) -> Void)?
+
+    /// Test seam (spawnRemoteSessionTab latent-bug RED phase): called
+    /// immediately before `spawnRemoteSessionTab` calls
+    /// `openNewWindow(initialHost:)`, mirroring
+    /// `_attachWindowCreationHookForTesting`'s exact "intercept right
+    /// before the actually-unsafe call" pattern -- `openNewWindow`
+    /// constructs a real `CalyxWindowController` and calls
+    /// `showWindow(nil)` for real, confirmed unsafe to drive in this test
+    /// host (see `AppDelegateAttachWindowTests`'s header for the
+    /// identical hang). `nil` (the default) leaves production behavior
+    /// unchanged. DO NOT use from production code.
+    var _spawnRemoteSessionTabNewWindowHookForTesting: (() -> Void)?
+    #endif
+
     /// `SessionBrowserModel.onRemoteSessionRequested`'s target (Session
     /// Browser's remote-host picker, `SessionBrowserWindowController
     /// .attachRemote(_:)`): spawns a new tab against `host` in the key
@@ -416,11 +444,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// against `host`, reaching a window controller the same way
     /// `attachWindow` always does for a session with no live surface
     /// anywhere yet.
+    ///
+    /// LATENT BUG (confirmed, in scope for this cycle's Green phase, same
+    /// round as the session-browser attach-as-tab fix): every real caller
+    /// of this method fires from inside the Session Browser's own button
+    /// action, at which point the Session Browser's own window (not any
+    /// `CalyxWindowController`'s window) is key -- so
+    /// `windowControllers.first(where: { $0.window?.isKeyWindow == true })`
+    /// never matches in practice, and this method always falls through to
+    /// `openNewWindow`, even when a main window is already open. See
+    /// `AppDelegateAttachSessionAsTabTests`'s scope-1 fix for the
+    /// identical defect and chosen resolution
+    /// (`windowControllers.first(where: { $0.window?.isKeyWindow == true }) ?? windowControllers.first`,
+    /// team-confirmed); this method's own fix is Green-phase work, not
+    /// yet applied here -- the two new hooks above exist solely to make
+    /// today's (buggy) behavior observable without hanging the test
+    /// process, see `AppDelegateSpawnRemoteSessionTabWindowLookupTests`.
     func spawnRemoteSessionTab(host: String?) {
-        if let keyWC = windowControllers.first(where: { $0.window?.isKeyWindow == true }) {
-            keyWC.createNewTab(host: host)
+        // FIX (see this method's own doc comment): the real caller fires
+        // from inside the Session Browser's own button action, at which
+        // point the Session Browser's plain NSWindow, not any
+        // CalyxWindowController's window, is key -- so an isKeyWindow-
+        // only lookup never matched in practice. Prefer the actually-key
+        // window if one exists, but fall back to the first available
+        // controller instead of dead-ending on the Session Browser panel
+        // holding key status.
+        if let targetWC = windowControllers.first(where: { $0.window?.isKeyWindow == true }) ?? windowControllers.first {
+            #if DEBUG
+            _spawnRemoteSessionTabAddTabHookForTesting?(targetWC)
+            if _spawnRemoteSessionTabAddTabHookForTesting != nil { return }
+            #endif
+            targetWC.createNewTab(host: host)
             return
         }
+        #if DEBUG
+        if let hook = _spawnRemoteSessionTabNewWindowHookForTesting {
+            hook()
+            return
+        }
+        #endif
         openNewWindow(initialHost: host)
     }
 
@@ -610,6 +672,96 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    #if DEBUG
+    /// Test seam (session browser Attach-consistency RED phase): when
+    /// non-nil, called with the `SessionAttachRoutingPolicy.Decision`
+    /// `attachSessionAsTab` just computed, immediately before acting on
+    /// it. Mirrors `_attachWindowPlaceholderTabObserverForTesting`'s
+    /// "new, narrow, DEBUG-gated, nil-by-default" shape: `nil` (the
+    /// default) leaves production behavior unchanged. DO NOT use from
+    /// production code.
+    var _attachSessionAsTabRoutingObserverForTesting: ((SessionAttachRoutingPolicy.Decision) -> Void)?
+    #endif
+
+    /// Session Browser's "Attach" action (`SessionBrowserWindowController
+    /// .attach(_:)`'s single entry point, replacing a direct
+    /// `attachWindow` call): keeps the local-attach flow consistent with
+    /// the sibling remote-session flow (`spawnRemoteSessionTab(host:)`),
+    /// per `SessionAttachRoutingPolicy`'s own doc comment. Computes both
+    /// of that policy's inputs from real `AppDelegate` state --
+    /// `isAttachedHere` from `SessionSurfaceMap` (identical to
+    /// `attachWindow`'s own F6 guard), `hasAvailableWindow` from the same
+    /// "prefer the key window, else the first available one" lookup
+    /// `spawnRemoteSessionTab` now also uses (see that method's own doc
+    /// comment for why an `isKeyWindow`-only lookup never matches a real
+    /// main window from either call site: both fire from inside the
+    /// Session Browser's own button action, at which point the Session
+    /// Browser's plain `NSWindow`, not any `CalyxWindowController`'s
+    /// window, is key) -- and dispatches to the matching action.
+    ///
+    func attachSessionAsTab(sessionID: String, cwd: String?, host: String? = nil) {
+        let isAttachedHere = SessionSurfaceMap.shared.surfaceID(for: sessionID) != nil
+        // Same "prefer key, else first" fallback as `spawnRemoteSessionTab`'s
+        // own fix, and for the identical reason: whichever controller this
+        // resolves to is also the one `.attachAsTab` below adds the new tab
+        // to, so `hasAvailableWindow` and the eventual target come from the
+        // same lookup.
+        let targetWindowController = windowControllers.first(where: { $0.window?.isKeyWindow == true })
+            ?? windowControllers.first
+        let decision = SessionAttachRoutingPolicy.decide(
+            isAttachedHere: isAttachedHere, hasAvailableWindow: targetWindowController != nil
+        )
+        #if DEBUG
+        _attachSessionAsTabRoutingObserverForTesting?(decision)
+        #endif
+        switch decision {
+        case .focusExistingSurface:
+            if focusWindowForExistingSession(sessionID: sessionID) { return }
+            // Stale mapping: focusWindowForExistingSession already
+            // unregistered it above (R6-D precedent). Re-decide now that
+            // isAttachedHere is no longer true, exactly one recursion.
+            attachSessionAsTab(sessionID: sessionID, cwd: cwd, host: host)
+        case .attachAsTab:
+            if let target = targetWindowController {
+                attachSessionAsNewTab(sessionID: sessionID, cwd: cwd, host: host, in: target)
+            }
+        case .attachAsNewWindow:
+            attachWindow(sessionID: sessionID, cwd: cwd, host: host)
+        }
+    }
+
+    /// `.attachAsTab`'s real work: reuses `restoreTabSurfaces`/
+    /// `fallbackCreateSurface` -- the same machinery `attachWindow` uses
+    /// to reattach `sessionID` to a placeholder leaf -- but wires the
+    /// result into `target`'s EXISTING window as a new tab
+    /// (`CalyxWindowController.attachRestoredTab(_:)`) instead of
+    /// constructing a brand-new window. Deliberately does not route
+    /// through `createNewTab`/`SessionSpawnPlanner`: both of those spawn
+    /// a brand-new session (`createManagedSurface`), not a reattach to
+    /// an already-running one. A total surface-creation failure leaves
+    /// `target` untouched (the tab is only wired in on success), so no
+    /// window/group cleanup is needed the way `attachWindow`'s own
+    /// failure path needs `cleanupFailedWindow`.
+    private func attachSessionAsNewTab(sessionID: String, cwd: String?, host: String?, in target: CalyxWindowController) {
+        guard let app = GhosttyAppController.shared.app, let window = target.window else { return }
+
+        let placeholderLeafID = UUID()
+        let tab = Tab(
+            pwd: cwd,
+            splitTree: SplitTree(leafID: placeholderLeafID),
+            sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID, host: host)]
+        )
+
+        fetchSessionsForAgentResume()
+        let restored = restoreTabSurfaces(tab: tab, app: app, window: window)
+        guard restored || fallbackCreateSurface(tab: tab, app: app, window: window) else {
+            logger.error("Failed to attach tab for session \(sessionID, privacy: .public)")
+            return
+        }
+
+        target.attachRestoredTab(tab)
+    }
+
     /// F11 (V13, WARNING, r4-fix-spec.md): the window-construction +
     /// registration boilerplate shared identically by `attachWindow` and
     /// `restoreWindow`. Does NOT cover the tab-restoration control flow
@@ -771,7 +923,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Main Menu
 
-    private func setupMainMenu() {
+    /// Not `private` any more (session-browser menu-item RED phase):
+    /// mirrors `closeAllTabsInGroup(id:)`'s/`processChildExited`'s/
+    /// `handleSessionReconnectDecision`'s own identical "un-privated for
+    /// direct test access" precedent. Builds and assigns a fresh
+    /// `NSApp.mainMenu` -- pure menu/item construction, no ghostty
+    /// surface, no window, no async work -- so, unlike `attachWindow`/
+    /// `showWindow`, driving it directly from a test is safe (confirmed:
+    /// see `AppDelegateSessionBrowserMenuItemTests`).
+    func setupMainMenu() {
         let mainMenu = NSMenu()
 
         // Application menu
@@ -940,6 +1100,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             action: #selector(handleToggleQuickTerminal),
             keyEquivalent: ""
         )
+
+        let sessionBrowserItem = NSMenuItem(
+            title: "Session Browser",
+            action: #selector(openSessionBrowser(_:)),
+            keyEquivalent: "b"
+        )
+        sessionBrowserItem.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(sessionBrowserItem)
 
         // Window menu
         let windowMenuItem = NSMenuItem()
@@ -2316,6 +2484,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleToggleQuickTerminal() {
         toggleQuickTerminal()
+    }
+
+    /// View menu's "Session Browser" item (Cmd+Shift+B): the same call
+    /// every other entry point into the session browser already makes
+    /// (`SessionBrowserWindowController.attachRemote(_:)`'s sibling
+    /// palette command `session.attach`, the Settings panel button).
+    @objc private func openSessionBrowser(_ sender: Any?) {
+        SessionBrowserWindowController.shared.showBrowser()
     }
 }
 

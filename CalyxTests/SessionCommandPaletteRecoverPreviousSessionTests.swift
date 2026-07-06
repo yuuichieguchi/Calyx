@@ -26,7 +26,7 @@
 //  NOTE ON THE LABEL: the task brief asked for "a Japanese label
 //  consistent with existing session commands." Investigated and
 //  DEVIATED: every existing PaletteCommand title in this codebase is
-//  English ("Attach Session…", "Detach Session", "Kill Session", "New
+//  English ("Session Browser…", "Detach Session", "Kill Session", "New
 //  Remote Session…"), and there is no Localizable.strings/.lproj
 //  anywhere in the app -- it has no localization infrastructure at all.
 //  A Japanese title would be inconsistent with literally every other

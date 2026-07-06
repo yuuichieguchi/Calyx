@@ -188,7 +188,7 @@ private struct SessionBrowserRowView: View {
             Spacer()
 
             if isRunning {
-                Button("Attach") { model.attach(row) }
+                Button(row.attachButtonLabel) { model.attach(row) }
                     .buttonStyle(.bordered)
                     .accessibilityIdentifier(AccessibilityID.SessionBrowser.attachButton(row.id))
                 Button("Kill") { Task { await model.kill(row) } }

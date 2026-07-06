@@ -535,7 +535,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         })
         commandRegistry.register(PaletteCommand(
             id: "session.attach",
-            title: "Attach Session…",
+            title: "Session Browser…",
             category: "Sessions"
         ) {
             SessionBrowserWindowController.shared.showBrowser()
@@ -1225,6 +1225,32 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         tab.splitTree = SplitTree(leafID: surfaceID)
 
         // Pause current tab
+        activeTab?.registry.pauseAll()
+
+        group.addTab(tab)
+        group.activeTabID = tab.id
+
+        rebuildSplitContainer()
+        updateLayout()
+        refreshHostingView()
+
+        restoreFocus()
+        retargetComposeOverlayIfNeeded()
+        requestSave()
+    }
+
+    /// Wires an already-constructed tab (built by `AppDelegate
+    /// .attachSessionAsTab`'s `.attachAsTab` branch via the same
+    /// `restoreTabSurfaces`/`fallbackCreateSurface` machinery a window
+    /// restore uses to reattach a persistent session's live surface,
+    /// rather than `createManagedSurface` spawning a brand-new one) into
+    /// this window's active group as a new tab. Reuses `createNewTab`'s
+    /// own tail (pause current tab, add/activate, rebuild/refresh,
+    /// restore focus, save) so an externally-constructed tab ends up
+    /// wired up identically to one `createNewTab` builds itself.
+    func attachRestoredTab(_ tab: Tab) {
+        guard let group = windowSession.activeGroup else { return }
+
         activeTab?.registry.pauseAll()
 
         group.addTab(tab)
