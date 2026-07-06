@@ -156,6 +156,16 @@ final class AppDelegateAttachSessionAsTabTests: XCTestCase {
         appDelegate._attachSessionAsTabRoutingObserverForTesting = { observedDecisions.append($0) }
         var creationHookCallCount = 0
         appDelegate._attachWindowCreationHookForTesting = { creationHookCallCount += 1 }
+        // Bail the `.attachAsTab` branch out immediately after it builds
+        // its placeholder tab, BEFORE `attachSessionAsNewTab` reaches the
+        // real ghostty-FFI surface + PTY creation
+        // (`GhosttyAppController.shared.app`/`restoreTabSurfaces`), which is
+        // unsafe from this test host and leaks a live surface across the
+        // process-wide singletons (see this hook's own doc comment on
+        // AppDelegate). Mirrors `_attachWindowCreationHookForTesting`'s
+        // role for the sibling `.attachAsNewWindow` branch above.
+        var attachAsTabCreationHookCallCount = 0
+        appDelegate._attachSessionAsNewTabCreationHookForTesting = { attachAsTabCreationHookCallCount += 1 }
 
         // An ordinary, unrelated main window is already open (mirrors the
         // real-world case this whole fix addresses: the user has a Calyx
@@ -188,6 +198,10 @@ final class AppDelegateAttachSessionAsTabTests: XCTestCase {
         XCTAssertEqual(creationHookCallCount, 0,
                        "attachSessionAsTab must never reach attachWindow's real window/surface creation " +
                        "step when a main window is already available to add a tab to instead")
+        XCTAssertEqual(attachAsTabCreationHookCallCount, 1,
+                       "The .attachAsTab branch must reach attachSessionAsNewTab's own creation bail-out " +
+                       "seam exactly once, proving the route is exercised without spawning a real ghostty " +
+                       "surface/PTY in the test host")
     }
 
     // MARK: - Row 4 (sanity/regression companion): not attached, no window at all

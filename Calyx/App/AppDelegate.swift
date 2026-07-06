@@ -745,6 +745,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// (e.g. `AppDelegateAttachSessionAsTabTests`'s `.attachAsTab` row)
     /// is unaffected. DO NOT use from production code.
     var _attachSessionAsNewTabPlaceholderTabObserverForTesting: ((Tab) -> Void)?
+
+    /// Test seam: mirrors `_attachWindowCreationHookForTesting` exactly,
+    /// for `attachSessionAsNewTab`'s `.attachAsTab` branch. When non-nil,
+    /// called immediately after the placeholder observer above and BEFORE
+    /// this method reaches `GhosttyAppController.shared.app` /
+    /// `restoreTabSurfaces` / `fallbackCreateSurface` / `attachRestoredTab`
+    /// -- the same real, ghostty-FFI-driven surface + PTY creation
+    /// `attachWindow` guards behind its own creation hook. Without this,
+    /// every test driving the `.attachAsTab` route (an unregistered
+    /// sessionID with a window available) spawns a real ghostty surface
+    /// and a real login-shell PTY in the unit-test host, which leak across
+    /// the process-wide `SurfaceRegistry`/`SessionSurfaceMap`/
+    /// `GhosttyAppController.shared` singletons and crash the XCTest host
+    /// during a later surface teardown (confirmed unsafe, identical to the
+    /// hang/crash `_attachWindowCreationHookForTesting`'s own doc comment
+    /// describes). `nil` (the default) leaves production behavior
+    /// unchanged. DO NOT use from production code.
+    var _attachSessionAsNewTabCreationHookForTesting: (() -> Void)?
     #endif
 
     /// `.attachAsTab`'s real work: reuses `restoreTabSurfaces`/
@@ -772,6 +790,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         #if DEBUG
         _attachSessionAsNewTabPlaceholderTabObserverForTesting?(tab)
+        if let hook = _attachSessionAsNewTabCreationHookForTesting {
+            hook()
+            return
+        }
         #endif
 
         fetchSessionsForAgentResume()

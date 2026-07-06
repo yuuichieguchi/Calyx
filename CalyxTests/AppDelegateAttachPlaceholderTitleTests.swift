@@ -99,8 +99,15 @@ final class AppDelegateAttachWindowPlaceholderTitleTests: XCTestCase {
     /// Builds the Row-3 fixture from AppDelegateAttachSessionAsTabTests
     /// (an unrelated main window already open, sessionID unregistered),
     /// so `attachSessionAsTab` routes through `.attachAsTab` ->
-    /// `attachSessionAsNewTab` for real.
+    /// `attachSessionAsNewTab`, and bails that branch out at its creation
+    /// seam right after the placeholder observer fires -- BEFORE the real
+    /// ghostty-FFI surface + PTY creation, which is unsafe from this test
+    /// host and leaks a live surface across the process-wide singletons
+    /// (see `_attachSessionAsNewTabCreationHookForTesting`'s own doc
+    /// comment on AppDelegate). The observed `Tab` these tests assert on is
+    /// fully built before the bail, so the bail changes nothing they check.
     private func insertUnrelatedWindowController(into appDelegate: AppDelegate) {
+        appDelegate._attachSessionAsNewTabCreationHookForTesting = { }
         let unrelatedTab = Tab(title: "Unrelated")
         let unrelatedGroup = TabGroup(name: "Default", tabs: [unrelatedTab], activeTabID: unrelatedTab.id)
         let unrelatedSession = WindowSession(groups: [unrelatedGroup], activeGroupID: unrelatedGroup.id)
