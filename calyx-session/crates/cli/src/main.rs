@@ -22,8 +22,12 @@ fn main() -> ExitCode {
         Command::Ls(args) => commands::ls::run(&parsed.runtime_dir, args),
         Command::Kill(args) => commands::kill::run(&parsed.runtime_dir, args),
         Command::Meta(args) => commands::meta::run(&parsed.runtime_dir, args),
+        Command::History(args) => commands::history::run(&parsed.runtime_dir, args),
         Command::RemoteInstall(args) => {
             commands::remote_install::run(&parsed.runtime_dir, &parsed.state_dir, args)
+        }
+        Command::Upgrade(args) => {
+            commands::upgrade::run(&parsed.runtime_dir, &parsed.state_dir, args)
         }
     };
     match result {

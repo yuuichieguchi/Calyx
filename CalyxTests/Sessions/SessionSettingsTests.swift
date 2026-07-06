@@ -92,4 +92,36 @@ final class SessionSettingsTests: XCTestCase {
         XCTAssertFalse(SessionSettings.agentResumeEnabled)
         XCTAssertFalse(SessionSettings.agentResumeAutoExecute)
     }
+
+    // MARK: - P6 RED2: historyPersistenceEnabled
+    //
+    // Held-out compile-RED (see SessionCommandSynthesizerRemoteAttachTests's
+    // header for this codebase's convention): historyPersistenceEnabled
+    // does not exist yet on SessionSettings, so these three cases fail
+    // to compile -- together with the rest of this round's new Swift
+    // API -- until the Green phase adds it, mirroring
+    // persistentSessionsEnabled's own shape exactly (UserDefaults-backed,
+    // routed through _testStore, defaults off).
+
+    func test_historyPersistenceEnabled_defaultsToFalse() {
+        XCTAssertFalse(SessionSettings.historyPersistenceEnabled,
+                       "historyPersistenceEnabled must default to false -- on-disk history capture is opt-in")
+    }
+
+    func test_historyPersistenceEnabled_setTrue_persistsAcrossReads() {
+        SessionSettings.historyPersistenceEnabled = true
+
+        XCTAssertTrue(SessionSettings.historyPersistenceEnabled,
+                     "Setting historyPersistenceEnabled to true must be readable back as true, in the " +
+                     "isolated test suite")
+    }
+
+    func test_resetToDefaults_alsoRestoresHistoryPersistenceEnabled() {
+        SessionSettings.historyPersistenceEnabled = true
+
+        SessionSettings.resetToDefaults()
+
+        XCTAssertFalse(SessionSettings.historyPersistenceEnabled,
+                      "resetToDefaults() must strip the persisted value, restoring the documented default")
+    }
 }

@@ -52,6 +52,13 @@ protocol SessionDaemonClientProtocol: Sendable {
     /// the LOCAL daemon. Added for P5's close=kill routing fix
     /// (`CalyxWindowController.killSessionIfPersistent`).
     func killRemote(host: String, sessionID: String) async
+    /// Toggles the daemon-wide on-disk history-persistence default
+    /// (`calyx-session history on`/`off`, i.e.
+    /// `ControlMsg::SetHistoryEnabled` -- see that message's own doc
+    /// comment: a live, in-memory override, never persisted
+    /// daemon-side). Added for P6's `HistoryPersistenceToggleCoordinator`
+    /// and `AppDelegate.reassertHistoryPersistenceIfNeeded()`.
+    func setHistoryEnabled(_ enabled: Bool) async
 }
 
 /// R14-B (r14-fix-spec.md): narrow `#if DEBUG` override hook for the
@@ -160,6 +167,14 @@ extension SessionDaemonClientProtocol {
     /// modification. A fake that actually exercises this behavior
     /// overrides it itself.
     func killRemote(host: String, sessionID: String) async {}
+
+    /// Default no-op implementation, mirroring `installRemote(host:)`'s
+    /// and `killRemote(host:sessionID:)`'s own identical precedent right
+    /// above, so every existing `SessionDaemonClientProtocol` fake
+    /// predating P6's `setHistoryEnabled(_:)` keeps conforming without
+    /// modification. A fake that actually exercises this behavior
+    /// overrides it itself.
+    func setHistoryEnabled(_ enabled: Bool) async {}
 
     /// R10-C item 2 (r10-fix-spec.md): the single bound shared by every
     /// query-style caller that must not await `listAll()` unbounded,
@@ -578,6 +593,29 @@ final class SessionDaemonClient: SessionDaemonClientProtocol, Sendable {
         await Task {
             _ = try? await commandRunner.run(
                 executable: sshPath, arguments: ["--", host, remoteCommand], workingDirectory: nil, environment: nil
+            )
+        }.value
+    }
+
+    /// Shells `history on`/`history off`, mirroring `kill(id:)`'s and
+    /// `setMeta(id:key:value:)`'s own `--runtime-dir`-prefixed argv
+    /// shape exactly, with a nil environment (the session root travels
+    /// via `--runtime-dir`, not an env override).
+    ///
+    /// A WRITE, so shielded from the caller's own ambient Task
+    /// cancellation the same structural way `kill(id:)` is (see that
+    /// method's own R14-C doc comment): an inner unstructured `Task`
+    /// around `commandRunner.run(...)` that ambient cancellation can
+    /// never reach -- an in-flight toggle write must run to completion
+    /// even if the caller's Task is cancelled mid-flight.
+    func setHistoryEnabled(_ enabled: Bool) async {
+        guard let binaryPath else { return }
+        let commandRunner = self.commandRunner
+        let runtimeDirArgument = self.runtimeDirArgument
+        let subcommand = enabled ? "on" : "off"
+        await Task {
+            _ = try? await commandRunner.run(
+                executable: binaryPath, arguments: runtimeDirArgument + ["history", subcommand], workingDirectory: nil, environment: nil
             )
         }.value
     }

@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -17,14 +18,53 @@ use crate::session::{SessionInput, SessionMailbox};
 pub(crate) struct Shared {
     pub(crate) state: Mutex<State>,
     pub(crate) cond: Condvar,
+    /// Root for this daemon's on-disk state; `spawn_session` derives
+    /// the history directory from it (see `crate::history`).
+    pub(crate) state_dir: PathBuf,
+    /// Live daemon-wide default for opt-in history persistence: seeded
+    /// from `DaemonConfig::history_enabled` at bind time, overridable
+    /// via `ControlMsg::SetHistoryEnabled`. Read once per session at
+    /// creation (`spawn_session`), so a mid-lifetime flip affects only
+    /// sessions created afterwards.
+    pub(crate) history_enabled: AtomicBool,
     /// Ledger snapshots headed for the persister thread; see
     /// `persist_ledger`. `None` once `shutdown_persister` ran.
     persist_tx: Mutex<Option<mpsc::Sender<Vec<SessionInfo>>>>,
     persister: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Live Handoff (EXPERIMENTAL, see `crate::handoff`): what
+    /// `ControlMsg::PrepareHandoff` needs from the serving entry point
+    /// (`crate::install_handoff_env`). `None` outside a served daemon
+    /// (unit tests, library embedding), which makes a handoff request
+    /// refuse cleanly instead of guessing paths.
+    pub(crate) handoff_env: Mutex<Option<HandoffEnv>>,
+    /// Single-flight latch for handoff attempts: `PrepareHandoff`
+    /// refuses while an earlier attempt is still pending.
+    pub(crate) handoff_in_progress: AtomicBool,
+}
+
+/// See `Shared::handoff_env`.
+pub(crate) struct HandoffEnv {
+    /// `DaemonConfig::runtime_dir`: where the dedicated handoff socket
+    /// gets bound.
+    pub(crate) runtime_dir: PathBuf,
+    /// A dup of the serving control listener, passed to the next
+    /// daemon generation so accepting never stops across a handoff
+    /// (no unbind/rebind gap; `crate::handoff`'s module doc).
+    pub(crate) listener: OwnedFd,
+    /// A dup of the held single-daemon flock fd (`crate::LOCK_FILE`),
+    /// which `offer_handoff` transfers through the same `SCM_RIGHTS`
+    /// batch as `listener` so the next daemon generation shares the
+    /// identical open file description and therefore already holds the
+    /// lock (P6 review E5: the receiver must not have to independently
+    /// re-acquire a lock the old daemon cannot release until after it
+    /// has been acked). `None` wherever the serving generation holds no
+    /// lock fd (library callers of `Daemon::bind` that never took the
+    /// lock), in which case a handoff simply carries no lock fd.
+    pub(crate) lock: Option<OwnedFd>,
 }
 
 impl Shared {
-    pub(crate) fn new(state_dir: PathBuf) -> Shared {
+    pub(crate) fn new(state_dir: PathBuf, history_enabled: bool) -> Shared {
         // Dedicated persister thread: registry-lock holders only take
         // an in-memory snapshot, so no request path ever waits on
         // write+fsync. Writes are throttled leading+trailing: a first
@@ -69,8 +109,12 @@ impl Shared {
                 last_activity: Instant::now(),
             }),
             cond: Condvar::new(),
+            state_dir,
+            history_enabled: AtomicBool::new(history_enabled),
             persist_tx: Mutex::new(Some(persist_tx)),
             persister: Mutex::new(Some(persister)),
+            handoff_env: Mutex::new(None),
+            handoff_in_progress: AtomicBool::new(false),
         }
     }
 

@@ -16,7 +16,7 @@ edition = "2021"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 ciborium = "0.2"
-nix = { version = "0.31", features = ["fs", "term", "process", "signal", "socket", "ioctl", "user", "poll"] }
+nix = { version = "0.31", features = ["fs", "term", "process", "signal", "socket", "ioctl", "user", "poll", "uio"] }
 ulid = { version = "1", features = ["serde"] }
 libc = "0.2"
 tempfile = "3"

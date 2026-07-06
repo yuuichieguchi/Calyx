@@ -18,6 +18,7 @@ class SettingsWindowController: NSWindowController {
     private let persistentSessionsSwitch = NSSwitch()
     private let agentResumeSwitch = NSSwitch()
     private let agentResumeAutoExecuteSwitch = NSSwitch()
+    private let historyPersistenceSwitch = NSSwitch()
 
     private init() {
         let window = NSWindow(
@@ -195,6 +196,11 @@ class SettingsWindowController: NSWindowController {
         persistentSessionsSwitch.action = #selector(persistentSessionsDidChange(_:))
         root.addArrangedSubview(row(label: "Enable persistent sessions", control: persistentSessionsSwitch))
 
+        historyPersistenceSwitch.state = SessionSettings.historyPersistenceEnabled ? .on : .off
+        historyPersistenceSwitch.target = self
+        historyPersistenceSwitch.action = #selector(historyPersistenceDidChange(_:))
+        root.addArrangedSubview(row(label: "Persist session history to disk", control: historyPersistenceSwitch))
+
         agentResumeSwitch.state = SessionSettings.agentResumeEnabled ? .on : .off
         agentResumeSwitch.target = self
         agentResumeSwitch.action = #selector(agentResumeDidChange(_:))
@@ -329,6 +335,13 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func persistentSessionsDidChange(_ sender: NSSwitch) {
         SessionSettings.persistentSessionsEnabled = (sender.state == .on)
+    }
+
+    @objc private func historyPersistenceDidChange(_ sender: NSSwitch) {
+        let enabled = sender.state == .on
+        Task {
+            await HistoryPersistenceToggleCoordinator.historyPersistenceEnabledDidChange(enabled)
+        }
     }
 
     @objc private func agentResumeDidChange(_ sender: NSSwitch) {

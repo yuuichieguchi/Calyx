@@ -240,6 +240,7 @@ fn sessions_ledger_file_survives_a_daemon_restart() {
     let config = daemon::DaemonConfig {
         runtime_dir: daemon.runtime_dir.clone(),
         state_dir: daemon.state_dir.clone(),
+        history_enabled: false,
     };
     drop(daemon);
     let _second = std::thread::spawn(move || daemon::Daemon::bind(config)?.run_until_idle());

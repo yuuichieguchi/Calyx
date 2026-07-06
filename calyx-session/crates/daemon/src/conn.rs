@@ -2,7 +2,9 @@
 //! `ControlMsg`s and `Input` frames, paired with a writer thread
 //! draining this client's `OutQueue`.
 
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -14,7 +16,7 @@ use proto::{
 
 use proto::SessionState;
 
-use crate::outq::{writer_loop, OutQueue};
+use crate::outq::{lock_unpoisoned, writer_loop, OutQueue};
 use crate::session::{spawn_session, SessionRequest};
 use crate::state::Shared;
 
@@ -26,6 +28,13 @@ const KILL_WAIT: Duration = Duration::from_secs(5);
 /// Upper bound on waiting for a mid-teardown session's ledger record
 /// (see `attach`'s exited-session path).
 const TEARDOWN_WAIT: Duration = Duration::from_secs(5);
+
+/// How often `kill`'s wait loop re-polls a dead-thread adopted ghost's
+/// liveness (P6 fix-batch S1). Such a ghost has no session thread left
+/// to flip its ledger and wake the condvar, so an uncapped wait would
+/// only reconcile again at the deadline; capping keeps a `Kill` that
+/// just signalled the real process from stalling the full `KILL_WAIT`.
+const GHOST_RECONCILE_POLL: Duration = Duration::from_millis(50);
 
 /// Caps on `MetaSet` payloads so a client can't balloon the in-memory
 /// registry and the on-disk ledger without bound.
@@ -139,6 +148,20 @@ impl Conn {
                 version: PROTOCOL_VERSION,
             }),
             ControlMsg::List => {
+                // Opportunistically finalize any dead-thread adopted
+                // ghost whose process has since died (P6 fix-batch S1),
+                // so `ls` does not keep reporting it as Running. Snapshot
+                // the ids first, then reconcile each: reconcile no-ops
+                // for a live session (its thread still holds the mailbox)
+                // and for a still-alive ghost, so only a genuinely dead
+                // one drops out of the listing below.
+                let ids: Vec<String> = {
+                    let state = self.shared.lock_state();
+                    state.sessions.keys().cloned().collect()
+                };
+                for id in &ids {
+                    crate::handoff::reconcile_adopted_ghost(&self.shared, id);
+                }
                 let sessions: Vec<_> = {
                     let state = self.shared.lock_state();
                     state.sessions.values().map(|entry| entry.info()).collect()
@@ -235,6 +258,24 @@ impl Conn {
                 }
                 true
             }
+            ControlMsg::SetHistoryEnabled { enabled } => {
+                // Affects only sessions created after this store:
+                // `spawn_session` reads the flag once at creation, so
+                // already-running sessions keep the value captured at
+                // their own creation (see crates/daemon/src/history.rs).
+                // SeqCst so a create that follows this reply on another
+                // connection is guaranteed to observe the new value.
+                self.shared.history_enabled.store(enabled, Ordering::SeqCst);
+                self.reply(&ControlMsg::SetHistoryEnabledOk { enabled })
+            }
+            ControlMsg::GetHistoryEnabled => {
+                // Query half of the toggle above (`SetHistoryEnabled`):
+                // read-only, so a `status` can never itself flip the
+                // flag. SeqCst to pair with the store above.
+                let enabled = self.shared.history_enabled.load(Ordering::SeqCst);
+                self.reply(&ControlMsg::HistoryEnabled { enabled })
+            }
+            ControlMsg::PrepareHandoff => self.prepare_handoff(),
             // Server-to-client messages arriving from a client are a
             // protocol violation.
             ControlMsg::HelloOk { .. }
@@ -245,9 +286,94 @@ impl Conn {
             | ControlMsg::AttachOk { .. }
             | ControlMsg::KillOk
             | ControlMsg::MetaOk { .. }
+            | ControlMsg::SetHistoryEnabledOk { .. }
+            | ControlMsg::HistoryEnabled { .. }
+            | ControlMsg::PrepareHandoffOk { .. }
             | ControlMsg::Event(_)
             | ControlMsg::Err { .. } => false,
         }
+    }
+
+    /// Live Handoff trigger (EXPERIMENTAL; see `crate::handoff`): binds
+    /// the dedicated handoff endpoint, replies with its path, and hands
+    /// the rest of the attempt (single bounded accept, offer, exit or
+    /// resume) to a dedicated host thread so this connection's reader
+    /// stays responsive. Single-flight via `Shared::handoff_in_progress`.
+    fn prepare_handoff(&mut self) -> bool {
+        if self.shared.handoff_in_progress.swap(true, Ordering::SeqCst) {
+            return self.reply(&ControlMsg::Err {
+                code: "handoff-in-progress".to_string(),
+                msg: "another handoff attempt is already pending".to_string(),
+            });
+        }
+        let refuse = |conn: &Conn, code: &str, msg: String| -> bool {
+            conn.shared
+                .handoff_in_progress
+                .store(false, Ordering::SeqCst);
+            conn.reply(&ControlMsg::Err {
+                code: code.to_string(),
+                msg,
+            })
+        };
+
+        let runtime_dir = {
+            let env = lock_unpoisoned(&self.shared.handoff_env);
+            env.as_ref().map(|env| env.runtime_dir.clone())
+        };
+        let Some(runtime_dir) = runtime_dir else {
+            return refuse(
+                self,
+                "handoff-unavailable",
+                "this daemon has no serving listener to hand off".to_string(),
+            );
+        };
+
+        let socket_path = runtime_dir.join(crate::HANDOFF_SOCKET_FILE);
+        // A stale endpoint can only be a crashed earlier attempt: the
+        // in-progress latch above serializes live ones.
+        match std::fs::remove_file(&socket_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return refuse(
+                    self,
+                    "handoff-bind-failed",
+                    format!("removing stale handoff socket failed: {e}"),
+                );
+            }
+        }
+        let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                return refuse(
+                    self,
+                    "handoff-bind-failed",
+                    format!("binding {} failed: {e}", socket_path.display()),
+                );
+            }
+        };
+        // Same private mode as the control socket; the uid check at
+        // accept time is the real gate, this narrows the surface.
+        if let Err(e) =
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        {
+            let _ = std::fs::remove_file(&socket_path);
+            return refuse(
+                self,
+                "handoff-bind-failed",
+                format!("chmod on handoff socket failed: {e}"),
+            );
+        }
+
+        // Reply before spawning the host so the Ok frame is queued
+        // ahead of any handoff-failed report (per-client FIFO).
+        let ok = self.reply(&ControlMsg::PrepareHandoffOk {
+            path: socket_path.display().to_string(),
+        });
+        let shared = Arc::clone(&self.shared);
+        let queue = Arc::clone(&self.queue);
+        thread::spawn(move || crate::handoff::host_handoff(shared, listener, socket_path, queue));
+        ok
     }
 
     fn attach(&mut self, id: String, create: Option<SessionSpec>, cols: u16, rows: u16) -> bool {
@@ -352,6 +478,22 @@ impl Conn {
             }
         }
 
+        // Refuse to fork a brand-new child while a Live Handoff is in
+        // progress (P6 review H1/H2; see crate::handoff). `offer_handoff`
+        // snapshots the live session ids once up front, so anything
+        // forked after that snapshot is never in the manifest and is
+        // silently lost (its child, its fd, its ledger entry) the instant
+        // the old daemon exits post-ack. The idempotent-attach path above
+        // (an already-live id) is unaffected; only a genuine create is
+        // gated. Same retryable code PrepareHandoff itself uses, so a
+        // client can retry against whichever daemon ends up serving.
+        if self.shared.handoff_in_progress.load(Ordering::SeqCst) {
+            return Err(ControlMsg::Err {
+                code: "handoff-in-progress".to_string(),
+                msg: "a live handoff is in progress; retry the create shortly".to_string(),
+            });
+        }
+
         // Spawn outside the state lock: fork/exec latency shouldn't
         // stall every other connection. A concurrent create of the
         // same id is resolved below by keeping the first entry. The
@@ -393,11 +535,17 @@ impl Conn {
 
     fn kill(&mut self, id: &str) -> bool {
         {
-            // killpg under the registry lock on purpose: the session
-            // thread removes its entry *before* reaping (see the
-            // teardown ordering in session.rs), so "entry present"
-            // here proves the child is not yet reaped and its pid
-            // therefore cannot have been reused by anything else.
+            // killpg under the registry lock on purpose: a forked
+            // session removes its entry *before* reaping (see the
+            // teardown ordering in session.rs), so for it "entry
+            // present" here proves the child is not yet reaped and its
+            // pid cannot have been reused. An adopted session this
+            // daemon never forked has no such guarantee (init may have
+            // reaped it and recycled the pid, the handoff module doc's
+            // experimental known limitation); signalling it is still
+            // the right move, and if its session thread has already
+            // returned (a still-alive-at-poll-bound ghost, S1) the wait
+            // loop below reconciles it once the signal takes effect.
             let state = self.shared.lock_state();
             match state.sessions.get(id) {
                 Some(entry) => {
@@ -411,19 +559,49 @@ impl Conn {
                     );
                 }
                 None => {
+                    // A session detached for an in-progress Live Handoff
+                    // is out of the live registry but still `Running` in
+                    // the ledger (handoff module doc): it is paused, not
+                    // gone, and will resume on this daemon or migrate to
+                    // the new one. Reply retryably rather than silently
+                    // swallowing the kill as no-such-session (P6 review
+                    // H4 / E#3). Any other missing id is a genuine
+                    // no-such-session.
+                    if self.shared.handoff_in_progress.load(Ordering::SeqCst)
+                        && matches!(
+                            state.ledger.get(id).map(|info| info.state),
+                            Some(SessionState::Running)
+                        )
+                    {
+                        drop(state);
+                        return self.reply(&ControlMsg::Err {
+                            code: "handoff-in-progress".to_string(),
+                            msg: format!(
+                                "session {id:?} is paused for a live handoff; retry the kill \
+                                 shortly"
+                            ),
+                        });
+                    }
                     drop(state);
                     return self.reply(&err_no_session(id));
                 }
             }
         }
 
-        // KillOk is only sent after the session thread has reaped the
-        // child (observable as the ledger flipping to Exited, which
-        // happens strictly after the reap) so a `kill -0` probe right
-        // after the reply is deterministic.
+        // KillOk is only sent after the session has reaped (observable
+        // as the ledger flipping to Exited, which happens strictly after
+        // the reap) so a `kill -0` probe right after the reply is
+        // deterministic. A live session's own thread does that flip and
+        // wakes the condvar; a dead-thread adopted ghost has no such
+        // thread, so this loop drives `reconcile_adopted_ghost` itself
+        // once the signal above has taken effect (P6 fix-batch S1). It
+        // no-ops for a live session, so it never races that session's
+        // own teardown.
         let deadline = Instant::now() + KILL_WAIT;
-        let mut state = self.shared.lock_state();
         loop {
+            crate::handoff::reconcile_adopted_ghost(&self.shared, id);
+
+            let state = self.shared.lock_state();
             let gone = !state.sessions.contains_key(id)
                 && state
                     .ledger
@@ -440,14 +618,16 @@ impl Conn {
                     msg: format!("session {id:?} did not exit within {KILL_WAIT:?}"),
                 });
             }
-            let (guard, _) = self
+            // Cap the wait so a ghost's liveness is re-polled promptly:
+            // nothing wakes the condvar for a dead-thread ghost, so an
+            // uncapped wait would only reconcile again at the deadline.
+            let wait = (deadline - now).min(GHOST_RECONCILE_POLL);
+            let _ = self
                 .shared
                 .cond
-                .wait_timeout(state, deadline - now)
+                .wait_timeout(state, wait)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = guard;
         }
-        drop(state);
         self.reply(&ControlMsg::KillOk)
     }
 
@@ -559,5 +739,382 @@ fn err_no_session(id: &str) -> ControlMsg {
     ControlMsg::Err {
         code: "no-such-session".to_string(),
         msg: format!("no session with id {id:?}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cat_spec(id: &str) -> SessionSpec {
+        SessionSpec {
+            id: id.to_string(),
+            name: None,
+            cwd: None,
+            argv: Some(vec!["/bin/cat".to_string()]),
+            env: vec![],
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    /// Kills the process group on drop (mirrors `handoff.rs`'s test
+    /// helper of the same shape): without this, a spawned `/bin/cat`
+    /// donor would outlive a test that panics on assertion failure,
+    /// which every RED test here is expected to do until the
+    /// corresponding handoff-window gate exists.
+    struct KillOnDrop(u32);
+
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(self.0 as i32),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+
+    /// Builds a real `Conn` wired to a real client-side `UnixStream`
+    /// (via the crate's own `writer_loop`, exactly like `handle_conn`
+    /// does), so a test can call a private `Conn` method directly and
+    /// still observe exactly what a real client socket would receive.
+    /// Returns the `Conn` plus a `FrameReader` over the client side.
+    fn make_test_conn(shared: &Arc<Shared>, conn_id: u64) -> (Conn, FrameReader<UnixStream>) {
+        let (client_side, server_side) = UnixStream::pair().expect("create scratch stream pair");
+        client_side
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+            .expect("set read timeout on the client side");
+        let queue = OutQueue::new();
+        {
+            let queue = Arc::clone(&queue);
+            thread::spawn(move || writer_loop(queue, server_side));
+        }
+        let conn = Conn {
+            shared: Arc::clone(shared),
+            queue,
+            conn_id,
+            hello_done: true,
+            attached: None,
+            input_drop_logged: false,
+        };
+        let reader = FrameReader::new(
+            client_side
+                .try_clone()
+                .expect("clone client stream for reader"),
+        );
+        (conn, reader)
+    }
+
+    /// H1 (P6 review, conn.rs:368 + handoff.rs:321): while a handoff is
+    /// in progress, `ControlMsg::New` (routed through
+    /// `Conn::create_session`) must not fork a brand-new child for any
+    /// id: the offering side's `offer_handoff` snapshots the live id
+    /// list once up front, so anything created after that snapshot is
+    /// never in the manifest and is silently lost (its child, fd, and
+    /// ledger entry) the instant the old daemon exits post-handoff.
+    /// `create_session` currently has no such gate at all.
+    #[test]
+    fn create_session_is_refused_while_handoff_in_progress() {
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        shared
+            .handoff_in_progress
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (conn, _reader) = make_test_conn(&shared, 1);
+        let id = "01J-p6-h1-create-during-handoff-test";
+        let spec = cat_spec(id);
+
+        let result = conn.create_session(&spec, false);
+
+        // Whatever child create_session may have spawned before
+        // failing must be cleaned up regardless of which assertion
+        // below fails first.
+        let leaked_pid = shared.lock_state().sessions.get(id).map(|entry| entry.pid);
+        let _kill_on_drop = leaked_pid.map(KillOnDrop);
+
+        match result {
+            Err(ControlMsg::Err { code, .. }) => {
+                assert_eq!(
+                    code, "handoff-in-progress",
+                    "create_session should refuse with a retryable handoff-in-progress \
+                     error while a handoff is pending, mirroring PrepareHandoff's own \
+                     err code, got code {code:?}"
+                );
+            }
+            other => panic!(
+                "create_session must return an Err while handoff_in_progress is set \
+                 instead of forking a new session, got {other:?}"
+            ),
+        }
+
+        let state = shared.lock_state();
+        assert!(
+            !state.sessions.contains_key(id),
+            "create_session must not register (or leave registered) a new session while \
+             a handoff is in progress: a session created after offer_handoff's id \
+             snapshot is never in the manifest and is orphaned when the old daemon exits"
+        );
+        assert!(
+            !state.ledger.contains_key(id),
+            "create_session must not add a ledger entry for a session created while a \
+             handoff is in progress"
+        );
+    }
+
+    /// H2 (P6 review, conn.rs:368 + handoff.rs:321, same root cause as
+    /// H1): `Attach { id, create: Some(spec) }` against an id that does
+    /// not yet exist funnels into the same `create_session` call
+    /// (`for_attach = true`). During a pending handoff this must not
+    /// silently attach a freshly forked (and therefore unmigrated)
+    /// session either.
+    #[test]
+    fn attach_with_create_is_refused_while_handoff_in_progress() {
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        shared
+            .handoff_in_progress
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (mut conn, mut reader) = make_test_conn(&shared, 2);
+        let id = "01J-p6-h2-attach-create-during-handoff-test";
+        let spec = cat_spec(id);
+
+        let keep_going = conn.attach(id.to_string(), Some(spec), 80, 24);
+
+        let leaked_pid = shared.lock_state().sessions.get(id).map(|entry| entry.pid);
+        let _kill_on_drop = leaked_pid.map(KillOnDrop);
+
+        assert!(
+            keep_going,
+            "attach should reply with a normal Err frame (not just drop the connection) \
+             so a client can retry"
+        );
+
+        let frame = reader.read_frame().expect("read the Attach reply frame");
+        let msg = decode_control(&frame.payload).expect("decode the Attach reply");
+        match msg {
+            ControlMsg::AttachOk { .. } => panic!(
+                "attach must not succeed in creating and attaching a brand-new session \
+                 while a handoff is in progress"
+            ),
+            ControlMsg::Err { code, .. } => {
+                assert_eq!(
+                    code, "handoff-in-progress",
+                    "attach's create-if-missing path should surface the same retryable \
+                     handoff-in-progress rejection as a plain New, got code {code:?}"
+                );
+            }
+            other => panic!("expected an Err reply, got {other:?}"),
+        }
+
+        let state = shared.lock_state();
+        assert!(
+            !state.sessions.contains_key(id),
+            "attach must not have registered a new session while a handoff is in progress"
+        );
+    }
+
+    /// H4 (P6 review, conn.rs:518 + E#3): a session currently detached
+    /// for an in-progress handoff (`handoff::detach_for_handoff` has
+    /// removed its live registry entry but the ledger still says
+    /// `Running`, per the handoff module doc's contract) must not have
+    /// its `Kill` silently swallowed as `no-such-session`: the session
+    /// is paused, not gone, and will either resume on this daemon or
+    /// migrate to the new one.
+    #[test]
+    fn kill_during_handoff_pause_window_does_not_report_no_such_session() {
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        let id = "01J-p6-h4-kill-during-pause-test";
+        let spec = cat_spec(id);
+        let entry =
+            crate::session::spawn_session(&shared, &spec).expect("spawn_session should succeed");
+        entry.release_start();
+        let pid = entry.pid;
+        let _kill_on_drop = KillOnDrop(pid);
+        {
+            let mut state = shared.lock_state();
+            state.ledger.insert(entry.id.clone(), entry.info());
+            state.sessions.insert(entry.id.clone(), entry);
+        }
+
+        // Simulate the pause window exactly as `offer_handoff` creates
+        // it: the flag is set before detaching (`Conn::prepare_handoff`
+        // sets it first), then `detach_for_handoff` removes the live
+        // entry while the ledger keeps saying `Running`.
+        shared
+            .handoff_in_progress
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let detached = crate::handoff::detach_for_handoff(&shared, id)
+            .expect("detach_for_handoff should return the live entry");
+
+        let (mut conn, mut reader) = make_test_conn(&shared, 3);
+        let keep_going = conn.kill(id);
+        assert!(
+            keep_going,
+            "a rejected/deferred kill should still reply normally, not just drop the \
+             connection"
+        );
+
+        let frame = reader.read_frame().expect("read the Kill reply frame");
+        let msg = decode_control(&frame.payload).expect("decode the Kill reply");
+        match msg {
+            ControlMsg::Err { code, .. } => {
+                assert_ne!(
+                    code, "no-such-session",
+                    "a Kill for a session currently detached for an in-progress handoff \
+                     must not be silently swallowed as no-such-session: the session is \
+                     paused, not gone"
+                );
+            }
+            other => panic!(
+                "expected a distinct retryable Err reply for a Kill during the handoff \
+                 pause window, got {other:?}"
+            ),
+        }
+
+        // Cleanup: this test's detached entry never went back into the
+        // registry (kill() found no live entry, unlike a real
+        // resume_all), so the real child is killed directly via the
+        // drop guard above; drop the detached entry's own handles now.
+        drop(detached);
+    }
+
+    /// P6 fix-batch sweep S1 wiring: `Conn::kill` for a still-alive
+    /// adopted ghost must both signal the real process (the ghost's
+    /// session thread has already returned, so killpg under the registry
+    /// lock is the only thing that still can) and then drive
+    /// `reconcile_adopted_ghost` from its wait loop, so the reply is a
+    /// clean `KillOk` with the entry dropped and the ledger flipped to
+    /// `Exited`, rather than a `kill-timeout` after `KILL_WAIT` (nothing
+    /// else would ever finalize a dead-thread ghost). Exercises the real
+    /// `Conn::kill` against a real client socket.
+    ///
+    /// The sentinel is spawned in its own session (`setsid`) so
+    /// killpg(pid) actually reaches it, exactly as it would a production
+    /// adopted child (which was setsid'd when first forked). Its `Child`
+    /// handle is parked in a reaper thread whose `wait()` reaps it the
+    /// instant the signal lands, so the wait loop's `kill(pid, 0)` probe
+    /// observes the same ESRCH a production adopted process (reaped by
+    /// init, never by this daemon) would show.
+    #[test]
+    fn kill_of_a_still_alive_adopted_ghost_signals_it_then_reconciles_to_exited() {
+        use std::os::fd::AsFd;
+        use std::os::unix::process::CommandExt;
+
+        let _poll_override =
+            crate::session::set_adopted_exit_poll_for_test(Duration::from_millis(50));
+
+        let (master_read, master_write) =
+            nix::unistd::pipe().expect("create scratch pipe standing in for the PTY master fd");
+        for fd in [&master_read, &master_write] {
+            nix::fcntl::fcntl(
+                fd.as_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .expect("set scratch pipe fd cloexec");
+        }
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // SAFETY: the pre_exec closure only calls setsid, which is
+        // async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let sentinel = cmd.spawn().expect("spawn sentinel session leader");
+        let sentinel_pid = sentinel.id();
+        let _kill_on_drop = KillOnDrop(sentinel_pid);
+
+        let id = "01J-p6-s1-kill-ghost-wiring-test".to_string();
+        let manifest_entry = crate::handoff::HandoffSessionEntry {
+            id: id.clone(),
+            name: None,
+            cwd: None,
+            created_at_ms: 0,
+            pid: sentinel_pid,
+            meta: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            replay: vec![],
+        };
+
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        let adopted = crate::handoff::adopt_session(&shared, manifest_entry, master_read)
+            .expect("adopt_session should construct a running session");
+        {
+            let mut state = shared.lock_state();
+            state.ledger.insert(adopted.id.clone(), adopted.info());
+            state.sessions.insert(adopted.id.clone(), adopted);
+        }
+
+        // Drive the adopted session to the dead-thread ghost state: EOF
+        // on the read side ends its thread, whose reap poll times out
+        // while the sentinel is still alive, so S1 keeps the entry
+        // registered and `Running`.
+        drop(master_write);
+        std::thread::sleep(Duration::from_millis(500));
+        {
+            let state = shared.lock_state();
+            assert!(
+                state.sessions.contains_key(&id),
+                "a still-alive adopted session must survive teardown as a registered ghost (S1)"
+            );
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_ok(),
+            "the sentinel must still be alive before the Kill under test (test precondition)"
+        );
+
+        // Reap the sentinel the instant kill's killpg lands, so the wait
+        // loop's liveness probe sees a real ESRCH.
+        let reaper = thread::spawn(move || {
+            let mut sentinel = sentinel;
+            let _ = sentinel.wait();
+        });
+
+        let (mut conn, mut reader) = make_test_conn(&shared, 7);
+        let keep_going = conn.kill(&id);
+        assert!(
+            keep_going,
+            "kill should reply normally, not drop the connection"
+        );
+
+        let frame = reader.read_frame().expect("read the Kill reply frame");
+        let msg = decode_control(&frame.payload).expect("decode the Kill reply");
+        assert!(
+            matches!(msg, ControlMsg::KillOk),
+            "Kill of a still-alive adopted ghost must signal it and reconcile to KillOk, got \
+             {msg:?}"
+        );
+
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_err(),
+            "Kill must have signalled the real adopted process, which is now gone"
+        );
+        let (still_registered, ledger_state) = {
+            let state = shared.lock_state();
+            (
+                state.sessions.contains_key(&id),
+                state.ledger.get(&id).map(|info| info.state),
+            )
+        };
+        assert!(
+            !still_registered,
+            "a reconciled ghost must be removed from the live registry"
+        );
+        assert!(
+            matches!(ledger_state, Some(SessionState::Exited { .. })),
+            "a reconciled ghost's ledger record must flip to Exited, got {ledger_state:?}"
+        );
+
+        reaper.join().expect("reaper thread should join");
     }
 }

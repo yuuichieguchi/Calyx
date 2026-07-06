@@ -94,6 +94,52 @@ pub enum ControlMsg {
         cols: u16,
         rows: u16,
     },
+    /// Enables or disables on-disk history persistence daemon-wide,
+    /// effective immediately for any session *created* after this
+    /// message is processed. Sessions already running keep whatever was
+    /// in effect when they were created (see the daemon module doc for
+    /// the full history-persistence contract): this only changes what
+    /// new sessions inherit, never anything already in flight. The
+    /// daemon also has a bind-time default (`DaemonConfig::history_enabled`,
+    /// e.g. from a `--persist-history` CLI flag), which seeds the value
+    /// this message subsequently overrides for the rest of the daemon's
+    /// process lifetime.
+    SetHistoryEnabled {
+        enabled: bool,
+    },
+    /// Reply to `SetHistoryEnabled`, echoing the value now in effect.
+    SetHistoryEnabledOk {
+        enabled: bool,
+    },
+    /// Queries the daemon-wide history-persistence default currently in
+    /// effect (see `SetHistoryEnabled`'s doc comment for the full
+    /// contract), without mutating it. Added for the CLI's `history
+    /// status` subcommand (P6 RED2): `SetHistoryEnabled`/`SetHistoryEnabledOk`
+    /// existed before this with no way for a client to observe the
+    /// current value without also setting it.
+    GetHistoryEnabled,
+    /// Reply to `GetHistoryEnabled`, carrying the value now in effect.
+    /// Never sent unprompted (unlike `Event`).
+    HistoryEnabled {
+        enabled: bool,
+    },
+    /// (EXPERIMENTAL) Asks the daemon to open its dedicated Live
+    /// Handoff endpoint (a raw fd-passing Unix socket, deliberately
+    /// separate from this framed control channel; see the daemon
+    /// crate's `handoff` module doc) for exactly one bounded-timeout
+    /// receiver connection. Sent by `calyx-session upgrade` before it
+    /// spawns the new daemon process. After the `PrepareHandoffOk`
+    /// reply, this connection reports the outcome: on handoff success
+    /// the daemon process exits (the connection just drops, like a
+    /// crash); on failure a `handoff-failed` `Err` arrives and the
+    /// daemon keeps serving unchanged.
+    PrepareHandoff,
+    /// Reply to `PrepareHandoff`, carrying the filesystem path of the
+    /// handoff endpoint the receiver must connect to
+    /// (`<runtime_dir>/handoff.sock`).
+    PrepareHandoffOk {
+        path: String,
+    },
     /// Server-pushed notification, unprompted by any client request.
     Event(SessionEvent),
     /// Generic error reply to any of the above.
@@ -168,4 +214,33 @@ pub fn encode_control(msg: &ControlMsg) -> Result<Vec<u8>, ProtoError> {
 /// client fully controls.
 pub fn decode_control(bytes: &[u8]) -> Result<ControlMsg, ProtoError> {
     ciborium::from_reader(bytes).map_err(|e| ProtoError::Cbor(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P6 (Live Handoff): the control-plane trigger for a handoff must
+    /// round-trip through CBOR. Exercised per variant shape because
+    /// CBOR encodes a unit enum variant and a struct enum variant
+    /// differently (a bare string vs. a map), so one passing does not
+    /// imply the other.
+    #[test]
+    fn prepare_handoff_round_trips_through_cbor() {
+        let msg = ControlMsg::PrepareHandoff;
+        let encoded = encode_control(&msg).expect("encode PrepareHandoff");
+        let decoded = decode_control(&encoded).expect("decode PrepareHandoff");
+        assert_eq!(decoded, msg);
+    }
+
+    /// See `prepare_handoff_round_trips_through_cbor`.
+    #[test]
+    fn prepare_handoff_ok_round_trips_through_cbor() {
+        let msg = ControlMsg::PrepareHandoffOk {
+            path: "/tmp/scratch-run/handoff.sock".to_string(),
+        };
+        let encoded = encode_control(&msg).expect("encode PrepareHandoffOk");
+        let decoded = decode_control(&encoded).expect("decode PrepareHandoffOk");
+        assert_eq!(decoded, msg);
+    }
 }
