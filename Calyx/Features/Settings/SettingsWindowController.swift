@@ -20,9 +20,16 @@ class SettingsWindowController: NSWindowController {
     private let agentResumeAutoExecuteSwitch = NSSwitch()
     private let historyPersistenceSwitch = NSSwitch()
 
+    private let tabViewController = NSTabViewController()
+
+    /// Fixed width for every pane so switching tabs only ever changes the
+    /// window's height, matching standard macOS Settings behavior.
+    private static let paneWidth: CGFloat = 560
+    private static let paneContentInset: CGFloat = 24
+
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 600, height: 760),
+            contentRect: NSRect(x: 0, y: 0, width: Self.paneWidth, height: 400),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -40,34 +47,118 @@ class SettingsWindowController: NSWindowController {
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
 
     private func setupContent() {
-        guard let window = self.window,
-              let contentView = window.contentView else { return }
+        tabViewController.tabStyle = .toolbar
 
-        let root = NSStackView()
-        root.orientation = .vertical
-        root.alignment = .leading
-        root.spacing = 18
-        root.translatesAutoresizingMaskIntoConstraints = false
-        contentView.addSubview(root)
+        for pane in SettingsPane.allCases {
+            let paneViewController = SettingsPaneContentViewController(
+                contentStack: paneStack(for: pane),
+                width: Self.paneWidth,
+                contentInset: Self.paneContentInset
+            )
+            let tabItem = NSTabViewItem(viewController: paneViewController)
+            tabItem.label = pane.title
+            tabViewController.addTabViewItem(tabItem)
+        }
 
-        NSLayoutConstraint.activate([
-            root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 24),
-            root.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -24),
-            root.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 24),
-            root.bottomAnchor.constraint(lessThanOrEqualTo: contentView.bottomAnchor, constant: -24),
-        ])
+        window?.contentViewController = tabViewController
 
-        // --- Theme Color Section ---
-        let themeTitle = NSTextField(labelWithString: "Theme Color")
-        themeTitle.font = .systemFont(ofSize: 20, weight: .semibold)
-        root.addArrangedSubview(themeTitle)
+        loadPresetIntoUI()
+    }
 
-        let themeSubtitle = NSTextField(labelWithString: "Choose a preset or pick a custom color.")
-        themeSubtitle.textColor = .secondaryLabelColor
-        themeSubtitle.font = .systemFont(ofSize: 13)
-        root.addArrangedSubview(themeSubtitle)
+    // MARK: - Pane construction (driven by SettingsRow.pane)
 
-        // Preset popup
+    /// A heading rendered immediately before the row that starts a new
+    /// visual group within a pane. Rows with no heading continue the
+    /// previous group.
+    private struct SectionHeading {
+        let title: String?
+        let subtitle: String?
+    }
+
+    private func sectionHeading(for row: SettingsRow) -> SectionHeading? {
+        switch row {
+        case .themeColorPreset:
+            return SectionHeading(title: "Theme Color", subtitle: "Choose a preset or pick a custom color.")
+        case .glassOpacity:
+            return SectionHeading(title: "Glass", subtitle: "Controls the transparency of the glass effect.")
+        case .smoothScrolling:
+            return SectionHeading(title: "Scrolling", subtitle: nil)
+        case .lspAutoInstall:
+            return SectionHeading(
+                title: nil,
+                subtitle: "Calyx hosts language servers and exposes them to AI agents over MCP. When a server is missing, Calyx can install it automatically."
+            )
+        case .persistentSessions:
+            return SectionHeading(
+                title: nil,
+                subtitle: "Persistent terminal sessions survive a crash or quit and can be reattached later, from this window or from the session browser."
+            )
+        case .openConfigFileFooter:
+            return SectionHeading(title: nil, subtitle: nil)
+        case .themeColorWell, .themeColorHex, .lspRequireConfirmation,
+             .historyPersistence, .agentResume, .agentResumeAutoExecute,
+             .openSessionBrowserButton:
+            return nil
+        }
+    }
+
+    private func paneStack(for pane: SettingsPane) -> NSStackView {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 18
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let rowsInPane = SettingsRow.allCases.filter { $0.pane == pane }
+        for (index, settingsRow) in rowsInPane.enumerated() {
+            if let heading = sectionHeading(for: settingsRow) {
+                if index > 0 {
+                    stack.addArrangedSubview(sectionDivider())
+                }
+                if let title = heading.title {
+                    stack.addArrangedSubview(sectionTitleLabel(title))
+                }
+                if let subtitle = heading.subtitle {
+                    stack.addArrangedSubview(SettingsLabelFactory.descriptionLabel(subtitle))
+                }
+            }
+            stack.addArrangedSubview(contentView(for: settingsRow))
+        }
+        return stack
+    }
+
+    private func contentView(for settingsRow: SettingsRow) -> NSView {
+        switch settingsRow {
+        case .themeColorPreset:
+            return themeColorPresetRow()
+        case .themeColorWell:
+            return controlRow(label: "Color", control: colorWell)
+        case .themeColorHex:
+            return themeColorHexRow()
+        case .glassOpacity:
+            return glassOpacityRow()
+        case .smoothScrolling:
+            return smoothScrollingRow()
+        case .lspAutoInstall:
+            return lspAutoInstallRow()
+        case .lspRequireConfirmation:
+            return lspRequireConfirmationRow()
+        case .persistentSessions:
+            return controlRow(label: "Enable persistent sessions", control: persistentSessionsSwitch)
+        case .historyPersistence:
+            return controlRow(label: "Persist session history to disk", control: historyPersistenceSwitch)
+        case .agentResume:
+            return controlRow(label: "Offer to resume agent CLI conversations", control: agentResumeSwitch)
+        case .agentResumeAutoExecute:
+            return controlRow(label: "Auto-execute resume (skip confirmation)", control: agentResumeAutoExecuteSwitch)
+        case .openSessionBrowserButton:
+            return sessionBrowserButtonRow()
+        case .openConfigFileFooter:
+            return configFileFooterRow()
+        }
+    }
+
+    private func themeColorPresetRow() -> NSView {
         let presets = ThemeColorPreset.allCases.filter { $0 != .custom }
         for preset in presets {
             presetPopup.addItem(withTitle: preset.displayName)
@@ -75,39 +166,22 @@ class SettingsWindowController: NSWindowController {
         presetPopup.addItem(withTitle: "Custom")
         presetPopup.target = self
         presetPopup.action = #selector(presetDidChange(_:))
-        root.addArrangedSubview(row(label: "Preset", control: presetPopup))
-
-        // Color well
         colorWell.color = ThemeColorPreset.original.color
         colorWell.target = self
         colorWell.action = #selector(colorWellDidChange(_:))
-        root.addArrangedSubview(row(label: "Color", control: colorWell))
+        return controlRow(label: "Preset", control: presetPopup)
+    }
 
-        // Hex field
+    private func themeColorHexRow() -> NSView {
         hexField.stringValue = ThemeColorPreset.defaultCustomHex
         hexField.placeholderString = "#RRGGBB"
         hexField.target = self
         hexField.action = #selector(hexFieldDidCommit(_:))
         hexField.widthAnchor.constraint(equalToConstant: 100).isActive = true
-        root.addArrangedSubview(row(label: "Hex", control: hexField))
+        return controlRow(label: "Hex", control: hexField)
+    }
 
-        // Separator between Theme Color and Glass
-        let themeDivider = NSBox()
-        themeDivider.boxType = .separator
-        themeDivider.translatesAutoresizingMaskIntoConstraints = false
-        themeDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        root.addArrangedSubview(themeDivider)
-
-        // --- Glass Section ---
-        let title = NSTextField(labelWithString: "Glass")
-        title.font = .systemFont(ofSize: 20, weight: .semibold)
-        root.addArrangedSubview(title)
-
-        let subtitle = NSTextField(labelWithString: "Controls the transparency of the glass effect.")
-        subtitle.textColor = .secondaryLabelColor
-        subtitle.font = .systemFont(ofSize: 13)
-        root.addArrangedSubview(subtitle)
-
+    private func glassOpacityRow() -> NSView {
         opacitySlider.target = self
         opacitySlider.action = #selector(opacityDidChange(_:))
         opacityLabel.alignment = .right
@@ -124,93 +198,34 @@ class SettingsWindowController: NSWindowController {
         opacityRow.addArrangedSubview(opacityText)
         opacityRow.addArrangedSubview(opacitySlider)
         opacityRow.addArrangedSubview(opacityLabel)
-        root.addArrangedSubview(opacityRow)
+        return opacityRow
+    }
 
-        let divider = NSBox()
-        divider.boxType = .separator
-        divider.translatesAutoresizingMaskIntoConstraints = false
-        divider.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        root.addArrangedSubview(divider)
-
-        // --- Scrolling Section ---
-        let scrollingTitle = NSTextField(labelWithString: "Scrolling")
-        scrollingTitle.font = .systemFont(ofSize: 20, weight: .semibold)
-        root.addArrangedSubview(scrollingTitle)
-
+    private func smoothScrollingRow() -> NSView {
         let smoothScrollSwitch = NSSwitch()
         smoothScrollSwitch.state = (UserDefaults.standard.object(forKey: "smoothScrollEnabled") as? Bool ?? true) ? .on : .off
         smoothScrollSwitch.target = self
         smoothScrollSwitch.action = #selector(smoothScrollDidChange(_:))
-        root.addArrangedSubview(row(label: "Smooth Scrolling", control: smoothScrollSwitch))
+        return controlRow(label: "Smooth Scrolling", control: smoothScrollSwitch)
+    }
 
-        let scrollingDivider = NSBox()
-        scrollingDivider.boxType = .separator
-        scrollingDivider.translatesAutoresizingMaskIntoConstraints = false
-        scrollingDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        root.addArrangedSubview(scrollingDivider)
-
-        // --- LSP Section ---
-        let lspTitle = NSTextField(labelWithString: "LSP Proxy")
-        lspTitle.font = .systemFont(ofSize: 20, weight: .semibold)
-        root.addArrangedSubview(lspTitle)
-
-        let lspSubtitle = NSTextField(labelWithString: "Calyx hosts language servers and exposes them to AI agents over MCP. When a server is missing, Calyx can install it automatically.")
-        lspSubtitle.textColor = .secondaryLabelColor
-        lspSubtitle.font = .systemFont(ofSize: 13)
-        lspSubtitle.maximumNumberOfLines = 0
-        lspSubtitle.preferredMaxLayoutWidth = 460
-        root.addArrangedSubview(lspSubtitle)
-
+    private func lspAutoInstallRow() -> NSView {
         let autoInstallSwitch = NSSwitch()
         autoInstallSwitch.state = LSPSettings.autoInstallEnabled ? .on : .off
         autoInstallSwitch.target = self
         autoInstallSwitch.action = #selector(lspAutoInstallDidChange(_:))
-        root.addArrangedSubview(row(label: "Auto-install language servers", control: autoInstallSwitch))
+        return controlRow(label: "Auto-install language servers", control: autoInstallSwitch)
+    }
 
+    private func lspRequireConfirmationRow() -> NSView {
         let requireConfirmSwitch = NSSwitch()
         requireConfirmSwitch.state = LSPSettings.requireInstallConfirmation ? .on : .off
         requireConfirmSwitch.target = self
         requireConfirmSwitch.action = #selector(lspRequireConfirmationDidChange(_:))
-        root.addArrangedSubview(row(label: "Confirm before each install step", control: requireConfirmSwitch))
+        return controlRow(label: "Confirm before each install step", control: requireConfirmSwitch)
+    }
 
-        let lspDivider = NSBox()
-        lspDivider.boxType = .separator
-        lspDivider.translatesAutoresizingMaskIntoConstraints = false
-        lspDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        root.addArrangedSubview(lspDivider)
-
-        // --- Sessions Section ---
-        let sessionsTitle = NSTextField(labelWithString: "Sessions")
-        sessionsTitle.font = .systemFont(ofSize: 20, weight: .semibold)
-        root.addArrangedSubview(sessionsTitle)
-
-        let sessionsSubtitle = NSTextField(labelWithString: "Persistent terminal sessions survive a crash or quit and can be reattached later, from this window or from the session browser.")
-        sessionsSubtitle.textColor = .secondaryLabelColor
-        sessionsSubtitle.font = .systemFont(ofSize: 13)
-        sessionsSubtitle.maximumNumberOfLines = 0
-        sessionsSubtitle.preferredMaxLayoutWidth = 460
-        root.addArrangedSubview(sessionsSubtitle)
-
-        persistentSessionsSwitch.state = SessionSettings.persistentSessionsEnabled ? .on : .off
-        persistentSessionsSwitch.target = self
-        persistentSessionsSwitch.action = #selector(persistentSessionsDidChange(_:))
-        root.addArrangedSubview(row(label: "Enable persistent sessions", control: persistentSessionsSwitch))
-
-        historyPersistenceSwitch.state = SessionSettings.historyPersistenceEnabled ? .on : .off
-        historyPersistenceSwitch.target = self
-        historyPersistenceSwitch.action = #selector(historyPersistenceDidChange(_:))
-        root.addArrangedSubview(row(label: "Persist session history to disk", control: historyPersistenceSwitch))
-
-        agentResumeSwitch.state = SessionSettings.agentResumeEnabled ? .on : .off
-        agentResumeSwitch.target = self
-        agentResumeSwitch.action = #selector(agentResumeDidChange(_:))
-        root.addArrangedSubview(row(label: "Offer to resume agent CLI conversations", control: agentResumeSwitch))
-
-        agentResumeAutoExecuteSwitch.state = SessionSettings.agentResumeAutoExecute ? .on : .off
-        agentResumeAutoExecuteSwitch.target = self
-        agentResumeAutoExecuteSwitch.action = #selector(agentResumeAutoExecuteDidChange(_:))
-        root.addArrangedSubview(row(label: "Auto-execute resume (skip confirmation)", control: agentResumeAutoExecuteSwitch))
-
+    private func sessionBrowserButtonRow() -> NSView {
         let openBrowserButton = NSButton(
             title: "Open Session Browser", target: self, action: #selector(openSessionBrowser(_:))
         )
@@ -219,15 +234,10 @@ class SettingsWindowController: NSWindowController {
         sessionsActions.orientation = .horizontal
         sessionsActions.addArrangedSubview(openBrowserButton)
         sessionsActions.addArrangedSubview(NSView())
-        root.addArrangedSubview(sessionsActions)
+        return sessionsActions
+    }
 
-        let sessionsDivider = NSBox()
-        sessionsDivider.boxType = .separator
-        sessionsDivider.translatesAutoresizingMaskIntoConstraints = false
-        sessionsDivider.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        root.addArrangedSubview(sessionsDivider)
-
-        // --- Config Actions ---
+    private func configFileFooterRow() -> NSView {
         let actions = NSStackView()
         actions.orientation = .horizontal
         actions.spacing = 8
@@ -242,9 +252,21 @@ class SettingsWindowController: NSWindowController {
         actions.addArrangedSubview(helpButton)
 
         actions.addArrangedSubview(NSView())
-        root.addArrangedSubview(actions)
+        return actions
+    }
 
-        loadPresetIntoUI()
+    private func sectionTitleLabel(_ text: String) -> NSTextField {
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 20, weight: .semibold)
+        return label
+    }
+
+    private func sectionDivider() -> NSView {
+        let box = NSBox()
+        box.boxType = .separator
+        box.translatesAutoresizingMaskIntoConstraints = false
+        box.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return box
     }
 
     func showSettings() {
@@ -408,7 +430,7 @@ class SettingsWindowController: NSWindowController {
         logger.info("Config reload requested")
     }
 
-    private func row(label: String, control: NSView) -> NSView {
+    private func controlRow(label: String, control: NSView) -> NSView {
         let stack = NSStackView()
         stack.orientation = .horizontal
         stack.spacing = 12
@@ -508,5 +530,50 @@ private final class GhosttyConfigHelpViewController: NSViewController {
             root.widthAnchor.constraint(equalToConstant: 360),
         ])
         self.view = container
+    }
+}
+
+/// Hosts one SettingsPane's content stack at a fixed width, sized to fit
+/// the stack's content height. NSTabViewController (tabStyle .toolbar)
+/// resizes the Settings window to each tab's preferredContentSize on
+/// selection, so panes with fewer rows produce a shorter window instead
+/// of a fixed-height scroll view.
+@MainActor
+private final class SettingsPaneContentViewController: NSViewController {
+
+    private let contentStack: NSStackView
+    private let width: CGFloat
+    private let contentInset: CGFloat
+
+    init(contentStack: NSStackView, width: CGFloat, contentInset: CGFloat) {
+        self.contentStack = contentStack
+        self.width = width
+        self.contentInset = contentInset
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
+
+    override func loadView() {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(contentStack)
+
+        NSLayoutConstraint.activate([
+            contentStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: contentInset),
+            contentStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -contentInset),
+            contentStack.topAnchor.constraint(equalTo: container.topAnchor, constant: contentInset),
+            contentStack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -contentInset),
+            contentStack.widthAnchor.constraint(equalToConstant: width - 2 * contentInset),
+        ])
+
+        self.view = container
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.layoutSubtreeIfNeeded()
+        preferredContentSize = NSSize(width: width, height: view.fittingSize.height)
     }
 }
