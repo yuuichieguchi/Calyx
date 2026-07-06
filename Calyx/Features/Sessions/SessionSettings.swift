@@ -21,6 +21,7 @@ struct SessionSettings: Sendable {
     static let persistentSessionsEnabledKey = "calyx.session.persistentSessionsEnabled"
     static let agentResumeEnabledKey = "calyx.session.agentResumeEnabled"
     static let agentResumeAutoExecuteKey = "calyx.session.agentResumeAutoExecute"
+    static let historyPersistenceEnabledKey = "calyx.session.historyPersistenceEnabled"
 
     /// Test isolation hook: production reads/writes `UserDefaults
     /// .standard`; tests call `_testUseSuite(named:)` with a
@@ -75,9 +76,24 @@ struct SessionSettings: Sendable {
         set { (_testStore ?? .standard).set(newValue, forKey: agentResumeAutoExecuteKey) }
     }
 
+    /// Opt-in switch for on-disk history persistence
+    /// (`ControlMsg::SetHistoryEnabled`'s daemon-wide default). Defaults
+    /// OFF, same rationale as `persistentSessionsEnabled` and
+    /// `agentResumeEnabled` — capturing pane history to disk should
+    /// never start without the user turning it on. Setting this does not
+    /// itself reach a running daemon; see
+    /// `HistoryPersistenceToggleCoordinator` (propagates a live toggle)
+    /// and `AppDelegate.reassertHistoryPersistenceIfNeeded()` (reasserts
+    /// it once per launch).
+    static var historyPersistenceEnabled: Bool {
+        get { (_testStore ?? .standard).bool(forKey: historyPersistenceEnabledKey) }
+        set { (_testStore ?? .standard).set(newValue, forKey: historyPersistenceEnabledKey) }
+    }
+
     static func resetToDefaults() {
         (_testStore ?? .standard).removeObject(forKey: persistentSessionsEnabledKey)
         (_testStore ?? .standard).removeObject(forKey: agentResumeEnabledKey)
         (_testStore ?? .standard).removeObject(forKey: agentResumeAutoExecuteKey)
+        (_testStore ?? .standard).removeObject(forKey: historyPersistenceEnabledKey)
     }
 }

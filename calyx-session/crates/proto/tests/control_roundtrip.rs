@@ -192,6 +192,16 @@ fn roundtrip_set_history_enabled_ok() {
 }
 
 #[test]
+fn roundtrip_get_history_enabled() {
+    assert_roundtrips(ControlMsg::GetHistoryEnabled);
+}
+
+#[test]
+fn roundtrip_history_enabled() {
+    assert_roundtrips(ControlMsg::HistoryEnabled { enabled: true });
+}
+
+#[test]
 fn roundtrip_event_exited() {
     assert_roundtrips(ControlMsg::Event(SessionEvent::Exited {
         id: "01J000000000000000000TEST".to_string(),

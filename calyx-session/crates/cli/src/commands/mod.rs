@@ -3,6 +3,7 @@
 pub mod attach;
 pub(crate) mod client;
 pub mod daemon;
+pub mod history;
 pub mod kill;
 pub mod ls;
 pub mod meta;

@@ -37,6 +37,9 @@ pub enum Command {
     Kill(KillArgs),
     /// Get/set session metadata.
     Meta(MetaArgs),
+    /// Enable/disable/query the daemon-wide on-disk history-persistence
+    /// default (via `ControlMsg::SetHistoryEnabled`/`GetHistoryEnabled`).
+    History(HistoryArgs),
     /// Deploy the session daemon (and, optionally, the ghostty terminfo
     /// entry) to a remote host over ssh.
     RemoteInstall(RemoteInstallArgs),
@@ -118,6 +121,26 @@ pub enum MetaCommand {
     Get {
         id: String,
     },
+}
+
+#[derive(Args, Debug)]
+pub struct HistoryArgs {
+    #[command(subcommand)]
+    pub command: HistoryCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HistoryCommand {
+    /// Enable on-disk history persistence for sessions created after
+    /// this point (sends `ControlMsg::SetHistoryEnabled { enabled:
+    /// true }`).
+    On,
+    /// Disable it (sends `ControlMsg::SetHistoryEnabled { enabled:
+    /// false }`).
+    Off,
+    /// Report whether it is currently enabled, without changing it
+    /// (sends `ControlMsg::GetHistoryEnabled`).
+    Status,
 }
 
 #[derive(Args, Debug)]

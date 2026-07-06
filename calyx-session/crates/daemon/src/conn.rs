@@ -246,6 +246,13 @@ impl Conn {
                 self.shared.history_enabled.store(enabled, Ordering::SeqCst);
                 self.reply(&ControlMsg::SetHistoryEnabledOk { enabled })
             }
+            ControlMsg::GetHistoryEnabled => {
+                // Query half of the toggle above (`SetHistoryEnabled`):
+                // read-only, so a `status` can never itself flip the
+                // flag. SeqCst to pair with the store above.
+                let enabled = self.shared.history_enabled.load(Ordering::SeqCst);
+                self.reply(&ControlMsg::HistoryEnabled { enabled })
+            }
             // Server-to-client messages arriving from a client are a
             // protocol violation.
             ControlMsg::HelloOk { .. }
@@ -257,6 +264,7 @@ impl Conn {
             | ControlMsg::KillOk
             | ControlMsg::MetaOk { .. }
             | ControlMsg::SetHistoryEnabledOk { .. }
+            | ControlMsg::HistoryEnabled { .. }
             | ControlMsg::Event(_)
             | ControlMsg::Err { .. } => false,
         }

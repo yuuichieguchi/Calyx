@@ -141,6 +141,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 createNewWindow()
             }
         }
+        Task { await reassertHistoryPersistenceIfNeeded() }
         // Process any URLs that arrived before launch completed
         if !pendingURLs.isEmpty {
             let urls = pendingURLs
@@ -1581,6 +1582,48 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return result
         }
+    }
+
+    /// P6 (R-B4): the attach-spawned calyx-session daemon always starts
+    /// with history OFF (`DaemonConfig::history_enabled`'s bind-time
+    /// default; see `ControlMsg::SetHistoryEnabled`'s own doc comment --
+    /// a live, in-memory override, never persisted daemon-side),
+    /// regardless of any `history on` a previous process lifetime sent
+    /// it. A user with `historyPersistenceEnabled` on therefore needs it
+    /// re-pushed once per launch, against whatever daemon this launch
+    /// attaches to or spawns. Gated on `persistentSessionsEnabled` (no
+    /// persistent daemon is ever spawned otherwise, so there is nothing
+    /// to reassert to) AND `historyPersistenceEnabled`. Called once from
+    /// `applicationDidFinishLaunching`, right after the
+    /// `restoreSession()`/`createNewWindow()` branch resolves -- NOT
+    /// piggybacked onto `fetchSessionsForAgentResume()`, which gates on
+    /// the unrelated `agentResumeEnabled` setting and would silently
+    /// skip reassertion for a user who has `persistentSessionsEnabled`
+    /// and `historyPersistenceEnabled` on but `agentResumeEnabled` off.
+    ///
+    /// CAVEAT: the daemon that ends up serving this launch's
+    /// persistent-session panes is spawned on demand, per pane, by the
+    /// FIRST `calyx-session attach --create` ghostty actually execs
+    /// (`commands/attach.rs`'s `connect_or_spawn`) -- a process this
+    /// call has no synchronous handle on and does not wait for. Unlike
+    /// `attach`, the `history` CLI subcommand does not auto-spawn a
+    /// daemon, so a reassertion that runs before any pane has actually
+    /// attached could race a not-yet-running daemon and silently no-op.
+    /// Left as documented best-effort rather than adding a bounded
+    /// retry: this whole feature is opt-in/experimental, the corner
+    /// self-heals on the next settings toggle (which also pushes
+    /// immediately, via `HistoryPersistenceToggleCoordinator`) or the
+    /// next launch, and a retry would add timers for a corner most
+    /// launches never hit (the daemon is typically already running from
+    /// a previous session by the time this races it).
+    func reassertHistoryPersistenceIfNeeded() async {
+        guard SessionSettings.persistentSessionsEnabled, SessionSettings.historyPersistenceEnabled else { return }
+        #if DEBUG
+        let client = _sessionDaemonClientForTesting ?? SessionDaemonClient.shared
+        #else
+        let client = SessionDaemonClient.shared
+        #endif
+        await client.setHistoryEnabled(true)
     }
 
     /// R8-D item 1 (r8-fix-spec.md; r7-verdicts.md's "Unbounded await

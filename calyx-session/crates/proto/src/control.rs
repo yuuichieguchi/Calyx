@@ -111,6 +111,18 @@ pub enum ControlMsg {
     SetHistoryEnabledOk {
         enabled: bool,
     },
+    /// Queries the daemon-wide history-persistence default currently in
+    /// effect (see `SetHistoryEnabled`'s doc comment for the full
+    /// contract), without mutating it. Added for the CLI's `history
+    /// status` subcommand (P6 RED2): `SetHistoryEnabled`/`SetHistoryEnabledOk`
+    /// existed before this with no way for a client to observe the
+    /// current value without also setting it.
+    GetHistoryEnabled,
+    /// Reply to `GetHistoryEnabled`, carrying the value now in effect.
+    /// Never sent unprompted (unlike `Event`).
+    HistoryEnabled {
+        enabled: bool,
+    },
     /// Server-pushed notification, unprompted by any client request.
     Event(SessionEvent),
     /// Generic error reply to any of the above.
