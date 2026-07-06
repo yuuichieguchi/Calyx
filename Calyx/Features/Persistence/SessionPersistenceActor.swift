@@ -94,9 +94,16 @@ actor SessionPersistenceActor {
     /// saveImmediately(_:) (via AppDelegate.saveImmediately(), called
     /// from windowWillClose), which this method does not change.
     func saveAtTermination(_ snapshot: SessionSnapshot) async {
-        if snapshot.windows.isEmpty, let onDisk = loadFromPath(savePath), !onDisk.windows.isEmpty {
-            logger.warning("Refusing to overwrite non-empty on-disk session with an empty snapshot at termination")
-            return
+        if snapshot.windows.isEmpty {
+            let onDiskSavePath = loadFromPath(savePath)
+            if let onDiskSavePath, !onDiskSavePath.windows.isEmpty {
+                logger.warning("Refusing to overwrite non-empty on-disk session with an empty snapshot at termination")
+                return
+            }
+            if onDiskSavePath == nil, let onDiskBackup = loadFromPath(backupPath), !onDiskBackup.windows.isEmpty {
+                logger.warning("Refusing to overwrite non-empty backup (savePath undecodable) with an empty snapshot at termination")
+                return
+            }
         }
         await performSave(snapshot)
     }
@@ -171,18 +178,30 @@ actor SessionPersistenceActor {
     /// whatever its content -- including one restore() itself failed to
     /// decode (corrupt JSON, unknown future schema version) -- since
     /// something is still worth keeping in that case too. A no-op when
-    /// savePath does not exist (nothing was ever saved, or a prior
-    /// preserve already moved it -- e.g. a second consecutive bad
-    /// launch keeps only the MOST RECENT preserved snapshot, an
-    /// explicit simplification, not an oversight: this call site only
-    /// ever fires once per launch and the caller (AppDelegate) is
-    /// responsible for not calling it at all when restore() decoded a
-    /// genuinely EMPTY snapshot). Returns whether a file was actually
-    /// moved, so the caller can distinguish a real preserve from a no-op.
+    /// savePath does not exist (nothing was ever saved). First-wins when
+    /// a preserved file already exists: the older, pre-incident session
+    /// is the valuable one (the last snapshot taken before whatever
+    /// started going wrong), while everything a crash loop preserves
+    /// afterward is just another state of an already-broken run, so an
+    /// existing preserved file is kept untouched rather than overwritten.
+    /// savePath itself is left in place in that branch too -- it is not
+    /// preserved anywhere, but this run's own subsequent saves will
+    /// rewrite it regardless, so removing it here would be gratuitous
+    /// file I/O with no data-safety benefit. Returns whether a preserved
+    /// file exists after the call, whether newly moved by this call or
+    /// already present from an earlier one, so the caller
+    /// (preserveDiscardedSessionIfAny()) keeps firing its
+    /// notify+flag wiring in both cases.
     @discardableResult
     func preserveSnapshotForRecovery() -> Bool {
         guard FileManager.default.fileExists(atPath: savePath.path) else { return false }
-        try? FileManager.default.removeItem(at: recoverySnapshotPath)
+        guard !FileManager.default.fileExists(atPath: recoverySnapshotPath.path) else {
+            // First-wins (F3): an earlier, still-unrecovered preserved
+            // session is more valuable than this run's own (also
+            // broken) on-disk state. savePath is left as-is; this run's
+            // own subsequent saves will rewrite it regardless.
+            return true
+        }
         try? FileManager.default.moveItem(at: savePath, to: recoverySnapshotPath)
         return true
     }
@@ -197,6 +216,29 @@ actor SessionPersistenceActor {
 
     func clearPreservedSnapshot() {
         try? FileManager.default.removeItem(at: recoverySnapshotPath)
+    }
+
+    /// Called when hasPreservedSnapshot() is true but
+    /// loadPreservedSnapshot() returned nil (corrupt bytes or an
+    /// unknown future schema version): renames the unusable recovery
+    /// file aside to sessions.recovery.json.corrupt instead of
+    /// deleting it -- nothing is destroyed, only retired from the
+    /// active recovery path -- so hasPreservedSnapshot() reports false
+    /// afterwards and the caller can stop offering a dead command. A
+    /// no-op returning false when there is nothing preserved to
+    /// quarantine (mirrors preserveSnapshotForRecovery()'s own
+    /// no-op-when-absent convention).
+    @discardableResult
+    func quarantineCorruptPreservedSnapshot() -> Bool {
+        guard FileManager.default.fileExists(atPath: recoverySnapshotPath.path) else { return false }
+        let quarantinePath = recoverySnapshotPath.appendingPathExtension("corrupt")
+        try? FileManager.default.removeItem(at: quarantinePath)
+        do {
+            try FileManager.default.moveItem(at: recoverySnapshotPath, to: quarantinePath)
+            return true
+        } catch {
+            return false
+        }
     }
 
     // MARK: - Crash Loop Detection

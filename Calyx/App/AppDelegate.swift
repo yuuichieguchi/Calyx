@@ -1095,8 +1095,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// True once Bug 3a's preserveSnapshotForRecovery() has moved a
     /// skipped/failed session's snapshot aside. Gates
     /// session.recoverPreviousSession's isAvailable. Cleared back to
-    /// false once recoverPreservedSession() successfully rebuilds
-    /// windows from it.
+    /// false once recoverPreservedSession() either restores at least
+    /// one window from the preserved snapshot (via
+    /// finalizeRecoverPreservedSession(restoredAny:)), or finds the
+    /// preserved snapshot undecodable and quarantines it (see
+    /// SessionPersistenceActor.quarantineCorruptPreservedSnapshot()). A
+    /// recovery attempt that restores nothing from an otherwise
+    /// decodable snapshot leaves this flag untouched, so the user's
+    /// last-resort backup is never silently destroyed.
     private(set) var hasPreservedSessionSnapshot = false
 
     #if DEBUG
@@ -1138,22 +1144,57 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// session.recoverPreviousSession's handler: loads the preserved
     /// snapshot (via the same actor _sessionPersistenceActorForTesting
-    /// seam scheduleRecoveryCounterResetAfterStableLaunch already uses),
-    /// rebuilds each window through the existing restoreWindow(_:)
-    /// machinery (same one restoreSession() itself uses), and clears the
-    /// preserved file only once that succeeds. A no-op (does not touch
-    /// restoreWindow/GhosttyAppController at all) when nothing is
-    /// actually preserved.
+    /// seam scheduleRecoveryCounterResetAfterStableLaunch already uses).
+    /// When the preserved snapshot is undecodable (corrupt JSON, unknown
+    /// future schema version) or nothing was preserved at all, quarantines
+    /// it (a safe no-op in the latter sub-case -- see
+    /// SessionPersistenceActor.quarantineCorruptPreservedSnapshot()) and
+    /// resets hasPreservedSessionSnapshot, so a dead command never stays
+    /// stuck available. Otherwise rebuilds each window through the
+    /// existing restoreWindow(_:) machinery (same one restoreSession()
+    /// itself uses), tracking whether any window actually restored, and
+    /// hands that result to finalizeRecoverPreservedSession(restoredAny:),
+    /// which only clears the preserved file and resets the flag once at
+    /// least one window restored -- a total-failure attempt leaves the
+    /// backup in place so the user can retry or investigate.
     func recoverPreservedSession() {
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
         Task {
-            guard let snapshot = await actor.loadPreservedSnapshot(), !snapshot.windows.isEmpty else { return }
-            for windowSnap in snapshot.windows {
-                _ = restoreWindow(windowSnap)
+            guard let snapshot = await actor.loadPreservedSnapshot() else {
+                // Nothing preserved, OR preserved but undecodable
+                // (corrupt/unknown schema) -- quarantine is a no-op in
+                // the former sub-case, so calling it unconditionally is
+                // safe and unsticks the latter.
+                await actor.quarantineCorruptPreservedSnapshot()
+                hasPreservedSessionSnapshot = false
+                return
             }
-            await actor.clearPreservedSnapshot()
-            hasPreservedSessionSnapshot = false
+            guard !snapshot.windows.isEmpty else { return }
+            var restoredAny = false
+            for windowSnap in snapshot.windows {
+                if restoreWindow(windowSnap) {
+                    restoredAny = true
+                }
+            }
+            await finalizeRecoverPreservedSession(restoredAny: restoredAny)
         }
+    }
+
+    /// Extracted from recoverPreservedSession() so the "was anything
+    /// actually recovered" bookkeeping is unit-testable without reaching
+    /// restoreWindow(_:)'s real GhosttyAppController/window-creation path
+    /// (see AppDelegateRecoverPreservedSessionFinalizeTests's own
+    /// reachability note). Mirrors
+    /// scheduleRecoveryCounterResetAfterStableLaunch(delay:)'s
+    /// actor-seam resolution. Clears the preserved snapshot and resets
+    /// hasPreservedSessionSnapshot ONLY when restoredAny is true;
+    /// otherwise leaves both untouched, so a recovery attempt that
+    /// restored NOTHING never destroys the user's last-resort backup.
+    func finalizeRecoverPreservedSession(restoredAny: Bool) async {
+        guard restoredAny else { return }
+        let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        await actor.clearPreservedSnapshot()
+        hasPreservedSessionSnapshot = false
     }
 
     /// Bug 3a/3b wiring shared by restoreSession()'s nil-snapshot,
