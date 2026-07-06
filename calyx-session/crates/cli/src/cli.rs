@@ -48,6 +48,13 @@ pub struct DaemonArgs {
     /// background.
     #[arg(long)]
     pub foreground: bool,
+    /// Enable opt-in on-disk history persistence by default for
+    /// sessions created by this daemon process (default off; see
+    /// `daemon::DaemonConfig::history_enabled`). Overridable for the
+    /// daemon's remaining lifetime without restarting it, via a future
+    /// `history` subcommand that sends `ControlMsg::SetHistoryEnabled`.
+    #[arg(long)]
+    pub persist_history: bool,
 }
 
 #[derive(Args, Debug)]

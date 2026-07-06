@@ -20,7 +20,9 @@
 use std::collections::VecDeque;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -30,6 +32,7 @@ use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::pty::Winsize;
 use proto::{encode_control, ControlMsg, FrameType, SessionEvent, SessionSpec, SessionState};
 
+use crate::history;
 use crate::outq::{lock_unpoisoned, OutQueue};
 use crate::state::{SessionEntry, Shared};
 
@@ -298,6 +301,11 @@ pub(crate) fn spawn_session(
         let mailbox = Arc::clone(&mailbox);
         let input = Arc::clone(&input);
         let master = pty.master;
+        let state_dir = shared.state_dir.clone();
+        // Read once, here at creation: `SetHistoryEnabled` only changes
+        // what *later* creations inherit (R6 semantics; see
+        // crate::history's module doc).
+        let history_enabled = shared.history_enabled.load(Ordering::SeqCst);
         thread::Builder::new()
             .name(format!("session-{id}"))
             .spawn(move || {
@@ -313,6 +321,8 @@ pub(crate) fn spawn_session(
                     rows,
                     ready_tx,
                     start_rx,
+                    state_dir,
+                    history_enabled,
                 })
             })
             .map_err(|e| format!("spawn session thread: {e}"))?;
@@ -350,6 +360,12 @@ struct SessionThread {
     rows: u16,
     ready_tx: mpsc::SyncSender<Result<(), String>>,
     start_rx: mpsc::Receiver<()>,
+    /// `Shared::state_dir`, cloned at spawn so the history paths need
+    /// no registry access from this thread.
+    state_dir: PathBuf,
+    /// The daemon-wide history flag as captured at this session's
+    /// creation (see `spawn_session`); later toggles don't reach here.
+    history_enabled: bool,
 }
 
 fn session_thread(ctx: SessionThread) {
@@ -365,6 +381,8 @@ fn session_thread(ctx: SessionThread) {
         rows,
         ready_tx,
         start_rx,
+        state_dir,
+        history_enabled,
     } = ctx;
     let master_raw = master.as_raw_fd();
 
@@ -384,7 +402,49 @@ fn session_thread(ctx: SessionThread) {
     // caller) means "proceed anyway" — the loop then just reaps the
     // already-killed child and the identity check below keeps its
     // teardown away from any same-id successor's registry entry.
-    let _ = start_rx.recv();
+    // `registered` additionally keeps an unregistered thread's hands
+    // off the history files: a create-race loser must never seed
+    // from, write to, or later delete files a same-id winner owns.
+    let registered = start_rx.recv().is_ok();
+
+    // Opt-in history persistence (see crate::history's module doc).
+    // Failures on this path are logged and degrade to "no history for
+    // this session" rather than tearing the session down: at this
+    // point the session is already registered and reported created,
+    // so there is no error channel back to the requesting client, and
+    // a live session is worth more than its history record.
+    let mut history: Option<history::HistoryWriter> = None;
+    if registered && history_enabled {
+        // Seed-once-then-reset: a leftover file means the previous
+        // daemon process died before this id's teardown ran. Feed it
+        // into the fresh terminal now, before the loop's first PTY
+        // feed, so the first Replay rendered for any attaching client
+        // already contains the pre-crash scrollback; then delete the
+        // files so the live appends below start from a clean slate.
+        match history::read_persisted(&state_dir, &id) {
+            Ok(Some(bytes)) => {
+                if let Err(e) = terminal.feed(&bytes) {
+                    eprintln!("calyx-sessiond: seeding persisted history failed for {id}: {e}");
+                }
+                if let Err(e) = history::HistoryWriter::remove_all(&state_dir, &id) {
+                    eprintln!("calyx-sessiond: resetting persisted history failed for {id}: {e}");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("calyx-sessiond: reading persisted history failed for {id}: {e}");
+            }
+        }
+        match history::HistoryWriter::open(&state_dir, &id, history::DEFAULT_CAP_BYTES) {
+            Ok(writer) => history = Some(writer),
+            Err(e) => {
+                eprintln!(
+                    "calyx-sessiond: opening history for {id} failed, running without \
+                     history: {e}"
+                );
+            }
+        }
+    }
 
     struct AttachedClient {
         conn_id: u64,
@@ -522,6 +582,24 @@ fn session_thread(ctx: SessionThread) {
                         // live clients shouldn't.
                         eprintln!("calyx-sessiond: vt feed failed for {id}: {e}");
                     }
+                    // Append before mirroring, so a client that has
+                    // observed some output can rely on those bytes
+                    // already being on disk. Plain buffered file I/O
+                    // (no fsync), a deliberate exception to this
+                    // thread's never-blocks rule, accepted as the cost
+                    // of opting in to history. On failure: log once
+                    // and stop persisting for this session only; the
+                    // session itself keeps running (history is
+                    // best-effort by design, see crate::history).
+                    if let Some(writer) = history.as_mut() {
+                        if let Err(e) = writer.append(chunk) {
+                            eprintln!(
+                                "calyx-sessiond: history append failed for {id}, stopping \
+                                 history for this session: {e}"
+                            );
+                            history = None;
+                        }
+                    }
                     let mut overflowed: Vec<u64> = Vec::new();
                     for client in &clients {
                         if !client.queue.push(FrameType::Output, chunk.to_vec()) {
@@ -547,14 +625,20 @@ fn session_thread(ctx: SessionThread) {
     //    (create-race losers must not delete a same-id winner's).
     //    Removal precedes the reap so `Kill` can rely on "entry
     //    present => child not yet reaped => pid not reused".
-    // 2. Reap the child (this is what frees the pid).
-    // 3. Record the exit code in the ledger (this is what `Kill` waits
+    // 2. Delete this session's on-disk history, when it was ours and
+    //    history was on: history exists to survive a daemon crash,
+    //    not a session's own end (kill and natural exit both land
+    //    here; this is the single teardown point). Before step 4's
+    //    ledger flip on purpose, so `KillOk` (gated on that flip)
+    //    implies the files are already gone.
+    // 3. Reap the child (this is what frees the pid).
+    // 4. Record the exit code in the ledger (this is what `Kill` waits
     //    for before `KillOk`, making its `kill -0` probe determinate).
-    // 4. Drain the mailbox one final time: an Attach could only have
+    // 5. Drain the mailbox one final time: an Attach could only have
     //    been enqueued while the entry was still present (conn.rs
     //    sends under the registry lock), so admitting stragglers here
     //    closes the "attached into silence" race.
-    // 5. Deliver Replay (for stragglers) + Exited to every client and
+    // 6. Deliver Replay (for stragglers) + Exited to every client and
     //    finish their queues so their connections close promptly.
     let mine = {
         let mut state = shared.lock_state();
@@ -569,6 +653,20 @@ fn session_thread(ctx: SessionThread) {
         shared.cond.notify_all();
         mine
     };
+
+    // Step 2: close the writer's fd before unlinking (not required on
+    // Unix, just tidy), then delete both generations. `mine` implies
+    // `registered`, so a create-race loser never gets here with files
+    // a winner owns; the check on `history_enabled` (not on the
+    // writer, which an append error may have dropped) keeps the
+    // cleanup running even when persisting stopped mid-session, and
+    // keeps a history-off session from ever touching the paths.
+    drop(history);
+    if mine && history_enabled {
+        if let Err(e) = history::HistoryWriter::remove_all(&state_dir, &id) {
+            eprintln!("calyx-sessiond: removing history for {id} failed: {e}");
+        }
+    }
 
     let exit_code = match child.wait() {
         Ok(status) => status
@@ -699,7 +797,7 @@ mod tests {
     #[test]
     fn spawned_session_master_input_fd_has_cloexec_set() {
         let tmp = tempfile::tempdir().expect("create scratch state dir");
-        let shared = Arc::new(Shared::new(tmp.path().to_path_buf()));
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
         let spec = SessionSpec {
             id: "01J-p2-cloexec-unit-test".to_string(),
             name: None,
@@ -746,7 +844,7 @@ mod tests {
     #[test]
     fn spawned_session_mailbox_wake_tx_fd_has_cloexec_set() {
         let tmp = tempfile::tempdir().expect("create scratch state dir");
-        let shared = Arc::new(Shared::new(tmp.path().to_path_buf()));
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
         let spec = SessionSpec {
             id: "01J-p2-cloexec-unit-test-2".to_string(),
             name: None,

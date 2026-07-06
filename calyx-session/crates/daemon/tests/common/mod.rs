@@ -50,10 +50,22 @@ pub struct ScratchDaemon {
 
 impl ScratchDaemon {
     /// Spawns `Daemon::bind(..).run_until_idle()` on a background
-    /// thread. Does not block on the daemon actually being ready;
-    /// callers should use `connect` (bounded retry) rather than
-    /// assuming readiness immediately after this returns.
+    /// thread, with history persistence off (the daemon's default; see
+    /// `spawn_with_history_enabled` for tests that need it on). Does
+    /// not block on the daemon actually being ready; callers should use
+    /// `connect` (bounded retry) rather than assuming readiness
+    /// immediately after this returns.
     pub fn spawn() -> ScratchDaemon {
+        Self::spawn_with_config(false)
+    }
+
+    /// Like `spawn`, but with history persistence on from this
+    /// daemon's very first session (P6 history-persistence tests only).
+    pub fn spawn_with_history_enabled() -> ScratchDaemon {
+        Self::spawn_with_config(true)
+    }
+
+    fn spawn_with_config(history_enabled: bool) -> ScratchDaemon {
         let tempdir = tempfile::tempdir().expect("create scratch tempdir for a test daemon");
         let runtime_dir = tempdir.path().join("run");
         let state_dir = tempdir.path().join("state");
@@ -62,6 +74,7 @@ impl ScratchDaemon {
         let config = DaemonConfig {
             runtime_dir: runtime_dir.clone(),
             state_dir: state_dir.clone(),
+            history_enabled,
         };
         let handle = thread::spawn(move || Daemon::bind(config)?.run_until_idle());
 

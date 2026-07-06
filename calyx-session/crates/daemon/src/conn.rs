@@ -3,6 +3,7 @@
 //! draining this client's `OutQueue`.
 
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -235,6 +236,16 @@ impl Conn {
                 }
                 true
             }
+            ControlMsg::SetHistoryEnabled { enabled } => {
+                // Affects only sessions created after this store:
+                // `spawn_session` reads the flag once at creation, so
+                // already-running sessions keep the value captured at
+                // their own creation (see crates/daemon/src/history.rs).
+                // SeqCst so a create that follows this reply on another
+                // connection is guaranteed to observe the new value.
+                self.shared.history_enabled.store(enabled, Ordering::SeqCst);
+                self.reply(&ControlMsg::SetHistoryEnabledOk { enabled })
+            }
             // Server-to-client messages arriving from a client are a
             // protocol violation.
             ControlMsg::HelloOk { .. }
@@ -245,6 +256,7 @@ impl Conn {
             | ControlMsg::AttachOk { .. }
             | ControlMsg::KillOk
             | ControlMsg::MetaOk { .. }
+            | ControlMsg::SetHistoryEnabledOk { .. }
             | ControlMsg::Event(_)
             | ControlMsg::Err { .. } => false,
         }

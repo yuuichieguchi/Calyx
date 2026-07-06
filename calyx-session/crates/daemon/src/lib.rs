@@ -30,10 +30,21 @@
 //! - **Idempotent create**: `Attach { id, create: Some(spec), .. }`
 //!   against an `id` that already exists attaches to the existing
 //!   session rather than spawning a second process for the same id.
+//! - **History (opt-in)**: off by default. With
+//!   `DaemonConfig::history_enabled` (CLI: `daemon --persist-history`),
+//!   or after `ControlMsg::SetHistoryEnabled { enabled: true }`, every
+//!   session *created while the flag is on* appends its raw PTY output
+//!   to `state_dir/history/<id>.raw` (dir mode `0700`, file mode
+//!   `0600`, two-generation rotation), deletes those files again on its
+//!   own teardown, and seeds a recreated session's terminal from
+//!   whatever a daemon crash left behind. The flag is read once per
+//!   session at creation, so mid-lifetime toggles never affect
+//!   already-running sessions. Full contract: `src/history.rs`.
 
 mod config;
 mod conn;
 mod error;
+mod history;
 mod ledger;
 mod outq;
 pub mod peer;
@@ -108,7 +119,10 @@ impl Daemon {
     /// change, and verify each accepted connection's peer uid via
     /// [`peer::verify_peer_uid`] before trusting anything it sends.
     pub fn run_until_idle(self) -> Result<(), DaemonError> {
-        let shared = Arc::new(Shared::new(self.config.state_dir.clone()));
+        let shared = Arc::new(Shared::new(
+            self.config.state_dir.clone(),
+            self.config.history_enabled,
+        ));
         shared.lock_state().ledger = ledger::load(&self.config.state_dir);
 
         let socket = self.socket_path();

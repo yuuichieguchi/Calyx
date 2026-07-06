@@ -94,6 +94,23 @@ pub enum ControlMsg {
         cols: u16,
         rows: u16,
     },
+    /// Enables or disables on-disk history persistence daemon-wide,
+    /// effective immediately for any session *created* after this
+    /// message is processed. Sessions already running keep whatever was
+    /// in effect when they were created (see the daemon module doc for
+    /// the full history-persistence contract): this only changes what
+    /// new sessions inherit, never anything already in flight. The
+    /// daemon also has a bind-time default (`DaemonConfig::history_enabled`,
+    /// e.g. from a `--persist-history` CLI flag), which seeds the value
+    /// this message subsequently overrides for the rest of the daemon's
+    /// process lifetime.
+    SetHistoryEnabled {
+        enabled: bool,
+    },
+    /// Reply to `SetHistoryEnabled`, echoing the value now in effect.
+    SetHistoryEnabledOk {
+        enabled: bool,
+    },
     /// Server-pushed notification, unprompted by any client request.
     Event(SessionEvent),
     /// Generic error reply to any of the above.

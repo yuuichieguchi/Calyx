@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Instant;
@@ -17,6 +18,15 @@ use crate::session::{SessionInput, SessionMailbox};
 pub(crate) struct Shared {
     pub(crate) state: Mutex<State>,
     pub(crate) cond: Condvar,
+    /// Root for this daemon's on-disk state; `spawn_session` derives
+    /// the history directory from it (see `crate::history`).
+    pub(crate) state_dir: PathBuf,
+    /// Live daemon-wide default for opt-in history persistence: seeded
+    /// from `DaemonConfig::history_enabled` at bind time, overridable
+    /// via `ControlMsg::SetHistoryEnabled`. Read once per session at
+    /// creation (`spawn_session`), so a mid-lifetime flip affects only
+    /// sessions created afterwards.
+    pub(crate) history_enabled: AtomicBool,
     /// Ledger snapshots headed for the persister thread; see
     /// `persist_ledger`. `None` once `shutdown_persister` ran.
     persist_tx: Mutex<Option<mpsc::Sender<Vec<SessionInfo>>>>,
@@ -24,7 +34,7 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn new(state_dir: PathBuf) -> Shared {
+    pub(crate) fn new(state_dir: PathBuf, history_enabled: bool) -> Shared {
         // Dedicated persister thread: registry-lock holders only take
         // an in-memory snapshot, so no request path ever waits on
         // write+fsync. Writes are throttled leading+trailing: a first
@@ -69,6 +79,8 @@ impl Shared {
                 last_activity: Instant::now(),
             }),
             cond: Condvar::new(),
+            state_dir,
+            history_enabled: AtomicBool::new(history_enabled),
             persist_tx: Mutex::new(Some(persist_tx)),
             persister: Mutex::new(Some(persister)),
         }

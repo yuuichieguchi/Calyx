@@ -18,6 +18,7 @@ pub fn run(
     let config = DaemonConfig {
         runtime_dir: resolve_runtime_dir(runtime_dir),
         state_dir: resolve_state_dir(state_dir),
+        history_enabled: args.persist_history,
     };
 
     if args.foreground {

@@ -182,6 +182,16 @@ fn roundtrip_resize() {
 }
 
 #[test]
+fn roundtrip_set_history_enabled() {
+    assert_roundtrips(ControlMsg::SetHistoryEnabled { enabled: true });
+}
+
+#[test]
+fn roundtrip_set_history_enabled_ok() {
+    assert_roundtrips(ControlMsg::SetHistoryEnabledOk { enabled: false });
+}
+
+#[test]
 fn roundtrip_event_exited() {
     assert_roundtrips(ControlMsg::Event(SessionEvent::Exited {
         id: "01J000000000000000000TEST".to_string(),
