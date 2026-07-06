@@ -246,15 +246,21 @@ pub fn run_handoff_receiver(
     // daemon's HANDOFF_ACK_TIMEOUT before it resumes.
     //
     // Known bounded residual: `adopt_session` starts each session thread
-    // reading its inherited PTY immediately (its pre-release contract,
-    // which the adopt/H7 unit tests rely on), so entries adopted before
-    // a later failure do read a little from their (duplicated) PTY
-    // masters before the process exits. The old daemon's own copies of
-    // those sessions stay paused until its ack timeout, so this can at
-    // worst drop a few bytes of one paused session's output, never split
-    // the registry or the on-disk ledger. Fully preventing even that
-    // would require deferring PTY consumption past the ack, which the
-    // pre-release contract does not currently allow.
+    // reading its inherited PTY (and, for a history-enabled session,
+    // appending to its `<id>.raw`) immediately, on its pre-release
+    // contract that the adopt/H7 unit tests rely on. So every session
+    // adopted *before* a later failure has already begun draining its
+    // (duplicated) PTY master, consuming bytes from the shared PTY that
+    // the old daemon's own paused copy will never see once it resumes,
+    // and possibly interleaving appends into the same history file. The
+    // exposure is therefore not a fixed few bytes of a single session:
+    // it scales with how many sessions were adopted before the one that
+    // failed, since each of them starts reading straight away. It still
+    // never splits the registry or the on-disk ledger, because staging
+    // defers both until the whole manifest succeeds. Fully preventing
+    // the lost/interleaved reads would require deferring PTY consumption
+    // past the ack, which the pre-release contract does not currently
+    // allow.
     let mut adopted: Vec<state::SessionEntry> = Vec::with_capacity(manifest.sessions.len());
     for (entry, master_fd) in manifest.sessions.into_iter().zip(fds) {
         let id = entry.id.clone();

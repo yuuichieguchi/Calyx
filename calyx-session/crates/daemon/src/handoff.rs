@@ -568,6 +568,18 @@ fn restore_entry(shared: &Arc<Shared>, entry: SessionEntry) {
 /// -1, the same sentinel `SessionChild::reap` uses when no status is
 /// available.
 fn finalize_exited(shared: &Arc<Shared>, entry: SessionEntry) {
+    // Delete this session's on-disk history, the same as the normal
+    // confirmed-exit teardown in `session.rs` (P6 fix-batch sweep S2):
+    // history exists to survive a daemon crash, not a session's own end,
+    // and this path ends the session. `remove_all` is a no-op when
+    // nothing is persisted, so it is unconditional; a failure is
+    // logged, not propagated, exactly as teardown does.
+    if let Err(e) = history::HistoryWriter::remove_all(&shared.state_dir, &entry.id) {
+        eprintln!(
+            "calyx-sessiond: removing history for {} failed: {e}",
+            entry.id
+        );
+    }
     let mut state = shared.lock_state();
     state.sessions.remove(&entry.id);
     if let Some(info) = state.ledger.get_mut(&entry.id) {
@@ -578,6 +590,63 @@ fn finalize_exited(shared: &Arc<Shared>, entry: SessionEntry) {
     state.touch();
     shared.persist_ledger(&state);
     shared.cond.notify_all();
+}
+
+/// Opportunistic reconciliation for a dead-thread adopted "ghost" (P6
+/// fix-batch sweep S1). An adopted session whose process outlived its
+/// post-EOF liveness poll (`SessionChild::reap` returned `None`) keeps
+/// its registry entry and its `Running` ledger record so a later `Kill`
+/// can still reach the real process; but its session thread has already
+/// returned, so nothing on that path will ever notice the process
+/// eventually dying. `Kill` and `List` (conn.rs) call this to finish
+/// the job.
+///
+/// If `id`'s still-registered entry belongs to a returned thread (its
+/// mailbox is the sole remaining holder, the same dead-thread test
+/// `restore_entry` uses) and its `pid` is now confirmed gone
+/// (`kill(pid, 0)` fails with `ESRCH`), this deletes its history, flips
+/// the ledger to `Exited { code: -1 }` (the unknowable-exit sentinel
+/// `finalize_exited` and `reap` also use), drops the entry, and returns
+/// `true`. It leaves a live session (thread still running, so its
+/// mailbox has more than one holder) or a still-alive process untouched
+/// and returns `false`: only a genuine ghost is ever finalized, so this
+/// never races a live session's own teardown.
+///
+/// Everything runs under the one registry lock (the liveness probe and
+/// the history unlink are both cheap and non-blocking): that keeps a
+/// same-id create and any concurrent reconciler from interleaving, so
+/// the removal always targets exactly the ghost that was probed.
+pub(crate) fn reconcile_adopted_ghost(shared: &Arc<Shared>, id: &str) -> bool {
+    let mut state = shared.lock_state();
+    let Some(entry) = state.sessions.get(id) else {
+        return false;
+    };
+    // A live session's thread still holds a mailbox clone; only a
+    // returned-thread ghost is a candidate.
+    if Arc::strong_count(&entry.mailbox) != 1 {
+        return false;
+    }
+    let pid = nix::unistd::Pid::from_raw(entry.pid as i32);
+    // Still alive: it stays a registered, killable ghost.
+    if nix::sys::signal::kill(pid, None).is_ok() {
+        return false;
+    }
+    // Confirmed gone: same terminal bookkeeping as `finalize_exited`,
+    // minus the code (unknowable for an adopted process; see the module
+    // doc's known limitation).
+    if let Err(e) = history::HistoryWriter::remove_all(&shared.state_dir, id) {
+        eprintln!("calyx-sessiond: removing history for {id} failed: {e}");
+    }
+    state.sessions.remove(id);
+    if let Some(info) = state.ledger.get_mut(id) {
+        info.state = SessionState::Exited { code: -1 };
+        info.pid = 0;
+        info.attached_clients = 0;
+    }
+    state.touch();
+    shared.persist_ledger(&state);
+    shared.cond.notify_all();
+    true
 }
 
 /// Failure path: wakes every parked session thread and re-registers
@@ -1071,6 +1140,105 @@ mod tests {
         );
     }
 
+    /// P6 fix-batch sweep S2 (`finalize_exited`, handoff.rs:570): H3's
+    /// fix flips the ledger to `Exited` for a session whose thread
+    /// already tore down during the handoff pause window, but never
+    /// deletes that session's on-disk history -- unlike the normal
+    /// confirmed-exit teardown path in `session.rs`, which deletes
+    /// history before flipping the ledger. `Shared` already exposes
+    /// `state_dir`, so `finalize_exited` has everything it needs to do
+    /// the same; a history-enabled session finalized this way must not
+    /// leak `state_dir/history/<id>.raw` forever (the module doc's
+    /// "history survives a daemon crash, not a session's own end"
+    /// invariant).
+    ///
+    /// Reproduced exactly like the H3 test above (real child killed,
+    /// its own teardown fully completes, then a stale
+    /// `PauseForHandoff` drives `restore_entry` into its
+    /// `finalize_exited` branch), with history enabled and a real
+    /// on-disk history file present first so its removal is actually
+    /// meaningful to assert on.
+    #[test]
+    fn finalize_exited_removes_history_files_for_a_history_enabled_session() {
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), true));
+        let id = "01J-p6-s2-finalize-exited-history-test";
+        let spec = cat_spec(id);
+        let entry = spawn_session(&shared, &spec).expect("spawn_session should succeed");
+        entry.release_start();
+        let pid = entry.pid;
+        {
+            let mut state = shared.lock_state();
+            state.ledger.insert(entry.id.clone(), entry.info());
+            state.sessions.insert(entry.id.clone(), entry);
+        }
+
+        let history_path = tmp.path().join("history").join(format!("{id}.raw"));
+        let seed_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !history_path.exists() && std::time::Instant::now() < seed_deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            history_path.exists(),
+            "history file should exist before the finalize_exited path under test"
+        );
+
+        // Step 1 of a real offer_handoff attempt: detach for handoff.
+        let detached = detach_for_handoff(&shared, id)
+            .expect("detach_for_handoff should return the live entry");
+
+        // Same deterministic reproduction as the H3 test above: kill
+        // the real child and wait for it to be fully reaped, so the
+        // session thread's own teardown (including its history
+        // writer's fd close) completes before the stale pause request
+        // arrives.
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("killpg the real donor child");
+
+        let reap_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
+            && std::time::Instant::now() < reap_deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_err(),
+            "the killed donor child should be reaped within 3s (test setup precondition); \
+             kill(pid, 0) still succeeded"
+        );
+        // Headroom for the session thread's own final mailbox drain /
+        // thread exit to complete right after the reap.
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Step 2: send the pause request to the now-detached,
+        // dead-threaded entry, exactly like offer_handoff's own loop.
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        detached
+            .mailbox
+            .send(SessionRequest::PauseForHandoff { reply: reply_tx });
+        let _ = reply_rx.recv_timeout(Duration::from_secs(2));
+
+        // Step 3: offer_handoff's real failure path -- restore_entry --
+        // detects the dead thread (mailbox strong_count == 1) and
+        // calls finalize_exited, the function under test.
+        restore_entry(&shared, detached);
+
+        let ledger_state = shared.lock_state().ledger.get(id).map(|info| info.state);
+        assert!(
+            matches!(ledger_state, Some(SessionState::Exited { .. })),
+            "finalize_exited must flip the ledger to Exited, got {ledger_state:?}"
+        );
+        assert!(
+            !history_path.exists(),
+            "finalize_exited must delete this history-enabled session's on-disk history \
+             files (state_dir/history/{id}.raw), the same as the normal teardown path's \
+             confirmed-exit branch does; the file is still present at {history_path:?}"
+        );
+    }
+
     /// H6 (P6 review, handoff.rs:403 / C+D#4): `offer_handoff` sends
     /// the manifest and fds with no write timeout at all (a read
     /// timeout is only set afterward, for the ack wait). A receiver
@@ -1331,6 +1499,266 @@ mod tests {
             history_still_present,
             "an adopted session's history file must not be deleted when its process is \
              confirmed still alive after the adopted-exit liveness-poll bound elapses"
+        );
+    }
+
+    /// P6 fix-batch sweep S1, part (a) -- the most severe defect the H7
+    /// fix introduced (session.rs:963, teardown's "Teardown, in a
+    /// deliberate order" comment, step 1): H7 (the test directly above)
+    /// only stopped `reap == None` from *lying* about a still-alive
+    /// adopted process (flipping the ledger to `Exited` and deleting
+    /// its history); it did not stop the registry-entry removal one
+    /// step *earlier* in that same teardown, which runs unconditionally
+    /// -- before `reap` is even called, regardless of what it later
+    /// returns. The combination is a permanent, unreachable ghost:
+    /// `state.sessions` no longer has the entry (so `Kill`, which only
+    /// consults that map, reports no-such-session outside a handoff
+    /// window and can never signal the real process again) while the
+    /// ledger stays `Running` forever (so `ls` reports it as live, and
+    /// nothing short of a daemon restart clears it -- there is no gc,
+    /// and nothing ever re-polls this pid again once this thread's
+    /// function returns).
+    ///
+    /// Contract pinned here (the "stronger" S1 option, chosen so `Kill`
+    /// stays meaningful without a new `SessionState` variant): a
+    /// still-alive-at-the-poll-bound adopted session's registry entry
+    /// must *survive* teardown. See the sibling test below for the
+    /// other half of the contract (the process is later reconciled to
+    /// `Exited` once it actually dies, rather than sitting registered
+    /// forever with no way to notice that death).
+    ///
+    /// Setup mirrors the H7 test directly above (pipe-as-master-fd
+    /// trick for a deterministic instant EOF, a `sleep 30` sentinel
+    /// process standing in for the manifest's `pid`, and the
+    /// 50ms-poll-bound test override) -- see that test's doc comment
+    /// for why each of those is deterministic and platform-safe.
+    #[test]
+    fn adopted_reap_timeout_ghost_stays_registered_instead_of_becoming_an_unreachable_running_entry(
+    ) {
+        let _poll_override =
+            crate::session::set_adopted_exit_poll_for_test(Duration::from_millis(50));
+
+        let (master_read, master_write) =
+            nix::unistd::pipe().expect("create scratch pipe standing in for the PTY master fd");
+        for fd in [&master_read, &master_write] {
+            nix::fcntl::fcntl(
+                fd.as_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .expect("set scratch pipe fd cloexec");
+        }
+
+        let mut sentinel = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sentinel process");
+        let sentinel_pid = sentinel.id();
+
+        let manifest_entry = HandoffSessionEntry {
+            id: "01J-p6-s1-ghost-registered-test".to_string(),
+            name: None,
+            cwd: None,
+            created_at_ms: 0,
+            pid: sentinel_pid,
+            meta: BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            replay: vec![],
+        };
+
+        let receiver_tmp = tempfile::tempdir().expect("scratch state dir for receiver");
+        let receiver_shared = Arc::new(Shared::new(receiver_tmp.path().to_path_buf(), false));
+
+        let id = manifest_entry.id.clone();
+        let adopted = adopt_session(&receiver_shared, manifest_entry, master_read).expect(
+            "adopt_session should construct a running session from a manifest entry + \
+             inherited fd",
+        );
+        {
+            let mut state = receiver_shared.lock_state();
+            state.ledger.insert(adopted.id.clone(), adopted.info());
+            state.sessions.insert(adopted.id.clone(), adopted);
+        }
+
+        // Real, instant EOF on the adopted thread's read side: the
+        // only thing that starts its teardown.
+        drop(master_write);
+
+        // Comfortably longer than the overridden 50ms poll bound, for
+        // the whole teardown (EOF -> reap's short poll -> post-reap
+        // handling) to run to completion.
+        std::thread::sleep(Duration::from_millis(500));
+
+        // Test-setup precondition: the sentinel must still be
+        // genuinely alive right now, so this really exercises "poll
+        // timed out while still alive", not a coincidental real exit.
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_ok(),
+            "the sentinel process must still be alive when the registry is checked (test \
+             setup precondition)"
+        );
+
+        let (still_registered, ledger_state) = {
+            let state = receiver_shared.lock_state();
+            (
+                state.sessions.contains_key(&id),
+                state.ledger.get(&id).map(|info| info.state),
+            )
+        };
+
+        let _ = sentinel.kill();
+        let _ = sentinel.wait();
+
+        assert!(
+            still_registered,
+            "an adopted session still alive at its liveness-poll bound must keep its \
+             registry entry (state.sessions) through teardown, so a later Kill can still \
+             reach the real process; teardown currently removes the entry unconditionally \
+             before reap even runs, leaving an unreachable Running ghost \
+             (still_registered=false, ledger_state={ledger_state:?})"
+        );
+    }
+
+    /// P6 fix-batch sweep S1, part (b): the other half of the contract
+    /// pinned by the test directly above. Keeping the registry entry
+    /// registered is not enough on its own -- nothing currently ever
+    /// re-checks an adopted-and-still-alive pid again once its session
+    /// thread's function returns, so without a reconciliation path a
+    /// "kept" ghost would simply stay `Running` forever too, just a
+    /// *registered* one instead of an unregistered one. A still-alive
+    /// adopted session that later actually exits must reach a clean
+    /// `Exited` state (history removed if enabled, ledger flipped,
+    /// registry entry removed) -- not remain stuck.
+    ///
+    /// This calls `reconcile_adopted_ghost` directly and
+    /// deterministically (a single re-poll pass) rather than sleeping
+    /// past some assumed background-loop interval, because that
+    /// interval is an implementation detail this test must not guess
+    /// at. **`reconcile_adopted_ghost` does not exist yet** -- this is
+    /// a deliberate compile-time RED for the reconciliation half of S1,
+    /// which needs new production machinery (part (a) above is a
+    /// pure runtime assertion and needs none). Proposed contract for
+    /// `GREEN`, mirroring `session.rs` teardown's own confirmed-exit
+    /// branch and `finalize_exited`'s -1 sentinel:
+    ///
+    /// `pub(crate) fn reconcile_adopted_ghost(shared: &Arc<Shared>, id: &str) -> bool`
+    ///
+    /// Looks up a still-registered entry for `id`, and if its `pid` is
+    /// now confirmed gone (`kill(pid, 0)` returns `ESRCH`): deletes its
+    /// history (if any is persisted for `id`), flips its ledger record
+    /// to `Exited { code: -1 }`, removes the registry entry, and
+    /// returns `true`. Returns `false` if there is nothing to do
+    /// (missing, or still alive). Intended to be driven by whatever the
+    /// implementer chooses -- a periodic background pass, or an
+    /// opportunistic check the next time `Kill`/`List` touches this id
+    /// -- this test does not assume which.
+    #[test]
+    fn adopted_reap_timeout_ghost_is_reconciled_to_exited_once_the_process_actually_dies() {
+        let _poll_override =
+            crate::session::set_adopted_exit_poll_for_test(Duration::from_millis(50));
+
+        let (master_read, master_write) =
+            nix::unistd::pipe().expect("create scratch pipe standing in for the PTY master fd");
+        for fd in [&master_read, &master_write] {
+            nix::fcntl::fcntl(
+                fd.as_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .expect("set scratch pipe fd cloexec");
+        }
+
+        let mut sentinel = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sentinel process");
+        let sentinel_pid = sentinel.id();
+
+        let manifest_entry = HandoffSessionEntry {
+            id: "01J-p6-s1-ghost-reconcile-test".to_string(),
+            name: None,
+            cwd: None,
+            created_at_ms: 0,
+            pid: sentinel_pid,
+            meta: BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            replay: vec![],
+        };
+
+        let receiver_tmp = tempfile::tempdir().expect("scratch state dir for receiver");
+        // History enabled + pre-seeded, so its removal on eventual
+        // reconciliation is actually meaningful to assert on (mirrors
+        // the H7 test's own history setup).
+        let history_dir = receiver_tmp.path().join("history");
+        std::fs::create_dir_all(&history_dir).expect("create scratch history dir");
+        let history_path = history_dir.join(format!("{}.raw", manifest_entry.id));
+        std::fs::write(&history_path, b"pre-handoff-history-bytes\n")
+            .expect("seed a pre-existing history file for the adopted id");
+
+        let receiver_shared = Arc::new(Shared::new(receiver_tmp.path().to_path_buf(), false));
+
+        let id = manifest_entry.id.clone();
+        let adopted = adopt_session(&receiver_shared, manifest_entry, master_read).expect(
+            "adopt_session should construct a running session from a manifest entry + \
+             inherited fd",
+        );
+        {
+            let mut state = receiver_shared.lock_state();
+            state.ledger.insert(adopted.id.clone(), adopted.info());
+            state.sessions.insert(adopted.id.clone(), adopted);
+        }
+
+        drop(master_write);
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_ok(),
+            "the sentinel process must still be alive right after teardown (test setup \
+             precondition)"
+        );
+
+        // Now make it really exit, and confirm that for real (ESRCH),
+        // so this test exercises actual reconciliation, not a
+        // coincidence.
+        let _ = sentinel.kill();
+        let _ = sentinel.wait();
+        let dead_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_ok()
+            && std::time::Instant::now() < dead_deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_err(),
+            "the sentinel must be confirmed dead before reconciliation is checked (test \
+             setup precondition)"
+        );
+
+        let finalized = reconcile_adopted_ghost(&receiver_shared, &id);
+
+        assert!(
+            finalized,
+            "reconcile_adopted_ghost must report that it finalized a still-registered \
+             ghost entry whose process is now confirmed dead"
+        );
+        let (still_registered, ledger_state) = {
+            let state = receiver_shared.lock_state();
+            (
+                state.sessions.contains_key(&id),
+                state.ledger.get(&id).map(|info| info.state),
+            )
+        };
+        assert!(
+            !still_registered,
+            "a reconciled ghost must be removed from the live registry"
+        );
+        assert!(
+            matches!(ledger_state, Some(SessionState::Exited { .. })),
+            "a reconciled ghost's ledger record must flip to Exited, got {ledger_state:?}"
+        );
+        assert!(
+            !history_path.exists(),
+            "a reconciled ghost's on-disk history must be removed the same way a normal \
+             confirmed exit removes it"
         );
     }
 

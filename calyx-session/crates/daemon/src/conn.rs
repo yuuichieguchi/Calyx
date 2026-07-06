@@ -29,6 +29,13 @@ const KILL_WAIT: Duration = Duration::from_secs(5);
 /// (see `attach`'s exited-session path).
 const TEARDOWN_WAIT: Duration = Duration::from_secs(5);
 
+/// How often `kill`'s wait loop re-polls a dead-thread adopted ghost's
+/// liveness (P6 fix-batch S1). Such a ghost has no session thread left
+/// to flip its ledger and wake the condvar, so an uncapped wait would
+/// only reconcile again at the deadline; capping keeps a `Kill` that
+/// just signalled the real process from stalling the full `KILL_WAIT`.
+const GHOST_RECONCILE_POLL: Duration = Duration::from_millis(50);
+
 /// Caps on `MetaSet` payloads so a client can't balloon the in-memory
 /// registry and the on-disk ledger without bound.
 const MAX_META_KEY_BYTES: usize = 256;
@@ -141,6 +148,20 @@ impl Conn {
                 version: PROTOCOL_VERSION,
             }),
             ControlMsg::List => {
+                // Opportunistically finalize any dead-thread adopted
+                // ghost whose process has since died (P6 fix-batch S1),
+                // so `ls` does not keep reporting it as Running. Snapshot
+                // the ids first, then reconcile each: reconcile no-ops
+                // for a live session (its thread still holds the mailbox)
+                // and for a still-alive ghost, so only a genuinely dead
+                // one drops out of the listing below.
+                let ids: Vec<String> = {
+                    let state = self.shared.lock_state();
+                    state.sessions.keys().cloned().collect()
+                };
+                for id in &ids {
+                    crate::handoff::reconcile_adopted_ghost(&self.shared, id);
+                }
                 let sessions: Vec<_> = {
                     let state = self.shared.lock_state();
                     state.sessions.values().map(|entry| entry.info()).collect()
@@ -514,11 +535,17 @@ impl Conn {
 
     fn kill(&mut self, id: &str) -> bool {
         {
-            // killpg under the registry lock on purpose: the session
-            // thread removes its entry *before* reaping (see the
-            // teardown ordering in session.rs), so "entry present"
-            // here proves the child is not yet reaped and its pid
-            // therefore cannot have been reused by anything else.
+            // killpg under the registry lock on purpose: a forked
+            // session removes its entry *before* reaping (see the
+            // teardown ordering in session.rs), so for it "entry
+            // present" here proves the child is not yet reaped and its
+            // pid cannot have been reused. An adopted session this
+            // daemon never forked has no such guarantee (init may have
+            // reaped it and recycled the pid, the handoff module doc's
+            // experimental known limitation); signalling it is still
+            // the right move, and if its session thread has already
+            // returned (a still-alive-at-poll-bound ghost, S1) the wait
+            // loop below reconciles it once the signal takes effect.
             let state = self.shared.lock_state();
             match state.sessions.get(id) {
                 Some(entry) => {
@@ -561,13 +588,20 @@ impl Conn {
             }
         }
 
-        // KillOk is only sent after the session thread has reaped the
-        // child (observable as the ledger flipping to Exited, which
-        // happens strictly after the reap) so a `kill -0` probe right
-        // after the reply is deterministic.
+        // KillOk is only sent after the session has reaped (observable
+        // as the ledger flipping to Exited, which happens strictly after
+        // the reap) so a `kill -0` probe right after the reply is
+        // deterministic. A live session's own thread does that flip and
+        // wakes the condvar; a dead-thread adopted ghost has no such
+        // thread, so this loop drives `reconcile_adopted_ghost` itself
+        // once the signal above has taken effect (P6 fix-batch S1). It
+        // no-ops for a live session, so it never races that session's
+        // own teardown.
         let deadline = Instant::now() + KILL_WAIT;
-        let mut state = self.shared.lock_state();
         loop {
+            crate::handoff::reconcile_adopted_ghost(&self.shared, id);
+
+            let state = self.shared.lock_state();
             let gone = !state.sessions.contains_key(id)
                 && state
                     .ledger
@@ -584,14 +618,16 @@ impl Conn {
                     msg: format!("session {id:?} did not exit within {KILL_WAIT:?}"),
                 });
             }
-            let (guard, _) = self
+            // Cap the wait so a ghost's liveness is re-polled promptly:
+            // nothing wakes the condvar for a dead-thread ghost, so an
+            // uncapped wait would only reconcile again at the deadline.
+            let wait = (deadline - now).min(GHOST_RECONCILE_POLL);
+            let _ = self
                 .shared
                 .cond
-                .wait_timeout(state, deadline - now)
+                .wait_timeout(state, wait)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state = guard;
         }
-        drop(state);
         self.reply(&ControlMsg::KillOk)
     }
 
@@ -943,5 +979,142 @@ mod tests {
         // resume_all), so the real child is killed directly via the
         // drop guard above; drop the detached entry's own handles now.
         drop(detached);
+    }
+
+    /// P6 fix-batch sweep S1 wiring: `Conn::kill` for a still-alive
+    /// adopted ghost must both signal the real process (the ghost's
+    /// session thread has already returned, so killpg under the registry
+    /// lock is the only thing that still can) and then drive
+    /// `reconcile_adopted_ghost` from its wait loop, so the reply is a
+    /// clean `KillOk` with the entry dropped and the ledger flipped to
+    /// `Exited`, rather than a `kill-timeout` after `KILL_WAIT` (nothing
+    /// else would ever finalize a dead-thread ghost). Exercises the real
+    /// `Conn::kill` against a real client socket.
+    ///
+    /// The sentinel is spawned in its own session (`setsid`) so
+    /// killpg(pid) actually reaches it, exactly as it would a production
+    /// adopted child (which was setsid'd when first forked). Its `Child`
+    /// handle is parked in a reaper thread whose `wait()` reaps it the
+    /// instant the signal lands, so the wait loop's `kill(pid, 0)` probe
+    /// observes the same ESRCH a production adopted process (reaped by
+    /// init, never by this daemon) would show.
+    #[test]
+    fn kill_of_a_still_alive_adopted_ghost_signals_it_then_reconciles_to_exited() {
+        use std::os::fd::AsFd;
+        use std::os::unix::process::CommandExt;
+
+        let _poll_override =
+            crate::session::set_adopted_exit_poll_for_test(Duration::from_millis(50));
+
+        let (master_read, master_write) =
+            nix::unistd::pipe().expect("create scratch pipe standing in for the PTY master fd");
+        for fd in [&master_read, &master_write] {
+            nix::fcntl::fcntl(
+                fd.as_fd(),
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+            )
+            .expect("set scratch pipe fd cloexec");
+        }
+
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // SAFETY: the pre_exec closure only calls setsid, which is
+        // async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let sentinel = cmd.spawn().expect("spawn sentinel session leader");
+        let sentinel_pid = sentinel.id();
+        let _kill_on_drop = KillOnDrop(sentinel_pid);
+
+        let id = "01J-p6-s1-kill-ghost-wiring-test".to_string();
+        let manifest_entry = crate::handoff::HandoffSessionEntry {
+            id: id.clone(),
+            name: None,
+            cwd: None,
+            created_at_ms: 0,
+            pid: sentinel_pid,
+            meta: std::collections::BTreeMap::new(),
+            cols: 80,
+            rows: 24,
+            replay: vec![],
+        };
+
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+        let adopted = crate::handoff::adopt_session(&shared, manifest_entry, master_read)
+            .expect("adopt_session should construct a running session");
+        {
+            let mut state = shared.lock_state();
+            state.ledger.insert(adopted.id.clone(), adopted.info());
+            state.sessions.insert(adopted.id.clone(), adopted);
+        }
+
+        // Drive the adopted session to the dead-thread ghost state: EOF
+        // on the read side ends its thread, whose reap poll times out
+        // while the sentinel is still alive, so S1 keeps the entry
+        // registered and `Running`.
+        drop(master_write);
+        std::thread::sleep(Duration::from_millis(500));
+        {
+            let state = shared.lock_state();
+            assert!(
+                state.sessions.contains_key(&id),
+                "a still-alive adopted session must survive teardown as a registered ghost (S1)"
+            );
+        }
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_ok(),
+            "the sentinel must still be alive before the Kill under test (test precondition)"
+        );
+
+        // Reap the sentinel the instant kill's killpg lands, so the wait
+        // loop's liveness probe sees a real ESRCH.
+        let reaper = thread::spawn(move || {
+            let mut sentinel = sentinel;
+            let _ = sentinel.wait();
+        });
+
+        let (mut conn, mut reader) = make_test_conn(&shared, 7);
+        let keep_going = conn.kill(&id);
+        assert!(
+            keep_going,
+            "kill should reply normally, not drop the connection"
+        );
+
+        let frame = reader.read_frame().expect("read the Kill reply frame");
+        let msg = decode_control(&frame.payload).expect("decode the Kill reply");
+        assert!(
+            matches!(msg, ControlMsg::KillOk),
+            "Kill of a still-alive adopted ghost must signal it and reconcile to KillOk, got \
+             {msg:?}"
+        );
+
+        assert!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(sentinel_pid as i32), None).is_err(),
+            "Kill must have signalled the real adopted process, which is now gone"
+        );
+        let (still_registered, ledger_state) = {
+            let state = shared.lock_state();
+            (
+                state.sessions.contains_key(&id),
+                state.ledger.get(&id).map(|info| info.state),
+            )
+        };
+        assert!(
+            !still_registered,
+            "a reconciled ghost must be removed from the live registry"
+        );
+        assert!(
+            matches!(ledger_state, Some(SessionState::Exited { .. })),
+            "a reconciled ghost's ledger record must flip to Exited, got {ledger_state:?}"
+        );
+
+        reaper.join().expect("reaper thread should join");
     }
 }

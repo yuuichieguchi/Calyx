@@ -895,21 +895,32 @@ fn session_thread(ctx: SessionThread) {
 
     // Teardown, in a deliberate order:
     //
-    // 1. Remove the registry entry — but only if it is *ours*
-    //    (create-race losers must not delete a same-id winner's).
-    //    Removal precedes the reap so `Kill` can rely on "entry
-    //    present => child not yet reaped => pid not reused".
-    // 2. Reap the child (this is what frees the pid). Reap runs
-    //    *before* the history delete and the ledger flip because an
-    //    adopted process may still be alive at its liveness-poll bound
-    //    (`reap` returns `None`, P6 review H7): that is not an exit, so
-    //    its history and its `Running` ledger record must both survive.
-    // 3. On a confirmed exit (`Some(code)`) only: delete this session's
+    // 1. Decide whether this teardown's entry is still *ours* (a
+    //    create-race loser must not touch a same-id winner's entry),
+    //    then remove it, with the removal split by child kind:
+    //      * A forked child's pid is freed only by the `waitpid` inside
+    //        `reap`, so its entry is removed *before* `reap`, keeping
+    //        `Kill`'s "entry present => child not yet reaped => pid not
+    //        reused" invariant intact.
+    //      * An adopted process is never `waitpid`-ed here (`reap` only
+    //        polls its liveness) and may still be alive at the poll
+    //        bound (`reap` returns `None`, P6 review H7). Its entry must
+    //        survive that poll so a later `Kill` can still reach the
+    //        real process, so an adopted entry is removed only *after*
+    //        `reap`, and only on a confirmed exit (P6 fix-batch S1).
+    // 2. Reap the child (a forked `waitpid`, or an adopted liveness
+    //    poll). This is what frees a forked pid.
+    // 3. On a confirmed exit (`Some(code)`): delete this session's
     //    on-disk history (when it was ours and history was on: history
     //    exists to survive a daemon crash, not a session's own end),
-    //    then flip the ledger to `Exited`. History is deleted before
-    //    the flip on purpose, so `KillOk` (gated on that flip) implies
-    //    the files are already gone.
+    //    drop an adopted entry (a forked one is already gone), then flip
+    //    the ledger to `Exited`. History is deleted before the flip on
+    //    purpose, so `KillOk` (gated on that flip) implies the files are
+    //    already gone. On `None` (an adopted process still alive at the
+    //    poll bound) the entry stays registered and its ledger record
+    //    stays `Running`: this thread returns, leaving a dead-thread
+    //    ghost that a later `Kill`/`List` finalizes via
+    //    `handoff::reconcile_adopted_ghost` once the process dies.
     // 4. Drain the mailbox one final time: an Attach could only have
     //    been enqueued while the entry was still present (conn.rs
     //    sends under the registry lock), so admitting stragglers here
@@ -917,18 +928,23 @@ fn session_thread(ctx: SessionThread) {
     // 5. Deliver Replay (for stragglers) + Exited to every client and
     //    finish their queues so their connections close promptly.
     let mine = {
-        let mut state = shared.lock_state();
-        let mine = state
+        let state = shared.lock_state();
+        state
             .sessions
             .get(&id)
-            .is_some_and(|entry| Arc::ptr_eq(&entry.mailbox, &mailbox));
-        if mine {
-            state.sessions.remove(&id);
-            state.touch();
-        }
-        shared.cond.notify_all();
-        mine
+            .is_some_and(|entry| Arc::ptr_eq(&entry.mailbox, &mailbox))
     };
+
+    // A forked child leaves the registry before its `waitpid` frees the
+    // pid (step 1). An adopted entry stays put until `reap` returns, so
+    // a still-alive adopted process keeps a Kill-reachable entry (S1).
+    let forked = matches!(child, SessionChild::Forked(_));
+    if mine && forked {
+        let mut state = shared.lock_state();
+        state.sessions.remove(&id);
+        state.touch();
+        shared.cond.notify_all();
+    }
 
     // Close the writer's fd (does not delete files): the delete, if
     // any, happens below only once the child is confirmed gone.
@@ -938,7 +954,8 @@ fn session_thread(ctx: SessionThread) {
 
     if mine {
         if let Some(exit_code) = reaped {
-            // Confirmed exit. Delete both history generations first (see
+            // Confirmed exit (always for a forked child; ESRCH for an
+            // adopted one). Delete both history generations first (see
             // the ordering note above); the `history_enabled` check,
             // not the writer (which an append error may have dropped),
             // keeps cleanup running even when persisting stopped
@@ -951,6 +968,15 @@ fn session_thread(ctx: SessionThread) {
                 }
             }
             let mut state = shared.lock_state();
+            // Drop an adopted entry now: it was held through the
+            // liveness poll above (so a concurrent Kill could still
+            // reach it), and no same-id create can have raced in while
+            // it stayed present. A forked entry is already gone and must
+            // not be removed a second time here, since its freed slot
+            // may since have been reused by a same-id successor.
+            if !forked {
+                state.sessions.remove(&id);
+            }
             if let Some(info) = state.ledger.get_mut(&id) {
                 info.state = SessionState::Exited { code: exit_code };
                 info.pid = 0;
@@ -961,12 +987,13 @@ fn session_thread(ctx: SessionThread) {
             shared.cond.notify_all();
         }
         // `reaped == None`: an adopted process still alive at its
-        // liveness-poll bound (H7). Its PTY has ended (this thread is
-        // tearing down) so it is already out of the live registry and
-        // the daemon can no longer serve it, but it did not exit: keep
-        // its history and leave its ledger record `Running` rather than
-        // fabricating an `Exited`. Reattaching it is not possible (the
-        // handoff module doc's known limitation).
+        // liveness-poll bound (H7). It did not exit, so keep its entry
+        // registered and its ledger record `Running` (P6 fix-batch S1):
+        // this thread returns, leaving a dead-thread ghost, but keeping
+        // the entry is what lets a later `Kill` reach the real process
+        // and `handoff::reconcile_adopted_ghost` finalize it once it
+        // dies. Removing it here (as the pre-S1 teardown did) left it
+        // permanently `Running` and unkillable, and kept its history.
     }
 
     // Stragglers and the terminal event still use a concrete code; an

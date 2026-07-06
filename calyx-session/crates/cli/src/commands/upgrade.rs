@@ -134,9 +134,12 @@ fn wait_for_outcome(client: &DaemonClient) -> Result<Option<(String, String)>, C
 }
 
 /// Connects to the (now transferred) control socket and lists live
-/// sessions, retrying briefly: the new daemon acks before it starts
-/// its accept loop, so the very first connect can land in the listen
-/// backlog a moment early. Returns the live-session count.
+/// sessions, retrying briefly. The new daemon starts accepting on the
+/// transferred listener *before* it acks the handoff (P6 review H5), and
+/// the old daemon exits only after receiving that ack, so by the time
+/// this runs the accept loop is already up. The short retry therefore
+/// only covers connect/listen-backlog jitter, not a genuine
+/// not-yet-listening window. Returns the live-session count.
 fn verify_new_daemon(socket: &std::path::Path) -> Result<usize, CommandError> {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     loop {
