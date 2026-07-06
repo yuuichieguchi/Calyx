@@ -3304,8 +3304,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        // Gated on `isAppActuallyTerminating` (the same R8-C canonical
+        // discriminator the destroy loop below reads), NOT on
+        // `isClosingForShutdown`: `closeLastWindow` sets that flag even for a
+        // non-terminating close (a quick terminal keeps the app alive), so
+        // gating on it alone would wrongly skip this save for that
+        // legitimate case too. On a genuinely terminating close, the only
+        // legitimate snapshot writer is `applicationWillTerminate`'s
+        // protected `saveAtTermination`; an unguarded save here would record
+        // the already-reduced (window-less) state and destroy the restore
+        // target for the next launch.
         if let appDelegate = NSApp.delegate as? AppDelegate,
-           appDelegate.isClosingLastManagedWindow(self) {
+           appDelegate.isClosingLastManagedWindow(self),
+           !isAppActuallyTerminating {
             // Persist current session before this final window is removed from AppDelegate.
             appDelegate.saveImmediately()
         }

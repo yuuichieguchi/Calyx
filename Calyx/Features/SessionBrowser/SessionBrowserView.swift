@@ -161,7 +161,7 @@ private struct SessionBrowserRowView: View {
                         .font(.system(size: 12.5, weight: .semibold, design: .rounded))
                         .lineLimit(1)
                     if row.isOrphan {
-                        Text("Orphaned")
+                        Text(SessionBrowserRow.orphanBadgeLabel)
                             .font(.system(size: 9, weight: .semibold))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 2)

@@ -34,6 +34,13 @@ struct SessionBrowserRow: Identifiable, Equatable, Sendable {
     /// attached somewhere, so "Attach" in the browser should reveal
     /// that pane rather than open a second attach connection.
     let isAttachedHere: Bool
+
+    /// User-visible label for the `isOrphan` badge (`SessionBrowserRowView`).
+    /// Kept separate from the SwiftUI view so this string is testable
+    /// without a snapshot/view-inspection dependency. Internal name
+    /// (`isOrphan`) is unchanged this cycle -- only the user-visible
+    /// wording moves from "Orphaned" to "Detached".
+    static let orphanBadgeLabel = "Detached"
 }
 
 @MainActor
