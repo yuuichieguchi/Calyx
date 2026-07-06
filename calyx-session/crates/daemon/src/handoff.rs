@@ -19,8 +19,11 @@
 //!    no PTY bytes can be fed to the terminal between the snapshot and
 //!    the pause taking effect).
 //! 2. Sends the encoded manifest plus every session's PTY master fd
-//!    (and its own listener fd) to the new daemon via `crate::fdpass`,
-//!    fd order matching `HandoffManifest::sessions` order.
+//!    (then its own listener fd, then the single-daemon lock fd) to the
+//!    new daemon via `crate::fdpass`, session fd order matching
+//!    `HandoffManifest::sessions` order. The lock fd travels so the new
+//!    daemon holds the same open file description the old one locked,
+//!    with no re-acquire race (P6 review E5).
 //! 3. Waits (bounded) for the new daemon's ack that it has adopted
 //!    every session and started accepting on the transferred listener.
 //!
@@ -87,8 +90,8 @@ use crate::state::{SessionEntry, Shared};
 pub(crate) const HANDOFF_ACK: u8 = 0x06;
 
 /// Upper bound on fds in one handoff (every session's PTY master plus
-/// the control listener), used to size the receiver's `SCM_RIGHTS`
-/// control buffer. This is a self-imposed protocol cap, not a kernel
+/// the control listener and the single-daemon lock fd), used to size
+/// the receiver's `SCM_RIGHTS` control buffer. This is a self-imposed protocol cap, not a kernel
 /// limit: it is deliberately *not* Linux's per-message `SCM_MAX_FD`
 /// (253), because this daemon targets macOS, which has no such fixed
 /// per-message constant. The value is chosen to stay comfortably under
@@ -343,15 +346,17 @@ pub(crate) fn offer_handoff(
 
     // Fail fast before pausing/rendering anything (P6 review H9): the
     // receiver's SCM_RIGHTS buffer is sized for MAX_HANDOFF_FDS (one fd
-    // per session plus the control listener), and an over-count is only
-    // caught at recv time otherwise, after a full pause/render/resume
-    // cycle has already been wasted. `+ 1` for the listener is an upper
-    // bound (a unit-test context with no installed listener sends one
-    // fewer), which only ever makes this check stricter, never laxer.
-    if ids.len() + 1 > MAX_HANDOFF_FDS {
+    // per session plus the control listener and the single-daemon lock
+    // fd), and an over-count is only caught at recv time otherwise,
+    // after a full pause/render/resume cycle has already been wasted.
+    // `+ 2` for the listener and lock fd is an upper bound (a unit-test
+    // context with no installed handoff env sends fewer), which only
+    // ever makes this check stricter, never laxer.
+    if ids.len() + 2 > MAX_HANDOFF_FDS {
         return Err(format!(
             "cannot hand off {} live sessions: exceeds the {}-fd-per-handoff limit \
-             (one PTY master per session plus the control listener)",
+             (one PTY master per session plus the control listener and the \
+             single-daemon lock fd)",
             ids.len(),
             MAX_HANDOFF_FDS
         ));
@@ -403,12 +408,14 @@ pub(crate) fn offer_handoff(
         }
     }
 
-    // Manifest and fds in matching order (module doc contract); the
-    // control listener travels last so the receiver can take over
-    // accepting with no unbind/rebind gap. It is absent only where no
-    // serving listener was installed (unit-test contexts).
+    // Manifest and fds in matching order (module doc contract): the
+    // control listener and then the single-daemon lock fd travel after
+    // every session's PTY master, so the receiver can take over
+    // accepting with no unbind/rebind gap and already hold the lock via
+    // the transferred fd. Both are absent only where no serving handoff
+    // env was installed (unit-test contexts).
     let mut sessions = Vec::with_capacity(candidates.len());
-    let mut fds: Vec<RawFd> = Vec::with_capacity(candidates.len() + 1);
+    let mut fds: Vec<RawFd> = Vec::with_capacity(candidates.len() + 2);
     for candidate in &mut candidates {
         sessions.push(HandoffSessionEntry {
             id: candidate.entry.id.clone(),
@@ -439,6 +446,31 @@ pub(crate) fn offer_handoff(
         }
     };
     if let Some(fd) = &listener_dup {
+        fds.push(fd.as_raw_fd());
+    }
+    // The single-daemon lock fd travels last (P6 review E5), after the
+    // listener, so the receiver already holds the exact open file
+    // description the old daemon locked and never has to re-acquire a
+    // lock the old daemon cannot release until after the ack. Absent
+    // only where this generation holds no lock fd (library callers of
+    // `Daemon::bind`, unit-test contexts).
+    let lock_dup: Option<OwnedFd> = {
+        let env = lock_unpoisoned(&shared.handoff_env);
+        match env.as_ref() {
+            Some(env) => match &env.lock {
+                Some(lock) => match lock.try_clone() {
+                    Ok(fd) => Some(fd),
+                    Err(e) => {
+                        resume_all(shared, candidates);
+                        return Err(format!("dup single-daemon lock for handoff failed: {e}"));
+                    }
+                },
+                None => None,
+            },
+            None => None,
+        }
+    };
+    if let Some(fd) = &lock_dup {
         fds.push(fd.as_raw_fd());
     }
 
@@ -640,6 +672,7 @@ mod tests {
     use super::*;
     use crate::outq::{writer_loop, OutQueue};
     use crate::session::{spawn_session, SessionRequest};
+    use crate::state::HandoffEnv;
 
     fn cat_spec(id: &str) -> SessionSpec {
         SessionSpec {
@@ -1298,6 +1331,84 @@ mod tests {
             history_still_present,
             "an adopted session's history file must not be deleted when its process is \
              confirmed still alive after the adopted-exit liveness-poll bound elapses"
+        );
+    }
+
+    /// P6 review E5, R2: `offer_handoff` must transfer the
+    /// single-daemon lock fd through the same `SCM_RIGHTS` batch as
+    /// the control listener, so a fixed receiver can adopt it as its
+    /// own hold instead of separately re-acquiring one the old daemon
+    /// cannot yet release (see `crate::lib`'s own `#[cfg(test)]`
+    /// module for R3's receiver-side test, and `crate::fdpass`'s for
+    /// R1's empirical flock/`SCM_RIGHTS` check). Wire order is pinned
+    /// here: sessions, then the listener, then the lock fd last -- one
+    /// fd more than today.
+    ///
+    /// No live sessions in this manifest (R2 is about the
+    /// listener/lock tail, not adoption content): with a `HandoffEnv`
+    /// installed carrying both a listener and a lock fd,
+    /// `offer_handoff` should send exactly 2 fds. It does not yet read
+    /// `HandoffEnv::lock` at all (only `HandoffEnv::listener`), so
+    /// today it sends exactly 1.
+    #[test]
+    fn offer_handoff_sends_the_single_daemon_lock_fd_alongside_the_listener() {
+        let tmp = tempfile::tempdir().expect("create scratch state dir");
+        let shared = Arc::new(Shared::new(tmp.path().to_path_buf(), false));
+
+        let listener_stand_in = UnixListener::bind(tmp.path().join("control-stand-in.sock"))
+            .expect("bind stand-in control listener");
+        let listener_fd = listener_stand_in
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("dup stand-in control listener");
+
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(tmp.path().join("lock-stand-in"))
+            .expect("create scratch lock file stand-in");
+        let lock_fd = lock_file
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("dup scratch lock file stand-in");
+
+        *lock_unpoisoned(&shared.handoff_env) = Some(HandoffEnv {
+            runtime_dir: tmp.path().to_path_buf(),
+            listener: listener_fd,
+            lock: Some(lock_fd),
+        });
+
+        let (offerer_side, receiver_side) = UnixStream::pair()
+            .expect("create scratch socketpair standing in for the handoff channel");
+
+        let shared_for_thread = Arc::clone(&shared);
+        let offer_thread = std::thread::spawn(move || {
+            // Short ack timeout: this test never sends one back, and
+            // R2 only cares about what was sent, not offer_handoff's
+            // eventual (here, timeout) return value.
+            offer_handoff(
+                &shared_for_thread,
+                &offerer_side,
+                Duration::from_millis(200),
+            )
+        });
+
+        let (_sidecar, fds) = fdpass::recv_fds(&receiver_side, MAX_HANDOFF_FDS)
+            .expect("recv_fds should receive offer_handoff's manifest and fds");
+
+        let _ = offer_thread
+            .join()
+            .expect("the offer_handoff thread must not panic");
+
+        assert_eq!(
+            fds.len(),
+            2,
+            "offer_handoff with 0 live sessions and a HandoffEnv carrying both a \
+             listener and a lock fd should send exactly 2 fds (the listener plus the \
+             single-daemon lock fd, P6 review E5); got {} -- offer_handoff does not yet \
+             read HandoffEnv::lock at all, only HandoffEnv::listener",
+            fds.len()
         );
     }
 }

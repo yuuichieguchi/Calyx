@@ -1,3 +1,4 @@
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 use daemon::{Daemon, DaemonConfig, LOCK_FILE};
@@ -150,9 +151,21 @@ fn run_daemonized(config: DaemonConfig) -> Result<u8, CommandError> {
         // SAFETY: plain _exit.
         Err(_) => unsafe { libc::_exit(0) },
     };
+    // Hand a dup of the held lock fd down to the daemon so a later Live
+    // Handoff can transfer the exact same open file description to the
+    // next generation (P6 review E5). The guard below is still leaked so
+    // this process holds the flock for its whole life regardless; the
+    // dup shares that one open file description (flock is per open file
+    // description), it never independently re-locks.
+    let lock_dup = match lock.as_fd().try_clone_to_owned() {
+        Ok(fd) => fd,
+        // SAFETY: _exit in a detached daemon that failed to set up.
+        Err(_) => unsafe { libc::_exit(1) },
+    };
     std::mem::forget(lock);
 
-    let code = match Daemon::bind(config).map(Daemon::run_until_idle) {
+    let code = match Daemon::bind(config).map(|daemon| daemon.with_lock(lock_dup).run_until_idle())
+    {
         Ok(Ok(())) => 0,
         Ok(Err(e)) | Err(e) => {
             eprintln!("calyx-session daemon: {e}");

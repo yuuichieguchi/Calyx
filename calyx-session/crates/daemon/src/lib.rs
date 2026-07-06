@@ -54,7 +54,7 @@ mod session;
 mod state;
 
 use std::fs;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -80,10 +80,6 @@ use state::Shared;
 /// daemon's manifest and fds after connecting.
 const HANDOFF_RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Bound on the receiver retrying the single-daemon flock takeover
-/// after acking (the old daemon releases it by exiting).
-const LOCK_TAKEOVER_WAIT: Duration = Duration::from_secs(5);
-
 /// How long the daemon lingers with zero sessions and zero clients
 /// before `run_until_idle` returns. Also covers the window right after
 /// startup, so short gaps between sequential CLI invocations never
@@ -96,6 +92,14 @@ const IDLE_LINGER: Duration = Duration::from_secs(30);
 pub struct Daemon {
     listener: UnixListener,
     config: DaemonConfig,
+    /// A dup of the single-daemon flock fd the CLI already holds
+    /// (`commands::daemon::run_daemonized`), wired in via
+    /// [`Daemon::with_lock`] so a later Live Handoff can transfer the
+    /// exact same open file description to the next daemon generation
+    /// (P6 review E5). `None` for library/embedding callers of
+    /// [`Daemon::bind`] that never took the lock, in which case a
+    /// handoff simply carries no lock fd.
+    lock: Option<OwnedFd>,
 }
 
 impl Daemon {
@@ -117,7 +121,25 @@ impl Daemon {
         }
         let listener = UnixListener::bind(&socket)?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
-        Ok(Daemon { listener, config })
+        Ok(Daemon {
+            listener,
+            config,
+            lock: None,
+        })
+    }
+
+    /// Wires the already-held single-daemon flock fd into this daemon so
+    /// a later Live Handoff can transfer the same open file description
+    /// to the next generation (P6 review E5). The CLI
+    /// (`commands::daemon::run_daemonized`) opens and flocks the lock
+    /// file itself before binding, leaks that guard for the process's
+    /// life, and hands a dup down here; the daemon never re-opens or
+    /// re-locks (flock is exclusive per open file description, so a
+    /// second lock on a fresh fd would deadlock against the CLI's own
+    /// hold).
+    pub fn with_lock(mut self, lock: OwnedFd) -> Daemon {
+        self.lock = Some(lock);
+        self
     }
 
     /// The path this daemon is (or, pre-`bind`, would be) listening on:
@@ -140,7 +162,12 @@ impl Daemon {
             self.config.history_enabled,
         ));
         shared.lock_state().ledger = ledger::load(&self.config.state_dir);
-        install_handoff_env(&shared, &self.config.runtime_dir, &self.listener)?;
+        install_handoff_env(
+            &shared,
+            &self.config.runtime_dir,
+            &self.listener,
+            self.lock.as_ref(),
+        )?;
 
         let socket = self.socket_path();
         start_accepting(&shared, self.listener);
@@ -174,17 +201,33 @@ pub fn run_handoff_receiver(
 
     let (sidecar, mut fds) = fdpass::recv_fds(&stream, handoff::MAX_HANDOFF_FDS)?;
     let manifest = handoff::decode_manifest(&sidecar)?;
-    if fds.len() != manifest.sessions.len() + 1 {
+    // P6 review E5: the wire contract carries the single-daemon lock fd
+    // too (order pinned by `offer_handoff`: sessions, then the control
+    // listener, then the lock fd last), so a real handoff is one fd per
+    // session plus two. This receiver adopts that lock fd as its own
+    // hold below rather than re-acquiring the lock separately; see R3's
+    // test in this module's `#[cfg(test)]` block.
+    if fds.len() != manifest.sessions.len() + 2 {
         return Err(DaemonError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!(
                 "handoff offered {} sessions but {} fds (expected one per session plus the \
-                 control listener)",
+                 control listener plus the single-daemon lock fd)",
                 manifest.sessions.len(),
                 fds.len()
             ),
         )));
     }
+    // Adopt the transferred single-daemon lock fd as this process's own
+    // hold: it shares the old daemon's open file description, so simply
+    // keeping it open means this generation already holds the exclusive
+    // flock, with no re-acquire race against a lock the old daemon
+    // cannot release until after it has been acked (P6 review E5). It is
+    // duped into the handoff env below (so the next generation can
+    // transfer it again) and then leaked so the hold lasts this
+    // process's whole life, the same discipline the daemonized CLI path
+    // uses (`commands::daemon::run_daemonized`).
+    let lock_fd = fds.pop().expect("length checked above");
     let listener_fd = fds.pop().expect("length checked above");
     let listener = UnixListener::from(listener_fd);
 
@@ -235,32 +278,35 @@ pub fn run_handoff_receiver(
         shared.persist_ledger(&state);
     }
     // Arm PrepareHandoff on this generation too, so the next upgrade
-    // can hand off again.
-    install_handoff_env(&shared, &config.runtime_dir, &listener)?;
+    // can hand off again, and carry the adopted lock fd forward so that
+    // handoff can transfer the same open file description onward.
+    install_handoff_env(&shared, &config.runtime_dir, &listener, Some(&lock_fd))?;
 
-    // Start serving the transferred socket, then take the single-daemon
-    // lock, and only then ack (P6 review H5 / E#4). The ack is the old
-    // daemon's unconditional point of no return: it `_exit`s on receipt.
-    // Doing both of those first means that by the time the old daemon
-    // exits, this process is already accepting on the transferred
-    // listener (no window with nobody serving it) and has attempted the
-    // lock takeover, so the ack is genuinely the last thing that can go
-    // wrong before it is committed. If this process instead dies or
-    // errors before the ack, the old daemon never exits: it resumes on
-    // its ack timeout and keeps every session.
+    // Start serving the transferred socket, then ack (P6 review H5 /
+    // E#4). The ack is the old daemon's unconditional point of no
+    // return: it `_exit`s on receipt. Accepting first means that by the
+    // time the old daemon exits, this process is already accepting on
+    // the transferred listener (no window with nobody serving it), so
+    // the ack is genuinely the last thing that can go wrong before it is
+    // committed. This generation already holds the single-daemon lock
+    // via the transferred fd (adopted above), so there is no separate
+    // lock takeover to sequence here (P6 review E5). If this process
+    // instead dies or errors before the ack, the old daemon never
+    // exits: it resumes on its ack timeout and keeps every session.
     //
     // Nothing above this ack touched shared on-disk state beyond the
     // ledger snapshot, which the old daemon would rewrite identically on
     // resume, so an error path here leaves the old daemon's world intact.
     start_accepting(&shared, listener);
 
-    // The old daemon releases the single-daemon flock only by exiting,
-    // which its receipt of the ack (below) triggers; this bounded
-    // takeover attempt runs first regardless so the ack is strictly the
-    // final step. If the old daemon is slow to release, this serves
-    // without the flock rather than blocking the ack forever (see
-    // `acquire_daemon_lock`).
-    acquire_daemon_lock(&config.runtime_dir);
+    // The transferred lock fd is this process's single-daemon hold (same
+    // open file description as the old daemon's): leak it so the hold
+    // lasts this process's whole life, exactly as the daemonized CLI
+    // path does. No re-acquire is needed or attempted -- the old daemon
+    // cannot release its flock until the ack below makes it exit, so a
+    // re-acquire loop could only ever wait out its own bound and serve
+    // lock-less (P6 review E5).
+    std::mem::forget(lock_fd);
 
     {
         use std::io::Write;
@@ -280,59 +326,24 @@ fn install_handoff_env(
     shared: &Arc<Shared>,
     runtime_dir: &Path,
     listener: &UnixListener,
+    lock: Option<&OwnedFd>,
 ) -> Result<(), DaemonError> {
     let dup = listener.as_fd().try_clone_to_owned()?;
+    // A dup of the single-daemon lock fd this serving generation holds,
+    // so `offer_handoff` can transfer the same open file description to
+    // the next generation (P6 review E5). `None` wherever this
+    // generation holds no lock fd (library callers of `Daemon::bind`
+    // that never took the lock).
+    let lock_dup = match lock {
+        Some(fd) => Some(fd.try_clone()?),
+        None => None,
+    };
     *lock_unpoisoned(&shared.handoff_env) = Some(state::HandoffEnv {
         runtime_dir: runtime_dir.to_path_buf(),
         listener: dup,
+        lock: lock_dup,
     });
     Ok(())
-}
-
-/// Takes the single-daemon flock after a handoff, retrying briefly
-/// because the old daemon only releases it by exiting (which the ack
-/// just triggered). Past the handoff's point of no return the adopted
-/// sessions outweigh the lock: on persistent failure this logs and
-/// serves anyway rather than abandoning them.
-fn acquire_daemon_lock(runtime_dir: &Path) {
-    let path = runtime_dir.join(LOCK_FILE);
-    let deadline = std::time::Instant::now() + LOCK_TAKEOVER_WAIT;
-    loop {
-        let file = match fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(e) => {
-                eprintln!(
-                    "calyx-sessiond: opening {} failed, serving without the single-daemon \
-                     lock: {e}",
-                    path.display()
-                );
-                return;
-            }
-        };
-        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => {
-                // Held for this process's whole life, same as the
-                // daemonized CLI path.
-                std::mem::forget(lock);
-                return;
-            }
-            Err(_) if std::time::Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(20));
-            }
-            Err((_, e)) => {
-                eprintln!(
-                    "calyx-sessiond: single-daemon lock not acquired after handoff ({e}); \
-                     serving without it"
-                );
-                return;
-            }
-        }
-    }
 }
 
 /// Spawns the accept loop for `listener` on a background thread. Split
@@ -428,39 +439,51 @@ mod tests {
 
     use super::*;
 
-    /// H5 (P6 review, lib.rs:227 / E#4 + C+D#2): `run_handoff_receiver`
-    /// writes `HANDOFF_ACK` -- the old daemon's unconditional point of
-    /// no return (`crate::handoff`'s module doc) -- *before* it takes
-    /// over the single-daemon lock (`acquire_daemon_lock`), let alone
-    /// before it is actually serving. If the receiver dies or wedges in
-    /// that gap, the old daemon has already been told to exit, and
-    /// every adopted session is orphaned.
+    /// E4 ordering (P6 review, originally H5, superseded by E5):
+    /// `run_handoff_receiver` writes `HANDOFF_ACK` -- the old daemon's
+    /// unconditional point of no return (`crate::handoff`'s module doc)
+    /// -- only *after* it has started accepting on the transferred
+    /// control listener, so the old daemon's post-ack `_exit` never
+    /// leaves that socket bound but unserved. E5 changed why the ack is
+    /// safe to send: the receiver now holds the single-daemon lock via
+    /// the transferred fd (the same open file description as the old
+    /// daemon's) instead of racing to re-acquire it, so the ack no
+    /// longer waits on any lock takeover at all, even when a previous
+    /// holder is slow to release. Both halves are pinned here.
     ///
-    /// Proven here without spinning up two real daemon processes: this
-    /// test plays the "old daemon" offering role itself (an empty
-    /// manifest, no sessions to keep this test simple; H5 is about
-    /// ordering, not adoption content) against a real
-    /// `run_handoff_receiver`, and pre-holds the single-daemon lock
-    /// file exclusively for a fixed window standing in for a
-    /// slow-releasing previous holder. `acquire_daemon_lock`'s own
-    /// retry loop cannot succeed before that window elapses; if the
-    /// ack byte arrives before it does, that proves `run_handoff_receiver`
-    /// sent it before completing the lock takeover attempt, which is
-    /// exactly the bug.
+    /// Proven without spinning up two real daemon processes: this test
+    /// plays the "old daemon" offering role itself (an empty manifest,
+    /// no sessions to keep this test simple; the ordering is about the
+    /// listener/lock tail, not adoption content) against a real
+    /// `run_handoff_receiver`. It holds the single-daemon lock file
+    /// exclusively for the whole test (a maximally slow-releasing
+    /// previous holder) and transfers THAT SAME fd as the handoff's
+    /// lock fd, exactly as a real `offer_handoff` does. Because the
+    /// receiver adopts that fd rather than re-acquiring the lock, the
+    /// ack arrives near-instant despite this test never releasing its
+    /// hold; the superseded contract (ack gated on a separate acquire
+    /// that could only succeed after a slow holder released) would
+    /// instead have made the receiver spin out its old takeover bound
+    /// and ack lock-less. A follow-up Hello round-trip on the
+    /// transferred control socket then confirms the receiver was
+    /// already serving it when it acked (the E4 ordering the original
+    /// H5 guarded).
     #[test]
-    fn handoff_receiver_sends_ack_only_after_the_daemon_lock_takeover_attempt_resolves() {
+    fn handoff_receiver_acks_promptly_and_serves_the_transferred_listener() {
+        use proto::{
+            decode_control, encode_control, ControlMsg, FrameReader, FrameType, FrameWriter,
+            PROTOCOL_VERSION,
+        };
+
         let runtime_tmp = tempfile::tempdir().expect("scratch runtime dir");
         let state_tmp = tempfile::tempdir().expect("scratch state dir");
         let runtime_dir = runtime_tmp.path().to_path_buf();
-
-        // Pre-hold the single-daemon lock file exclusively: stands in
-        // for a slow-releasing old daemon / concurrent lock holder.
-        // Released after a fixed window from a background thread
-        // rather than immediately, so `acquire_daemon_lock`'s retry
-        // loop (20ms polls, bounded at LOCK_TAKEOVER_WAIT = 5s) cannot
-        // possibly succeed before that window elapses.
-        let lock_path = runtime_dir.join(LOCK_FILE);
         std::fs::create_dir_all(&runtime_dir).expect("create scratch runtime dir");
+
+        // Hold the single-daemon lock exclusively for the whole test: a
+        // maximally slow-releasing previous holder. Never dropped before
+        // the assertions below.
+        let lock_path = runtime_dir.join(LOCK_FILE);
         let lock_file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -470,18 +493,13 @@ mod tests {
         let held_lock =
             nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
                 .expect("test should be able to pre-acquire the scratch lock file");
-        const HOLD: Duration = Duration::from_secs(2);
-        std::thread::spawn(move || {
-            std::thread::sleep(HOLD);
-            drop(held_lock);
-        });
 
         // A real bound listener stands in for the transferred control
-        // listener: run_handoff_receiver only ever wraps whatever fd
-        // it is handed, it never inspects its origin.
-        let control_listener =
-            std::os::unix::net::UnixListener::bind(runtime_dir.join("control-stand-in.sock"))
-                .expect("bind stand-in control listener");
+        // listener: run_handoff_receiver only ever wraps whatever fd it
+        // is handed, it never inspects its origin.
+        let control_socket = runtime_dir.join("control-stand-in.sock");
+        let control_listener = std::os::unix::net::UnixListener::bind(&control_socket)
+            .expect("bind stand-in control listener");
 
         // The dedicated handoff endpoint run_handoff_receiver connects
         // to, played by this test as the offering ("old daemon") side.
@@ -496,11 +514,11 @@ mod tests {
         };
 
         let receiver_thread = std::thread::spawn(move || {
-            // The subject under test, entirely unmodified. Its
-            // eventual `block_until_idle()` call blocks until idle (up to
-            // 30s with no sessions/clients); this thread is intentionally
-            // left detached rather than joined; the process ends at
-            // the end of the whole test binary run.
+            // The subject under test, entirely unmodified. Its eventual
+            // `block_until_idle()` call blocks until idle (up to 30s with
+            // no sessions/clients); this thread is intentionally left
+            // detached rather than joined; the process ends at the end of
+            // the whole test binary run.
             let _ = run_handoff_receiver(config, &handoff_socket);
         });
 
@@ -513,28 +531,230 @@ mod tests {
             .as_fd()
             .try_clone_to_owned()
             .expect("dup the stand-in control listener");
-        fdpass::send_fds(&offerer_stream, &sidecar, &[listener_fd.as_raw_fd()])
-            .expect("send the manifest and control listener fd to the receiver");
+        // The E5 design: transfer the SAME open file description this
+        // test holds the exclusive flock on (order: listener, then lock
+        // last, matching run_handoff_receiver's two trailing pops).
+        let lock_fd = held_lock
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("dup the held lock fd for transfer");
+        fdpass::send_fds(
+            &offerer_stream,
+            &sidecar,
+            &[listener_fd.as_raw_fd(), lock_fd.as_raw_fd()],
+        )
+        .expect("send the manifest, control listener fd, and lock fd to the receiver");
 
+        // Near-instant ack despite this test still holding the lock: the
+        // receiver adopted it via the transferred fd and never
+        // re-acquires. The superseded contract would have spun its old
+        // takeover bound (seconds) before acking here.
+        const ACK_BOUND: Duration = Duration::from_secs(1);
         let start = std::time::Instant::now();
         offerer_stream
-            .set_read_timeout(Some(HOLD + Duration::from_secs(4)))
+            .set_read_timeout(Some(ACK_BOUND))
             .expect("set ack read timeout");
         let mut ack_byte = [0u8; 1];
-        (&offerer_stream)
-            .read_exact(&mut ack_byte)
-            .expect("the receiver should eventually send its ack");
-        let ack_arrived_after = start.elapsed();
-
-        let _ = receiver_thread; // intentionally left running; see above.
-
-        assert!(
-            ack_arrived_after >= HOLD,
-            "HANDOFF_ACK arrived after {ack_arrived_after:?}, before the {HOLD:?} window \
-             this test still held the single-daemon lock exclusively: \
-             run_handoff_receiver must not send the ack until after its own lock \
-             takeover attempt (acquire_daemon_lock) has resolved, let alone before it \
-             is actually serving"
+        (&offerer_stream).read_exact(&mut ack_byte).expect(
+            "the receiver should ack within 1s because it holds the single-daemon lock \
+             via the transferred fd (same open file description as this test's \
+             still-held `held_lock`) and never re-acquires a lock the old daemon cannot \
+             release until after the ack (P6 review E5)",
         );
+        let ack_arrived_after = start.elapsed();
+        assert!(
+            ack_arrived_after < ACK_BOUND,
+            "ack arrived after {ack_arrived_after:?}, at or beyond the {ACK_BOUND:?} bound"
+        );
+        assert_eq!(ack_byte[0], handoff::HANDOFF_ACK, "unexpected ack byte");
+
+        // E4 ordering: the ack came after start_accepting, so the
+        // transferred control listener is already being served. A fresh
+        // client's Hello round-trip on it must succeed.
+        let client = UnixStream::connect(&control_socket)
+            .expect("connect to the transferred control socket the receiver took over");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set control round-trip read timeout");
+        let hello = encode_control(&ControlMsg::Hello {
+            version: PROTOCOL_VERSION,
+        })
+        .expect("encode Hello");
+        let mut writer = FrameWriter::new(
+            client
+                .try_clone()
+                .expect("clone the control stream for writing"),
+        );
+        writer
+            .write_frame(FrameType::Control, &hello)
+            .expect("write Hello to the transferred control socket");
+        let mut reader = FrameReader::new(client);
+        let frame = reader.read_frame().expect(
+            "the receiver must answer a Hello on the transferred control listener, proving \
+             it began accepting (start_accepting) before it acked -- the E4 ordering the \
+             original H5 test guarded (P6 review E5 supersession)",
+        );
+        let reply = decode_control(&frame.payload).expect("decode the Hello reply");
+        assert!(
+            matches!(reply, ControlMsg::HelloOk { version } if version == PROTOCOL_VERSION),
+            "expected HelloOk from the transferred control listener, got {reply:?}"
+        );
+
+        drop(held_lock);
+        let _ = receiver_thread; // intentionally left running; see above.
+    }
+
+    /// R3 (P6 review E5, RED): a handoff receiver must hold the
+    /// single-daemon lock via the transferred lock fd (same open file
+    /// description as the old daemon's), never by separately
+    /// re-acquiring it through `acquire_daemon_lock`. E5's bug: the
+    /// old daemon cannot release its own flock until *after* it
+    /// receives the ack (module doc's point of no return), so
+    /// `acquire_daemon_lock`'s pre-ack retry loop is trying to acquire
+    /// a lock that structurally cannot be freed yet -- every real
+    /// handoff today burns the full `LOCK_TAKEOVER_WAIT` (5s) and then
+    /// acks anyway, serving lock-less.
+    ///
+    /// This test plays the "old daemon" side itself (empty manifest,
+    /// no sessions -- R3 is about the lock, not adoption content) and,
+    /// critically, sends the SAME fd it holds an exclusive flock on as
+    /// the lock fd in the handoff payload, exactly as a fixed
+    /// `offer_handoff` would (the whole point of E5's fix: the lock
+    /// travels through the same `SCM_RIGHTS` batch as the listener).
+    /// It never releases that lock during the read below. If
+    /// `run_handoff_receiver` correctly adopted the transferred fd as
+    /// its own hold (sharing that open file description), it would
+    /// already hold the lock the instant it received the fds and
+    /// could ack near-instantly, regardless of this test's own copy
+    /// staying open. Today it instead discards the transferred lock
+    /// fd (see the `let _lock_fd = ...` in `run_handoff_receiver`) and
+    /// calls `acquire_daemon_lock`, whose retry loop cannot succeed
+    /// while this test's copy of the SAME open file description stays
+    /// locked -- so the ack does not arrive within the short bound
+    /// below.
+    #[test]
+    fn run_handoff_receiver_holds_the_lock_via_the_transferred_fd_without_reacquiring() {
+        let runtime_tmp = tempfile::tempdir().expect("scratch runtime dir");
+        let state_tmp = tempfile::tempdir().expect("scratch state dir");
+        let runtime_dir = runtime_tmp.path().to_path_buf();
+        std::fs::create_dir_all(&runtime_dir).expect("create scratch runtime dir");
+
+        let lock_path = runtime_dir.join(LOCK_FILE);
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .expect("open scratch lock file");
+        // Never dropped before this test's key assertion below: stands
+        // in for the old daemon, which structurally cannot release its
+        // own flock until after the ack this test is waiting for.
+        let held_lock =
+            nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .expect("test should be able to pre-acquire the scratch lock file");
+
+        let control_listener =
+            std::os::unix::net::UnixListener::bind(runtime_dir.join("control-stand-in.sock"))
+                .expect("bind stand-in control listener");
+        let handoff_socket = runtime_dir.join("handoff-stand-in.sock");
+        let handoff_listener = std::os::unix::net::UnixListener::bind(&handoff_socket)
+            .expect("bind stand-in handoff listener");
+
+        let config = DaemonConfig {
+            runtime_dir: runtime_dir.clone(),
+            state_dir: state_tmp.path().to_path_buf(),
+            history_enabled: false,
+        };
+
+        let receiver_thread = std::thread::spawn(move || {
+            let _ = run_handoff_receiver(config, &handoff_socket);
+        });
+
+        let (offerer_stream, _) = handoff_listener
+            .accept()
+            .expect("accept the receiver's connection to the handoff endpoint");
+        let manifest = HandoffManifest { sessions: vec![] };
+        let sidecar = encode_manifest(&manifest).expect("encode an empty manifest");
+        let listener_fd = control_listener
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("dup the stand-in control listener");
+        // The fixed-design part: the SAME open file description
+        // `held_lock` holds the exclusive flock on, duped and sent
+        // alongside the listener (order: listener, then lock last,
+        // matching `run_handoff_receiver`'s two trailing pops).
+        let lock_fd = held_lock
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("dup the held lock fd for transfer");
+        fdpass::send_fds(
+            &offerer_stream,
+            &sidecar,
+            &[listener_fd.as_raw_fd(), lock_fd.as_raw_fd()],
+        )
+        .expect("send the manifest, control listener fd, and lock fd to the receiver");
+
+        const ACK_BOUND: Duration = Duration::from_millis(300);
+        let start = std::time::Instant::now();
+        offerer_stream
+            .set_read_timeout(Some(ACK_BOUND))
+            .expect("set ack read timeout");
+        let mut ack_byte = [0u8; 1];
+        (&offerer_stream).read_exact(&mut ack_byte).expect(
+            "the receiver should ack within 300ms because it already holds the \
+             single-daemon lock via the transferred fd (same open file description as \
+             this test's still-held `held_lock`) and must never need to independently \
+             re-acquire a lock the old daemon cannot release until after the ack (P6 \
+             review E5): today it discards the transferred lock fd and retries \
+             acquire_daemon_lock instead, which cannot succeed while held_lock stays \
+             open, so the ack takes up to LOCK_TAKEOVER_WAIT (5s) instead of arriving \
+             promptly",
+        );
+        let ack_arrived_after = start.elapsed();
+        assert!(
+            ack_arrived_after < ACK_BOUND,
+            "ack arrived after {ack_arrived_after:?}, at or beyond the {ACK_BOUND:?} \
+             bound"
+        );
+
+        // Full contract: the receiver's hold must outlive this test's
+        // own references. Release them exactly the way a real old daemon
+        // does at the point of no return -- by CLOSING them without ever
+        // unlocking (it `_exit`s, which closes its fds but never calls
+        // flock `LOCK_UN`). Dropping the `Flock` guard here would instead
+        // run its `LOCK_UN` on the shared open file description and
+        // release the single lock the receiver shares (flock locks live
+        // on the open file description, not the fd, so `LOCK_UN` via any
+        // one dup frees it for every dup); `fdpass`'s R1 test pins that
+        // close-not-unlock distinction. With both of this test's fds
+        // closed but the receiver's transferred dup still open, a fresh
+        // exclusive flock must still fail.
+        let held_raw = held_lock.as_raw_fd();
+        std::mem::forget(held_lock);
+        // SAFETY: `held_raw` is this test's own still-open fd (nothing
+        // else has closed it), closed here without unlocking so only the
+        // receiver's transferred dup keeps the open file description
+        // (and its lock) alive.
+        assert_eq!(
+            unsafe { libc::close(held_raw) },
+            0,
+            "closing this test's original lock fd should succeed"
+        );
+        drop(lock_fd);
+        let fresh = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .expect("open a fresh fd on the same lock file");
+        let fresh_result =
+            nix::fcntl::Flock::lock(fresh, nix::fcntl::FlockArg::LockExclusiveNonblock);
+        assert!(
+            fresh_result.is_err(),
+            "a fresh exclusive flock attempt should still fail after this test closes its \
+             own lock fds without unlocking, proving the receiver holds the lock via its \
+             transferred dup of the same open file description alone (P6 review E5); see \
+             fdpass's R1 test for the close-not-unlock semantics"
+        );
+
+        let _ = receiver_thread; // intentionally left running; see H5's test above.
     }
 }

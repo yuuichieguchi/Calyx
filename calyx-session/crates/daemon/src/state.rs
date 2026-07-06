@@ -51,6 +51,16 @@ pub(crate) struct HandoffEnv {
     /// daemon generation so accepting never stops across a handoff
     /// (no unbind/rebind gap; `crate::handoff`'s module doc).
     pub(crate) listener: OwnedFd,
+    /// A dup of the held single-daemon flock fd (`crate::LOCK_FILE`),
+    /// which `offer_handoff` transfers through the same `SCM_RIGHTS`
+    /// batch as `listener` so the next daemon generation shares the
+    /// identical open file description and therefore already holds the
+    /// lock (P6 review E5: the receiver must not have to independently
+    /// re-acquire a lock the old daemon cannot release until after it
+    /// has been acked). `None` wherever the serving generation holds no
+    /// lock fd (library callers of `Daemon::bind` that never took the
+    /// lock), in which case a handoff simply carries no lock fd.
+    pub(crate) lock: Option<OwnedFd>,
 }
 
 impl Shared {

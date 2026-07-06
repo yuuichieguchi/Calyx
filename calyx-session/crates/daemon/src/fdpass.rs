@@ -256,4 +256,101 @@ mod tests {
             "fds[1] (pipe 2's write end) must arrive as received_fds[1]"
         );
     }
+
+    /// P6 review E5, R1 (empirical, foundational): the single-daemon
+    /// lock is a `flock(2)` (`nix::fcntl::Flock` with
+    /// `FlockArg::LockExclusiveNonblock`; see
+    /// `cli::commands::daemon::run_daemonized` and
+    /// `crate::acquire_daemon_lock`), not a POSIX `fcntl`/`lockf`
+    /// record lock. BSD/macOS `flock(2)` associates the lock with the
+    /// *open file description*, so a duplicate obtained via `dup`,
+    /// `fork`, or (this test's concern) `SCM_RIGHTS` shares the exact
+    /// same lock, released only once every fd referencing that open
+    /// file description is closed -- unlike a POSIX `fcntl` record
+    /// lock, which is scoped to the owning process and is dropped by
+    /// closing *any* fd on that file from that process, duplicate or
+    /// not. This test verifies the `flock` claim empirically against
+    /// the real kernel rather than assuming it, since E5's whole fix
+    /// design (transfer the lock fd through the handoff's `SCM_RIGHTS`
+    /// batch so the receiver already holds the lock) depends on it.
+    ///
+    /// Sequence: lock a real tempfile exclusively, transfer that
+    /// locked fd through `send_fds`/`recv_fds` (the exact mechanism a
+    /// handoff would use), close the ORIGINAL fd via a raw `close(2)`
+    /// without ever calling `LOCK_UN` (mirroring both
+    /// `acquire_daemon_lock`'s `mem::forget` discipline and a real
+    /// process `_exit`, neither of which unlocks explicitly), then
+    /// assert a completely fresh open+flock attempt on the same path
+    /// still fails -- proving the lock survived via the *received*
+    /// duplicate alone, with the original fd/process out of the
+    /// picture entirely.
+    #[test]
+    fn flock_ownership_survives_scm_rights_transfer_and_original_fd_close() {
+        let tmp = tempfile::NamedTempFile::new().expect("create scratch lock file");
+        let path = tmp.path().to_path_buf();
+
+        let locked_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open scratch lock file for locking");
+        let locked =
+            nix::fcntl::Flock::lock(locked_file, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .expect("initial exclusive nonblocking flock should succeed on an unlocked file");
+
+        let (a, b) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::empty(),
+        )
+        .expect("create scratch socketpair to stand in for the handoff channel");
+        let sender = UnixStream::from(a);
+        let receiver = UnixStream::from(b);
+
+        let locked_raw = locked.as_raw_fd();
+        let send_thread = std::thread::spawn(move || {
+            send_fds(&sender, b"lock-fd-transfer-test", &[locked_raw])
+                .expect("send_fds should transfer the locked fd");
+        });
+        let (_sidecar, mut received) =
+            recv_fds(&receiver, 1).expect("recv_fds should receive the transferred lock fd");
+        send_thread
+            .join()
+            .expect("the sending thread must not panic");
+        let received_lock_fd = received.pop().expect("exactly one fd should be received");
+
+        // Drop the Rust `Flock` value without running its `Drop` (which
+        // would call `flock(..., LOCK_UN)` and explicitly release the
+        // lock for every fd sharing this open file description, not
+        // just this one) -- then a raw `close(2)` ends only this one
+        // fd, exactly the way process exit does: one fewer reference
+        // to the open file description, no explicit unlock.
+        std::mem::forget(locked);
+        // SAFETY: `locked_raw` is a valid, still-open fd this test
+        // owns (send_fds only read it to build the ancillary message;
+        // it did not consume or close it), and nothing else in this
+        // process has closed it yet.
+        let close_rc = unsafe { libc::close(locked_raw) };
+        assert_eq!(close_rc, 0, "closing the original lock fd should succeed");
+
+        // The received duplicate is still open and shares the same
+        // open file description, so a brand-new open+flock attempt on
+        // the same path must still fail: the lock outlived the
+        // original fd/process entirely.
+        let fresh = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open a fresh fd on the same lock file");
+        let fresh_result =
+            nix::fcntl::Flock::lock(fresh, nix::fcntl::FlockArg::LockExclusiveNonblock);
+        assert!(
+            fresh_result.is_err(),
+            "a fresh exclusive flock attempt should still fail after closing only the \
+             original locked fd, proving the lock is tied to the open file description \
+             and survives via the SCM_RIGHTS-received duplicate alone (P6 review E5, R1 \
+             empirical check)"
+        );
+
+        drop(received_lock_fd);
+    }
 }
