@@ -13,6 +13,7 @@ actor SessionPersistenceActor {
     private let savePath: URL
     private let backupPath: URL
     private let recoveryMarkerPath: URL
+    private let recoverySnapshotPath: URL
     private var pendingSave: Task<Void, Never>?
 
     static let shared = SessionPersistenceActor()
@@ -38,6 +39,7 @@ actor SessionPersistenceActor {
         self.savePath = calyxDir.appendingPathComponent("sessions.json")
         self.backupPath = calyxDir.appendingPathComponent("sessions.json.bak")
         self.recoveryMarkerPath = calyxDir.appendingPathComponent(".recovery")
+        self.recoverySnapshotPath = calyxDir.appendingPathComponent("sessions.recovery.json")
     }
 
     func sessionSavePath() -> URL {
@@ -79,6 +81,23 @@ actor SessionPersistenceActor {
 
     func saveImmediately(_ snapshot: SessionSnapshot) async {
         pendingSave?.cancel()
+        await performSave(snapshot)
+    }
+
+    /// Save used ONLY from applicationWillTerminate. Unlike
+    /// saveImmediately(_:), refuses to let an EMPTY snapshot replace a
+    /// non-empty on-disk snapshot -- teardown ordering can hand this
+    /// call an empty snapshot (windowControllers already drained) even
+    /// though a good session is still on disk from an earlier save,
+    /// and there is no recovery once that file is overwritten. A
+    /// user's deliberate "close every window" save keeps going through
+    /// saveImmediately(_:) (via AppDelegate.saveImmediately(), called
+    /// from windowWillClose), which this method does not change.
+    func saveAtTermination(_ snapshot: SessionSnapshot) async {
+        if snapshot.windows.isEmpty, let onDisk = loadFromPath(savePath), !onDisk.windows.isEmpty {
+            logger.warning("Refusing to overwrite non-empty on-disk session with an empty snapshot at termination")
+            return
+        }
         await performSave(snapshot)
     }
 
@@ -141,6 +160,43 @@ actor SessionPersistenceActor {
             logger.error("Failed to decode session from \(path.lastPathComponent): \(error.localizedDescription)")
             return nil
         }
+    }
+
+    // MARK: - Recovery Preservation
+
+    /// Moves whatever is CURRENTLY on disk at savePath aside to the
+    /// recovery path, so the next launch's own saves (which only ever
+    /// touch savePath/backupPath) cannot clobber it. Takes no snapshot
+    /// parameter deliberately: it preserves the RAW on-disk file,
+    /// whatever its content -- including one restore() itself failed to
+    /// decode (corrupt JSON, unknown future schema version) -- since
+    /// something is still worth keeping in that case too. A no-op when
+    /// savePath does not exist (nothing was ever saved, or a prior
+    /// preserve already moved it -- e.g. a second consecutive bad
+    /// launch keeps only the MOST RECENT preserved snapshot, an
+    /// explicit simplification, not an oversight: this call site only
+    /// ever fires once per launch and the caller (AppDelegate) is
+    /// responsible for not calling it at all when restore() decoded a
+    /// genuinely EMPTY snapshot). Returns whether a file was actually
+    /// moved, so the caller can distinguish a real preserve from a no-op.
+    @discardableResult
+    func preserveSnapshotForRecovery() -> Bool {
+        guard FileManager.default.fileExists(atPath: savePath.path) else { return false }
+        try? FileManager.default.removeItem(at: recoverySnapshotPath)
+        try? FileManager.default.moveItem(at: savePath, to: recoverySnapshotPath)
+        return true
+    }
+
+    func hasPreservedSnapshot() -> Bool {
+        FileManager.default.fileExists(atPath: recoverySnapshotPath.path)
+    }
+
+    func loadPreservedSnapshot() -> SessionSnapshot? {
+        loadFromPath(recoverySnapshotPath)
+    }
+
+    func clearPreservedSnapshot() {
+        try? FileManager.default.removeItem(at: recoverySnapshotPath)
     }
 
     // MARK: - Crash Loop Detection

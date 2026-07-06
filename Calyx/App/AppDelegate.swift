@@ -168,6 +168,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 createNewWindow()
             }
         }
+        // Bug 3c gap-close: a snapshot preserved by a PREVIOUS run's
+        // restoreSession() (via preserveSnapshotForRecovery()) still sits
+        // on disk at launch even though THIS run never called that method
+        // itself -- without this, `session.recoverPreviousSession` would
+        // stay unavailable until the next skipped/failed restore, instead
+        // of offering the still-pending recovery from before. Mirrors
+        // reassertHistoryPersistenceIfNeeded()'s own async-Task-after-launch shape.
+        Task { await initializeHasPreservedSessionSnapshotFlag() }
         Task { await reassertHistoryPersistenceIfNeeded() }
         // Process any URLs that arrived before launch completed
         if !pendingURLs.isEmpty {
@@ -258,7 +266,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let snapshot = buildSnapshot()
         var done = false
         Task {
-            await SessionPersistenceActor.shared.saveImmediately(snapshot)
+            // Bug 2: saveAtTermination(_:), unlike saveImmediately(_:),
+            // refuses to let an empty snapshot (teardown ordering can hand
+            // this an already-drained windowControllers) clobber a
+            // non-empty on-disk session -- see its own doc comment.
+            await SessionPersistenceActor.shared.saveAtTermination(snapshot)
             await SessionPersistenceActor.shared.resetRecoveryCounter()
             done = true
         }
@@ -1056,6 +1068,122 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    #if DEBUG
+    /// Test seam: overrides the SessionPersistenceActor instance
+    /// scheduleRecoveryCounterResetAfterStableLaunch(delay:) resets,
+    /// instead of SessionPersistenceActor.shared. DO NOT use from
+    /// production code.
+    var _sessionPersistenceActorForTesting: SessionPersistenceActor?
+    #endif
+
+    /// Schedules a delayed reset of the crash-loop recovery counter,
+    /// confirming this launch survived `delay` before declaring it
+    /// stable. Called exactly once per restoreSession() invocation,
+    /// unconditionally -- independent of whether anything was restored
+    /// -- so every launch that stays up long enough eventually resets
+    /// the counter. A launch that crashes before `delay` elapses never
+    /// runs this Task's body, so the counter is left incremented for
+    /// the crash-loop detector exactly as today.
+    func scheduleRecoveryCounterResetAfterStableLaunch(delay: Duration = .seconds(5)) {
+        let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        Task {
+            try? await Task.sleep(for: delay)
+            await actor.resetRecoveryCounter()
+        }
+    }
+
+    /// True once Bug 3a's preserveSnapshotForRecovery() has moved a
+    /// skipped/failed session's snapshot aside. Gates
+    /// session.recoverPreviousSession's isAvailable. Cleared back to
+    /// false once recoverPreservedSession() successfully rebuilds
+    /// windows from it.
+    private(set) var hasPreservedSessionSnapshot = false
+
+    #if DEBUG
+    /// Test seam: mirrors _setApplicationTerminatingForTesting's
+    /// convention for a private(set) Bool. DO NOT use from production code.
+    func _setHasPreservedSessionSnapshotForTesting(_ value: Bool) {
+        hasPreservedSessionSnapshot = value
+    }
+    #endif
+
+    /// Bug 3c gap-close: initializes hasPreservedSessionSnapshot from
+    /// whatever preserveSnapshotForRecovery() left on disk in a PREVIOUS
+    /// run, so a relaunch (where THIS run's own restoreSession() never
+    /// calls preserveSnapshotForRecovery() itself) still offers the
+    /// still-pending recovery command. Mirrors
+    /// reassertHistoryPersistenceIfNeeded()'s async-Task-after-launch shape.
+    private func initializeHasPreservedSessionSnapshotFlag() async {
+        let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        hasPreservedSessionSnapshot = await actor.hasPreservedSnapshot()
+    }
+
+    /// Tells the user restoreSession() skipped or failed to restore
+    /// their previous windows/tabs, and that the previous session was
+    /// preserved (see SessionPersistenceActor.preserveSnapshotForRecovery(),
+    /// Bug 3a) and can be recovered via the command palette's
+    /// "Recover Previous Session" action (session.recoverPreviousSession,
+    /// Bug 3c). Called once from restoreSession()'s crash-loop-skip and
+    /// restoredAny-false branches (see
+    /// SessionPersistenceActorRecoveryPreservationTests's wire-point
+    /// note for the full branch list), alongside preserveSnapshotForRecovery().
+    func notifyPreviousSessionNotRestored() {
+        NotificationManager.shared.sendNotification(
+            title: "Previous session not restored",
+            body: "Calyx didn't restore your previous windows and tabs, but they're safely preserved. " +
+                  "Recover them from the command palette (\"Recover Previous Session\").",
+            tabID: UUID()
+        )
+    }
+
+    /// session.recoverPreviousSession's handler: loads the preserved
+    /// snapshot (via the same actor _sessionPersistenceActorForTesting
+    /// seam scheduleRecoveryCounterResetAfterStableLaunch already uses),
+    /// rebuilds each window through the existing restoreWindow(_:)
+    /// machinery (same one restoreSession() itself uses), and clears the
+    /// preserved file only once that succeeds. A no-op (does not touch
+    /// restoreWindow/GhosttyAppController at all) when nothing is
+    /// actually preserved.
+    func recoverPreservedSession() {
+        let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        Task {
+            guard let snapshot = await actor.loadPreservedSnapshot(), !snapshot.windows.isEmpty else { return }
+            for windowSnap in snapshot.windows {
+                _ = restoreWindow(windowSnap)
+            }
+            await actor.clearPreservedSnapshot()
+            hasPreservedSessionSnapshot = false
+        }
+    }
+
+    /// Bug 3a/3b wiring shared by restoreSession()'s nil-snapshot,
+    /// crash-loop-skip, and restoredAny-false branches: moves whatever
+    /// is currently on disk aside into the recovery file (a harmless
+    /// no-op when nothing is there -- e.g. the nil branch's "nothing was
+    /// ever saved" sub-case), and, only when a file was actually moved,
+    /// marks it recoverable and tells the user. Deliberately does NOT
+    /// notify/flag on a no-op preserve: an on-disk file can be absent
+    /// even after a successful restore() (e.g. restore() fell back to
+    /// backupPath while savePath itself never existed), and a
+    /// notification claiming a session is recoverable when
+    /// session.recoverPreviousSession would find nothing would be
+    /// actively misleading.
+    private func preserveDiscardedSessionIfAny() {
+        var didPreserve = false
+        var done = false
+        Task {
+            didPreserve = await SessionPersistenceActor.shared.preserveSnapshotForRecovery()
+            done = true
+        }
+        let deadline = Date().addingTimeInterval(2.0)
+        while !done, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+        guard didPreserve else { return }
+        hasPreservedSessionSnapshot = true
+        notifyPreviousSessionNotRestored()
+    }
+
     private func restoreSession() -> Bool {
         // Crash-loop detection
         var recoveryCount = 0
@@ -1074,13 +1202,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
         }
 
-        guard let snapshot, !snapshot.windows.isEmpty else {
+        // Bug 1: every restoreSession() invocation schedules the delayed
+        // stability-confirmation reset, unconditionally -- independent of
+        // what is found or done below -- so a healthy "nothing to
+        // restore" launch does not leave the crash-loop counter
+        // incremented forever (see this method's own doc comment).
+        scheduleRecoveryCounterResetAfterStableLaunch()
+
+        guard let snapshot else {
+            // restore() failed to decode, or nothing was ever saved --
+            // preserveDiscardedSessionIfAny() harmlessly no-ops in the
+            // latter sub-case.
+            logger.info("No session to restore (count=\(recoveryCount))")
+            preserveDiscardedSessionIfAny()
+            return false
+        }
+
+        guard !snapshot.windows.isEmpty else {
+            // The user deliberately closed every window before their
+            // last quit -- not a loss to recover from, so this branch
+            // does not preserve or notify.
             logger.info("No session to restore (count=\(recoveryCount))")
             return false
         }
 
         if recoveryCount > SessionPersistenceActor.maxRecoveryAttempts {
             logger.warning("Crash loop detected (\(recoveryCount) attempts), skipping restore")
+            preserveDiscardedSessionIfAny()
             return false
         }
 
@@ -1099,13 +1247,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !restoredAny {
             logger.warning("Failed to restore any windows")
+            preserveDiscardedSessionIfAny()
             return false
-        }
-
-        // Reset recovery counter after successful restore (delayed to confirm stability)
-        Task {
-            try? await Task.sleep(for: .seconds(5))
-            await SessionPersistenceActor.shared.resetRecoveryCounter()
         }
 
         return true

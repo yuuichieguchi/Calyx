@@ -570,6 +570,20 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ) { [weak self] in
             self?.presentSessionsBrowserForRemoteHostPicker()
         })
+        // Bug 3c: gated on AppDelegate.hasPreservedSessionSnapshot, the
+        // synchronous cache set by restoreSession()'s preserve branches
+        // (and initialized at launch from any file preserved by a
+        // previous run) -- mirrors every other AppDelegate-level query
+        // this codebase already reads via `NSApp.delegate as? AppDelegate`
+        // (isTerminating, closingWouldTerminate(_:), etc.).
+        commandRegistry.register(PaletteCommand(
+            id: "session.recoverPreviousSession",
+            title: "Recover Previous Session",
+            category: "Sessions",
+            isAvailable: { (NSApp.delegate as? AppDelegate)?.hasPreservedSessionSnapshot ?? false }
+        ) {
+            (NSApp.delegate as? AppDelegate)?.recoverPreservedSession()
+        })
     }
 
     /// `session.newRemote`'s handler: reuses the existing Sessions
