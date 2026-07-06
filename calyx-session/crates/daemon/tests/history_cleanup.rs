@@ -152,3 +152,64 @@ fn a_session_that_exits_on_its_own_also_removes_its_history_file() {
         history_path.display()
     );
 }
+
+/// R3 (team-lead RED assignment, B2): teardown cleanup today is gated
+/// on the *daemon-wide* `history_enabled` flag alone
+/// (`crates/daemon/src/session.rs:966`), the same asymmetry R1/R2
+/// exercise on the create side. A session created while a leftover
+/// history file for its id already exists must have that file (and its
+/// rotation) removed on kill, even when the daemon-wide flag is off:
+/// the file's existence at creation is what proves this particular
+/// session opted in for its own lifetime (see
+/// crates/daemon/tests/history_crash_restore.rs's R1/R2), and cleanup
+/// must honor the same proof, not the flag alone.
+///
+/// The leftover file is manufactured directly (`fs::write`, mirroring
+/// crates/daemon/src/history.rs's own unit tests) rather than via a
+/// full two-daemon-generation crash simulation: what is under test
+/// here is teardown's cleanup gating, not the seed path R1/R2 already
+/// cover, so a single flag-off `ScratchDaemon` with a pre-existing file
+/// is the smaller, sufficient reproduction.
+#[test]
+fn killing_a_session_removes_leftover_history_files_even_when_the_daemon_flag_is_off() {
+    let daemon = common::ScratchDaemon::spawn(); // history_enabled: false (the default)
+    let id = "01J-p6-r3-cleanup-flag-off-test";
+
+    let history_dir = daemon.state_dir.join("history");
+    std::fs::create_dir_all(&history_dir).expect("create scratch history dir");
+    let history_path = history_dir.join(format!("{id}.raw"));
+    std::fs::write(&history_path, b"LEFTOVER_FROM_A_PRIOR_CRASH\n")
+        .expect("write scratch leftover history file, standing in for a prior crash's file");
+
+    let spec = SessionSpec {
+        id: id.to_string(),
+        name: None,
+        cwd: None,
+        argv: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf 'R3_ALIVE_MARKER\\n'; cat".to_string(),
+        ]),
+        env: vec![],
+        cols: 80,
+        rows: 24,
+    };
+    let _stream = attach_and_wait_for_marker(&daemon, spec, "R3_ALIVE_MARKER");
+
+    let control = daemon.connect().expect("connect control stream");
+    common::hello(&control);
+    let reply = common::roundtrip(&control, &ControlMsg::Kill { id: id.to_string() })
+        .expect("Kill round-trip");
+    assert!(
+        matches!(reply, ControlMsg::KillOk),
+        "expected KillOk, got {reply:?}"
+    );
+
+    assert!(
+        !history_path.exists(),
+        "a history file left over from a prior crash must be removed on kill even when the \
+         daemon-wide history flag is off, since the file's existence at session creation is \
+         what proves this session opted in for its own lifetime, found: {}",
+        history_path.display()
+    );
+}

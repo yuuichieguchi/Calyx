@@ -628,8 +628,20 @@ fn session_thread(ctx: SessionThread) {
     // point the session is already registered and reported created,
     // so there is no error channel back to the requesting client, and
     // a live session is worth more than its history record.
+    //
+    // File existence wins over the daemon-wide flag: a history file is
+    // only ever created for an opted-in session, so a leftover one
+    // proves this id's user opted in for the session's whole lifetime,
+    // and a daemon crash resetting the in-memory flag to its bind-time
+    // default must not silently revoke that opt-in. Both the seed
+    // below and the writer's continued appends therefore run whenever
+    // a file exists, regardless of `history_enabled` (the same
+    // asymmetry Live Handoff adoption applies via
+    // history::has_persisted; see handoff::adopt_session). With no
+    // file on disk the flag alone decides, keeping the flag-off "no
+    // history dir or file at all" contract intact for fresh sessions.
     let mut history: Option<history::HistoryWriter> = None;
-    if registered && history_enabled {
+    if registered && (history_enabled || history::has_persisted(&state_dir, &id)) {
         // Seed-once-then-reset: a leftover file means the previous
         // daemon process died before this id's teardown ran. Feed it
         // into the fresh terminal now, before the loop's first PTY
@@ -957,16 +969,19 @@ fn session_thread(ctx: SessionThread) {
         if let Some(exit_code) = reaped {
             // Confirmed exit (always for a forked child; ESRCH for an
             // adopted one). Delete both history generations first (see
-            // the ordering note above); the `history_enabled` check,
-            // not the writer (which an append error may have dropped),
-            // keeps cleanup running even when persisting stopped
-            // mid-session, and keeps a history-off session from ever
-            // touching the paths. `mine` implies `registered`, so a
-            // create-race loser never gets here with a winner's files.
-            if history_enabled {
-                if let Err(e) = history::HistoryWriter::remove_all(&state_dir, &id) {
-                    eprintln!("calyx-sessiond: removing history for {id} failed: {e}");
-                }
+            // the ordering note above), unconditionally rather than
+            // gated on the in-memory flag or the writer (which an
+            // append error may have dropped): a file created under a
+            // prior generation's opt-in must go even when this
+            // generation's flag is off (file existence wins; see the
+            // seed block above), cleanup must keep running when
+            // persisting stopped mid-session, and remove_all treats
+            // missing files as a no-op, so a session that never
+            // persisted deletes nothing. `mine` implies `registered`,
+            // so a create-race loser never gets here with a winner's
+            // files.
+            if let Err(e) = history::HistoryWriter::remove_all(&state_dir, &id) {
+                eprintln!("calyx-sessiond: removing history for {id} failed: {e}");
             }
             let mut state = shared.lock_state();
             // Drop an adopted entry now: it was held through the
