@@ -26,6 +26,9 @@ fn main() -> ExitCode {
         Command::RemoteInstall(args) => {
             commands::remote_install::run(&parsed.runtime_dir, &parsed.state_dir, args)
         }
+        Command::Upgrade(args) => {
+            commands::upgrade::run(&parsed.runtime_dir, &parsed.state_dir, args)
+        }
     };
     match result {
         Ok(code) => ExitCode::from(code),

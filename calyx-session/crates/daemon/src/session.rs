@@ -58,6 +58,30 @@ pub(crate) enum SessionRequest {
     /// No-op: wakes the session thread so it re-evaluates pending
     /// input (POLLOUT interest) after a `SessionInput::submit`.
     Pump,
+    /// Live Handoff pause (see `crate::handoff`): render a replay
+    /// snapshot on this thread (which makes it atomic with the pause),
+    /// reply, then park with no further PTY reads until the returned
+    /// `PausedSession::resume_tx` fires or is dropped. Only ever sent
+    /// by `handoff::offer_handoff`.
+    PauseForHandoff {
+        reply: mpsc::SyncSender<Result<PausedSession, String>>,
+    },
+}
+
+/// A session parked for Live Handoff: `SessionRequest::PauseForHandoff`'s
+/// successful reply. Dropping `resume_tx` without sending resumes the
+/// session thread, so an offerer that dies mid-attempt (early return,
+/// panic) can never leave a session parked forever; the handoff success
+/// path must therefore `mem::forget` this to keep the old thread parked
+/// through the process's `_exit` (see `handoff::offer_handoff`).
+pub(crate) struct PausedSession {
+    /// `vt::Terminal::render_replay` output at the moment of pausing.
+    pub(crate) replay: Vec<u8>,
+    /// Terminal geometry in effect at the moment of pausing (tracks
+    /// `Resize` requests, not the creation-time size).
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) resume_tx: mpsc::SyncSender<()>,
 }
 
 /// Request channel into a session thread, woken via a self-pipe so the
@@ -68,6 +92,13 @@ pub(crate) struct SessionMailbox {
 }
 
 impl SessionMailbox {
+    pub(crate) fn new(wake_tx: OwnedFd) -> SessionMailbox {
+        SessionMailbox {
+            requests: Mutex::new(VecDeque::new()),
+            wake_tx,
+        }
+    }
+
     pub(crate) fn send(&self, request: SessionRequest) {
         lock_unpoisoned(&self.requests).push_back(request);
         // A full pipe already guarantees a pending wakeup, and a closed
@@ -96,7 +127,7 @@ pub(crate) struct SessionInput {
 }
 
 impl SessionInput {
-    fn new() -> Arc<SessionInput> {
+    pub(crate) fn new() -> Arc<SessionInput> {
         Arc::new(SessionInput {
             pending: Mutex::new(VecDeque::new()),
         })
@@ -159,6 +190,115 @@ fn drain_nonblocking(pending: &mut VecDeque<u8>, fd: BorrowedFd) {
                 break;
             }
         }
+    }
+}
+
+/// The process on the far side of a session's PTY, as seen by this
+/// daemon: either a child it forked itself, or a process inherited via
+/// Live Handoff (see `crate::handoff`) that some previous daemon
+/// generation forked.
+pub(crate) enum SessionChild {
+    /// Forked by this process: a real `waitpid` status is available.
+    Forked(Child),
+    /// Adopted via Live Handoff: not this process's child, so no
+    /// `waitpid` is possible and exit detection degrades to liveness
+    /// polling (the handoff module doc's known limitation).
+    Adopted { pid: u32 },
+}
+
+/// Upper bound on the adopted-session liveness poll after PTY EOF: the
+/// terminal side has already ended at that point, so a process that
+/// merely closed its tty and lives on must not stall teardown forever.
+const ADOPTED_EXIT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl SessionChild {
+    /// Best-effort abort when the session thread fails before its main
+    /// loop (terminal init). A forked child is this daemon's to kill
+    /// and reap; an adopted process is deliberately left untouched:
+    /// adoption failure happens before the handoff ack, so the sending
+    /// daemon still owns that session and will resume it (see
+    /// `crate::handoff`'s point-of-no-return contract).
+    fn abort_before_loop(&mut self) {
+        match self {
+            SessionChild::Forked(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            SessionChild::Adopted { .. } => {}
+        }
+    }
+
+    /// Waits out the child's end and returns the exit code to record
+    /// in the ledger.
+    fn reap(&mut self, id: &str) -> i32 {
+        match self {
+            SessionChild::Forked(child) => match child.wait() {
+                Ok(status) => status
+                    .code()
+                    .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+                Err(e) => {
+                    eprintln!("calyx-sessiond: waitpid failed for {id}: {e}");
+                    -1
+                }
+            },
+            SessionChild::Adopted { pid } => {
+                // Known limitation (crate::handoff module doc): this
+                // daemon never forked `pid`, so there is no status to
+                // collect. Poll liveness until the process is gone or
+                // the bound elapses, then record the unknowable exit
+                // code as -1, the same value the waitpid-failure path
+                // above uses.
+                let deadline = std::time::Instant::now() + ADOPTED_EXIT_POLL;
+                let pid = nix::unistd::Pid::from_raw(*pid as i32);
+                while nix::sys::signal::kill(pid, None).is_ok()
+                    && std::time::Instant::now() < deadline
+                {
+                    thread::sleep(std::time::Duration::from_millis(20));
+                }
+                -1
+            }
+        }
+    }
+}
+
+/// Nonblocking, CLOEXEC self-pipe for a session mailbox. macOS has no
+/// `pipe2`, so both flags are applied after the fact; the (tiny) fork
+/// window in between is accepted on this platform.
+pub(crate) fn make_wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
+    let (wake_rx, wake_tx) = nix::unistd::pipe().map_err(|e| format!("pipe failed: {e}"))?;
+    for fd in [&wake_rx, &wake_tx] {
+        nix::fcntl::fcntl(
+            fd.as_fd(),
+            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+        )
+        .map_err(|e| format!("set wake pipe nonblocking: {e}"))?;
+        nix::fcntl::fcntl(
+            fd.as_fd(),
+            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
+        )
+        .map_err(|e| format!("set wake pipe cloexec: {e}"))?;
+    }
+    Ok((wake_rx, wake_tx))
+}
+
+/// Spawns the session thread for `ctx` and waits for its terminal to
+/// initialize. The `vt::Terminal` can only be created on the session
+/// thread (`!Send`), so creation failure is only observable through
+/// the ready channel; waiting here means no caller ever reports a
+/// half-alive session.
+pub(crate) fn start_session_thread(
+    ctx: SessionThread,
+    ready_rx: mpsc::Receiver<Result<(), String>>,
+) -> Result<(), String> {
+    let name = format!("session-{}", ctx.id);
+    thread::Builder::new()
+        .name(name)
+        .spawn(move || session_thread(ctx))
+        .map_err(|e| format!("spawn session thread: {e}"))?;
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("terminal init failed: {e}")),
+        Err(_) => Err("session thread died during startup".to_string()),
     }
 }
 
@@ -264,74 +404,39 @@ pub(crate) fn spawn_session(
     );
     let input = SessionInput::new();
 
-    // macOS has no pipe2, so CLOEXEC is applied after the fact; the
-    // (tiny) fork window in between is accepted on this platform.
-    let (wake_rx, wake_tx) = nix::unistd::pipe().map_err(|e| format!("pipe failed: {e}"))?;
-    for fd in [&wake_rx, &wake_tx] {
-        nix::fcntl::fcntl(
-            fd.as_fd(),
-            nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-        )
-        .map_err(|e| format!("set wake pipe nonblocking: {e}"))?;
-        nix::fcntl::fcntl(
-            fd.as_fd(),
-            nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC),
-        )
-        .map_err(|e| format!("set wake pipe cloexec: {e}"))?;
-    }
-    let mailbox = Arc::new(SessionMailbox {
-        requests: Mutex::new(VecDeque::new()),
-        wake_tx,
-    });
+    let (wake_rx, wake_tx) = make_wake_pipe()?;
+    let mailbox = Arc::new(SessionMailbox::new(wake_tx));
 
     let created_at_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    // The vt::Terminal can only be created on the session thread
-    // (!Send); wait for that to succeed before reporting the session
-    // as created, so a terminal failure never yields a half-alive
-    // session.
     let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
     let (start_tx, start_rx) = mpsc::sync_channel::<()>(1);
-    {
-        let shared = Arc::clone(shared);
-        let id = spec.id.clone();
-        let mailbox = Arc::clone(&mailbox);
-        let input = Arc::clone(&input);
-        let master = pty.master;
-        let state_dir = shared.state_dir.clone();
-        // Read once, here at creation: `SetHistoryEnabled` only changes
-        // what *later* creations inherit (R6 semantics; see
-        // crate::history's module doc).
-        let history_enabled = shared.history_enabled.load(Ordering::SeqCst);
-        thread::Builder::new()
-            .name(format!("session-{id}"))
-            .spawn(move || {
-                session_thread(SessionThread {
-                    shared,
-                    id,
-                    master,
-                    wake_rx,
-                    mailbox,
-                    input,
-                    child,
-                    cols,
-                    rows,
-                    ready_tx,
-                    start_rx,
-                    state_dir,
-                    history_enabled,
-                })
-            })
-            .map_err(|e| format!("spawn session thread: {e}"))?;
-    }
-    match ready_rx.recv() {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(format!("terminal init failed: {e}")),
-        Err(_) => return Err("session thread died during startup".to_string()),
-    }
+    // Read once, here at creation: `SetHistoryEnabled` only changes
+    // what *later* creations inherit (R6 semantics; see
+    // crate::history's module doc).
+    let history_enabled = shared.history_enabled.load(Ordering::SeqCst);
+    start_session_thread(
+        SessionThread {
+            shared: Arc::clone(shared),
+            id: spec.id.clone(),
+            master: pty.master,
+            wake_rx,
+            mailbox: Arc::clone(&mailbox),
+            input: Arc::clone(&input),
+            child: SessionChild::Forked(child),
+            cols,
+            rows,
+            ready_tx,
+            start_rx,
+            state_dir: shared.state_dir.clone(),
+            history_enabled,
+            seed_replay: Vec::new(),
+        },
+        ready_rx,
+    )?;
 
     Ok(SessionEntry {
         id: spec.id.clone(),
@@ -348,24 +453,35 @@ pub(crate) fn spawn_session(
     })
 }
 
-struct SessionThread {
-    shared: Arc<Shared>,
-    id: String,
-    master: OwnedFd,
-    wake_rx: OwnedFd,
-    mailbox: Arc<SessionMailbox>,
-    input: Arc<SessionInput>,
-    child: Child,
-    cols: u16,
-    rows: u16,
-    ready_tx: mpsc::SyncSender<Result<(), String>>,
-    start_rx: mpsc::Receiver<()>,
+/// Everything a session thread owns, assembled by `spawn_session` (a
+/// forked child) or `handoff::adopt_session` (an inherited one) and
+/// consumed by `start_session_thread`.
+pub(crate) struct SessionThread {
+    pub(crate) shared: Arc<Shared>,
+    pub(crate) id: String,
+    pub(crate) master: OwnedFd,
+    pub(crate) wake_rx: OwnedFd,
+    pub(crate) mailbox: Arc<SessionMailbox>,
+    pub(crate) input: Arc<SessionInput>,
+    pub(crate) child: SessionChild,
+    pub(crate) cols: u16,
+    pub(crate) rows: u16,
+    pub(crate) ready_tx: mpsc::SyncSender<Result<(), String>>,
+    pub(crate) start_rx: mpsc::Receiver<()>,
     /// `Shared::state_dir`, cloned at spawn so the history paths need
     /// no registry access from this thread.
-    state_dir: PathBuf,
+    pub(crate) state_dir: PathBuf,
     /// The daemon-wide history flag as captured at this session's
     /// creation (see `spawn_session`); later toggles don't reach here.
-    history_enabled: bool,
+    /// For an adopted session, "creation" is its original daemon's:
+    /// `handoff::adopt_session` derives this from whether the session
+    /// was already persisting (its history file survives the handoff).
+    pub(crate) history_enabled: bool,
+    /// Live Handoff adoption: replay bytes fed into the fresh terminal
+    /// before the loop's first PTY read, so the first `Replay` any
+    /// attaching client sees already contains the pre-handoff content.
+    /// Empty for a forked session.
+    pub(crate) seed_replay: Vec<u8>,
 }
 
 fn session_thread(ctx: SessionThread) {
@@ -383,15 +499,20 @@ fn session_thread(ctx: SessionThread) {
         start_rx,
         state_dir,
         history_enabled,
+        seed_replay,
     } = ctx;
     let master_raw = master.as_raw_fd();
+    let adopted = matches!(child, SessionChild::Adopted { .. });
+    // Geometry currently in effect, tracked across Resize requests so
+    // a handoff pause can report the size its replay was rendered at.
+    let mut cur_cols = cols;
+    let mut cur_rows = rows;
 
-    let mut terminal = match vt::Terminal::new(cols, rows, SCROLLBACK_BYTES) {
+    let mut terminal = match vt::Terminal::new(cur_cols, cur_rows, SCROLLBACK_BYTES) {
         Ok(t) => t,
         Err(e) => {
             let _ = ready_tx.send(Err(e.to_string()));
-            let _ = child.kill();
-            let _ = child.wait();
+            child.abort_before_loop();
             return;
         }
     };
@@ -407,6 +528,19 @@ fn session_thread(ctx: SessionThread) {
     // from, write to, or later delete files a same-id winner owns.
     let registered = start_rx.recv().is_ok();
 
+    // Live Handoff adoption: reconstruct the pre-handoff screen and
+    // scrollback before the loop's first PTY read, so the first Replay
+    // any attaching client receives already contains it. A feed
+    // failure degrades to a blank starting terminal (logged), the same
+    // way the crash-restore seed below degrades: the live session is
+    // worth more than its catch-up content.
+    if !seed_replay.is_empty() {
+        if let Err(e) = terminal.feed(&seed_replay) {
+            eprintln!("calyx-sessiond: seeding handoff replay failed for {id}: {e}");
+        }
+    }
+    drop(seed_replay);
+
     // Opt-in history persistence (see crate::history's module doc).
     // Failures on this path are logged and degrade to "no history for
     // this session" rather than tearing the session down: at this
@@ -421,18 +555,30 @@ fn session_thread(ctx: SessionThread) {
         // feed, so the first Replay rendered for any attaching client
         // already contains the pre-crash scrollback; then delete the
         // files so the live appends below start from a clean slate.
-        match history::read_persisted(&state_dir, &id) {
-            Ok(Some(bytes)) => {
-                if let Err(e) = terminal.feed(&bytes) {
-                    eprintln!("calyx-sessiond: seeding persisted history failed for {id}: {e}");
+        //
+        // Never for an adopted session: its leftover file means
+        // continuation, not a crash (the previous generation's exit
+        // deliberately skipped teardown), the handoff replay above is
+        // the authoritative snapshot of that same content, and the
+        // writer opening in append mode below keeps the file's "what
+        // this session's PTY produced" meaning intact across the
+        // generation change.
+        if !adopted {
+            match history::read_persisted(&state_dir, &id) {
+                Ok(Some(bytes)) => {
+                    if let Err(e) = terminal.feed(&bytes) {
+                        eprintln!("calyx-sessiond: seeding persisted history failed for {id}: {e}");
+                    }
+                    if let Err(e) = history::HistoryWriter::remove_all(&state_dir, &id) {
+                        eprintln!(
+                            "calyx-sessiond: resetting persisted history failed for {id}: {e}"
+                        );
+                    }
                 }
-                if let Err(e) = history::HistoryWriter::remove_all(&state_dir, &id) {
-                    eprintln!("calyx-sessiond: resetting persisted history failed for {id}: {e}");
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("calyx-sessiond: reading persisted history failed for {id}: {e}");
                 }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                eprintln!("calyx-sessiond: reading persisted history failed for {id}: {e}");
             }
         }
         match history::HistoryWriter::open(&state_dir, &id, history::DEFAULT_CAP_BYTES) {
@@ -514,8 +660,40 @@ fn session_thread(ctx: SessionThread) {
                     if let Err(e) = terminal.resize(cols.max(1), rows.max(1)) {
                         eprintln!("calyx-sessiond: vt resize failed for {id}: {e}");
                     }
+                    cur_cols = cols.max(1);
+                    cur_rows = rows.max(1);
                 }
                 SessionRequest::Pump => {}
+                SessionRequest::PauseForHandoff { reply } => {
+                    // Snapshot and park on this thread, in that order:
+                    // single-thread ownership is what makes the replay
+                    // atomic with the pause (no PTY byte can be fed
+                    // between them). See crate::handoff's module doc.
+                    match terminal.render_replay() {
+                        Ok(replay) => {
+                            let (resume_tx, resume_rx) = mpsc::sync_channel::<()>(1);
+                            let paused = PausedSession {
+                                replay,
+                                cols: cur_cols,
+                                rows: cur_rows,
+                                resume_tx,
+                            };
+                            if reply.send(Ok(paused)).is_ok() {
+                                // Parked: no PTY reads until the
+                                // offerer's verdict. An explicit send
+                                // and a dropped channel both mean
+                                // "resume"; only the old process's
+                                // post-ack `_exit` leaves this parked
+                                // for good (see PausedSession's doc).
+                                let _ = resume_rx.recv();
+                            }
+                        }
+                        Err(e) => {
+                            let _ =
+                                reply.send(Err(format!("render_replay for handoff failed: {e}")));
+                        }
+                    }
+                }
             }
         }
         update_responder(
@@ -668,15 +846,7 @@ fn session_thread(ctx: SessionThread) {
         }
     }
 
-    let exit_code = match child.wait() {
-        Ok(status) => status
-            .code()
-            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
-        Err(e) => {
-            eprintln!("calyx-sessiond: waitpid failed for {id}: {e}");
-            -1
-        }
-    };
+    let exit_code = child.reap(&id);
 
     if mine {
         let mut state = shared.lock_state();
@@ -700,6 +870,13 @@ fn session_thread(ctx: SessionThread) {
                 clients.retain(|client| client.conn_id != conn_id);
             }
             SessionRequest::Resize { .. } | SessionRequest::Pump => {}
+            SessionRequest::PauseForHandoff { reply } => {
+                // Exit raced the handoff attempt: report it so the
+                // offerer fails the whole attempt (and resumes the
+                // sessions that did pause) instead of waiting out its
+                // reply timeout.
+                let _ = reply.send(Err(format!("session {id:?} exited during handoff pause")));
+            }
         }
     }
 

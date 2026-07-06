@@ -9,6 +9,7 @@ pub mod ls;
 pub mod meta;
 pub mod new;
 pub mod remote_install;
+pub mod upgrade;
 
 use std::fmt;
 use std::path::{Path, PathBuf};

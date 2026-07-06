@@ -181,6 +181,17 @@ impl HistoryWriter {
     }
 }
 
+/// Whether any history is persisted on disk for `id` (either
+/// generation). Live Handoff adoption (`crate::handoff::adopt_session`)
+/// uses this as the session's creation-time history flag made durable:
+/// a session that was persisting under the previous daemon generation
+/// keeps persisting (the writer appends to the surviving file), one
+/// that was not stays off, regardless of the receiving daemon's own
+/// daemon-wide default.
+pub(crate) fn has_persisted(state_dir: &Path, id: &str) -> bool {
+    active_path(state_dir, id).exists() || rotated_path(state_dir, id).exists()
+}
+
 /// Reads back whatever history is currently persisted on disk for
 /// `id`: `None` if neither `<id>.raw` nor `<id>.raw.1` exists, else the
 /// rotated file's bytes (oldest) followed by the active file's bytes

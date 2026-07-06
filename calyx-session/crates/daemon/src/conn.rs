@@ -2,6 +2,7 @@
 //! `ControlMsg`s and `Input` frames, paired with a writer thread
 //! draining this client's `OutQueue`.
 
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -15,7 +16,7 @@ use proto::{
 
 use proto::SessionState;
 
-use crate::outq::{writer_loop, OutQueue};
+use crate::outq::{lock_unpoisoned, writer_loop, OutQueue};
 use crate::session::{spawn_session, SessionRequest};
 use crate::state::Shared;
 
@@ -253,6 +254,7 @@ impl Conn {
                 let enabled = self.shared.history_enabled.load(Ordering::SeqCst);
                 self.reply(&ControlMsg::HistoryEnabled { enabled })
             }
+            ControlMsg::PrepareHandoff => self.prepare_handoff(),
             // Server-to-client messages arriving from a client are a
             // protocol violation.
             ControlMsg::HelloOk { .. }
@@ -265,9 +267,92 @@ impl Conn {
             | ControlMsg::MetaOk { .. }
             | ControlMsg::SetHistoryEnabledOk { .. }
             | ControlMsg::HistoryEnabled { .. }
+            | ControlMsg::PrepareHandoffOk { .. }
             | ControlMsg::Event(_)
             | ControlMsg::Err { .. } => false,
         }
+    }
+
+    /// Live Handoff trigger (EXPERIMENTAL; see `crate::handoff`): binds
+    /// the dedicated handoff endpoint, replies with its path, and hands
+    /// the rest of the attempt (single bounded accept, offer, exit or
+    /// resume) to a dedicated host thread so this connection's reader
+    /// stays responsive. Single-flight via `Shared::handoff_in_progress`.
+    fn prepare_handoff(&mut self) -> bool {
+        if self.shared.handoff_in_progress.swap(true, Ordering::SeqCst) {
+            return self.reply(&ControlMsg::Err {
+                code: "handoff-in-progress".to_string(),
+                msg: "another handoff attempt is already pending".to_string(),
+            });
+        }
+        let refuse = |conn: &Conn, code: &str, msg: String| -> bool {
+            conn.shared
+                .handoff_in_progress
+                .store(false, Ordering::SeqCst);
+            conn.reply(&ControlMsg::Err {
+                code: code.to_string(),
+                msg,
+            })
+        };
+
+        let runtime_dir = {
+            let env = lock_unpoisoned(&self.shared.handoff_env);
+            env.as_ref().map(|env| env.runtime_dir.clone())
+        };
+        let Some(runtime_dir) = runtime_dir else {
+            return refuse(
+                self,
+                "handoff-unavailable",
+                "this daemon has no serving listener to hand off".to_string(),
+            );
+        };
+
+        let socket_path = runtime_dir.join(crate::HANDOFF_SOCKET_FILE);
+        // A stale endpoint can only be a crashed earlier attempt: the
+        // in-progress latch above serializes live ones.
+        match std::fs::remove_file(&socket_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return refuse(
+                    self,
+                    "handoff-bind-failed",
+                    format!("removing stale handoff socket failed: {e}"),
+                );
+            }
+        }
+        let listener = match std::os::unix::net::UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(e) => {
+                return refuse(
+                    self,
+                    "handoff-bind-failed",
+                    format!("binding {} failed: {e}", socket_path.display()),
+                );
+            }
+        };
+        // Same private mode as the control socket; the uid check at
+        // accept time is the real gate, this narrows the surface.
+        if let Err(e) =
+            std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600))
+        {
+            let _ = std::fs::remove_file(&socket_path);
+            return refuse(
+                self,
+                "handoff-bind-failed",
+                format!("chmod on handoff socket failed: {e}"),
+            );
+        }
+
+        // Reply before spawning the host so the Ok frame is queued
+        // ahead of any handoff-failed report (per-client FIFO).
+        let ok = self.reply(&ControlMsg::PrepareHandoffOk {
+            path: socket_path.display().to_string(),
+        });
+        let shared = Arc::clone(&self.shared);
+        let queue = Arc::clone(&self.queue);
+        thread::spawn(move || crate::handoff::host_handoff(shared, listener, socket_path, queue));
+        ok
     }
 
     fn attach(&mut self, id: String, create: Option<SessionSpec>, cols: u16, rows: u16) -> bool {

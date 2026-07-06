@@ -9,6 +9,8 @@ proto = { path = "../proto" }
 vt = { path = "../vt" }
 nix = { workspace = true }
 libc = { workspace = true }
+serde = { workspace = true }
+ciborium = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]

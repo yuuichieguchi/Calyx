@@ -31,6 +31,26 @@ pub(crate) struct Shared {
     /// `persist_ledger`. `None` once `shutdown_persister` ran.
     persist_tx: Mutex<Option<mpsc::Sender<Vec<SessionInfo>>>>,
     persister: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Live Handoff (EXPERIMENTAL, see `crate::handoff`): what
+    /// `ControlMsg::PrepareHandoff` needs from the serving entry point
+    /// (`crate::install_handoff_env`). `None` outside a served daemon
+    /// (unit tests, library embedding), which makes a handoff request
+    /// refuse cleanly instead of guessing paths.
+    pub(crate) handoff_env: Mutex<Option<HandoffEnv>>,
+    /// Single-flight latch for handoff attempts: `PrepareHandoff`
+    /// refuses while an earlier attempt is still pending.
+    pub(crate) handoff_in_progress: AtomicBool,
+}
+
+/// See `Shared::handoff_env`.
+pub(crate) struct HandoffEnv {
+    /// `DaemonConfig::runtime_dir`: where the dedicated handoff socket
+    /// gets bound.
+    pub(crate) runtime_dir: PathBuf,
+    /// A dup of the serving control listener, passed to the next
+    /// daemon generation so accepting never stops across a handoff
+    /// (no unbind/rebind gap; `crate::handoff`'s module doc).
+    pub(crate) listener: OwnedFd,
 }
 
 impl Shared {
@@ -83,6 +103,8 @@ impl Shared {
             history_enabled: AtomicBool::new(history_enabled),
             persist_tx: Mutex::new(Some(persist_tx)),
             persister: Mutex::new(Some(persister)),
+            handoff_env: Mutex::new(None),
+            handoff_in_progress: AtomicBool::new(false),
         }
     }
 

@@ -43,6 +43,13 @@ pub enum Command {
     /// Deploy the session daemon (and, optionally, the ghostty terminfo
     /// entry) to a remote host over ssh.
     RemoteInstall(RemoteInstallArgs),
+    /// (EXPERIMENTAL) Migrate the running daemon to a new daemon binary
+    /// without killing any session: PTY master fds and the listening
+    /// socket are handed off via SCM_RIGHTS. See `daemon::handoff`'s
+    /// module doc for the full contract and its known limitations
+    /// (notably: an adopted session's exit code cannot be a real
+    /// `waitpid` status).
+    Upgrade(UpgradeArgs),
 }
 
 #[derive(Args, Debug)]
@@ -58,6 +65,12 @@ pub struct DaemonArgs {
     /// `history` subcommand that sends `ControlMsg::SetHistoryEnabled`.
     #[arg(long)]
     pub persist_history: bool,
+    /// (EXPERIMENTAL, internal) Run as a Live Handoff receiver:
+    /// connect to PATH (a preparing daemon's handoff endpoint), adopt
+    /// its sessions and control listener, then serve in its place.
+    /// Spawned by `calyx-session upgrade`; not meant for direct use.
+    #[arg(long, value_name = "PATH")]
+    pub handoff_connect: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -170,9 +183,76 @@ pub struct RemoteInstallArgs {
     pub terminfo: Option<PathBuf>,
 }
 
+#[derive(Args, Debug)]
+pub struct UpgradeArgs {
+    /// Path to the new daemon binary to hand sessions off to (default:
+    /// this CLI's own executable path, i.e. upgrading in place to
+    /// whatever `calyx-session` binary is currently installed).
+    #[arg(long)]
+    pub binary: Option<PathBuf>,
+}
+
 fn parse_kv(s: &str) -> Result<(String, String), String> {
     match s.split_once('=') {
         Some((k, v)) => Ok((k.to_string(), v.to_string())),
         None => Err(format!("expected key=value, got `{s}`")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    /// R6 (P6 RED3): `upgrade` parses with no flags, defaulting
+    /// `binary` to `None` (resolved by `commands::upgrade::run` to
+    /// `std::env::current_exe()`).
+    #[test]
+    fn upgrade_parses_with_default_binary_none() {
+        let cli = Cli::try_parse_from(["calyx-session", "upgrade"])
+            .expect("upgrade should parse with no flags");
+        match cli.command {
+            Command::Upgrade(args) => assert_eq!(args.binary, None),
+            other => panic!("expected Command::Upgrade, got {other:?}"),
+        }
+    }
+
+    /// R6: `upgrade --binary <path>` overrides the default.
+    #[test]
+    fn upgrade_parses_an_explicit_binary_path() {
+        let cli = Cli::try_parse_from([
+            "calyx-session",
+            "upgrade",
+            "--binary",
+            "/tmp/new-calyx-session",
+        ])
+        .expect("upgrade --binary should parse");
+        match cli.command {
+            Command::Upgrade(args) => {
+                assert_eq!(args.binary, Some(PathBuf::from("/tmp/new-calyx-session")));
+            }
+            other => panic!("expected Command::Upgrade, got {other:?}"),
+        }
+    }
+
+    /// R6: the `upgrade` subcommand's help text calls out that the
+    /// feature is experimental, so a user invoking it (or reading
+    /// `calyx-session help`) is not surprised by its known limitations
+    /// (see `daemon::handoff`'s module doc).
+    #[test]
+    fn upgrade_subcommand_help_is_marked_experimental() {
+        let cmd = Cli::command();
+        let upgrade = cmd
+            .find_subcommand("upgrade")
+            .expect("upgrade subcommand should be registered");
+        let about = upgrade
+            .get_about()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        assert!(
+            about.to_uppercase().contains("EXPERIMENTAL"),
+            "upgrade's help text should call out that it is experimental, got: {about:?}"
+        );
     }
 }
