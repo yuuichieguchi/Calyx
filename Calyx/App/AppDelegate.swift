@@ -573,6 +573,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let placeholderLeafID = UUID()
         let tab = Tab(
+            title: SessionTabTitle.fromCwd(cwd, home: NSHomeDirectory()),
             pwd: cwd,
             splitTree: SplitTree(leafID: placeholderLeafID),
             sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID, host: host)]
@@ -730,6 +731,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    #if DEBUG
+    /// Test seam (attached-tab placeholder title RED phase): mirrors
+    /// `_attachWindowPlaceholderTabObserverForTesting` exactly -- same
+    /// "new, narrow, DEBUG-gated, nil-by-default, purely additive"
+    /// shape, just for `attachSessionAsNewTab`'s placeholder `Tab`
+    /// instead of `attachWindow`'s. `attachSessionAsNewTab` is private
+    /// and has no other seam that observes the placeholder tab it
+    /// constructs before wiring it into `target`, so without this,
+    /// nothing in this file's `.attachAsTab` path could pin the tab's
+    /// initial `title`/`pwd`. `nil` (the default) leaves production
+    /// behavior unchanged; every existing test reaching this method
+    /// (e.g. `AppDelegateAttachSessionAsTabTests`'s `.attachAsTab` row)
+    /// is unaffected. DO NOT use from production code.
+    var _attachSessionAsNewTabPlaceholderTabObserverForTesting: ((Tab) -> Void)?
+    #endif
+
     /// `.attachAsTab`'s real work: reuses `restoreTabSurfaces`/
     /// `fallbackCreateSurface` -- the same machinery `attachWindow` uses
     /// to reattach `sessionID` to a placeholder leaf -- but wires the
@@ -747,10 +764,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let placeholderLeafID = UUID()
         let tab = Tab(
+            title: SessionTabTitle.fromCwd(cwd, home: NSHomeDirectory()),
             pwd: cwd,
             splitTree: SplitTree(leafID: placeholderLeafID),
             sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID, host: host)]
         )
+
+        #if DEBUG
+        _attachSessionAsNewTabPlaceholderTabObserverForTesting?(tab)
+        #endif
 
         fetchSessionsForAgentResume()
         let restored = restoreTabSurfaces(tab: tab, app: app, window: window)

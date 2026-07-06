@@ -20,7 +20,7 @@ class SettingsWindowController: NSWindowController {
     private let agentResumeAutoExecuteSwitch = NSSwitch()
     private let historyPersistenceSwitch = NSSwitch()
 
-    private let tabViewController = NSTabViewController()
+    private let tabViewController = SettingsTabViewController()
 
     /// Fixed width for every pane so switching tabs only ever changes the
     /// window's height, matching standard macOS Settings behavior.
@@ -34,7 +34,6 @@ class SettingsWindowController: NSWindowController {
             backing: .buffered,
             defer: false
         )
-        window.title = "Settings"
         window.center()
         window.isReleasedWhenClosed = false
 
@@ -48,6 +47,13 @@ class SettingsWindowController: NSWindowController {
 
     private func setupContent() {
         tabViewController.tabStyle = .toolbar
+        // Standard macOS Settings behavior: the window's title tracks the
+        // selected pane, so mirror NSTabViewController's own selection
+        // callback into the window's title bar.
+        tabViewController.onTabSelectionChange = { [weak self] tabViewItem in
+            guard let title = tabViewItem?.label else { return }
+            self?.window?.title = title
+        }
 
         for pane in SettingsPane.allCases {
             let paneViewController = SettingsPaneContentViewController(
@@ -57,10 +63,12 @@ class SettingsWindowController: NSWindowController {
             )
             let tabItem = NSTabViewItem(viewController: paneViewController)
             tabItem.label = pane.title
+            tabItem.image = NSImage(systemSymbolName: pane.icon, accessibilityDescription: pane.title)
             tabViewController.addTabViewItem(tabItem)
         }
 
         window?.contentViewController = tabViewController
+        window?.title = SettingsPane.allCases.first?.title ?? "Settings"
 
         loadPresetIntoUI()
     }
@@ -530,6 +538,21 @@ private final class GhosttyConfigHelpViewController: NSViewController {
             root.widthAnchor.constraint(equalToConstant: 360),
         ])
         self.view = container
+    }
+}
+
+/// Exposes NSTabViewController's own NSTabViewDelegate callback
+/// (`tabView(_:didSelect:)`, the override point NSTabViewController
+/// documents for subclasses reacting to selection changes) as a plain
+/// closure, so SettingsWindowController can update the window's title
+/// without itself subclassing NSTabViewController.
+@MainActor
+private final class SettingsTabViewController: NSTabViewController {
+    var onTabSelectionChange: ((NSTabViewItem?) -> Void)?
+
+    override func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        super.tabView(tabView, didSelect: tabViewItem)
+        onTabSelectionChange?(tabViewItem)
     }
 }
 

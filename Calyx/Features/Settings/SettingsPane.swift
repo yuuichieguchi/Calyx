@@ -20,4 +20,15 @@ enum SettingsPane: CaseIterable {
         case .lsp: return "LSP"
         }
     }
+
+    /// SF Symbol name for this pane's toolbar tab item. The toolbar-style
+    /// NSTabViewController renders a tab item with no image as a
+    /// degenerate fat header instead of a proper toolbar button.
+    var icon: String {
+        switch self {
+        case .appearance: return "paintbrush"
+        case .sessions: return "terminal"
+        case .lsp: return "gearshape.2"
+        }
+    }
 }

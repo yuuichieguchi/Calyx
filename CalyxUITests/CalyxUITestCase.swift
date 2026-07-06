@@ -91,4 +91,25 @@ class CalyxUITestCase: XCTestCase {
             .matching(predicate)
             .count
     }
+
+    /// Fixed scratch directory the team lead reads screenshots from by
+    /// hand after a run -- NOT a general-purpose artifact location, so
+    /// don't add unrelated files here.
+    static let uiShotDir =
+        "/private/tmp/claude-501/-Users-eguchiyuuichi-projects-Calyx/89de745c-6981-4a74-a046-7082604214ca/scratchpad/ui-shots"
+
+    /// Saves a full-screen `XCUIScreen` screenshot (not a single
+    /// element's, so window chrome/toolbar icons are visible exactly as
+    /// a human eyeballing the result would see them) as `<name>.png`
+    /// under `uiShotDir`. Best-effort: a write failure here must not
+    /// fail the calling test, since the screenshot itself isn't part of
+    /// what the test is asserting.
+    @discardableResult
+    func saveScreenshot(name: String) -> String {
+        try? FileManager.default.createDirectory(atPath: Self.uiShotDir, withIntermediateDirectories: true)
+        let path = "\(Self.uiShotDir)/\(name).png"
+        let screenshot = XCUIScreen.main.screenshot()
+        try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: path))
+        return path
+    }
 }

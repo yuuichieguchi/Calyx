@@ -30,8 +30,21 @@
 //  PANE ORDER: Appearance, Sessions, LSP -- the order the user's own
 //  restructure request listed them in.
 //
+//  ICON COVERAGE (round-2 Red phase, user-reported defect): the Settings
+//  toolbar's tabStyle (.toolbar, SettingsWindowController.setupContent())
+//  renders a degenerate fat header with sunk text when a tab item has no
+//  icon -- NSTabViewController's toolbar style expects one. SettingsPane
+//  gains an `icon` (SF Symbol name) below, a held-out compile-RED
+//  addition (SettingsPane already exists, but `.icon` does not yet):
+//  the whole CalyxTests target fails to build until the Green phase adds
+//  it, exactly like this file's original SettingsPane/SettingsRow
+//  compile-RED (see header above). The NSTabViewItem.image/window-title
+//  wiring itself is not covered here (see AppDelegateAttachPlaceholderTitleTests's
+//  sibling investigation note and this cycle's handoff for why).
+//
 
 import XCTest
+import AppKit
 @testable import Calyx
 
 final class SettingsPaneTests: XCTestCase {
@@ -88,5 +101,24 @@ final class SettingsPaneTests: XCTestCase {
         XCTAssertEqual(SettingsRow.allCases.count, Self.expectedRows.count,
                        "SettingsRow gained or lost a case without updating this pin's " +
                        "expectedRows -- update it deliberately, not by coincidence")
+    }
+
+    // MARK: - Pane icons (toolbar tabStyle requires one per tab item)
+
+    func test_settingsPane_iconSymbolNames() {
+        XCTAssertEqual(SettingsPane.appearance.icon, "paintbrush")
+        XCTAssertEqual(SettingsPane.sessions.icon, "terminal")
+        XCTAssertEqual(SettingsPane.lsp.icon, "gearshape.2")
+    }
+
+    func test_settingsPane_icon_resolvesToARealSFSymbolOnThisDeploymentTarget() {
+        for pane in SettingsPane.allCases {
+            let image = NSImage(systemSymbolName: pane.icon, accessibilityDescription: nil)
+            XCTAssertNotNil(
+                image,
+                "SF Symbol \"\(pane.icon)\" for \(pane) must resolve to a real NSImage on this " +
+                "deployment target, or the toolbar tab item ends up with no icon again"
+            )
+        }
     }
 }
