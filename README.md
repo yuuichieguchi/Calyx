@@ -13,7 +13,10 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **Tab Groups** -- 10 color presets, collapsible/expandable sections with chevron toggle, double-click to rename groups or individual tabs, drag-to-reorder tabs in tab bar and sidebar
 - **Split Panes** -- horizontal and vertical splits with directional focus navigation
 - **Command Palette** -- search and execute all operations with `Cmd+Shift+P`
-- **Session Persistence** -- tabs, splits, and working directories auto-saved and restored on restart
+- **Layout Restore** -- tabs, splits, and working directories auto-saved and restored on restart
+- **Persistent Sessions** -- opt-in daemon-backed sessions (`calyx-session`) that survive quit and crash; reattach from the Session Browser (`Cmd+Shift+B`); a recovery bar offers the preserved session when auto-restore is skipped or fails; opt-in on-disk history
+- **Remote Sessions** -- persistent sessions on SSH hosts picked from `~/.ssh/config`; one-time daemon deploy via `calyx-session remote-install <host>`
+- **Agent Resume** -- reattached sessions can offer to resume the agent CLI conversation that was running (Settings -> Sessions)
 - **Desktop Notifications** -- OSC 9/99/777 support with rate limiting
 - **Browser Integration** -- WKWebView tabs alongside terminal tabs (http/https only, non-persistent storage, popup blocking)
 - **Scrollback Search** -- `Cmd+F` to search terminal scrollback with match highlighting, `Cmd+G`/`Cmd+Shift+G` to navigate matches
@@ -85,6 +88,7 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 |---|---|
 | `Cmd+Shift+P` | Command palette |
 | `Cmd+Shift+E` | Toggle compose overlay |
+| `Cmd+Shift+B` | Session Browser |
 
 ### Compose Overlay
 
@@ -116,7 +120,7 @@ Calyx can expose language server features to CLI AI agents through the same MCP 
 
 1. Open the command palette (`Cmd+Shift+P`) and run **Enable AI Agent IPC**.
 2. Restart or reconnect your AI agent so it picks up the `calyx-ipc` MCP server.
-3. Optional: open Settings -> **LSP Proxy** and enable auto-install for missing language servers.
+3. Optional: open Settings -> **LSP** and enable auto-install for missing language servers.
 
 Calyx keeps language servers running in the background, syncs file changes from disk, and starts the right server on the first `lsp_*` call for a workspace.
 
