@@ -145,34 +145,17 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         })
     }
 
-    /// Opens the session browser via the command palette's "Session
-    /// Browser…" command (`CalyxWindowController.swift`'s
-    /// `commandRegistry.register(PaletteCommand(id: "session.attach"
-    /// ...))`, ungated -- unlike "New Remote Session…" it has no
-    /// `isAvailable` closure, so it doesn't require
-    /// `persistentSessionsEnabled` to be reachable, though this suite
-    /// enables that setting anyway since the scenario itself needs
-    /// persistent sessions). Filtering on a substring of the title
-    /// (not the full "Session Browser…" including its ellipsis) mirrors
-    /// `CommandPaletteUITests.test_executeCommand`'s own "New Tab"
-    /// pattern. NOTE: this command was titled "Attach Session…" when
-    /// this suite was first written; it was renamed to "Session
-    /// Browser…" by the same production fix that made attach land as a
-    /// tab (commit 2bf60b307, "the palette command formerly titled
-    /// Attach Session... is now Session Browser... -- it only ever
-    /// opened the browser; the old name read as attach-this-tab") --
-    /// field-verified this rename broke this exact lookup (a run against
-    /// that commit failed here with the "Sessions" window never
-    /// appearing) before this string was updated to match.
-    private func openSessionBrowserViaPalette() {
-        openCommandPaletteViaMenu()
-        let searchField = app.descendants(matching: .any)
-            .matching(identifier: "calyx.commandPalette.searchField")
-            .firstMatch
-        XCTAssertTrue(waitFor(searchField), "Command palette search field did not appear.")
-        searchField.typeText("Session Browser")
-        Thread.sleep(forTimeInterval: 0.3)
-        searchField.typeKey(.enter, modifierFlags: [])
+    /// Opens the session browser via the View menu's "Session Browser"
+    /// item (added in the same UX round as the attach-as-tab fix). This
+    /// deliberately does NOT go through the command palette: the plain
+    /// command-palette UI tests are pre-existing bit-rot (they fail the
+    /// same way at yesterday's baseline, independent of the session
+    /// work), so routing through the palette here would couple this
+    /// suite to that unrelated breakage. The menu item is the direct,
+    /// user-facing entry point this round added and is what we want to
+    /// exercise anyway.
+    private func openSessionBrowserViaMenu() {
+        menuAction("View", item: "Session Browser")
     }
 
     /// Full Attach/Kill round trip: session A (the initial window's
@@ -330,7 +313,7 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
             "real to reflect. Row: \(sessionBRow)"
         )
 
-        openSessionBrowserViaPalette()
+        openSessionBrowserViaMenu()
         let browserWindow = app.windows["Sessions"]
         XCTAssertTrue(waitFor(browserWindow, timeout: 10), "Session browser window (\"Sessions\") did not open.")
 
@@ -469,7 +452,7 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         // upcoming click lands on the browser's row, not on the tab bar
         // of the window attaching B just added a tab to (same screen
         // position).
-        openSessionBrowserViaPalette()
+        openSessionBrowserViaMenu()
         XCTAssertTrue(waitFor(browserWindow, timeout: 10), "Session browser window did not stay open/re-raise after attaching B.")
 
         // Kill A: a currently-attached (not just Running) session,
