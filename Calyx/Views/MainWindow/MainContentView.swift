@@ -15,6 +15,12 @@ struct MainContentView: View {
     var activeDiffState: DiffLoadState?
     var activeDiffSource: DiffSource?
     var activeDiffReviewStore: DiffReviewStore?
+    /// Chrome-style in-app recovery bar (RecoveryBarModel.swift), shown
+    /// above the tab bar/pane content as the first child of `body`'s own
+    /// top-level `VStack`. `nil` (no existing caller besides
+    /// CalyxWindowController) simply shows no bar, same as
+    /// `hasPreservedSessionSnapshot == false`.
+    var recoveryBarModel: RecoveryBarModel?
 
     @Binding var sidebarMode: SidebarMode
     var gitChangesState: GitChangesState = .notLoaded
@@ -68,11 +74,20 @@ struct MainContentView: View {
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            if let recoveryBarModel, recoveryBarModel.showRecoveryBar {
+                RecoveryBarView(model: recoveryBarModel)
+            }
+            mainContent
+        }
+    }
+
+    private var mainContent: some View {
         let activeGroup = windowSession.activeGroup
         let activeTabs = activeGroup?.tabs ?? []
         let activeTabID = activeGroup?.activeTabID
 
-        GlassEffectContainer {
+        return GlassEffectContainer {
             HStack(spacing: 0) {
                 if windowSession.showSidebar {
                     SidebarContentView(

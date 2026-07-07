@@ -15,10 +15,6 @@ class SettingsWindowController: NSWindowController {
     private let presetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let colorWell = NSColorWell()
     private let hexField = NSTextField()
-    private let persistentSessionsSwitch = NSSwitch()
-    private let agentResumeSwitch = NSSwitch()
-    private let agentResumeAutoExecuteSwitch = NSSwitch()
-    private let historyPersistenceSwitch = NSSwitch()
 
     private let tabViewController = SettingsTabViewController()
 
@@ -152,13 +148,13 @@ class SettingsWindowController: NSWindowController {
         case .lspRequireConfirmation:
             return lspRequireConfirmationRow()
         case .persistentSessions:
-            return controlRow(label: "Enable persistent sessions", control: persistentSessionsSwitch)
+            return persistentSessionsRow()
         case .historyPersistence:
-            return controlRow(label: "Persist session history to disk", control: historyPersistenceSwitch)
+            return historyPersistenceRow()
         case .agentResume:
-            return controlRow(label: "Offer to resume agent CLI conversations", control: agentResumeSwitch)
+            return agentResumeRow()
         case .agentResumeAutoExecute:
-            return controlRow(label: "Auto-execute resume (skip confirmation)", control: agentResumeAutoExecuteSwitch)
+            return agentResumeAutoExecuteRow()
         case .openSessionBrowserButton:
             return sessionBrowserButtonRow()
         case .openConfigFileFooter:
@@ -231,6 +227,60 @@ class SettingsWindowController: NSWindowController {
         requireConfirmSwitch.target = self
         requireConfirmSwitch.action = #selector(lspRequireConfirmationDidChange(_:))
         return controlRow(label: "Confirm before each install step", control: requireConfirmSwitch)
+    }
+
+    /// Pure mapping from a Sessions-pane toggle row to the SessionSettings
+    /// value it must seed its initial `.state` from. Extracted as its own
+    /// function (rather than reading SessionSettings directly inline in
+    /// each row builder) because SettingsWindowController.shared's
+    /// one-shot, process-lifetime construction makes the seeding behavior
+    /// unobservable through the real singleton in a test -- this has none
+    /// of that lifetime, so a test can set SessionSettings directly and
+    /// call it standalone.
+    static func sessionToggleInitialState(for row: SettingsRow) -> Bool {
+        switch row {
+        case .persistentSessions: return SessionSettings.persistentSessionsEnabled
+        case .historyPersistence: return SessionSettings.historyPersistenceEnabled
+        case .agentResume: return SessionSettings.agentResumeEnabled
+        case .agentResumeAutoExecute: return SessionSettings.agentResumeAutoExecute
+        default: return false
+        }
+    }
+
+    private func persistentSessionsRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.persistentSessionsSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .persistentSessions) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(persistentSessionsDidChange(_:))
+        return controlRow(label: "Enable persistent sessions", control: toggleSwitch)
+    }
+
+    private func historyPersistenceRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.historyPersistenceSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .historyPersistence) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(historyPersistenceDidChange(_:))
+        return controlRow(label: "Persist session history to disk", control: toggleSwitch)
+    }
+
+    private func agentResumeRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.agentResumeSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .agentResume) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(agentResumeDidChange(_:))
+        return controlRow(label: "Offer to resume agent CLI conversations", control: toggleSwitch)
+    }
+
+    private func agentResumeAutoExecuteRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.agentResumeAutoExecuteSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .agentResumeAutoExecute) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(agentResumeAutoExecuteDidChange(_:))
+        return controlRow(label: "Auto-execute resume (skip confirmation)", control: toggleSwitch)
     }
 
     private func sessionBrowserButtonRow() -> NSView {

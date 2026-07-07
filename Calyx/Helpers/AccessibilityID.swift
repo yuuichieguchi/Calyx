@@ -68,6 +68,19 @@ enum AccessibilityID {
         static func fileEntry(_ path: String) -> String { "calyx.git.file.\(path)" }
         static func commitRow(_ hash: String) -> String { "calyx.git.commit.\(hash)" }
     }
+    /// Sessions pane of the Settings window
+    /// (Calyx/Features/Settings/SettingsWindowController.swift). Applied
+    /// to the four toggle NSSwitch controls so an XCUITest suite can
+    /// locate a specific switch by a stable identifier instead of an
+    /// ordinal position (`app.switches.firstMatch`), which silently
+    /// breaks the moment a row is reordered or another switch is added
+    /// above it.
+    enum Settings {
+        static let persistentSessionsSwitch = "calyx.settings.sessions.persistentSessionsSwitch"
+        static let historyPersistenceSwitch = "calyx.settings.sessions.historyPersistenceSwitch"
+        static let agentResumeSwitch = "calyx.settings.sessions.agentResumeSwitch"
+        static let agentResumeAutoExecuteSwitch = "calyx.settings.sessions.agentResumeAutoExecuteSwitch"
+    }
     enum SessionBrowser {
         static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }
         static func attachButton(_ id: String) -> String { "calyx.sessionBrowser.row.\(id).attachButton" }
@@ -75,6 +88,19 @@ enum AccessibilityID {
         static func remoteHostRow(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host)" }
         static func remoteHostAttachButton(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host).attachButton" }
         static func remoteHostInstallButton(_ host: String) -> String { "calyx.sessionBrowser.remoteHost.\(host).installButton" }
+    }
+    /// Chrome-style in-app "your previous session was preserved" bar,
+    /// shown at the top of a window when AppDelegate
+    /// .hasPreservedSessionSnapshot is true (see RecoveryBarModel,
+    /// Calyx/Features/Persistence/). Deliberately `calyx.recoveryBar.*`
+    /// (a container + two per-window action buttons), not the bare
+    /// `calyx.recoveryBar` some other single-container enums here use
+    /// (e.g. Sidebar.container == "calyx.sidebar"), since this bar's own
+    /// two buttons need distinguishable identifiers alongside it.
+    enum RecoveryBar {
+        static let container = "calyx.recoveryBar.container"
+        static let restoreButton = "calyx.recoveryBar.restoreButton"
+        static let dismissButton = "calyx.recoveryBar.dismissButton"
     }
     enum Diff {
         static let container = "calyx.diff"

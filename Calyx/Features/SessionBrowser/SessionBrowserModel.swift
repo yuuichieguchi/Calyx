@@ -166,9 +166,27 @@ final class SessionBrowserModel {
     }
 
     /// Populates `remoteHostCandidates` from the injected
-    /// `hostCandidateProvider`.
+    /// `hostCandidateProvider`. Gated on
+    /// `SessionSettings.persistentSessionsEnabled`: `SessionSpawnPlanner
+    /// .plan(for:)` silently downgrades a host-carrying spawn to a local
+    /// `.passthrough` while that flag is off, so offering a remote host to
+    /// attach to here would be a silent lie about what "Attach" is about
+    /// to do. Leaves `remoteHostCandidates` untouched (not cleared) while
+    /// the flag is off -- `showRemoteHostsSection` is what actually hides
+    /// the section, independent of whatever this array holds.
     func refreshRemoteHostCandidates() {
+        guard SessionSettings.persistentSessionsEnabled else { return }
         remoteHostCandidates = hostCandidateProvider.hostCandidates()
+    }
+
+    /// Whether the Remote Hosts section should render at all. Reads
+    /// `SessionSettings.persistentSessionsEnabled` live (not a cached
+    /// snapshot), so flipping the setting off hides the section
+    /// immediately, even if `remoteHostCandidates` still holds a stale
+    /// non-empty list from an earlier refresh taken while the setting was
+    /// on.
+    var showRemoteHostsSection: Bool {
+        SessionSettings.persistentSessionsEnabled && !remoteHostCandidates.isEmpty
     }
 
     /// Requests spawning a new remote session against `host`.
@@ -176,10 +194,41 @@ final class SessionBrowserModel {
         onRemoteSessionRequested?(SessionSpawnContext(host: host, origin: .tab))
     }
 
+    /// Per-host install status for the Remote Hosts row's Install button
+    /// (`installStatus(forHost:)`), mirroring `isRefreshing`'s existing
+    /// in-flight-flag precedent but keyed per host, since different
+    /// hosts' installs are independent of each other.
+    enum RemoteInstallStatus: Equatable, Sendable {
+        case idle
+        case installing
+        case succeeded
+        /// The failing `CommandResult`'s stderr; `nil` when
+        /// `installRemote(host:)` itself returned `nil`.
+        case failed(String?)
+    }
+
+    private(set) var remoteInstallStatuses: [String: RemoteInstallStatus] = [:]
+
+    /// A host with no install attempted yet reports `.idle`.
+    func installStatus(forHost host: String) -> RemoteInstallStatus {
+        remoteInstallStatuses[host] ?? .idle
+    }
+
     /// Deploys the daemon to `host` via the injected `daemonClient`'s
     /// own `installRemote(host:)`, returning its result -- mirrors
-    /// `kill(_:)`'s existing injectable-client pattern.
+    /// `kill(_:)`'s existing injectable-client pattern. Also drives
+    /// `installStatus(forHost:)` around that same call: `.installing`
+    /// while the daemon round-trip is in flight, then `.succeeded` or
+    /// `.failed` once it resolves. Return value/signature unchanged --
+    /// this only adds a status side effect.
     func installRemote(host: String) async -> CommandResult? {
-        await daemonClient.installRemote(host: host)
+        remoteInstallStatuses[host] = .installing
+        let result = await daemonClient.installRemote(host: host)
+        if let result, result.exitCode == 0 {
+            remoteInstallStatuses[host] = .succeeded
+        } else {
+            remoteInstallStatuses[host] = .failed(result?.stderr)
+        }
+        return result
     }
 }

@@ -52,6 +52,21 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// codebase favors over driving real UI. No other production code
     /// outside this file reads it.
     let commandRegistry = CommandRegistry()
+    /// Chrome-style in-app recovery bar's per-window view-model
+    /// (RecoveryBarModel.swift). Seeded from AppDelegate's CURRENT
+    /// `hasPreservedSessionSnapshot` at construction time -- mirrors
+    /// `session.recoverPreviousSession`'s own
+    /// `(NSApp.delegate as? AppDelegate)?.hasPreservedSessionSnapshot`
+    /// read above, so no window-controller construction call site in
+    /// AppDelegate.swift needs to thread a seeded model through. Any
+    /// later change (the async flag resolving, or a recovery attempt)
+    /// is broadcast into this instance via
+    /// `updateHasPreservedSessionSnapshot(_:)` -- see AppDelegate's
+    /// `broadcastHasPreservedSessionSnapshotToRecoveryBars()`.
+    let recoveryBarModel = RecoveryBarModel(
+        hasPreservedSessionSnapshot: (NSApp.delegate as? AppDelegate)?.hasPreservedSessionSnapshot ?? false,
+        onRestore: { (NSApp.delegate as? AppDelegate)?.recoverPreservedSession() }
+    )
     private var closingTabIDs: Set<UUID> = []
     #if DEBUG
     /// Test seam (P4 round-4 fix RED phase): read-only observability
@@ -1027,6 +1042,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             activeDiffState: activeDiffState,
             activeDiffSource: activeDiffSource,
             activeDiffReviewStore: activeDiffReviewStore,
+            recoveryBarModel: recoveryBarModel,
             sidebarMode: Binding(
                 get: { [weak self] in self?.windowSession.sidebarMode ?? .tabs },
                 set: { [weak self] in
@@ -1094,6 +1110,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     private func refreshHostingView() {
         hostingView?.rootView = buildMainContentView()
+    }
+
+    /// Called by `AppDelegate.broadcastHasPreservedSessionSnapshotToRecoveryBars()`
+    /// immediately after `recoveryBarModel.updateHasPreservedSessionSnapshot(_:)`,
+    /// mirroring `toggleComposeOverlay()`'s/`dismissComposeOverlay()`'s own
+    /// "mutate observable state, then explicitly refresh" pattern (this
+    /// codebase's established convention -- `NSHostingView` is not relied
+    /// on to pick up an external `@Observable` change on its own). Not
+    /// `private`: called from AppDelegate.swift, a different file.
+    func refreshRecoveryBar() {
+        refreshHostingView()
     }
 
     private func recreateHostingView() {

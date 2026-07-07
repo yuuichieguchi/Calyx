@@ -15,7 +15,7 @@ struct SessionBrowserView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if !model.remoteHostCandidates.isEmpty {
+            if model.showRemoteHostsSection {
                 remoteHostsSection
             }
             Group {
@@ -90,6 +90,22 @@ private struct RemoteHostRowView: View {
     let host: String
     let model: SessionBrowserModel
 
+    private var installStatus: SessionBrowserModel.RemoteInstallStatus {
+        model.installStatus(forHost: host)
+    }
+
+    /// User-visible label for the Install button, reflecting
+    /// `installStatus` so a failed attempt (bad SSH auth, unreachable
+    /// host) is distinguishable from a real success instead of the
+    /// button silently doing nothing visible either way.
+    private var installButtonLabel: String {
+        switch installStatus {
+        case .idle, .failed: return "Install"
+        case .installing: return "Installing…"
+        case .succeeded: return "Installed"
+        }
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             Circle()
@@ -105,8 +121,9 @@ private struct RemoteHostRowView: View {
             Button("Attach") { model.attachToRemoteHost(host) }
                 .buttonStyle(.bordered)
                 .accessibilityIdentifier(AccessibilityID.SessionBrowser.remoteHostAttachButton(host))
-            Button("Install") { Task { await model.installRemote(host: host) } }
+            Button(installButtonLabel) { Task { await model.installRemote(host: host) } }
                 .buttonStyle(.bordered)
+                .disabled(installStatus == .installing)
                 .accessibilityIdentifier(AccessibilityID.SessionBrowser.remoteHostInstallButton(host))
         }
         .padding(.horizontal, 14)

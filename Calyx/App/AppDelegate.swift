@@ -1419,15 +1419,72 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     #endif
 
+    /// Reentrancy guard for `recoverPreservedSession()`: two back-to-back
+    /// invocations (e.g. a double-click on "Recover Previous Session")
+    /// would otherwise each independently load the same preserved
+    /// snapshot and each run their own `restoreWindow(_:)` loop over its
+    /// windows, restoring every window TWICE. Mirrors
+    /// `SessionBrowserModel.refresh()`'s existing `isRefreshing` guard.
+    private(set) var isRecovering = false
+
+    #if DEBUG
+    /// Test seam: mirrors `_setHasPreservedSessionSnapshotForTesting`'s
+    /// convention for a private(set) Bool. DO NOT use from production code.
+    func _setIsRecoveringForTesting(_ value: Bool) {
+        isRecovering = value
+    }
+    #endif
+
     /// Bug 3c gap-close: initializes hasPreservedSessionSnapshot from
     /// whatever preserveSnapshotForRecovery() left on disk in a PREVIOUS
     /// run, so a relaunch (where THIS run's own restoreSession() never
     /// calls preserveSnapshotForRecovery() itself) still offers the
     /// still-pending recovery command. Mirrors
     /// reassertHistoryPersistenceIfNeeded()'s async-Task-after-launch shape.
-    private func initializeHasPreservedSessionSnapshotFlag() async {
+    ///
+    /// Not `private` any more (recovery-bar empty-snapshot fix, mirrors
+    /// `finalizeRecoverPreservedSession(restoredAny:)`'s own identical
+    /// extraction-for-testability precedent):
+    /// AppDelegateEmptyPreservedSnapshotTests drives this directly via
+    /// `@testable import Calyx`.
+    ///
+    /// A decodable-but-EMPTY preserved snapshot (`windows.isEmpty`) has
+    /// nothing to recover, so it is treated as ABSENT here: the useless
+    /// file is retired (clearPreservedSnapshot()) and the flag stays
+    /// false, instead of trusting hasPreservedSnapshot()'s bare file-
+    /// existence check -- an empty file left on disk would otherwise
+    /// re-trigger this same dead state on every future launch. Broadcasts
+    /// the resolved value to every tracked window controller's
+    /// RecoveryBarModel either way, fixing the launch-time race where a
+    /// window was already constructed (with the flag still at its
+    /// initial `false`) before this Task resolves (see
+    /// RecoveryBarModelTests.swift's own header).
+    func initializeHasPreservedSessionSnapshotFlag() async {
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
-        hasPreservedSessionSnapshot = await actor.hasPreservedSnapshot()
+        guard let snapshot = await actor.loadPreservedSnapshot(), !snapshot.windows.isEmpty else {
+            await actor.clearPreservedSnapshot()
+            hasPreservedSessionSnapshot = false
+            broadcastHasPreservedSessionSnapshotToRecoveryBars()
+            return
+        }
+        hasPreservedSessionSnapshot = true
+        broadcastHasPreservedSessionSnapshotToRecoveryBars()
+    }
+
+    /// Pushes the current `hasPreservedSessionSnapshot` into every
+    /// currently-tracked window controller's `RecoveryBarModel`
+    /// (RecoveryBarModel.swift), so an already-constructed window's bar
+    /// updates in lockstep with this flag instead of only ever
+    /// reflecting whatever value was current at that window's own
+    /// construction time. Called from every site that changes this
+    /// flag: `initializeHasPreservedSessionSnapshotFlag()`,
+    /// `recoverPreservedSession()`'s empty/corrupt-snapshot guards, and
+    /// `finalizeRecoverPreservedSession(restoredAny:)`.
+    private func broadcastHasPreservedSessionSnapshotToRecoveryBars() {
+        for wc in windowControllers {
+            wc.recoveryBarModel.updateHasPreservedSessionSnapshot(hasPreservedSessionSnapshot)
+            wc.refreshRecoveryBar()
+        }
     }
 
     /// Tells the user restoreSession() skipped or failed to restore
@@ -1464,8 +1521,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// least one window restored -- a total-failure attempt leaves the
     /// backup in place so the user can retry or investigate.
     func recoverPreservedSession() {
+        guard !isRecovering else { return }
+        isRecovering = true
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
         Task {
+            defer { isRecovering = false }
             guard let snapshot = await actor.loadPreservedSnapshot() else {
                 // Nothing preserved, OR preserved but undecodable
                 // (corrupt/unknown schema) -- quarantine is a no-op in
@@ -1473,9 +1533,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // safe and unsticks the latter.
                 await actor.quarantineCorruptPreservedSnapshot()
                 hasPreservedSessionSnapshot = false
+                broadcastHasPreservedSessionSnapshotToRecoveryBars()
                 return
             }
-            guard !snapshot.windows.isEmpty else { return }
+            // Empty-snapshot fix: a decodable-but-empty preserved
+            // snapshot has nothing to recover -- clear the useless file
+            // and reset the flag (mirroring
+            // finalizeRecoverPreservedSession(restoredAny: true)'s own
+            // two-step "clear + reset" shape) instead of a silent no-op
+            // that leaves a permanently dead command enabled.
+            guard !snapshot.windows.isEmpty else {
+                await actor.clearPreservedSnapshot()
+                hasPreservedSessionSnapshot = false
+                broadcastHasPreservedSessionSnapshotToRecoveryBars()
+                return
+            }
             var restoredAny = false
             for windowSnap in snapshot.windows {
                 if restoreWindow(windowSnap) {
@@ -1501,6 +1573,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
         await actor.clearPreservedSnapshot()
         hasPreservedSessionSnapshot = false
+        broadcastHasPreservedSessionSnapshotToRecoveryBars()
     }
 
     /// Single-slot, lock-protected box used ONLY to bridge a
