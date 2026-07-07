@@ -73,13 +73,39 @@ struct MainContentView: View {
         )
     }
 
+    // `mainContent` is applied here exactly once, unconditionally, as the
+    // base of `.safeAreaInset` -- NOT branched inside an `if`/`else` (the
+    // previous `VStack(spacing: 0) { conditional bar; mainContent }`
+    // shape). Two reasons, in order of how they were found:
+    //
+    // 1. Titlebar regression (found via `git diff 1a17867c1^ 1a17867c1`
+    //    -- pre-feature `body` returned `mainContent`'s own
+    //    `GlassEffectContainer` chain directly as the SwiftUI root; the
+    //    VStack wrapper made an unstyled, non-safe-area-ignoring `VStack`
+    //    the new root instead, which changed what `geo.safeAreaInsets.top`
+    //    reports inside `mainContent`'s own titlebar-glass overlay
+    //    (further down in this file), breaking the transparent/glass
+    //    titlebar even with the bar hidden. `mainContent.safeAreaInset(...)`
+    //    keeps `mainContent` itself as that same root chain when the inset
+    //    content is empty, restoring the pre-feature root exactly.
+    // 2. `mainContent` hosts `SplitContainerView` (real ghostty terminal
+    //    `NSView`s via `TerminalContainerView`'s `NSViewRepresentable`). An
+    //    `if { VStack { bar; mainContent } } else { mainContent }` shape
+    //    puts `mainContent` at two different static positions in the view
+    //    tree -- SwiftUI's `_ConditionalContent` tears down and rebuilds
+    //    whichever branch was active every time the branch flips, which
+    //    would destroy and recreate the live terminal surfaces every time
+    //    Restore/Dismiss hides the bar. `.safeAreaInset` applies to
+    //    `mainContent` unconditionally; only the inset's own (small,
+    //    disposable) content is conditional, so `mainContent` never moves
+    //    across a branch boundary and its terminal state survives.
     var body: some View {
-        VStack(spacing: 0) {
-            if let recoveryBarModel, recoveryBarModel.showRecoveryBar {
-                RecoveryBarView(model: recoveryBarModel)
+        mainContent
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if let recoveryBarModel, recoveryBarModel.showRecoveryBar {
+                    RecoveryBarView(model: recoveryBarModel)
+                }
             }
-            mainContent
-        }
     }
 
     private var mainContent: some View {

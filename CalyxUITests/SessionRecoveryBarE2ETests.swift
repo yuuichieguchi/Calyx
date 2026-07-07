@@ -416,5 +416,13 @@ final class SessionRecoveryBarAbsentE2ETests: CalyxUITestCase {
             "A normal launch with nothing preserved on disk must show no recovery bar at all " +
             "(contract point 4) -- AccessibilityID.RecoveryBar.container must never appear."
         )
+
+        // Visual regression evidence for the bar's hosting change in
+        // MainContentView (`.safeAreaInset` over `mainContent`, not a
+        // wrapping `VStack`): this is the one state a hosting mistake
+        // could break WITHOUT any of this suite's other assertions
+        // catching it -- the window's own titlebar/glass chrome with no
+        // bar in the tree at all.
+        saveScreenshot(name: "recoveryBar_absent_normalLaunch")
     }
 }
