@@ -134,7 +134,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// `GhosttyAppController.shared` is ever touched, since ghostty reads
     /// this variable from its own process environment at engine init.
     func applyGhosttyResourcesDirEnvironmentIfNeeded() {
+        #if DEBUG
         let root = _ghosttyResourcesRootForTesting ?? Bundle.main.resourceURL ?? Bundle.main.bundleURL
+        #else
+        let root = Bundle.main.resourceURL ?? Bundle.main.bundleURL
+        #endif
         let resolvedPath = GhosttyResourcesDirResolver(resourcesRoot: root).resolve()
         GhosttyResourcesDirEnvironment.apply(resolvedPath)
     }
@@ -1361,7 +1365,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// applicationWillTerminate's genuinely synchronous call stack.
     func saveForTermination() {
         let snapshot = pendingTerminationSnapshot ?? buildSnapshot()
+        #if DEBUG
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        #else
+        let actor = SessionPersistenceActor.shared
+        #endif
         let box = SyncBridgeBox<Bool>(false)
         Task.detached {
             await actor.saveAtTermination(snapshot)
@@ -1391,7 +1399,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// runs this Task's body, so the counter is left incremented for
     /// the crash-loop detector exactly as today.
     func scheduleRecoveryCounterResetAfterStableLaunch(delay: Duration = .seconds(5)) {
+        #if DEBUG
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        #else
+        let actor = SessionPersistenceActor.shared
+        #endif
         Task {
             try? await Task.sleep(for: delay)
             await actor.resetRecoveryCounter()
@@ -1460,7 +1472,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// initial `false`) before this Task resolves (see
     /// RecoveryBarModelTests.swift's own header).
     func initializeHasPreservedSessionSnapshotFlag() async {
+        #if DEBUG
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        #else
+        let actor = SessionPersistenceActor.shared
+        #endif
         guard let snapshot = await actor.loadPreservedSnapshot(), !snapshot.windows.isEmpty else {
             await actor.clearPreservedSnapshot()
             hasPreservedSessionSnapshot = false
@@ -1523,7 +1539,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func recoverPreservedSession() {
         guard !isRecovering else { return }
         isRecovering = true
+        #if DEBUG
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        #else
+        let actor = SessionPersistenceActor.shared
+        #endif
         Task {
             defer { isRecovering = false }
             guard let snapshot = await actor.loadPreservedSnapshot() else {
@@ -1570,7 +1590,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// restored NOTHING never destroys the user's last-resort backup.
     func finalizeRecoverPreservedSession(restoredAny: Bool) async {
         guard restoredAny else { return }
+        #if DEBUG
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        #else
+        let actor = SessionPersistenceActor.shared
+        #endif
         await actor.clearPreservedSnapshot()
         hasPreservedSessionSnapshot = false
         broadcastHasPreservedSessionSnapshotToRecoveryBars()
@@ -1629,7 +1653,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// See SyncBridgeBox's own doc comment for why the disk read runs
     /// in a `Task.detached` instead of a plain `Task { }`.
     func attemptSessionRestoreFromDisk(deadline: TimeInterval = 2.0) -> SessionRestoreDiskOutcome {
+        #if DEBUG
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        #else
+        let actor = SessionPersistenceActor.shared
+        #endif
         let box = SyncBridgeBox<(snapshot: SessionSnapshot?, done: Bool)>((nil, false))
         let task = Task.detached {
             let recoveryCount = await actor.incrementRecoveryCounter()
@@ -1662,7 +1690,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// above; see SyncBridgeBox's own doc comment for why this also
     /// needs `Task.detached`.
     func attemptPreserveDiscardedSessionOnDisk(deadline: TimeInterval = 2.0) -> SessionPreserveDiskOutcome {
+        #if DEBUG
         let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        #else
+        let actor = SessionPersistenceActor.shared
+        #endif
         let box = SyncBridgeBox<(didPreserve: Bool, done: Bool)>((false, false))
         let task = Task.detached {
             let didPreserve = await actor.preserveSnapshotForRecovery()
