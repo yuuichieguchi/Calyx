@@ -8,6 +8,26 @@ import XCTest
 class CalyxUITestCase: XCTestCase {
     var app: XCUIApplication!
     private var sessionTempDir: String?
+    /// Per-test-unique `UserDefaults` suite name, read by
+    /// `SessionSettings.uiTestSuite` via `CALYX_UITEST_DEFAULTS_SUITE`.
+    ///
+    /// INCIDENT THAT MADE THIS MANDATORY: before this fix, this base
+    /// `setUp()` (the launch path every subclass here uses unless it
+    /// overrides `setUp()` with its own launch, e.g.
+    /// `SettingsSessionsToggleE2ETests`) launched the app-under-test with
+    /// no defaults isolation and no `HOME` override at all. During a
+    /// window when the developer's real `com.calyx.terminal.e2e` defaults
+    /// domain happened to have `persistentSessionsEnabled=1`, every
+    /// tab/rename/reorder suite's app instance read that real domain,
+    /// found persistence on, and created REAL persistent sessions against
+    /// the developer's real `~/.calyx` daemon on every launch -- 47 zombie
+    /// shells accumulated in one day of running these suites. Setting this
+    /// suite name before `app.launch()` mirrors
+    /// `SettingsSessionsToggleE2ETests`'s own established isolation (see
+    /// that file's header for why a dedicated suite, not just a `HOME`
+    /// override, is required: `UserDefaults.standard` is mediated by
+    /// `cfprefsd` and keyed by the real macOS account, not by `HOME`).
+    private var defaultsSuiteName: String?
 
     /// Override in subclasses to add extra launch arguments (e.g. UserDefaults overrides).
     var additionalLaunchArguments: [String] { [] }
@@ -26,6 +46,11 @@ class CalyxUITestCase: XCTestCase {
         )
         sessionTempDir = tempDir
         app.launchEnvironment["CALYX_UITEST_SESSION_DIR"] = tempDir
+
+        let suiteName = "com.calyx.tests.e2e.CalyxUITestCase-\(UUID().uuidString)"
+        defaultsSuiteName = suiteName
+        app.launchEnvironment["CALYX_UITEST_DEFAULTS_SUITE"] = suiteName
+
         app.launch()
     }
 
@@ -33,6 +58,20 @@ class CalyxUITestCase: XCTestCase {
         app.terminate()
         if let dir = sessionTempDir {
             try? FileManager.default.removeItem(atPath: dir)
+        }
+        if let suiteName = defaultsSuiteName {
+            // Best-effort only, mirroring SettingsSessionsToggleE2ETests's
+            // own cleanup and its documented cfprefsd-flush caveat: the
+            // app-under-test is a SEPARATE process, and cfprefsd flushes a
+            // just-terminated process's writes to its on-disk plist on its
+            // own schedule, sometimes after this point. A leftover plist
+            // is harmless -- `suiteName` is a fresh UUID every run, so it
+            // is never read by anything again, and this never touches the
+            // real `com.calyx.terminal.e2e` domain.
+            Thread.sleep(forTimeInterval: 1.0)
+            UserDefaults().removePersistentDomain(forName: suiteName)
+            let suitePlistPath = "\(NSHomeDirectory())/Library/Preferences/\(suiteName).plist"
+            try? FileManager.default.removeItem(atPath: suitePlistPath)
         }
         super.tearDown()
     }

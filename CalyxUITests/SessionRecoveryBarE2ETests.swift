@@ -284,6 +284,111 @@ final class SessionRecoveryBarE2ETests: CalyxUITestCase {
             "gone, Dismiss wrongly destroyed the user's last-resort backup."
         )
     }
+
+    // MARK: - Command palette drives the same recovery machinery the bar fronts, end-to-end
+
+    /// Polls a plain synchronous condition (never an AX/XCUIElement
+    /// query -- those have their own re-snapshot rules, see
+    /// `pollForRecoveryBarContainer`'s doc comment above) on a fixed
+    /// interval until it returns true or `timeout` elapses.
+    @discardableResult
+    private func pollUntil(timeout: TimeInterval = 10, condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.2)
+        } while Date() < deadline
+        return false
+    }
+
+    /// Proves the exact same underlying machinery the bar's Restore
+    /// button calls into (`AppDelegate.recoverPreservedSession()` /
+    /// `finalizeRecoverPreservedSession(restoredAny:)`) end-to-end
+    /// through a DIFFERENT, input-driven UI surface: the command
+    /// palette's own "Recover Previous Session" entry
+    /// (`session.recoverPreviousSession`, registered in
+    /// `CalyxWindowController.setupCommandRegistry()`). Unlike the bar,
+    /// the palette is opened/typed/confirmed entirely via real
+    /// keystrokes, so XCUITest's AX-notification-driven polling sees
+    /// every state change live -- the same reasoning
+    /// `CommandPaletteUITests.swift`'s own `test_executeCommand` already
+    /// relies on. Proves three things a real user would notice: (a) a
+    /// new window is actually rebuilt from the preserved snapshot, (b)
+    /// the preserved file is cleared afterward (not merely hidden,
+    /// unlike Dismiss -- see the test above), (c) the command itself
+    /// disappears from the palette's own search results afterward:
+    /// `CommandRegistry.search(query:)` filters out any command whose
+    /// `isAvailable()` is false BEFORE fuzzy-matching (confirmed by
+    /// reading CommandRegistry.swift), so once
+    /// `hasPreservedSessionSnapshot` flips to false this command is not
+    /// merely "shown disabled" -- it is entirely absent from the
+    /// results table.
+    func test_recoveryBar_paletteRecoverPreviousSession_restoresWindowClearsFileAndDisablesCommand() {
+        XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not appear after launch.")
+
+        let windowCountBeforeRestore = app.windows.count
+
+        openCommandPaletteViaMenu()
+        let searchField = app.descendants(matching: .any)
+            .matching(identifier: "calyx.commandPalette.searchField")
+            .firstMatch
+        XCTAssertTrue(waitFor(searchField), "Command palette search field did not appear.")
+        searchField.typeText("Recover Previous Session")
+        searchField.typeKey(.enter, modifierFlags: [])
+
+        let palette = app.descendants(matching: .any)
+            .matching(identifier: "calyx.commandPalette")
+            .firstMatch
+        waitForNonExistence(palette)
+
+        // recoverPreservedSession() rebuilds windows/tabs asynchronously
+        // (a Task, per AppDelegate.swift) -- poll rather than assume
+        // it's immediate, mirroring the bar's own Restore-button test.
+        let restoredWindowAppeared = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "count > \(windowCountBeforeRestore)"),
+            object: app.windows
+        )
+        XCTAssertEqual(
+            XCTWaiter().wait(for: [restoredWindowAppeared], timeout: 10), .completed,
+            "Executing \"Recover Previous Session\" from the command palette must rebuild the " +
+            "preserved snapshot's window (one additional NSWindow beyond the launch-time window), " +
+            "proving it drove the same recoverPreservedSession()/restoreWindow(_:) machinery the " +
+            "bar's own Restore button calls."
+        )
+
+        // finalizeRecoverPreservedSession(restoredAny:) clears the file
+        // AFTER restoreWindow(_:) has already run (see
+        // AppDelegate.recoverPreservedSession()'s own ordering), so the
+        // file-clear can lag slightly behind the window appearing --
+        // poll rather than assume it's already done.
+        XCTAssertTrue(
+            pollUntil(timeout: 10) { !FileManager.default.fileExists(atPath: self.preservedSnapshotPath) },
+            "A successful recovery through the command palette must clear the preserved snapshot " +
+            "file (unlike Dismiss, which deliberately leaves it in place)."
+        )
+
+        // Re-open the palette and search again: the command must now be
+        // entirely absent from the results, not merely present-but-
+        // disabled, per CommandRegistry.search(query:)'s own
+        // isAvailable() pre-filter.
+        openCommandPaletteViaMenu()
+        let searchFieldAgain = app.descendants(matching: .any)
+            .matching(identifier: "calyx.commandPalette.searchField")
+            .firstMatch
+        XCTAssertTrue(waitFor(searchFieldAgain), "Command palette search field did not reappear.")
+        searchFieldAgain.typeText("Recover Previous Session")
+        Thread.sleep(forTimeInterval: 0.3)
+
+        let resultsTable = app.descendants(matching: .any)
+            .matching(identifier: "calyx.commandPalette.resultsTable")
+            .firstMatch
+        XCTAssertEqual(
+            resultsTable.tableRows.count, 0,
+            "\"Recover Previous Session\" must no longer be a search result once " +
+            "hasPreservedSessionSnapshot is false -- CommandRegistry.search(query:) filters out " +
+            "any command whose isAvailable() returns false before fuzzy-matching even runs."
+        )
+    }
 }
 
 /// Precondition: NO preserved snapshot on disk (a normal, fresh launch
