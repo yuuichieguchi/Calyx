@@ -80,6 +80,9 @@ enum AccessibilityID {
         static let historyPersistenceSwitch = "calyx.settings.sessions.historyPersistenceSwitch"
         static let agentResumeSwitch = "calyx.settings.sessions.agentResumeSwitch"
         static let agentResumeAutoExecuteSwitch = "calyx.settings.sessions.agentResumeAutoExecuteSwitch"
+        static let smoothScrollingSwitch = "calyx.settings.appearance.smoothScrollingSwitch"
+        static let lspAutoInstallSwitch = "calyx.settings.lsp.lspAutoInstallSwitch"
+        static let lspRequireConfirmationSwitch = "calyx.settings.lsp.lspRequireConfirmationSwitch"
     }
     enum SessionBrowser {
         static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }

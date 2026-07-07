@@ -131,6 +131,26 @@ class CalyxUITestCase: XCTestCase {
             .count
     }
 
+    /// The identifiers of every tab currently shown in the horizontal tab
+    /// bar (`calyx.tabBar.tab.<UUID>`, excluding `.closeButton` children),
+    /// i.e. the tabs belonging to whichever group is CURRENTLY ACTIVE
+    /// (`MainContentView.mainContent` feeds `TabBarContentView` from
+    /// `windowSession.activeGroup?.tabs` alone, so switching the active
+    /// group changes exactly this set). Used to prove a group-switching
+    /// action actually moved the active group, rather than merely
+    /// leaving the group COUNT unchanged (which a no-op switch would also
+    /// satisfy).
+    func currentTabBarTabIdentifiers() -> Set<String> {
+        let uuidPattern = "[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}"
+        let predicate = NSPredicate(format: "identifier MATCHES %@", "calyx\\.tabBar\\.tab\\.\(uuidPattern)")
+        return Set(
+            app.descendants(matching: .any)
+                .matching(predicate)
+                .allElementsBoundByIndex
+                .map { $0.identifier }
+        )
+    }
+
     /// Fixed scratch directory the team lead reads screenshots from by
     /// hand after a run -- NOT a general-purpose artifact location, so
     /// don't add unrelated files here. ONE level under `/tmp`,

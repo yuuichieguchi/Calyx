@@ -193,6 +193,56 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         menuAction("Calyx", item: "Quit Calyx")
     }
 
+    /// Every currently-open window (this suite never opens the session
+    /// browser, unlike `SessionBrowserAttachKillE2ETests`, so no title
+    /// filter is needed there -- kept anyway, mirroring that file's own
+    /// `countMainWindows()` exactly, so this stays correct if a future
+    /// change to this suite ever does open it).
+    private func countMainWindows() -> Int {
+        app.windows.matching(NSPredicate(format: "NOT (title == %@)", "Sessions")).count
+    }
+
+    /// The visible title of every tab currently shown in the sidebar,
+    /// mirroring `SessionBrowserAttachKillE2ETests.sidebarTabTitles()`
+    /// exactly (see that file's own doc comment for why the sidebar,
+    /// not the horizontal tab bar).
+    private func sidebarTabTitles() -> Set<String> {
+        let rows = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@ AND NOT identifier ENDSWITH %@", "calyx.sidebar.tab.", ".closeButton"))
+        return Set(rows.allElementsBoundByIndex.map { row in
+            row.descendants(matching: .staticText).firstMatch.value as? String ?? ""
+        })
+    }
+
+    private func tildeAbbreviated(_ path: String, home: String) -> String {
+        // Unlike SessionBrowserAttachKillE2ETests's own copy of this
+        // helper (never called with `path == home` exactly, only
+        // subdirectories), this suite's restored tab's cwd IS home
+        // itself (no `cd` ever performed), which must map to the bare
+        // "~" -- matching `SessionTabTitle.fromCwd`'s own identical
+        // exact-match case.
+        if path == home { return "~" }
+        let prefix = home.hasSuffix("/") ? home : home + "/"
+        guard path.hasPrefix(prefix) else { return path }
+        return "~/" + String(path.dropFirst(prefix.count))
+    }
+
+    /// Candidate expected titles for a restored pane whose cwd is
+    /// `homeDir` itself, tolerating whether the shell-integration-
+    /// reported cwd reflects the literal path this suite set `HOME` to,
+    /// or macOS's symlink-resolved physical path (`/tmp` is itself a
+    /// symlink to `/private/tmp`) -- an orthogonal platform quirk this
+    /// suite's own `HOME` override cannot control, unrelated to whether
+    /// the restore feature under test actually works.
+    private func expectedHomeTitleCandidates() -> Set<String> {
+        var candidates: Set<String> = [tildeAbbreviated(homeDir, home: homeDir)]
+        let resolved = (homeDir as NSString).resolvingSymlinksInPath
+        if resolved != homeDir {
+            candidates.insert(tildeAbbreviated(resolved, home: resolved))
+        }
+        return candidates
+    }
+
     // MARK: - Daemon-ledger polling
     //
     // Verification is daemon-ledger-based, not keystroke-based: this
@@ -397,6 +447,12 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
             )
         }
 
+        // Baseline for the user-visible window-count assertion below,
+        // captured immediately before quitting (mirrors
+        // SessionBrowserAttachKillE2ETests:353-361's own "capture right
+        // before the action under test" placement).
+        let mainWindowCountBeforeQuit = countMainWindows()
+
         // Quit via the app's own menu, NOT `app.terminate()`: `terminate()`
         // sends SIGTERM, which bypasses AppKit's termination flow, so the
         // synchronous snapshot save this test depends on never runs (see
@@ -409,6 +465,55 @@ final class SessionPersistenceE2ETests: CalyxUITestCase {
         )
         relaunchWithSameEnvironment()
         XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not reappear after relaunch.")
+
+        // USER-VISIBLE outcome (a): restoring must reopen the SAME
+        // number of main windows as before quitting, not more/fewer --
+        // mirrors SessionBrowserAttachKillE2ETests:390-395's own
+        // window-count assertion. The ledger-identity assertions below
+        // only prove the daemon-side session survived, not that the
+        // app's own window layout was restored correctly.
+        XCTAssertEqual(
+            countMainWindows(), mainWindowCountBeforeQuit,
+            "The number of Calyx main windows changed after restarting (before: " +
+            "\(mainWindowCountBeforeQuit), after: \(countMainWindows())); restart is " +
+            "expected to restore the same window layout, not open a different number of windows."
+        )
+
+        // USER-VISIBLE outcome (b): every restored tab's title must be
+        // cwd-derived (this suite's own isolated HOME), NOT the
+        // `Tab.init` default `"Terminal"` a title-less restore would
+        // silently fall back to -- mirrors
+        // SessionBrowserAttachKillE2ETests:397-447's own title
+        // assertions. Read via the sidebar (`sidebarTabTitles()`'s own
+        // doc comment), polled since the sidebar's restored rows can lag
+        // one beat behind the window reappearing. Checked as a SET of
+        // distinct titles (not a per-tab count): both this test's tabs
+        // share the same cwd (this suite's isolated HOME, no `cd` ever
+        // performed), so they legitimately show the SAME title ("~"),
+        // collapsing to one element regardless of how many tabs actually
+        // restored -- `preRestart.count` (a ledger-timing-dependent
+        // count of sessions confirmed Running+attached before quitting,
+        // which can itself be 1 or 2, see this test's own earlier
+        // comment) is not a reliable proxy for the sidebar's own tab
+        // count and is deliberately not used as a lower bound here.
+        var restoredTitles = sidebarTabTitles()
+        for _ in 0..<8 where restoredTitles.isEmpty {
+            Thread.sleep(forTimeInterval: 1)
+            restoredTitles = sidebarTabTitles()
+        }
+        XCTAssertFalse(restoredTitles.isEmpty, "Expected at least one restored sidebar tab after relaunch, got none.")
+        XCTAssertFalse(
+            restoredTitles.contains("Terminal"),
+            "Restored tab(s) should show cwd-derived titles, not the generic \"Terminal\" default. Titles: \(restoredTitles)"
+        )
+        let expectedTitleCandidates = expectedHomeTitleCandidates()
+        for title in restoredTitles {
+            XCTAssertTrue(
+                expectedTitleCandidates.contains(title),
+                "Restored tab title \"\(title)\" did not match any expected tilde-abbreviated " +
+                "form of this suite's isolated HOME (\(homeDir!)): \(expectedTitleCandidates)"
+            )
+        }
 
         // The restored panes' reattach to their daemon-held sessions
         // completes asynchronously after the window appears, with no

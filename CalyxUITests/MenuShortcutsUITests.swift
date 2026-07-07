@@ -242,6 +242,141 @@ final class MenuShortcutsUITests: CalyxUITestCase {
         )
     }
 
+    /// Shared by the Split Left/Up/Down functional tests below --
+    /// mirrors `test_splitRightViaMenu_createsSecondSurface`'s own body
+    /// exactly, parameterized on the File-menu item title.
+    private func assertSplitViaMenuAddsDivider(menuItemTitle: String) {
+        let dividersBefore = app.windows.firstMatch
+            .descendants(matching: .splitter)
+            .count
+
+        openMenuBarItem("File")
+
+        let splitItem = app.menuBars.menuItems[menuItemTitle]
+        XCTAssertTrue(
+            splitItem.waitForExistence(timeout: 3),
+            "'\(menuItemTitle)' menu item must exist under File"
+        )
+        splitItem.click()
+
+        let dividersAfter = waitForSplitterCount(timeout: 8) { $0 > dividersBefore }
+
+        XCTAssertGreaterThan(
+            dividersAfter, dividersBefore,
+            "File > \(menuItemTitle) should add a split divider (surface count should grow). before=\(dividersBefore), after=\(dividersAfter)"
+        )
+    }
+
+    func test_splitLeftViaMenu_createsSecondSurface() {
+        assertSplitViaMenuAddsDivider(menuItemTitle: "Split Left")
+    }
+
+    func test_splitUpViaMenu_createsSecondSurface() {
+        assertSplitViaMenuAddsDivider(menuItemTitle: "Split Up")
+    }
+
+    func test_splitDownViaMenu_createsSecondSurface() {
+        assertSplitViaMenuAddsDivider(menuItemTitle: "Split Down")
+    }
+
+    // MARK: - Focus Split (functional: focus actually moves)
+
+    /// After a real split, each `Focus Split <direction>` menu action must
+    /// actually move keyboard focus to a DIFFERENT surface, not just be
+    /// enabled/clickable (see `test_focusSplit_isDisabled_whenNoSplit`
+    /// for the disabled-state coverage this complements).
+    ///
+    /// Focus is not exposed through any accessibility identifier today
+    /// (`SurfaceView`, the raw ghostty-backed `NSView` each split surface
+    /// renders into, sets none -- investigated, not assumed) and adding
+    /// one is outside this task's identifier-only production scope
+    /// (limited to the named Settings switches). Instead this proves
+    /// focus moved BEHAVIORALLY: `PaneCLIExec.paneExec`/
+    /// `panePasteAndReturn` paste into whatever surface is CURRENTLY the
+    /// key window's first responder (the same mechanism every other
+    /// pane-driving suite in this directory relies on), so tagging each
+    /// surface's own shell with a distinct `$PANE` value the moment it is
+    /// known to be focused (right after `File > Split Right`/`Split
+    /// Down`, whose own `handleNewSplitNotification` calls
+    /// `window?.makeFirstResponder(newView)` on the just-created surface)
+    /// lets a later `echo $PANE` read back EXACTLY which surface is
+    /// focused at that moment -- a Focus Split action that failed to
+    /// move focus would read back the SAME (stale) tag, making this
+    /// assertion fail for the right reason.
+    func test_focusSplitDirections_moveFocusBetweenSurfaces() {
+        var cmdCounter = 0
+
+        // Tag the original (only) surface while it is necessarily the
+        // one with focus.
+        _ = paneExec("export PANE=ORIGINAL; echo tagged", counter: &cmdCounter)
+
+        // Split Right: the new surface becomes first responder
+        // immediately (handleNewSplitNotification). Tag it while known-focused.
+        let dividersBeforeRight = app.windows.firstMatch.descendants(matching: .splitter).count
+        menuAction("File", item: "Split Right")
+        _ = waitForSplitterCount(timeout: 8) { $0 > dividersBeforeRight }
+        _ = paneExec("export PANE=RIGHT; echo tagged", counter: &cmdCounter)
+
+        // Focus Split Left should move focus from RIGHT back to ORIGINAL.
+        openMenuBarItem("Window")
+        hoverMenuItem("Focus Split")
+        let focusLeft = app.menuBars.menuItems["Focus Split Left"]
+        XCTAssertTrue(focusLeft.waitForExistence(timeout: 3), "'Focus Split Left' menu item must exist")
+        focusLeft.click()
+        Thread.sleep(forTimeInterval: 0.3)
+        let afterFocusLeft = paneExec("echo $PANE", counter: &cmdCounter)
+        XCTAssertEqual(
+            afterFocusLeft, "ORIGINAL",
+            "Focus Split Left should move focus back to the original (left) surface"
+        )
+
+        // Focus Split Right should move focus back to RIGHT.
+        openMenuBarItem("Window")
+        hoverMenuItem("Focus Split")
+        let focusRight = app.menuBars.menuItems["Focus Split Right"]
+        XCTAssertTrue(focusRight.waitForExistence(timeout: 3), "'Focus Split Right' menu item must exist")
+        focusRight.click()
+        Thread.sleep(forTimeInterval: 0.3)
+        let afterFocusRight = paneExec("echo $PANE", counter: &cmdCounter)
+        XCTAssertEqual(
+            afterFocusRight, "RIGHT",
+            "Focus Split Right should move focus to the right surface"
+        )
+
+        // From RIGHT (currently focused), split down to create a
+        // vertical neighbor; tag it while known-focused.
+        let dividersBeforeDown = app.windows.firstMatch.descendants(matching: .splitter).count
+        menuAction("File", item: "Split Down")
+        _ = waitForSplitterCount(timeout: 8) { $0 > dividersBeforeDown }
+        _ = paneExec("export PANE=BOTTOM; echo tagged", counter: &cmdCounter)
+
+        // Focus Split Up should move focus from BOTTOM to its upper neighbor, RIGHT.
+        openMenuBarItem("Window")
+        hoverMenuItem("Focus Split")
+        let focusUp = app.menuBars.menuItems["Focus Split Up"]
+        XCTAssertTrue(focusUp.waitForExistence(timeout: 3), "'Focus Split Up' menu item must exist")
+        focusUp.click()
+        Thread.sleep(forTimeInterval: 0.3)
+        let afterFocusUp = paneExec("echo $PANE", counter: &cmdCounter)
+        XCTAssertEqual(
+            afterFocusUp, "RIGHT",
+            "Focus Split Up should move focus to the surface above (RIGHT)"
+        )
+
+        // Focus Split Down should move focus back to BOTTOM.
+        openMenuBarItem("Window")
+        hoverMenuItem("Focus Split")
+        let focusDown = app.menuBars.menuItems["Focus Split Down"]
+        XCTAssertTrue(focusDown.waitForExistence(timeout: 3), "'Focus Split Down' menu item must exist")
+        focusDown.click()
+        Thread.sleep(forTimeInterval: 0.3)
+        let afterFocusDown = paneExec("echo $PANE", counter: &cmdCounter)
+        XCTAssertEqual(
+            afterFocusDown, "BOTTOM",
+            "Focus Split Down should move focus back to the surface below (BOTTOM)"
+        )
+    }
+
     func test_findViaMenu_opensSearchBar() {
         // 起動直後は search bar が非表示
         let searchField = app.descendants(matching: .any)
@@ -271,6 +406,15 @@ final class MenuShortcutsUITests: CalyxUITestCase {
     }
 
     func test_nextGroupViaMenu_switchesGroup() {
+        // Baseline: the first group's own tab-bar tab identifier set,
+        // captured before a second group exists, so a later switch BACK
+        // to it can be proven by observing the SAME set reappear
+        // (`CalyxUITestCase.currentTabBarTabIdentifiers()`'s own doc
+        // comment: `TabBarContentView` is fed exclusively from
+        // `windowSession.activeGroup?.tabs`) -- not just that the group
+        // COUNT is unchanged, which a no-op switch would also satisfy.
+        let firstGroupTabIdentifiers = currentTabBarTabIdentifiers()
+
         // まず 2 つ目のグループを作成
         openMenuBarItem("Window")
         hoverMenuItem("Group")
@@ -280,6 +424,14 @@ final class MenuShortcutsUITests: CalyxUITestCase {
         let observedAfterNew = waitForGroupCount(2, timeout: 5)
 
         XCTAssertEqual(observedAfterNew, 2, "Should have 2 groups after creating a new one")
+
+        // The newly created group becomes active on creation, so the tab
+        // bar should now show its own (different) tab.
+        let secondGroupTabIdentifiers = currentTabBarTabIdentifiers()
+        XCTAssertNotEqual(
+            secondGroupTabIdentifiers, firstGroupTabIdentifiers,
+            "Creating a new group via the menu should make it active, so the tab bar should show its own tab"
+        )
 
         // Previous Group に切り替え
         openMenuBarItem("Window")
@@ -301,6 +453,14 @@ final class MenuShortcutsUITests: CalyxUITestCase {
             "Previous Group should switch active group, not remove one"
         )
 
+        // The ACTIVE group must have actually switched back to the
+        // first group: the tab bar's visible tab set should match the
+        // baseline captured before the second group ever existed.
+        XCTAssertEqual(
+            currentTabBarTabIdentifiers(), firstGroupTabIdentifiers,
+            "Previous Group should switch the active group back to the first one, so the tab bar shows its tab again"
+        )
+
         // Next Group で戻れることも確認
         openMenuBarItem("Window")
         hoverMenuItem("Group")
@@ -315,6 +475,13 @@ final class MenuShortcutsUITests: CalyxUITestCase {
         XCTAssertEqual(
             currentGroupCount(), 2,
             "Next Group should switch active group, not remove one"
+        )
+
+        // The ACTIVE group must have switched forward again, back to the
+        // second group's own tab.
+        XCTAssertEqual(
+            currentTabBarTabIdentifiers(), secondGroupTabIdentifiers,
+            "Next Group should switch the active group forward to the second one, so the tab bar shows its tab again"
         )
     }
 

@@ -55,6 +55,17 @@ final class BrowserUITests: CalyxUITestCase {
             .matching(identifier: "calyx.browser.urlDisplay")
             .firstMatch
         XCTAssertTrue(urlDisplay.exists, "URL display should exist")
+
+        // BrowserContainerView's urlDisplay is a plain SwiftUI `Text`
+        // showing `controller.browserState.url.absoluteString`, so its
+        // rendered string surfaces to XCUITest as `.value` -- assert it
+        // actually shows the loaded page's URL, not just that the
+        // element exists.
+        let urlText = (urlDisplay.value as? String) ?? urlDisplay.label
+        XCTAssertTrue(
+            urlText.contains("example.com"),
+            "URL display should show the loaded page's URL (contains \"example.com\"), got: \"\(urlText)\""
+        )
     }
 
     func test_navigationButtons() {

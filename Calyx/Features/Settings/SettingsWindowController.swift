@@ -207,6 +207,7 @@ class SettingsWindowController: NSWindowController {
 
     private func smoothScrollingRow() -> NSView {
         let smoothScrollSwitch = NSSwitch()
+        smoothScrollSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.smoothScrollingSwitch)
         smoothScrollSwitch.state = (UserDefaults.standard.object(forKey: "smoothScrollEnabled") as? Bool ?? true) ? .on : .off
         smoothScrollSwitch.target = self
         smoothScrollSwitch.action = #selector(smoothScrollDidChange(_:))
@@ -215,6 +216,7 @@ class SettingsWindowController: NSWindowController {
 
     private func lspAutoInstallRow() -> NSView {
         let autoInstallSwitch = NSSwitch()
+        autoInstallSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.lspAutoInstallSwitch)
         autoInstallSwitch.state = LSPSettings.autoInstallEnabled ? .on : .off
         autoInstallSwitch.target = self
         autoInstallSwitch.action = #selector(lspAutoInstallDidChange(_:))
@@ -223,6 +225,7 @@ class SettingsWindowController: NSWindowController {
 
     private func lspRequireConfirmationRow() -> NSView {
         let requireConfirmSwitch = NSSwitch()
+        requireConfirmSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.lspRequireConfirmationSwitch)
         requireConfirmSwitch.state = LSPSettings.requireInstallConfirmation ? .on : .off
         requireConfirmSwitch.target = self
         requireConfirmSwitch.action = #selector(lspRequireConfirmationDidChange(_:))
