@@ -4,10 +4,11 @@
 // Chrome-style in-app "your previous session was preserved" bar,
 // shown at the top of a window's content when `model.showRecoveryBar`
 // is true (see RecoveryBarModel's own file header for the full
-// design-decision writeup). Hosted as the first child of
-// MainContentView's top-level VStack, above the tab bar/pane content --
-// never intercepts first responder/keyboard focus, since neither the
-// bar nor its buttons are ever made first responder by any code path.
+// design-decision writeup). Hosted via `MainContentView.body`'s
+// `mainContent.safeAreaInset(edge: .top)`, above the tab bar/pane
+// content -- never intercepts first responder/keyboard focus, since
+// neither the bar nor its buttons are ever made first responder by any
+// code path.
 
 import SwiftUI
 
@@ -47,10 +48,26 @@ struct RecoveryBarView: View {
 /// Same glass-chrome treatment as `TabBarContentView`'s own
 /// `TabBarBackgroundModifier` (the closest existing precedent: another
 /// horizontal bar sitting directly above/adjacent to the tab strip,
-/// bottom-edge-separated from what follows it) -- ties this bar's tint
-/// to the user's theme color + glass opacity instead of a fixed
+/// bottom-edge-separated from what follows it) -- ties this bar's
+/// look to the user's theme color + glass opacity instead of a fixed
 /// `.thinMaterial`, so it reads as part of the window chrome rather
 /// than a foreign overlay.
+///
+/// Deliberately does NOT apply its own `.glassEffect(...)` tint pass
+/// (unlike `TabBarBackgroundModifier`/`SidebarBackgroundModifier`,
+/// which do): this bar is hosted via `mainContent.safeAreaInset(edge:
+/// .top)` in `MainContentView`, and `mainContent`'s own titlebar-glass
+/// overlay (the `GeometryReader`-sized rect further down in that file)
+/// sizes itself from `geo.safeAreaInsets.top`, which now spans BOTH the
+/// real titlebar height AND this bar's own height while it's shown --
+/// so that overlay's single glassEffect tint pass already paints
+/// straight through this bar's strip with the exact same
+/// `GlassTheme.chromeTint(...)` formula used below. Adding a second
+/// `.glassEffect` here stacked two passes of the identical tint in this
+/// one strip, reading visibly darker than the single-pass chrome above
+/// and below it (user-reported). This modifier now only supplies the
+/// bottom stroke + text/button legibility handling; the glass surface
+/// itself is inherited from `mainContent`.
 private struct RecoveryBarBackgroundModifier: ViewModifier {
     let reduceTransparency: Bool
     @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
@@ -78,7 +95,6 @@ private struct RecoveryBarBackgroundModifier: ViewModifier {
                 .overlay(alignment: .bottom) { Divider() }
         } else {
             content
-                .glassEffect(.clear.tint(Color(nsColor: GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity))), in: .rect)
                 .overlay(alignment: .bottom) {
                     Rectangle()
                         .fill(GlassTheme.specularStroke.opacity(0.28))
