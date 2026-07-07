@@ -65,11 +65,15 @@ struct MCPRouter: Sendable {
 
     // MARK: - Schema Helpers
 
-    private static func prop(_ type: String, _ desc: String) -> AnyCodable {
+    /// `internal` (not `private`): shared with `MCPCommandLogBridge` and
+    /// `MCPLSPBridge`, which used to each carry their own copy of this
+    /// exact helper. Promoted to a single source of truth (code review
+    /// finding) instead of three independently-drifting copies.
+    static func prop(_ type: String, _ desc: String) -> AnyCodable {
         AnyCodable(["type": AnyCodable(type), "description": AnyCodable(desc)] as [String: AnyCodable])
     }
 
-    private static func arrayProp(_ itemType: String, _ desc: String) -> AnyCodable {
+    static func arrayProp(_ itemType: String, _ desc: String) -> AnyCodable {
         AnyCodable([
             "type": AnyCodable("array"),
             "items": AnyCodable(["type": AnyCodable(itemType)] as [String: AnyCodable]),
@@ -77,7 +81,7 @@ struct MCPRouter: Sendable {
         ] as [String: AnyCodable])
     }
 
-    private static func schema(
+    static func schema(
         properties: [String: AnyCodable],
         required: [String] = []
     ) -> [String: AnyCodable] {
@@ -162,10 +166,16 @@ struct MCPRouter: Sendable {
         MCPLSPBridge.tools
     }
 
-    /// Combined IPC + LSP tool catalogue. Used by `tools/list` to advertise
-    /// every tool the server can dispatch.
+    /// terminal_* tool catalogue. Delegates to `MCPCommandLogBridge.tools`,
+    /// same rationale as `lspTools` delegating to `MCPLSPBridge.tools`.
+    static var terminalTools: [MCPTool] {
+        MCPCommandLogBridge.tools
+    }
+
+    /// Combined IPC + LSP + terminal_* tool catalogue. Used by
+    /// `tools/list` to advertise every tool the server can dispatch.
     static var allTools: [MCPTool] {
-        tools + lspTools
+        tools + lspTools + terminalTools
     }
 
     /// Classifier — does `name` belong to the LSP tool surface?
@@ -173,6 +183,13 @@ struct MCPRouter: Sendable {
     /// dispatch table.
     static func isLSPTool(name: String) -> Bool {
         name.hasPrefix("lsp_")
+    }
+
+    /// Classifier — does `name` belong to the terminal_* (CommandLog) tool
+    /// surface? Identifies tools by the `terminal_` prefix, same shape as
+    /// `isLSPTool`.
+    static func isTerminalTool(name: String) -> Bool {
+        name.hasPrefix("terminal_")
     }
 
     /// Opening paragraph shared by both instructions variants below.
@@ -226,6 +243,7 @@ struct MCPRouter: Sendable {
         "Use list_peers to discover other connected instances. Use broadcast for announcements relevant to all peers.",
         "Browser automation tools (browser_*) are available when browser scripting is enabled via the Command Palette. Use browser_snapshot to inspect pages and browser_click/browser_fill to interact with elements. Element refs (@e1, @e2) from snapshots can be used as selectors.",
         "LSP language tools (lsp_*) are available when the LSP bridge is started. Use lsp_hover to inspect type information and documentation at a position in a file. Use lsp_definition / lsp_declaration / lsp_type_definition / lsp_implementation for navigation. Use lsp_references for finding usages. Use lsp_completion for autocomplete and lsp_workspace_symbol for cross-file symbol search. All LSP tools require workspace_root, language_id, and (most of them) file/line/column arguments.",
+        "Terminal command-history tools (terminal_*) are available when shell integration is installed (zsh and fish only, currently). Use terminal_list_commands to list the commands recorded for a surface, oldest-first, terminal_read_output to fetch a specific command's captured output, and terminal_await_command to block until a running command finishes or the timeout elapses. terminal_await_command returns {\"status\": \"timeout\"} on timeout — simply call it again to keep waiting. terminal_list_commands and terminal_await_command's surface_id argument also accepts a calyx-session ID in place of the raw surface UUID (terminal_read_output takes command_id instead and has no surface_id argument).",
     ]
 
     /// Static, trusted instructions text for a connection with no

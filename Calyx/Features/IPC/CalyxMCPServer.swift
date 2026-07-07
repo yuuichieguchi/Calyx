@@ -86,6 +86,16 @@ final class CalyxMCPServer {
     /// leak state across cases -- same rationale as `agentRegistry`.
     var commandLogStore: CommandLogStore = .shared
 
+    /// Lazily constructed, cached `MCPCommandLogBridge` that `terminal_*`
+    /// calls dispatch through. `lazy` so it's only built on first actual
+    /// `terminal_*` dispatch (not at `CalyxMCPServer` init), by which
+    /// point any test that overrides `commandLogStore`/`sessionSurfaceMap`
+    /// has already done so; built exactly once and reused afterward
+    /// (never recreated per call).
+    private lazy var lazyCommandLogBridge = MCPCommandLogBridge(
+        store: commandLogStore, sessionSurfaceMap: sessionSurfaceMap
+    )
+
     /// Resolves a calyx-session ID to the surface UUID currently
     /// attached to it, for `/mcp` and `/agent-event` requests whose
     /// `X-Calyx-Surface-ID` header carries a session ID rather than a
@@ -1318,6 +1328,15 @@ final class CalyxMCPServer {
             )
         }
 
+        // terminal_* route — dispatched through `MCPCommandLogBridge`.
+        if MCPRouter.isTerminalTool(name: toolName) {
+            return await handleTerminalToolCall(
+                id: id,
+                toolName: toolName,
+                params: params
+            )
+        }
+
         let arguments = extractDict(params, "arguments")
 
         switch toolName {
@@ -1615,6 +1634,31 @@ final class CalyxMCPServer {
                 id: id,
                 text: "LSP tool error: \(error.localizedDescription)"
             )
+        }
+    }
+
+    // MARK: - terminal_* Tool Dispatch
+
+    /// Route a `terminal_*` tool call to `MCPCommandLogBridge`, mirroring
+    /// `handleLSPToolCall`'s shape at a small scale: unlike the LSP
+    /// bridge (optional, only live after `startLSP()`), the command-log
+    /// bridge is always available (the lazily-built, cached
+    /// `lazyCommandLogBridge`). `MCPCommandLogBridgeError` conforms to
+    /// `LocalizedError`, so (unlike `handleLSPToolCall`'s per-case
+    /// switch over `MCPLSPBridgeError`) a single generic `catch` can
+    /// build the tool-error text straight from
+    /// `error.localizedDescription`.
+    private func handleTerminalToolCall(
+        id: JSONRPCId,
+        toolName: String,
+        params: [String: AnyCodable]
+    ) async -> (statusCode: Int, body: Data?) {
+        let arguments = extractDict(params, "arguments") ?? [:]
+        do {
+            let text = try await lazyCommandLogBridge.handleToolCall(name: toolName, arguments: arguments)
+            return toolSuccess(id: id, text: text)
+        } catch {
+            return toolError(id: id, text: error.localizedDescription)
         }
     }
 

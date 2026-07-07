@@ -198,10 +198,11 @@ final class MCPProtocolTests: XCTestCase {
     // ==================== 2. Tools List — IPC + LSP Tool Surface ====================
 
     func test_toolsListResponse_containsAllTools() throws {
-        // Arrange — `tools/list` advertises the combined IPC + LSP surface
-        // (6 IPC + 70 LSP = 76 tools; Round 7 removed ack_messages). Each
-        // IPC name must be present and the LSP catalogue must be surfaced
-        // alongside.
+        // Arrange — `tools/list` advertises the combined IPC + LSP +
+        // terminal_* surface (6 IPC + 70 LSP + 3 terminal_* = 79 tools;
+        // Round 7 removed ack_messages, P3 added the terminal_* surface).
+        // Each IPC name must be present and the LSP catalogue must be
+        // surfaced alongside.
         let id = JSONRPCId.int(2)
         let expectedIPCTools: Set<String> = [
             "register_peer", "list_peers", "send_message",
@@ -226,8 +227,8 @@ final class MCPProtocolTests: XCTestCase {
                       "Tools list must contain every IPC tool; got: \(actualNames)")
         XCTAssertTrue(actualNames.contains("lsp_hover"),
                       "Tools list must surface the LSP tool catalogue alongside IPC tools")
-        XCTAssertEqual(toolsResult.tools.count, 76,
-                       "Tools list must contain 6 IPC + 70 LSP = 76 tools")
+        XCTAssertEqual(toolsResult.tools.count, 79,
+                       "Tools list must contain 6 IPC + 70 LSP + 3 terminal_* = 79 tools")
     }
 
     // ==================== Round 7: ack_messages removed; receive is ====================
@@ -657,5 +658,42 @@ final class MCPProtocolTests: XCTestCase {
         let jsonObj = try JSONSerialization.jsonObject(with: data) as! [String: Any]
         XCTAssertTrue(jsonObj["id"] is NSNull || jsonObj["id"] == nil,
                       "Nil id must serialize as JSON null")
+    }
+
+    // ==================== P3: terminal_* tool surface ====================
+
+    // A single method (rather than separate true/false-only tests):
+    // asserting a "must be true" case alongside the "must be false"
+    // cases guards against a permanently-false isTerminalTool passing
+    // vacuously.
+    func test_isTerminalTool_classifiesByTerminalPrefix() {
+        XCTAssertTrue(MCPRouter.isTerminalTool(name: "terminal_list_commands"))
+        XCTAssertTrue(MCPRouter.isTerminalTool(name: "terminal_read_output"))
+        XCTAssertTrue(MCPRouter.isTerminalTool(name: "terminal_await_command"))
+
+        XCTAssertFalse(MCPRouter.isTerminalTool(name: "lsp_hover"))
+        XCTAssertFalse(MCPRouter.isTerminalTool(name: "register_peer"))
+        XCTAssertFalse(MCPRouter.isTerminalTool(name: "terminal"),
+                       "The bare word 'terminal' (no trailing underscore) must not match the terminal_ prefix")
+    }
+
+    func test_allTools_containsTerminalTools() {
+        // Sanity: terminalTools itself must actually enumerate the 3
+        // tools -- otherwise the containment assertion below would be
+        // indistinguishable from a permanently-empty terminalTools that
+        // happens to be a subset of anything.
+        XCTAssertEqual(Set(MCPRouter.terminalTools.map(\.name)),
+                       Set(["terminal_list_commands", "terminal_read_output", "terminal_await_command"]),
+                       "Precondition: terminalTools must enumerate exactly the 3 terminal_* tools")
+
+        let allNames = Set(MCPRouter.allTools.map(\.name))
+        XCTAssertTrue(allNames.isSuperset(of: Set(MCPRouter.terminalTools.map(\.name))),
+                      "allTools must include every tool terminalTools advertises")
+    }
+
+    func test_instructions_mentionsTerminalAwaitCommand() {
+        XCTAssertTrue(MCPRouter.instructions.contains("terminal_await_command"),
+                      "The default instructions text must mention terminal_await_command so an MCP " +
+                      "client can discover the terminal_* tool surface")
     }
 }

@@ -1204,11 +1204,11 @@ private func positionRequestSchema(
     extraRequired: [String] = []
 ) -> [String: AnyCodable] {
     var props: [String: AnyCodable] = [
-        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-        "file": prop("string", "Absolute path or file:// URI of the target file"),
-        "line": prop("integer", "0-based line number"),
-        "column": prop("integer", "0-based UTF-16 column / character offset"),
+        "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "file": MCPRouter.prop("string", "Absolute path or file:// URI of the target file"),
+        "line": MCPRouter.prop("integer", "0-based line number"),
+        "column": MCPRouter.prop("integer", "0-based UTF-16 column / character offset"),
     ]
     for (key, value) in extraProperties {
         props[key] = value
@@ -1220,14 +1220,6 @@ private func positionRequestSchema(
         "properties": AnyCodable(props),
         "required": AnyCodable(required.map { AnyCodable($0) }),
     ]
-}
-
-/// Build a single `{ "type": ..., "description": ... }` JSON-Schema fragment.
-private func prop(_ type: String, _ description: String) -> AnyCodable {
-    AnyCodable([
-        "type": AnyCodable(type),
-        "description": AnyCodable(description),
-    ] as [String: AnyCodable])
 }
 
 /// Build the JSON-Schema for an item-based MCP tool (the call/type
@@ -1243,8 +1235,8 @@ private func itemBasedSchema(
     itemDescription: String
 ) -> [String: AnyCodable] {
     let props: [String: AnyCodable] = [
-        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
         itemKey: AnyCodable([
             "type": AnyCodable("object"),
             "description": AnyCodable(itemDescription),
@@ -1263,9 +1255,9 @@ private func itemBasedSchema(
 /// inline schema but factored into a shared helper.
 private func fileOnlySchema() -> [String: AnyCodable] {
     let props: [String: AnyCodable] = [
-        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-        "file": prop("string", "Absolute path or file:// URI of the target file"),
+        "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "file": MCPRouter.prop("string", "Absolute path or file:// URI of the target file"),
     ]
     let required = ["workspace_root", "language_id", "file"]
     return [
@@ -1283,13 +1275,13 @@ private func rangeRequestSchema(
     extraRequired: [String] = []
 ) -> [String: AnyCodable] {
     var props: [String: AnyCodable] = [
-        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-        "file": prop("string", "Absolute path or file:// URI of the target file"),
-        "start_line": prop("integer", "0-based start line of the target range"),
-        "start_column": prop("integer", "0-based start column of the target range"),
-        "end_line": prop("integer", "0-based end line of the target range"),
-        "end_column": prop("integer", "0-based end column of the target range"),
+        "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "file": MCPRouter.prop("string", "Absolute path or file:// URI of the target file"),
+        "start_line": MCPRouter.prop("integer", "0-based start line of the target range"),
+        "start_column": MCPRouter.prop("integer", "0-based start column of the target range"),
+        "end_line": MCPRouter.prop("integer", "0-based end line of the target range"),
+        "end_column": MCPRouter.prop("integer", "0-based end column of the target range"),
     ]
     for (key, value) in extraProperties {
         props[key] = value
@@ -1316,9 +1308,9 @@ private func formattingSchema(
     includePositionAndCh: Bool
 ) -> [String: AnyCodable] {
     var props: [String: AnyCodable] = [
-        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-        "file": prop("string", "Absolute path or file:// URI of the target file"),
+        "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "file": MCPRouter.prop("string", "Absolute path or file:// URI of the target file"),
         "options": AnyCodable([
             "type": AnyCodable("object"),
             "description": AnyCodable(
@@ -1330,16 +1322,16 @@ private func formattingSchema(
     ]
     var required = ["workspace_root", "language_id", "file", "options"]
     if includeRange {
-        props["start_line"] = prop("integer", "0-based start line of the target range")
-        props["start_column"] = prop("integer", "0-based start column of the target range")
-        props["end_line"] = prop("integer", "0-based end line of the target range")
-        props["end_column"] = prop("integer", "0-based end column of the target range")
+        props["start_line"] = MCPRouter.prop("integer", "0-based start line of the target range")
+        props["start_column"] = MCPRouter.prop("integer", "0-based start column of the target range")
+        props["end_line"] = MCPRouter.prop("integer", "0-based end line of the target range")
+        props["end_column"] = MCPRouter.prop("integer", "0-based end column of the target range")
         required.append(contentsOf: ["start_line", "start_column", "end_line", "end_column"])
     }
     if includePositionAndCh {
-        props["line"] = prop("integer", "0-based line number where the character was typed")
-        props["column"] = prop("integer", "0-based UTF-16 column where the character was typed")
-        props["ch"] = prop(
+        props["line"] = MCPRouter.prop("integer", "0-based line number where the character was typed")
+        props["column"] = MCPRouter.prop("integer", "0-based UTF-16 column where the character was typed")
+        props["ch"] = MCPRouter.prop(
             "string",
             "The character that triggered on-type formatting (e.g. '}' or ';')"
         )
@@ -1361,7 +1353,7 @@ private func formattingSchema(
 private func filesArraySchema(itemKeys: [String]) -> [String: AnyCodable] {
     var itemProps: [String: AnyCodable] = [:]
     for key in itemKeys {
-        itemProps[key] = prop("string", "file:// URI for this file or folder")
+        itemProps[key] = MCPRouter.prop("string", "file:// URI for this file or folder")
     }
     let itemSchema: [String: AnyCodable] = [
         "type": AnyCodable("object"),
@@ -1369,8 +1361,8 @@ private func filesArraySchema(itemKeys: [String]) -> [String: AnyCodable] {
         "required": AnyCodable(itemKeys.map { AnyCodable($0) }),
     ]
     let props: [String: AnyCodable] = [
-        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+        "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
         "files": AnyCodable([
             "type": AnyCodable("array"),
             "description": AnyCodable(
@@ -1587,7 +1579,7 @@ enum ReferencesTool: MCPLSPTool {
     static let description = "Find all references to the symbol at a position."
     static let inputSchema: [String: AnyCodable] = positionRequestSchema(
         extraProperties: [
-            "include_declaration": prop(
+            "include_declaration": MCPRouter.prop(
                 "boolean",
                 "Whether to include the declaration site in the result"
             ),
@@ -1669,9 +1661,9 @@ enum DocumentSymbolTool: MCPLSPTool {
     static let description = "Return the symbol tree (classes, functions, etc.) for a single file."
     static let inputSchema: [String: AnyCodable] = {
         var props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "file": prop("string", "Absolute path or file:// URI of the target file"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "file": MCPRouter.prop("string", "Absolute path or file:// URI of the target file"),
         ]
         let required = ["workspace_root", "language_id", "file"]
         return [
@@ -1715,9 +1707,9 @@ enum WorkspaceSymbolTool: MCPLSPTool {
     static let description = "Search for symbols across the whole workspace by name."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "query": prop("string", "Substring to match against symbol names"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "query": MCPRouter.prop("string", "Substring to match against symbol names"),
         ]
         let required = ["workspace_root", "language_id", "query"]
         return [
@@ -1758,11 +1750,11 @@ enum CompletionTool: MCPLSPTool {
     static let description = "Request code completion suggestions at a position."
     static let inputSchema: [String: AnyCodable] = positionRequestSchema(
         extraProperties: [
-            "trigger_kind": prop(
+            "trigger_kind": MCPRouter.prop(
                 "integer",
                 "CompletionTriggerKind: 1=Invoked, 2=TriggerCharacter, 3=TriggerForIncompleteCompletions"
             ),
-            "trigger_character": prop(
+            "trigger_character": MCPRouter.prop(
                 "string",
                 "Single character that triggered completion (only when trigger_kind == 2)"
             ),
@@ -1901,7 +1893,7 @@ enum RenameTool: MCPLSPTool {
     static let description = "Rename the symbol at a position across the workspace."
     static let inputSchema: [String: AnyCodable] = positionRequestSchema(
         extraProperties: [
-            "new_name": prop("string", "New name to apply to the symbol"),
+            "new_name": MCPRouter.prop("string", "New name to apply to the symbol"),
         ],
         extraRequired: ["new_name"]
     )
@@ -1961,7 +1953,7 @@ enum CodeActionTool: MCPLSPTool {
                     "type": AnyCodable("string"),
                 ] as [String: AnyCodable]),
             ] as [String: AnyCodable]),
-            "trigger_kind": prop(
+            "trigger_kind": MCPRouter.prop(
                 "integer",
                 "CodeActionTriggerKind: 1=Invoked, 2=Automatic. Forwarded into context.triggerKind."
             ),
@@ -2050,11 +2042,11 @@ enum DiagnosticsTool: MCPLSPTool {
     static let description = "Pull the current diagnostics for a file (textDocument/diagnostic)."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "file": prop("string", "Absolute path or file:// URI of the target file"),
-            "identifier": prop("string", "Optional server-side identifier from registration"),
-            "previous_result_id": prop("string", "Optional result id from a prior diagnostic response"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "file": MCPRouter.prop("string", "Absolute path or file:// URI of the target file"),
+            "identifier": MCPRouter.prop("string", "Optional server-side identifier from registration"),
+            "previous_result_id": MCPRouter.prop("string", "Optional result id from a prior diagnostic response"),
         ]
         let required = ["workspace_root", "language_id", "file"]
         return [
@@ -2105,7 +2097,7 @@ enum CheckInstallationTool: MCPLSPTool {
     static let description = "Report installation status of LSP servers (optionally for one languageId)."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "language_id": prop(
+            "language_id": MCPRouter.prop(
                 "string",
                 "Optional. If present, check only this languageId; otherwise check every registry entry."
             ),
@@ -2141,8 +2133,8 @@ enum InstallTool: MCPLSPTool {
     static let description = "Auto-install the LSP server for a languageId."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "language_id": prop("string", "Target languageId to install (e.g. 'typescript')"),
-            "approve_prerequisites": prop(
+            "language_id": MCPRouter.prop("string", "Target languageId to install (e.g. 'typescript')"),
+            "approve_prerequisites": MCPRouter.prop(
                 "boolean",
                 "If true, the installer is also allowed to install missing prerequisites (e.g. npm)."
             ),
@@ -2188,7 +2180,7 @@ enum InstallStatusTool: MCPLSPTool {
     static let description = "Return the current install status for a languageId."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "language_id": prop("string", "Target languageId to query"),
+            "language_id": MCPRouter.prop("string", "Target languageId to query"),
         ]
         let required = ["language_id"]
         return [
@@ -2236,8 +2228,8 @@ enum SessionWarmupTool: MCPLSPTool {
     static let description = "Pre-start an LSP session for a workspace + languageId pair. Optionally pre-opens an initial set of files so subsequent position/range/file tools can dispatch immediately."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
             "files": AnyCodable([
                 "type": AnyCodable("array"),
                 "description": AnyCodable(
@@ -2306,8 +2298,8 @@ enum SessionShutdownTool: MCPLSPTool {
     static let description = "Shut down a specific LSP session and forget it from the cache."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
         ]
         let required = ["workspace_root", "language_id"]
         return [
@@ -2754,23 +2746,23 @@ enum InlineValueTool: MCPLSPTool {
     static let description = "Get inline value hints for a range while a debugger is stopped at a frame."
     static let inputSchema: [String: AnyCodable] = rangeRequestSchema(
         extraProperties: [
-            "frame_id": prop(
+            "frame_id": MCPRouter.prop(
                 "integer",
                 "DAP stack frame id where execution has stopped. Defaults to 0."
             ),
-            "stopped_start_line": prop(
+            "stopped_start_line": MCPRouter.prop(
                 "integer",
                 "0-based start line of the stopped-location range. Defaults to start_line."
             ),
-            "stopped_start_column": prop(
+            "stopped_start_column": MCPRouter.prop(
                 "integer",
                 "0-based start column of the stopped-location range. Defaults to start_column."
             ),
-            "stopped_end_line": prop(
+            "stopped_end_line": MCPRouter.prop(
                 "integer",
                 "0-based end line of the stopped-location range. Defaults to end_line."
             ),
-            "stopped_end_column": prop(
+            "stopped_end_column": MCPRouter.prop(
                 "integer",
                 "0-based end column of the stopped-location range. Defaults to end_column."
             ),
@@ -2890,15 +2882,15 @@ enum SelectionRangeTool: MCPLSPTool {
         let positionItemSchema: [String: AnyCodable] = [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
-                "line": prop("integer", "0-based line number"),
-                "column": prop("integer", "0-based UTF-16 column / character offset"),
+                "line": MCPRouter.prop("integer", "0-based line number"),
+                "column": MCPRouter.prop("integer", "0-based UTF-16 column / character offset"),
             ] as [String: AnyCodable]),
             "required": AnyCodable([AnyCodable("line"), AnyCodable("column")]),
         ]
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "file": prop("string", "Absolute path or file:// URI of the target file"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "file": MCPRouter.prop("string", "Absolute path or file:// URI of the target file"),
             "positions": AnyCodable([
                 "type": AnyCodable("array"),
                 "description": AnyCodable("Positions at which to compute selection ranges"),
@@ -3045,10 +3037,10 @@ enum SemanticTokensDeltaTool: MCPLSPTool {
     static let description = "Get a delta of semantic tokens against a previous result id (textDocument/semanticTokens/full/delta)."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "file": prop("string", "Absolute path or file:// URI of the target file"),
-            "previous_result_id": prop(
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "file": MCPRouter.prop("string", "Absolute path or file:// URI of the target file"),
+            "previous_result_id": MCPRouter.prop(
                 "string",
                 "resultId returned by a previous semanticTokens/full (or /delta) call"
             ),
@@ -3540,15 +3532,15 @@ enum WorkspaceDiagnosticPullTool: MCPLSPTool {
         let previousResultIdItemSchema: [String: AnyCodable] = [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
-                "uri": prop("string", "Document URI the prior result id belongs to"),
-                "value": prop("string", "Previous resultId from the server"),
+                "uri": MCPRouter.prop("string", "Document URI the prior result id belongs to"),
+                "value": MCPRouter.prop("string", "Previous resultId from the server"),
             ] as [String: AnyCodable]),
             "required": AnyCodable([AnyCodable("uri"), AnyCodable("value")]),
         ]
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "identifier": prop(
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "identifier": MCPRouter.prop(
                 "string",
                 "Optional server-side identifier from registration"
             ),
@@ -3615,9 +3607,9 @@ enum WorkspaceExecuteCommandTool: MCPLSPTool {
     static let description = "Execute a server-side command (workspace/executeCommand)."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "command": prop("string", "Identifier of the command handler on the server"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "command": MCPRouter.prop("string", "Identifier of the command handler on the server"),
             "arguments": AnyCodable([
                 "type": AnyCodable("array"),
                 "description": AnyCodable(
@@ -3677,19 +3669,19 @@ enum WorkspaceApplyEditTool: MCPLSPTool {
     static let description = "Apply a WorkspaceEdit locally. Bridge-internal — no LSP request is sent. With commit:false, returns a dry-run failure; with commit:true, the minimal stub reports applied:true (the FS write is owned by a follow-up batch)."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
             "edit": AnyCodable([
                 "type": AnyCodable("object"),
                 "description": AnyCodable(
                     "WorkspaceEdit to apply (LSP WorkspaceEdit shape: changes / documentChanges / changeAnnotations)."
                 ),
             ] as [String: AnyCodable]),
-            "commit": prop(
+            "commit": MCPRouter.prop(
                 "boolean",
                 "If true, commit the edit. If false, perform a dry-run that reports applied:false / failureReason:'dry-run'."
             ),
-            "label": prop(
+            "label": MCPRouter.prop(
                 "string",
                 "Optional human-readable label for the edit (used by clients for undo UI)."
             ),
@@ -3736,9 +3728,9 @@ enum WorkspaceConfigurationGetTool: MCPLSPTool {
     static let description = "Read a bridge-side workspace configuration value previously written with lsp_workspace_configuration_set. No LSP request is sent."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "section": prop("string", "Configuration section identifier (e.g. 'editor.tabSize')"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "section": MCPRouter.prop("string", "Configuration section identifier (e.g. 'editor.tabSize')"),
         ]
         let required = ["workspace_root", "language_id", "section"]
         return [
@@ -3784,9 +3776,9 @@ enum WorkspaceConfigurationSetTool: MCPLSPTool {
     static let description = "Write a bridge-side workspace configuration value visible to lsp_workspace_configuration_get. No LSP request is sent."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
-            "section": prop("string", "Configuration section identifier (e.g. 'editor.tabSize')"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "section": MCPRouter.prop("string", "Configuration section identifier (e.g. 'editor.tabSize')"),
             "value": AnyCodable([
                 "description": AnyCodable(
                     "Value to store. Any JSON-shaped value is accepted and round-tripped verbatim."
@@ -4073,7 +4065,7 @@ enum BatchTool: MCPLSPTool {
         let requestItemSchema: [String: AnyCodable] = [
             "type": AnyCodable("object"),
             "properties": AnyCodable([
-                "tool": prop("string", "Name of the bridge tool to dispatch (e.g. 'lsp_hover')"),
+                "tool": MCPRouter.prop("string", "Name of the bridge tool to dispatch (e.g. 'lsp_hover')"),
                 "params": AnyCodable([
                     "type": AnyCodable("object"),
                     "description": AnyCodable(
@@ -4218,7 +4210,7 @@ enum HoverBundleTool: MCPLSPTool {
     static let description = "AI-friendly bundle of hover + definition + surrounding source for a position. Fans out textDocument/hover and textDocument/definition in parallel and surfaces them, along with a ±context_lines source snippet around the cursor, and (when discoverable) resolves up to 5 dependent type identifiers via workspace/symbol + follow-up hover lookups."
     static let inputSchema: [String: AnyCodable] = positionRequestSchema(
         extraProperties: [
-            "context_lines": prop(
+            "context_lines": MCPRouter.prop(
                 "integer",
                 "Lines of source context to include around (line, column) in surrounding_code. Default 10, min 0, max 100."
             ),
@@ -4691,15 +4683,15 @@ enum SymbolWalkTool: MCPLSPTool {
     static let description = "BFS a call or type hierarchy from a seed item. `kind` selects the walk direction: call_incoming (default) routes through callHierarchy/incomingCalls, call_outgoing through callHierarchy/outgoingCalls, type_supertypes / type_subtypes prepare via textDocument/prepareTypeHierarchy and then iterate typeHierarchy/{supertypes,subtypes}. Returns `{items: [{level, item, edge?}], depth_reached: Int}`."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
             "item": AnyCodable([
                 "type": AnyCodable("object"),
                 "description": AnyCodable(
                     "Seed item. For call_incoming / call_outgoing this is a CallHierarchyItem; for type_supertypes / type_subtypes a TypeHierarchyItem (structurally identical). Forwarded verbatim to the underlying LSP request."
                 ),
             ] as [String: AnyCodable]),
-            "kind": prop(
+            "kind": MCPRouter.prop(
                 "string",
                 "Direction to walk. One of: call_incoming (default), call_outgoing, type_supertypes, type_subtypes."
             ),
@@ -5115,7 +5107,7 @@ enum GlobalWorkspaceSymbolTool: MCPLSPTool {
     static let description = "Search for symbols across every cached LSP session (any workspace, any languageId). Fans `workspace/symbol` out across `LSPService.allSessions()` and concatenates the results."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "query": prop("string", "Substring to match against symbol names"),
+            "query": MCPRouter.prop("string", "Substring to match against symbol names"),
         ]
         return [
             "type": AnyCodable("object"),
@@ -5296,12 +5288,12 @@ enum DiagnosticsDiffTool: MCPLSPTool {
     static let description = "Return the diagnostics that changed in a workspace since a previous snapshot id. Reads from the bridge-owned DiagnosticsStore — no LSP request is sent."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop(
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop(
                 "string",
                 "LSP languageId — accepted for parity with other tools but not used by the diff (the store keys on workspace only)."
             ),
-            "since_snapshot_id": prop(
+            "since_snapshot_id": MCPRouter.prop(
                 "integer",
                 "Snapshot id previously issued by the store; the diff returns URIs whose diagnostics changed strictly after this id."
             ),
@@ -5343,8 +5335,8 @@ enum CapabilitiesTool: MCPLSPTool {
     static let description = "Return the server's static + dynamic capability snapshot for a workspace+language. Reads the session-resident CapabilityRegistry — no LSP request is sent."
     static let inputSchema: [String: AnyCodable] = {
         let props: [String: AnyCodable] = [
-            "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-            "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
+            "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+            "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'rust')"),
         ]
         let required = ["workspace_root", "language_id"]
         return [
@@ -5400,8 +5392,8 @@ enum CapabilitiesTool: MCPLSPTool {
 /// struct.
 private func notebookSchema() -> [String: AnyCodable] {
     let props: [String: AnyCodable] = [
-        "workspace_root": prop("string", "Absolute path or file:// URI of the workspace root"),
-        "language_id": prop("string", "LSP languageId (e.g. 'typescript', 'python')"),
+        "workspace_root": MCPRouter.prop("string", "Absolute path or file:// URI of the workspace root"),
+        "language_id": MCPRouter.prop("string", "LSP languageId (e.g. 'typescript', 'python')"),
         "notebook": AnyCodable([
             "type": AnyCodable("object"),
             "description": AnyCodable(
