@@ -259,6 +259,20 @@ final class CommandEventDecodeTests: XCTestCase {
         XCTAssertNil(event.ts, "A ts value implausibly small to be epoch milliseconds must decode as absent")
     }
 
+    func test_decode_tsAboveMaximumPlausibleMillisThreshold_treatedAsAbsent() throws {
+        // A wildly-implausible far-future ts -- e.g. corrupted input --
+        // must not decode into a bogus Date millennia from now, which
+        // would otherwise let a multi-billion-year elapsed gap reach
+        // CommandLogStore.finalize's duration derivation.
+        let data = json("""
+        { "phase": "end", "cmd_id": "abc-123", "ts": 99999999999999999 }
+        """)
+
+        let event = try XCTUnwrap(CommandEvent.decode(from: data))
+
+        XCTAssertNil(event.ts, "A ts value implausibly large to be a real epoch-millisecond timestamp must decode as absent")
+    }
+
     // MARK: - Type confusion
 
     func test_decode_phaseAsNumber_returnsNil() {

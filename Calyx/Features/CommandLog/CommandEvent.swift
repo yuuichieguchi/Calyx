@@ -65,9 +65,9 @@ struct CommandEvent: Sendable {
         // JSONSerialization bridged the literal (same dual-cast as
         // LSPSession's request-id decode).
         var ts: Date?
-        if let tsMillis = object["ts"] as? Int, Double(tsMillis) >= Self.minimumPlausibleTsMillis {
+        if let tsMillis = object["ts"] as? Int, Self.isPlausibleTsMillis(Double(tsMillis)) {
             ts = Date(timeIntervalSince1970: Double(tsMillis) / 1000)
-        } else if let tsMillis = object["ts"] as? Double, tsMillis >= Self.minimumPlausibleTsMillis {
+        } else if let tsMillis = object["ts"] as? Double, Self.isPlausibleTsMillis(tsMillis) {
             ts = Date(timeIntervalSince1970: tsMillis / 1000)
         }
 
@@ -78,9 +78,22 @@ struct CommandEvent: Sendable {
     /// implausible for a real "now" -- most plausibly an accidental
     /// epoch-SECONDS value (~1.7e9 for a current date) rather than
     /// milliseconds, which would otherwise decode into a bogus
-    /// early-1970s `Date`. Treated as if `ts` were absent, so ingest
-    /// falls back to `CommandLogStore.now()`.
+    /// early-1970s `Date`.
     private static let minimumPlausibleTsMillis: Double = 100_000_000_000
+    /// A `ts` above this (1e14 epoch-millisecond, ~year 5138) threshold
+    /// is equally implausible -- most plausibly a corrupted/garbage
+    /// value. Defense-in-depth: `CommandLogStore.finalize`'s own
+    /// duration derivation independently clamps an implausible
+    /// `endedAt - startedAt` gap rather than trapping, but rejecting an
+    /// absurd `ts` here means it never reaches that far to begin with.
+    private static let maximumPlausibleTsMillis: Double = 100_000_000_000_000
+
+    /// A `ts` outside `[minimumPlausibleTsMillis, maximumPlausibleTsMillis]`
+    /// is treated as if `ts` were absent, so ingest falls back to
+    /// `CommandLogStore.now()`.
+    private static func isPlausibleTsMillis(_ millis: Double) -> Bool {
+        millis >= minimumPlausibleTsMillis && millis <= maximumPlausibleTsMillis
+    }
 
     private static func decodeBase64String(_ base64: String) -> String? {
         guard let data = Data(base64Encoded: base64),

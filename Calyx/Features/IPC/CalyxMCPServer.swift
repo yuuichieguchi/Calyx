@@ -81,6 +81,11 @@ final class CalyxMCPServer {
     /// leak state across cases.
     var agentRegistry: AgentRegistry = .shared
 
+    /// Store that `/command-event` ingests into. Defaults to the shared
+    /// singleton; tests inject an isolated instance so assertions don't
+    /// leak state across cases -- same rationale as `agentRegistry`.
+    var commandLogStore: CommandLogStore = .shared
+
     /// Resolves a calyx-session ID to the surface UUID currently
     /// attached to it, for `/mcp` and `/agent-event` requests whose
     /// `X-Calyx-Surface-ID` header carries a session ID rather than a
@@ -161,6 +166,8 @@ final class CalyxMCPServer {
             return await routeMCP(request: request)
         case ("POST", "/agent-event"):
             return await routeAgentEvent(request: request)
+        case ("POST", "/command-event"):
+            return await routeCommandEvent(request: request)
         default:
             return HTTPParser.response(statusCode: 404, body: nil)
         }
@@ -278,6 +285,53 @@ final class CalyxMCPServer {
                 surfaceID: surfaceID, agentKind: kind, agentSessionID: agentSessionID
             )
         }
+        return HTTPParser.response(statusCode: 204, body: nil)
+    }
+
+    /// Ingests a shell integration's command-lifecycle event
+    /// (`CommandEvent`) into `commandLogStore`. Contract (Green phase):
+    /// bearer token check (401) -> body present and <= 262_144 bytes,
+    /// cap checked BEFORE decode (400 missing / 413 oversized) ->
+    /// `CommandEvent.decode(from:)` (400 on nil) -> `X-Calyx-Surface-ID`
+    /// header: missing/empty is a malformed-client 400, but a
+    /// present-and-non-empty header that `resolveSurfaceID(from:)` still
+    /// can't resolve (an unknown calyx-session ID -- a detached
+    /// persistent session that keeps emitting after its pane closed,
+    /// normal steady-state) is a silent 204 drop, NOT a 400 -> resolved,
+    /// `commandLogStore.ingest(event, surfaceID:)` -> 204. Unlike
+    /// `routeAgentEvent`, ingestion is NOT gated on
+    /// `CommandTrackingSettings.trackingEnabled` -- the endpoint stays
+    /// live regardless; the shell-integration env injection is the only
+    /// gate on whether events ever arrive here at all.
+    private func routeCommandEvent(request: HTTPRequest) async -> HTTPResponse {
+        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+            return HTTPParser.response(statusCode: 401, body: nil)
+        }
+
+        guard let body = request.body else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+        guard body.count <= 262_144 else {
+            return HTTPParser.response(statusCode: 413, body: nil)
+        }
+
+        guard let event = CommandEvent.decode(from: body) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        guard let rawSurfaceIDHeader = header(named: "X-Calyx-Surface-ID", in: request.headers)?
+            .trimmingCharacters(in: .whitespaces), !rawSurfaceIDHeader.isEmpty else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        guard let surfaceID = resolveSurfaceID(from: request.headers) else {
+            // A present, non-empty header that still doesn't resolve (an
+            // unregistered calyx-session ID) is normal steady-state for a
+            // detached persistent session, not a client error.
+            return HTTPParser.response(statusCode: 204, body: nil)
+        }
+
+        commandLogStore.ingest(event, surfaceID: surfaceID)
         return HTTPParser.response(statusCode: 204, body: nil)
     }
 

@@ -167,6 +167,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // launch unchanged.
         if LaunchEnvironmentPolicy.isUnitTestHost() { return }
 
+        // Wire the real Ghostty-FFI-backed output reader now that we're
+        // definitely not in the unit-test host (a GhosttyCommandOutputReader
+        // read touches live ghostty FFI, unsafe there).
+        CommandLogStore.shared.reader = GhosttyCommandOutputReader()
+
         // Must run before GhosttyAppController.shared's first access below:
         // ghostty forwards shell-integration scripts to surface children
         // only when GHOSTTY_RESOURCES_DIR is already set in this process's

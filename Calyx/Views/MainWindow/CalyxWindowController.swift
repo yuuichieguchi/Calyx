@@ -2620,6 +2620,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         tab.splitTree = tab.splitTree.remapLeafIDs(mapping)
         tab.sessionRefs = tab.sessionRefs.remappingKeys(mapping)
         SessionSurfaceMap.shared.replaceSurface(old: oldSurfaceID, new: newSurfaceID)
+        CommandLogStore.shared.remapSurface(old: oldSurfaceID, new: newSurfaceID)
 
         reconnectingSurfaceIDs.insert(oldSurfaceID)
         tab.registry.destroySurface(oldSurfaceID)

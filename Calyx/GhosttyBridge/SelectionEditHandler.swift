@@ -128,7 +128,11 @@ final class GhosttySurfaceSelectionReader: SelectionReading {
     /// freed: `GhosttyFFI.surfaceFreeText` only releases the buffer
     /// `raw.text` points to, not the `ghostty_text_s` value itself,
     /// whose other fields were already value-copied by the FFI call.
-    private func readAndDecodeText(
+    /// Internal (not `private`): `GhosttyCommandOutputReader` also routes
+    /// its own `readScreenTailLines(surfaceID:count:)` through this same
+    /// lifecycle (constructing a throwaway `GhosttySurfaceSelectionReader`
+    /// for the surface it already resolved) rather than duplicating it.
+    func readAndDecodeText(
         _ read: (inout ghostty_text_s) -> Bool
     ) -> (text: String, raw: ghostty_text_s)? {
         var text = ghostty_text_s()

@@ -29,8 +29,12 @@
 //    returns nil immediately if none is running; a timed-out or
 //    cancelled wait unregisters its awaiter, leaving no husk behind
 //  - markOrphaned transitions running records and resumes pending awaits
-//  - handleCommandFinished (OSC133) only ever merges durationNanos --
-//    never exitCode, which is exclusively the script end event's
+//  - finalize derives durationNanos from endedAt - startedAt, clamped to
+//    [0, a plausibility ceiling] -- 0 for clock skew, the ceiling for a
+//    wildly-implausible elapsed gap (never overflowing UInt64 on the
+//    nanosecond conversion) -- never exitCode, which is exclusively the
+//    script end event's (ghostty's OSC133 duration signal was tried and
+//    dropped, see finalize's own doc comment)
 //  - remapSurface moves records (clearing scrollbarTotalAtStart, since
 //    the new surfaceID's scrollback counter is unrelated) and pending
 //    awaits to a new surfaceID
@@ -673,61 +677,73 @@ final class CommandLogStoreTests: XCTestCase {
         XCTAssertEqual(awaited.state, .orphaned)
     }
 
-    // MARK: - handleCommandFinished (OSC133) merge
+    // MARK: - duration derivation
 
-    func test_handleCommandFinishedBeforeEnd_mergesDurationAtEndIngest_exitCodeStaysScripts() throws {
+    func test_finalize_derivesDurationFromStartAndEndTimestamps() throws {
         let store = CommandLogStore()
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
         reader.totals[surfaceID] = 1
-        store.ingest(startEvent(cmdID: "cmd-13a"), surfaceID: surfaceID)
+        // ts 1_000ms / 1_500ms, expressed as the Date CommandEvent.decode
+        // would produce from those raw epoch-millisecond values.
+        let startedAt = Date(timeIntervalSince1970: 1.0)
+        let endedAt = Date(timeIntervalSince1970: 1.5)
+        store.ingest(startEvent(cmdID: "cmd-duration", ts: startedAt), surfaceID: surfaceID)
+        store.ingest(endEvent(cmdID: "cmd-duration", exitCode: 0, ts: endedAt), surfaceID: surfaceID)
 
-        store.handleCommandFinished(surfaceID: surfaceID, durationNanos: 123_456_789)
-        store.ingest(endEvent(cmdID: "cmd-13a", exitCode: 5), surfaceID: surfaceID)
+        let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
+        XCTAssertEqual(record.durationNanos, 500_000_000, "durationNanos must be endedAt - startedAt in nanoseconds")
+    }
+
+    func test_finalize_endBeforeStart_clockSkew_durationClampsToZero_noTrap() throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.totals[surfaceID] = 1
+
+        // The end arrives (and buffers) before its matching start, with a
+        // ts that's chronologically BEFORE the eventual start's own ts
+        // (clock skew between the two hook invocations) -- finalize must
+        // clamp the resulting negative interval to 0, not underflow
+        // UInt64 or trap.
+        let endedAt = Date(timeIntervalSince1970: 1.0)
+        store.ingest(endEvent(cmdID: "cmd-skew", exitCode: 0, ts: endedAt), surfaceID: surfaceID)
+
+        let startedAt = Date(timeIntervalSince1970: 2.0)
+        store.ingest(startEvent(cmdID: "cmd-skew", ts: startedAt), surfaceID: surfaceID)
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
         XCTAssertEqual(record.state, .finished)
-        XCTAssertEqual(record.exitCode, 5, "OSC133 carries no exit code -- only the script's own end event may set it")
-        XCTAssertEqual(record.durationNanos, 123_456_789, "handleCommandFinished's duration must be stored on the record")
+        XCTAssertEqual(record.durationNanos, 0,
+                       "A negative elapsed time (clock skew, end ts before start ts) must clamp to 0, not " +
+                       "underflow UInt64 or trap")
     }
 
-    func test_handleCommandFinishedAfterEnd_appliesDurationToAlreadyFinishedRecord_exitCodeUnchanged() throws {
+    func test_finalize_endedAtCenturiesAfterStartedAt_durationClampsToCeiling_noTrap() throws {
         let store = CommandLogStore()
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
         reader.totals[surfaceID] = 1
-        store.ingest(startEvent(cmdID: "cmd-13b"), surfaceID: surfaceID)
-        store.ingest(endEvent(cmdID: "cmd-13b", exitCode: 5), surfaceID: surfaceID)
 
-        store.handleCommandFinished(surfaceID: surfaceID, durationNanos: 987_654_321)
+        let startedAt = Date(timeIntervalSince1970: 0)
+        store.ingest(startEvent(cmdID: "cmd-overflow", ts: startedAt), surfaceID: surfaceID)
 
-        let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
-        XCTAssertEqual(record.exitCode, 5, "A handleCommandFinished arriving after end must never touch exitCode")
-        XCTAssertEqual(record.durationNanos, 987_654_321,
-                       "A handleCommandFinished arriving after end must still fill in duration on the finished record")
-    }
-
-    func test_handleCommandFinished_neverChangesExitCode_beforeOrAfterEnd() throws {
-        let store = CommandLogStore()
-        let reader = FakeOutputReader()
-        let surfaceID = UUID()
-        store.reader = reader
-        reader.totals[surfaceID] = 1
-        store.ingest(startEvent(cmdID: "cmd-13c"), surfaceID: surfaceID)
-
-        // Ghostty always reports a bare OSC133 `133;D` as exit code 0
-        // regardless of the script's real result, so this store must
-        // never let handleCommandFinished's signal -- which no longer
-        // even carries an exit code -- influence exitCode at all,
-        // whether it arrives before or after the script's own end event.
-        store.handleCommandFinished(surfaceID: surfaceID, durationNanos: 111)
-        store.ingest(endEvent(cmdID: "cmd-13c", exitCode: 5), surfaceID: surfaceID)
-        store.handleCommandFinished(surfaceID: surfaceID, durationNanos: 222)
+        // Constructed directly (bypassing CommandEvent.decode, which now
+        // rejects a ts this implausible outright -- see
+        // test_decode_tsAboveMaximumPlausibleMillisThreshold_treatedAsAbsent):
+        // a wildly-far-future endedAt, ~31,700 years past startedAt, must
+        // not overflow UInt64 on finalize's `* 1_000_000_000` nanosecond
+        // conversion.
+        let endedAt = Date(timeIntervalSince1970: 1_000_000_000_000)
+        store.ingest(endEvent(cmdID: "cmd-overflow", exitCode: 0, ts: endedAt), surfaceID: surfaceID)
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
-        XCTAssertEqual(record.exitCode, 5, "handleCommandFinished must never change exitCode, before or after end")
+        XCTAssertEqual(record.state, .finished, "An extreme elapsed duration must still finish the record, not trap")
+        XCTAssertEqual(record.durationNanos, 1_000_000_000_000_000_000,
+                       "durationNanos must clamp to the plausibility ceiling, not overflow UInt64")
     }
 
     // MARK: - remapSurface

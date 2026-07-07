@@ -116,10 +116,33 @@ final class CommandLogStore {
         finalize(surfaceID: surfaceID, recordID: running.id, scriptExitCode: event.exitCode, endedAt: event.ts ?? now())
     }
 
+    /// Ceiling on `finalize`'s derived `durationNanos`, in seconds
+    /// (1e9s ≈ 31.7 years -- far beyond any real command, but small
+    /// enough that `* 1_000_000_000` lands at exactly 1e18ns, safely
+    /// inside `UInt64.max` (~1.8e19) with headroom to spare). A plain
+    /// `Double(UInt64.max) / 1_000_000_000` ceiling looks equivalent but
+    /// ISN'T: `Double` can't represent `UInt64.max` exactly, so dividing
+    /// then re-multiplying by 1e9 rounds back up past `UInt64.max` and
+    /// `UInt64(...)` still traps at that "ceiling" -- verified empirically.
+    /// This fixed, round-trip-safe constant sidesteps that entirely.
+    private static let maximumPlausibleDurationSeconds: Double = 1_000_000_000
+
     /// Transitions a running record to `.finished`: applies the script's
-    /// own exit code (OSC133 never contributes one -- see
-    /// `handleCommandFinished(surfaceID:durationNanos:)`), materializes
-    /// output, and resumes any awaiters.
+    /// own exit code, derives `durationNanos` from `endedAt - startedAt`
+    /// clamped to `[0, maximumPlausibleDurationSeconds]` -- 0 for clock
+    /// skew (an `endedAt` at or before `startedAt` must never underflow
+    /// the unsigned nanosecond count), the ceiling for a wildly-implausible
+    /// `endedAt` (e.g. a garbage-but-decode-plausible `ts`, which would
+    /// otherwise overflow `UInt64` on the `* 1_000_000_000` conversion
+    /// below and fatal-trap the whole app on one authenticated
+    /// `/command-event` POST) -- materializes output, and resumes any
+    /// awaiters. This is the ONLY place `durationNanos` is ever set:
+    /// ghostty's own OSC133 command-finished signal reports an unreliable
+    /// exit code (ghostty always sends 0 for "unknown", indistinguishable
+    /// from a real success) and was dropped entirely in favor of this --
+    /// deriving duration from the shell integration's own start/end
+    /// timestamps is both simpler and always correct to millisecond
+    /// precision.
     private func finalize(surfaceID: UUID, recordID: UUID, scriptExitCode: Int32?, endedAt: Date) {
         guard var records = recordsBySurface[surfaceID],
               let index = records.firstIndex(where: { $0.id == recordID }) else { return }
@@ -128,6 +151,9 @@ final class CommandLogStore {
 
         record.endedAt = endedAt
         record.exitCode = scriptExitCode
+        let elapsedSeconds = endedAt.timeIntervalSince(record.startedAt)
+        let clampedSeconds = min(max(elapsedSeconds, 0), Self.maximumPlausibleDurationSeconds)
+        record.durationNanos = UInt64(clampedSeconds * 1_000_000_000)
         record.output = materializeOutput(surfaceID: surfaceID, record: record)
         record.state = .finished
 
@@ -404,34 +430,6 @@ final class CommandLogStore {
     /// asserting a timed-out/cancelled wait leaves no husk behind.
     var _testAwaiterCount: Int {
         awaitersByRecordID.values.reduce(0) { $0 + $1.count }
-    }
-
-    // MARK: - handleCommandFinished (OSC133)
-
-    /// OSC133's `;D` (command-finished) marker carries a duration but no
-    /// reliable exit code -- ghostty always reports a bare `133;D` as
-    /// exit code 0 regardless of the script's actual result, so this
-    /// store never trusts OSC133 for `exitCode`; only the shell
-    /// integration's own end event (`ingestEnd`) ever sets it. While the
-    /// surface's foreground command is still running, the latest
-    /// `durationNanos` always wins (a running record can receive more
-    /// than one OSC133 signal); once finished, a duration is only filled
-    /// in if none was captured yet, so a late/duplicate signal can't
-    /// clobber a value already recorded.
-    func handleCommandFinished(surfaceID: UUID, durationNanos: UInt64) {
-        guard var records = recordsBySurface[surfaceID] else { return }
-        if let runningIndex = records.lastIndex(where: { $0.state == .running }) {
-            records[runningIndex].durationNanos = durationNanos
-            recordsBySurface[surfaceID] = records
-            return
-        }
-        guard let lastIndex = records.indices.last,
-              records[lastIndex].state == .finished,
-              records[lastIndex].durationNanos == nil else {
-            return
-        }
-        records[lastIndex].durationNanos = durationNanos
-        recordsBySurface[surfaceID] = records
     }
 
     // MARK: - markOrphaned
