@@ -458,6 +458,19 @@ private struct TabItemButton: View {
             ))
         }
         .onHover { isHovering = $0 }
+        // The tab body is hosted inside an `NSHostingView` (via
+        // `TabClickContainer`), whose AppKit subtree owns the
+        // accessibility children. Without an explicit container element a
+        // bare `.accessibilityIdentifier` here is dropped and never
+        // surfaces to XCUITest, so `calyx.tabBar.tab.<UUID>` vanishes from
+        // the tree entirely. `.accessibilityElement(children: .contain)`
+        // creates the container element that carries the identifier and
+        // label, matching the sidebar's `TabRowItemView`. (Note: XCUITest
+        // exposes a container element's identifier and label but NOT its
+        // `AXValue`, so the `.accessibilityValue` index below does not
+        // surface; tests that need a tab's ordinal position read it from
+        // on-screen geometry instead of that value.)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.TabBar.tab(tab.id))
         .accessibilityLabel(visibleTitle.isEmpty ? fallbackTitle : visibleTitle)
     }

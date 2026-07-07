@@ -388,6 +388,13 @@ private struct GroupSectionView: View {
                 }
                 .accessibilityElement(children: .contain)
                 .accessibilityIdentifier(AccessibilityID.Sidebar.group(group.id))
+                // The group-name `Text` lives inside the header's
+                // `TabClickContainer` `NSHostingView` and is otherwise
+                // invisible to XCUITest / assistive tech (the `.contain`
+                // container does not surface hosted children). Carry the
+                // name explicitly so the group announces itself and
+                // name-based lookups (e.g. after a rename) resolve it.
+                .accessibilityLabel(group.name)
                 .onAssumeInsideHover($isHoveringHeader)
             }
 
@@ -642,6 +649,12 @@ private struct TabRowItemView: View {
         .onAssumeInsideHover($isHovering)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.Sidebar.tab(tab.id))
+        // The title `Text` lives inside the `TabClickContainer`'s
+        // `NSHostingView`, whose subtree the `.contain` container does not
+        // surface to XCUITest / assistive tech. Carry the name explicitly on
+        // the container so the row announces its title (and so name-based
+        // lookups resolve it), matching `TabItemButton` in the tab bar.
+        .accessibilityLabel(displayText)
     }
 
     private var fallbackTitle: String {

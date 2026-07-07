@@ -9,34 +9,59 @@ final class TabReorderUITests: CalyxUITestCase {
 
     // MARK: - Helpers
 
-    /// Returns all elements whose `accessibilityValue` matches the given string.
-    private func elements(withValue value: String) -> XCUIElementQuery {
-        app.descendants(matching: .any)
-            .matching(NSPredicate(format: "value == %@", value))
+    // Position-ordered tab lookup.
+    //
+    // The tab rows expose their `calyx.*.tab.<UUID>` identifier (via
+    // `.accessibilityElement(children: .contain)`) but NOT their
+    // `.accessibilityValue` index: XCUITest surfaces a container element's
+    // identifier and label, but not its `AXValue`, so the previous
+    // value-based index lookup returned nothing. Instead, resolve a tab's
+    // ordinal position from the on-screen geometry of the identifier-bearing
+    // elements: left-to-right (minX) for the horizontal tab bar,
+    // top-to-bottom (minY) for the vertical sidebar list.
+    private static let uuidPattern =
+        "[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}"
+
+    /// Tab-bar tab elements (identifier `calyx.tabBar.tab.<UUID>`, no
+    /// `.closeButton` suffix) sorted left-to-right by frame.
+    private func tabBarTabsByPosition() -> [XCUIElement] {
+        let predicate = NSPredicate(format: "identifier MATCHES %@",
+                                    "calyx\\.tabBar\\.tab\\.\(Self.uuidPattern)")
+        let query = app.descendants(matching: .any).matching(predicate)
+        return (0..<query.count)
+            .map { query.element(boundBy: $0) }
+            .sorted { $0.frame.minX < $1.frame.minX }
     }
 
-    /// Returns elements whose `accessibilityValue` matches a LIKE pattern (supports `*` wildcards).
-    private func elements(valueLike pattern: String) -> XCUIElementQuery {
-        app.descendants(matching: .any)
-            .matching(NSPredicate(format: "value LIKE %@", pattern))
+    /// Sidebar tab elements (identifier `calyx.sidebar.tab.<UUID>`) sorted
+    /// top-to-bottom by frame.
+    private func sidebarTabsByPosition() -> [XCUIElement] {
+        let predicate = NSPredicate(format: "identifier MATCHES %@",
+                                    "calyx\\.sidebar\\.tab\\.\(Self.uuidPattern)")
+        let query = app.descendants(matching: .any).matching(predicate)
+        return (0..<query.count)
+            .map { query.element(boundBy: $0) }
+            .sorted { $0.frame.minY < $1.frame.minY }
     }
 
-    /// Reads the `accessibilityIdentifier` of the element at a given tab-bar index.
-    /// Returns nil if no element with that index value exists.
+    private func tabBarTab(atIndex index: Int) -> XCUIElement? {
+        let tabs = tabBarTabsByPosition()
+        return index < tabs.count ? tabs[index] : nil
+    }
+
+    private func sidebarTab(atIndex index: Int) -> XCUIElement? {
+        let tabs = sidebarTabsByPosition()
+        return index < tabs.count ? tabs[index] : nil
+    }
+
+    /// Reads the identifier of the tab-bar tab at a given ordinal position.
     private func tabBarTabIdentifier(atIndex index: Int) -> String? {
-        let value = "calyx.tabBar.tab.index.\(index)"
-        let query = elements(withValue: value)
-        guard query.count > 0 else { return nil }
-        return query.firstMatch.identifier
+        tabBarTab(atIndex: index)?.identifier
     }
 
-    /// Reads the `accessibilityIdentifier` of the sidebar tab element at a given index.
-    /// The value pattern is "calyx.sidebar.group.<UUID>.tab.index.<N>".
+    /// Reads the identifier of the sidebar tab at a given ordinal position.
     private func sidebarTabIdentifier(atIndex index: Int) -> String? {
-        let pattern = "calyx.sidebar.group.*.tab.index.\(index)"
-        let query = elements(valueLike: pattern)
-        guard query.count > 0 else { return nil }
-        return query.firstMatch.identifier
+        sidebarTab(atIndex: index)?.identifier
     }
 
     /// Creates `count` additional tabs (beyond the initial one) and waits for them to appear.
@@ -55,21 +80,15 @@ final class TabReorderUITests: CalyxUITestCase {
         XCTAssertEqual(countTabBarTabs(), 3, "Should have 3 tabs before drag")
 
         // Capture the identifier of the tab currently at index 0
-        let firstTabValue = "calyx.tabBar.tab.index.0"
-        let firstTabElement = elements(withValue: firstTabValue).firstMatch
-        XCTAssertTrue(
-            waitFor(firstTabElement, timeout: 5),
-            "Tab at index 0 should exist"
-        )
+        guard let firstTabElement = tabBarTab(atIndex: 0) else {
+            return XCTFail("Tab at index 0 should exist")
+        }
         let originalFirstTabID = firstTabElement.identifier
 
         // Also capture the tab at index 2 to know the drag target position
-        let thirdTabValue = "calyx.tabBar.tab.index.2"
-        let thirdTabElement = elements(withValue: thirdTabValue).firstMatch
-        XCTAssertTrue(
-            waitFor(thirdTabElement, timeout: 5),
-            "Tab at index 2 should exist"
-        )
+        guard let thirdTabElement = tabBarTab(atIndex: 2) else {
+            return XCTFail("Tab at index 2 should exist")
+        }
 
         // Act: drag the first tab to the right, past the third tab
         firstTabElement.press(forDuration: 0.2, thenDragTo: thirdTabElement)
@@ -102,26 +121,22 @@ final class TabReorderUITests: CalyxUITestCase {
         createTabs(count: 2)
         XCTAssertEqual(countTabBarTabs(), 3, "Should have 3 tabs before toggling sidebar")
 
-        // Open the sidebar
-        toggleSidebarViaMenu()
+        // The sidebar is shown by default (WindowSession.showSidebar
+        // defaults to true), so its tab rows are already on screen. Do NOT
+        // call toggleSidebarViaMenu() here: that would CLOSE the sidebar and
+        // hide the very rows this test drags. Just let it settle.
         Thread.sleep(forTimeInterval: 1.0)
 
         // Find the sidebar tab at index 0
-        let firstSidebarPattern = "calyx.sidebar.group.*.tab.index.0"
-        let firstSidebarTab = elements(valueLike: firstSidebarPattern).firstMatch
-        XCTAssertTrue(
-            waitFor(firstSidebarTab, timeout: 5),
-            "Sidebar tab at index 0 should exist"
-        )
+        guard let firstSidebarTab = sidebarTab(atIndex: 0) else {
+            return XCTFail("Sidebar tab at index 0 should exist")
+        }
         let originalFirstSidebarID = firstSidebarTab.identifier
 
         // Find the sidebar tab at index 2
-        let thirdSidebarPattern = "calyx.sidebar.group.*.tab.index.2"
-        let thirdSidebarTab = elements(valueLike: thirdSidebarPattern).firstMatch
-        XCTAssertTrue(
-            waitFor(thirdSidebarTab, timeout: 5),
-            "Sidebar tab at index 2 should exist"
-        )
+        guard let thirdSidebarTab = sidebarTab(atIndex: 2) else {
+            return XCTFail("Sidebar tab at index 2 should exist")
+        }
 
         // Act: drag the first sidebar tab down past the third
         firstSidebarTab.press(forDuration: 0.2, thenDragTo: thirdSidebarTab)
@@ -155,12 +170,9 @@ final class TabReorderUITests: CalyxUITestCase {
         XCTAssertEqual(countTabBarTabs(), 2, "Should have 2 tabs")
 
         // Find the tab at index 0
-        let firstTabValue = "calyx.tabBar.tab.index.0"
-        let firstTabElement = elements(withValue: firstTabValue).firstMatch
-        XCTAssertTrue(
-            waitFor(firstTabElement, timeout: 5),
-            "Tab at index 0 should exist"
-        )
+        guard let firstTabElement = tabBarTab(atIndex: 0) else {
+            return XCTFail("Tab at index 0 should exist")
+        }
         let tabID = firstTabElement.identifier
 
         // Act: perform a very short press-and-drag (within the 5pt minimumDistance threshold)
@@ -180,7 +192,9 @@ final class TabReorderUITests: CalyxUITestCase {
         )
 
         // Verify the tab is still tappable by clicking it
-        let tabElement = elements(withValue: firstTabValue).firstMatch
+        guard let tabElement = tabBarTab(atIndex: 0) else {
+            return XCTFail("Tab at index 0 should still exist")
+        }
         XCTAssertTrue(tabElement.isHittable, "Tab should be hittable after a sub-threshold drag")
         tabElement.click()
 
