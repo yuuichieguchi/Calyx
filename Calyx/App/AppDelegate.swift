@@ -15,9 +15,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingURLs: [URL] = []
     private var quickTerminalController: QuickTerminalController?
 
+    /// Captured the moment termination is confirmed (isTerminationConfirmed's
+    /// didSet, false -> true transition only), BEFORE any window teardown or
+    /// removeWindowController(_:) call can empty windowControllers/appSession.
+    /// applicationWillTerminate (via saveForTermination()) consults this
+    /// instead of re-deriving buildSnapshot() from the possibly-already-
+    /// emptied live state, so the confirm-quit-by-closing-the-last-window
+    /// route always saves a real snapshot. Covers BOTH termination routes:
+    /// windowShouldClose's confirm branch and applicationShouldTerminate's
+    /// own Cmd+Q branch both set isTerminationConfirmed = true.
+    private(set) var pendingTerminationSnapshot: SessionSnapshot?
+
+    #if DEBUG
+    /// Test seam: force pendingTerminationSnapshot directly instead of
+    /// only via isTerminationConfirmed's didSet, so saveForTermination()'s
+    /// own "prefers the captured snapshot over a live rebuild" contract is
+    /// testable in isolation from the capture mechanism itself. DO NOT use
+    /// from production code.
+    func _setPendingTerminationSnapshotForTesting(_ snapshot: SessionSnapshot?) {
+        pendingTerminationSnapshot = snapshot
+    }
+    #endif
+
     /// Set when the user has already confirmed quit (prevents double-prompting
-    /// between windowShouldClose and applicationShouldTerminate).
-    var isTerminationConfirmed = false
+    /// between windowShouldClose and applicationShouldTerminate). The
+    /// false -> true transition also captures pendingTerminationSnapshot
+    /// (see that property's own doc comment for why); resetting back to
+    /// false (applicationShouldTerminate's own "already confirmed" branch)
+    /// deliberately leaves any already-captured snapshot untouched.
+    var isTerminationConfirmed = false {
+        didSet {
+            guard isTerminationConfirmed, !oldValue else { return }
+            pendingTerminationSnapshot = buildSnapshot()
+        }
+    }
 
     /// P4 round-6 fix (R6-A/R6-D, r6-fix-spec.md): app-wide "the app is
     /// actually terminating" discriminator, distinct from any single
@@ -290,27 +321,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
         }
 
-        // Last-window close path already persists synchronously in windowWillClose.
-        // Avoid overwriting with an empty snapshot during app teardown.
-        if windowControllers.isEmpty || appSession.windows.isEmpty {
+        // Last-window close path already persists synchronously in
+        // windowWillClose. This guard's ONLY remaining job is skipping
+        // pointless work when there is neither a captured confirm-time
+        // pendingTerminationSnapshot nor any live window left to build one
+        // from -- saveForTermination()'s own saveAtTermination(_:) call
+        // already refuses to let an empty snapshot clobber a non-empty
+        // on-disk one, so this is not a correctness gate: a non-nil
+        // pendingTerminationSnapshot (the confirm-quit-by-closing-the-
+        // last-window route, see that property's own doc comment) must
+        // still be saved even though windowControllers/appSession are
+        // already emptied by the time this runs.
+        let hasLiveWindows = !windowControllers.isEmpty && !appSession.windows.isEmpty
+        guard pendingTerminationSnapshot != nil || hasLiveWindows else {
             return
         }
 
-        let snapshot = buildSnapshot()
-        var done = false
-        Task {
-            // Bug 2: saveAtTermination(_:), unlike saveImmediately(_:),
-            // refuses to let an empty snapshot (teardown ordering can hand
-            // this an already-drained windowControllers) clobber a
-            // non-empty on-disk session -- see its own doc comment.
-            await SessionPersistenceActor.shared.saveAtTermination(snapshot)
-            await SessionPersistenceActor.shared.resetRecoveryCounter()
-            done = true
-        }
-        let deadline = Date().addingTimeInterval(1.0)
-        while !done, Date() < deadline {
-            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
-        }
+        saveForTermination()
         windowControllers.removeAll()
     }
 
@@ -1313,6 +1340,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    /// Extracted from applicationWillTerminate's save step so it is
+    /// directly unit-testable: applicationWillTerminate itself is gated
+    /// behind LaunchEnvironmentPolicy.isUnitTestHost() and always
+    /// early-returns in the CalyxTests process (see that gate's own doc
+    /// comment), so no test can drive it directly. Saves
+    /// pendingTerminationSnapshot when present, falling back to
+    /// buildSnapshot() otherwise (the existing behavior for e.g. a Cmd+Q
+    /// with no window-close race). Routes through saveAtTermination(_:),
+    /// which itself refuses to let an empty snapshot clobber a non-empty
+    /// on-disk one, and resets the crash-loop counter exactly as
+    /// applicationWillTerminate's own Task body already did.
+    /// See SyncBridgeBox's own doc comment for why this uses
+    /// `Task.detached` instead of the plain `Task { }` every other
+    /// busy-wait in this file uses: this method must also behave
+    /// correctly when driven directly from an async XCTest method
+    /// (AppDelegatePendingTerminationSnapshotTests), not only from
+    /// applicationWillTerminate's genuinely synchronous call stack.
+    func saveForTermination() {
+        let snapshot = pendingTerminationSnapshot ?? buildSnapshot()
+        let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        let box = SyncBridgeBox<Bool>(false)
+        Task.detached {
+            await actor.saveAtTermination(snapshot)
+            await actor.resetRecoveryCounter()
+            box.value = true
+        }
+        let deadline = Date().addingTimeInterval(1.0)
+        while !box.value, Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+    }
+
     #if DEBUG
     /// Test seam: overrides the SessionPersistenceActor instance
     /// scheduleRecoveryCounterResetAfterStableLaunch(delay:) resets,
@@ -1442,51 +1501,173 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         hasPreservedSessionSnapshot = false
     }
 
-    /// Bug 3a/3b wiring shared by restoreSession()'s nil-snapshot,
-    /// crash-loop-skip, and restoredAny-false branches: moves whatever
-    /// is currently on disk aside into the recovery file (a harmless
-    /// no-op when nothing is there -- e.g. the nil branch's "nothing was
-    /// ever saved" sub-case), and, only when a file was actually moved,
-    /// marks it recoverable and tells the user. Deliberately does NOT
+    /// Single-slot, lock-protected box used ONLY to bridge a
+    /// `Task.detached` result back into a synchronous busy-wait loop.
+    ///
+    /// WHY THIS EXISTS (confirmed empirically, not theoretical): a plain
+    /// (non-detached) `Task { ... }` created inside a `@MainActor`
+    /// method inherits MainActor isolation, so it is queued onto
+    /// MainActor's SAME serial turn the enclosing synchronous method is
+    /// still occupying. When that method is invoked from a genuinely
+    /// synchronous, non-Task call stack (e.g. `applicationDidFinishLaunching`,
+    /// every production call site here), no other MainActor turn is in
+    /// the way, so the queued task runs as soon as the run loop is
+    /// pumped -- this is why the busy-wait convention used throughout
+    /// this file already works for production. But when the SAME method
+    /// is invoked from a caller that is ITSELF already an async Task
+    /// running on MainActor (an `async` XCTest method, exactly what
+    /// AppDelegateSessionRestoreDiskTimeoutTests/
+    /// AppDelegatePendingTerminationSnapshotTests need for their own
+    /// setup), the child task cannot start until the CURRENT MainActor
+    /// turn (this very function) returns -- confirmed by raising the
+    /// busy-wait deadline to 10s in a throwaway experiment and observing
+    /// it still never completes; only `Task.detached`, which runs
+    /// independently of MainActor's turn, avoids this. `Task.detached`'s
+    /// closure must be `@Sendable`, so its result cannot cross back via
+    /// a captured `var` the way the inherited-isolation `Task { }`
+    /// pattern does elsewhere in this file; `@unchecked Sendable` here is
+    /// justified because EVERY read and write of `value` is serialized
+    /// through `lock`, so there is no actual unsynchronized shared
+    /// mutable state despite crossing an isolation domain.
+    private final class SyncBridgeBox<Value>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var storedValue: Value
+        init(_ value: Value) { storedValue = value }
+        var value: Value {
+            get { lock.lock(); defer { lock.unlock() }; return storedValue }
+            set { lock.lock(); defer { lock.unlock() }; storedValue = newValue }
+        }
+    }
+
+    enum SessionRestoreDiskOutcome: Equatable {
+        case snapshot(SessionSnapshot)
+        case empty
+        case timedOut
+    }
+
+    /// Extracted from restoreSession()'s crash-loop-check + disk-read
+    /// preamble so the timeout branch is genuinely unit-drivable and
+    /// distinguishable from "the actor completed and said no" (see
+    /// AppDelegateSessionRestoreDiskTimeoutTests's own header for the
+    /// full root-cause narrative). `deadline: 0` deterministically
+    /// forces `.timedOut` without needing an artificially slow actor.
+    /// See SyncBridgeBox's own doc comment for why the disk read runs
+    /// in a `Task.detached` instead of a plain `Task { }`.
+    func attemptSessionRestoreFromDisk(deadline: TimeInterval = 2.0) -> SessionRestoreDiskOutcome {
+        let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        let box = SyncBridgeBox<(snapshot: SessionSnapshot?, done: Bool)>((nil, false))
+        let task = Task.detached {
+            let recoveryCount = await actor.incrementRecoveryCounter()
+            var snapshot: SessionSnapshot?
+            if recoveryCount <= SessionPersistenceActor.maxRecoveryAttempts {
+                snapshot = await actor.restore()
+            }
+            box.value = (snapshot, true)
+        }
+        let deadlineDate = Date().addingTimeInterval(deadline)
+        while !box.value.done, Date() < deadlineDate {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+        guard box.value.done else {
+            task.cancel()
+            return .timedOut
+        }
+        guard let snapshot = box.value.snapshot else { return .empty }
+        return .snapshot(snapshot)
+    }
+
+    enum SessionPreserveDiskOutcome: Equatable {
+        case preserved
+        case notPreserved
+        case timedOut
+    }
+
+    /// Extracted from preserveDiscardedSessionIfAny()'s body for the
+    /// identical reason as attemptSessionRestoreFromDisk(deadline:)
+    /// above; see SyncBridgeBox's own doc comment for why this also
+    /// needs `Task.detached`.
+    func attemptPreserveDiscardedSessionOnDisk(deadline: TimeInterval = 2.0) -> SessionPreserveDiskOutcome {
+        let actor = _sessionPersistenceActorForTesting ?? SessionPersistenceActor.shared
+        let box = SyncBridgeBox<(didPreserve: Bool, done: Bool)>((false, false))
+        let task = Task.detached {
+            let didPreserve = await actor.preserveSnapshotForRecovery()
+            box.value = (didPreserve, true)
+        }
+        let deadlineDate = Date().addingTimeInterval(deadline)
+        while !box.value.done, Date() < deadlineDate {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+        guard box.value.done else {
+            task.cancel()
+            return .timedOut
+        }
+        return box.value.didPreserve ? .preserved : .notPreserved
+    }
+
+    /// Synchronously bridges the async hasRunningPersistentSessions()
+    /// into restoreSession()'s own synchronous body. Unlike
+    /// attemptSessionRestoreFromDisk(deadline:)/
+    /// attemptPreserveDiscardedSessionOnDisk(deadline:) above, this uses
+    /// a plain (non-detached) `Task { }`, not SyncBridgeBox/Task.detached:
+    /// hasRunningPersistentSessions() is itself MainActor-isolated (this
+    /// class's default), so a detached task calling back into it would
+    /// need to re-acquire MainActor's turn -- exactly the deadlock
+    /// SyncBridgeBox's own doc comment describes -- reintroducing the
+    /// same bug this bridge exists to avoid. This is safe as the plain,
+    /// inherited-isolation form ONLY because restoreSession() (this
+    /// method's sole caller) is itself reached exclusively from
+    /// applicationDidFinishLaunching, a genuinely synchronous call stack
+    /// with no enclosing MainActor Task already occupying a turn -- if
+    /// this is ever driven from an async test caller the way
+    /// attemptSessionRestoreFromDisk's sibling tests are, it needs the
+    /// same SyncBridgeBox treatment first. The generous default deadline
+    /// comfortably exceeds SessionDaemonClient.daemonQueryBoundTimeoutSeconds's
+    /// own default bound, so a merely-slow (not unreachable) daemon
+    /// still gets a real chance to answer; if it doesn't, this
+    /// conservatively reports `false` -- the same "no evidence of an
+    /// anomaly" default hasRunningPersistentSessions() itself already
+    /// reports for a probe failure.
+    private func hasRunningPersistentSessionsBridged(deadline: TimeInterval = 6.0) -> Bool {
+        var result = false
+        var done = false
+        Task {
+            result = await hasRunningPersistentSessions()
+            done = true
+        }
+        let deadlineDate = Date().addingTimeInterval(deadline)
+        while !done, Date() < deadlineDate {
+            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
+        }
+        return result
+    }
+
+    /// Bug 3a/3b wiring shared by restoreSession()'s empty-outcome,
+    /// timed-out, and restoredAny-false branches: moves whatever is
+    /// currently on disk aside into the recovery file (a harmless no-op
+    /// when nothing is there -- e.g. the "nothing was ever saved"
+    /// sub-case), and, only when a file was actually moved, marks it
+    /// recoverable and tells the user. Deliberately does NOT
     /// notify/flag on a no-op preserve: an on-disk file can be absent
     /// even after a successful restore() (e.g. restore() fell back to
     /// backupPath while savePath itself never existed), and a
     /// notification claiming a session is recoverable when
     /// session.recoverPreviousSession would find nothing would be
-    /// actively misleading.
+    /// actively misleading. On `.timedOut`, we do not know for certain
+    /// whether a recovery file exists, so this never claims one does.
     private func preserveDiscardedSessionIfAny() {
-        var didPreserve = false
-        var done = false
-        Task {
-            didPreserve = await SessionPersistenceActor.shared.preserveSnapshotForRecovery()
-            done = true
+        switch attemptPreserveDiscardedSessionOnDisk() {
+        case .preserved:
+            hasPreservedSessionSnapshot = true
+            notifyPreviousSessionNotRestored()
+        case .notPreserved:
+            break
+        case .timedOut:
+            logger.warning("Timed out attempting to preserve a discarded session snapshot")
         }
-        let deadline = Date().addingTimeInterval(2.0)
-        while !done, Date() < deadline {
-            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
-        }
-        guard didPreserve else { return }
-        hasPreservedSessionSnapshot = true
-        notifyPreviousSessionNotRestored()
     }
 
     private func restoreSession() -> Bool {
-        // Crash-loop detection
-        var recoveryCount = 0
-        var snapshot: SessionSnapshot?
-        var done = false
-
-        Task {
-            recoveryCount = await SessionPersistenceActor.shared.incrementRecoveryCounter()
-            if recoveryCount <= SessionPersistenceActor.maxRecoveryAttempts {
-                snapshot = await SessionPersistenceActor.shared.restore()
-            }
-            done = true
-        }
-        let deadline = Date().addingTimeInterval(2.0)
-        while !done, Date() < deadline {
-            RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
-        }
+        let outcome = attemptSessionRestoreFromDisk()
 
         // Bug 1: every restoreSession() invocation schedules the delayed
         // stability-confirmation reset, unconditionally -- independent of
@@ -1495,26 +1676,45 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // incremented forever (see this method's own doc comment).
         scheduleRecoveryCounterResetAfterStableLaunch()
 
-        guard let snapshot else {
-            // restore() failed to decode, or nothing was ever saved --
-            // preserveDiscardedSessionIfAny() harmlessly no-ops in the
-            // latter sub-case.
-            logger.info("No session to restore (count=\(recoveryCount))")
+        let snapshot: SessionSnapshot
+        switch outcome {
+        case .timedOut:
+            // C3: never silently fall through to createNewWindow() as if
+            // disk were confirmed empty -- we genuinely don't know
+            // whether there was something to restore.
+            logger.warning("Timed out reading session snapshot from disk")
             preserveDiscardedSessionIfAny()
             return false
+        case .empty:
+            // restore() failed to decode, nothing was ever saved, or the
+            // crash-loop counter exceeded maxRecoveryAttempts --
+            // preserveDiscardedSessionIfAny() harmlessly no-ops in the
+            // "nothing was ever saved" sub-case.
+            logger.info("No session to restore")
+            preserveDiscardedSessionIfAny()
+            return false
+        case .snapshot(let restored):
+            snapshot = restored
         }
 
         guard !snapshot.windows.isEmpty else {
+            // C4: with close=kill semantics, a genuinely empty on-disk
+            // snapshot from a deliberate "closed every window" quit
+            // should never coexist with the daemon still reporting a
+            // running persistent session -- when it does, this is much
+            // more likely a bug/race (see hasRunningPersistentSessions's
+            // own doc comment) than a deliberate quit, so route through
+            // preserve+notify instead of silently accepting it.
+            if hasRunningPersistentSessionsBridged() {
+                logger.warning("Empty session snapshot restored alongside a running persistent session; treating as an anomaly")
+                preserveDiscardedSessionIfAny()
+                notifyPreviousSessionNotRestored()
+                return false
+            }
             // The user deliberately closed every window before their
             // last quit -- not a loss to recover from, so this branch
             // does not preserve or notify.
-            logger.info("No session to restore (count=\(recoveryCount))")
-            return false
-        }
-
-        if recoveryCount > SessionPersistenceActor.maxRecoveryAttempts {
-            logger.warning("Crash loop detected (\(recoveryCount) attempts), skipping restore")
-            preserveDiscardedSessionIfAny()
+            logger.info("No session to restore")
             return false
         }
 
@@ -2100,6 +2300,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // will read.
         guard !Task.isCancelled else { return [:] }
         return Dictionary(sessions.map { ($0.id, $0) }, uniquingKeysWith: { _, latest in latest })
+    }
+
+    /// True when the daemon's ledger currently reports at least one
+    /// RUNNING persistent session. Reuses listAllSessionsBounded(client:)
+    /// exactly as fetchSessionsForAgentResume() already does -- bounded,
+    /// best-effort; a probe failure (daemon unreachable/timeout) surfaces
+    /// as an empty ledger, which this method treats as "no evidence of
+    /// any anomaly" (current, unchanged behavior for that case).
+    /// Consulted by restoreSession()'s empty-snapshot branch: with
+    /// close=kill semantics, a genuinely empty snapshot from a deliberate
+    /// "closed every window" quit should never coexist with a still-
+    /// running persistent session.
+    func hasRunningPersistentSessions() async -> Bool {
+        #if DEBUG
+        let client = _sessionDaemonClientForTesting ?? SessionDaemonClient.shared
+        #else
+        let client = SessionDaemonClient.shared
+        #endif
+        let sessions = await AppDelegate.listAllSessionsBounded(client: client)
+        return sessions.values.contains { session in
+            if case .running = session.state { return true }
+            return false
+        }
     }
 
     /// P4: once a reattached persistent-session surface exists, checks

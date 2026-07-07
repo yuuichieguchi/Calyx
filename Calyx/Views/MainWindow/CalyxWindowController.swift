@@ -3305,6 +3305,18 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // the window still closes either way (isClosingForShutdown/
         // return true below are unaffected), only whether a LATER
         // Cmd+Q silently skips its own confirm-quit prompt changes.
+        //
+        // Product decision (user-ratified): reaching this point means
+        // closing this window terminates the app (closingWouldTerminate
+        // above), so this red-button close deliberately keeps the exact
+        // same quit/detach semantics as Cmd+Q -- sessions are preserved
+        // for restore on the next launch (applicationWillTerminate's
+        // saveForTermination(), not an unconditional kill), simply
+        // because the close originated from the window's own close
+        // button rather than the app menu. An explicit close that does
+        // NOT terminate the app (another window or a quick terminal
+        // stays open) still kills this window's own persistent
+        // sessions via windowWillClose's teardown loop.
         markTerminationConfirmedAndSetClosingForShutdown()
         return true
     }

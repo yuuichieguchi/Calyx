@@ -102,6 +102,14 @@ class SplitContainerView: NSView {
 
         if activeLeafID == nil || scrollWrappers[activeLeafID!] == nil {
             activeLeafID = tree.focusedLeafID
+            // A brand new container's (or brand new tab's, after
+            // updateRegistry(_:) resets activeLeafID) first-ever active
+            // leaf pick — mirrors surfaceDidBecomeActive's own call so the
+            // production requestSave() wiring fires for a window/tab's
+            // first surface with no later focus/split/tab action required.
+            if let id = activeLeafID {
+                onActiveLeafChange?(id)
+            }
         }
         applyActiveDimming()
         reapUnusedDividers()
