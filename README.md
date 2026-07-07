@@ -14,7 +14,7 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **Split Panes** -- horizontal and vertical splits with directional focus navigation
 - **Command Palette** -- search and execute all operations with `Cmd+Shift+P`
 - **Layout Restore** -- tabs, splits, and working directories auto-saved and restored on restart
-- **Persistent Sessions** -- opt-in daemon-backed sessions (`calyx-session`) that survive quit and crash; reattach from the Session Browser (`Cmd+Shift+B`); a recovery bar offers the preserved session when auto-restore is skipped or fails; opt-in on-disk history
+- **Persistent Sessions** -- opt-in daemon-backed sessions (`calyx-session`) that survive quit and crash; the toggle applies only to panes opened after it is enabled; reattach from the Session Browser (`Cmd+Shift+B`); a recovery bar offers the preserved session when auto-restore is skipped or fails; opt-in on-disk history
 - **Remote Sessions** -- persistent sessions on SSH hosts picked from `~/.ssh/config`; one-time daemon deploy via `calyx-session remote-install <host>`
 - **Agent Resume** -- reattached sessions can offer to resume the agent CLI conversation that was running (Settings -> Sessions)
 - **Desktop Notifications** -- OSC 9/99/777 support with rate limiting
