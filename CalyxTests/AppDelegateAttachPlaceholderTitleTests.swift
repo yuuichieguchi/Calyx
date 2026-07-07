@@ -36,6 +36,27 @@
 //  is already exercised for real by that existing, passing test, so
 //  running it again here for real is no new risk.
 //
+//  EXTENSION (overridden-HOME RED, E2E-proven + screenshot-confirmed):
+//  both call sites derive the placeholder title via
+//  `SessionTabTitle.fromCwd(cwd, home: NSHomeDirectory())`, and
+//  `NSHomeDirectory()` does not follow a `HOME` environment override --
+//  it resolves via the user database, not the env var (mirrors why
+//  `SessionRootResolver.swift`'s own doc comment forbids
+//  `FileManager.homeDirectoryForCurrentUser` for the identical reason).
+//  So under an overridden `HOME` (the E2E harness, and by the P4
+//  root-resolver lesson any environment where HOME differs from the
+//  real user record), the tilde abbreviation never fires and a raw
+//  absolute path shows as the tab title. The cases below `setenv`
+//  `HOME` to a fixture path (save+restore in teardown, mirroring
+//  `AppDelegateApplyGhosttyResourcesDirEnvironmentTests`' established
+//  env-juggling convention) and assert the placeholder title
+//  abbreviates against THAT overridden home, computed by hand from the
+//  fix's contract, independent of any particular implementation. Both
+//  fail today for a genuine reason: `NSHomeDirectory()` still returns
+//  the real test host's home, which shares no path-prefix relationship
+//  with the fixture `HOME`, so `SessionTabTitle.fromCwd` falls through
+//  to returning the raw `cwd` unabbreviated.
+//
 
 import XCTest
 import AppKit
@@ -43,6 +64,35 @@ import AppKit
 
 @MainActor
 final class AppDelegateAttachWindowPlaceholderTitleTests: XCTestCase {
+
+    // MARK: - Overridden-HOME fixture (env-juggling convention from
+    // AppDelegateApplyGhosttyResourcesDirEnvironmentTests)
+
+    private var originalHOME: String?
+
+    override func setUp() {
+        super.setUp()
+        originalHOME = ProcessInfo.processInfo.environment["HOME"]
+    }
+
+    override func tearDown() {
+        if let originalHOME {
+            setenv("HOME", originalHOME, 1)
+        } else {
+            unsetenv("HOME")
+        }
+        super.tearDown()
+    }
+
+    /// A path guaranteed distinct from (and never a path-prefix relative
+    /// of) the real test host's `NSHomeDirectory()`, so a title that
+    /// abbreviates against it can only be correct if the production code
+    /// actually consulted the overridden `HOME`, never `NSHomeDirectory()`.
+    private func makeOverriddenHomePath() -> String {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppDelegateAttachPlaceholderTitleTests-HOME-override-\(UUID().uuidString)")
+            .path
+    }
 
     // MARK: - attachWindow's placeholder tab
 
@@ -77,6 +127,44 @@ final class AppDelegateAttachWindowPlaceholderTitleTests: XCTestCase {
 
         XCTAssertEqual(observedTab?.title, "~",
                        "A cwd exactly equal to the home directory must abbreviate to a bare \"~\"")
+    }
+
+    func test_attachWindow_placeholderTab_nestedCwd_underOverriddenHOME_titleIsAbbreviatedPath() {
+        let overriddenHome = makeOverriddenHomePath()
+        setenv("HOME", overriddenHome, 1)
+
+        let appDelegate = AppDelegate()
+        var observedTab: Tab?
+        appDelegate._attachWindowPlaceholderTabObserverForTesting = { observedTab = $0 }
+        appDelegate._attachWindowCreationHookForTesting = { }
+
+        let sessionID = "test-session-\(UUID().uuidString)"
+        let cwd = "\(overriddenHome)/sub"
+
+        appDelegate.attachWindow(sessionID: sessionID, cwd: cwd)
+
+        XCTAssertEqual(observedTab?.title, "~/sub",
+                       "Under an overridden HOME (as in the E2E harness), the placeholder title must " +
+                       "abbreviate against THAT home, not the real NSHomeDirectory() -- NSHomeDirectory() " +
+                       "does not follow a HOME environment override")
+    }
+
+    func test_attachWindow_placeholderTab_cwdIsExactlyOverriddenHOME_titleIsBareTilde() {
+        let overriddenHome = makeOverriddenHomePath()
+        setenv("HOME", overriddenHome, 1)
+
+        let appDelegate = AppDelegate()
+        var observedTab: Tab?
+        appDelegate._attachWindowPlaceholderTabObserverForTesting = { observedTab = $0 }
+        appDelegate._attachWindowCreationHookForTesting = { }
+
+        let sessionID = "test-session-\(UUID().uuidString)"
+
+        appDelegate.attachWindow(sessionID: sessionID, cwd: overriddenHome)
+
+        XCTAssertEqual(observedTab?.title, "~",
+                       "A cwd exactly equal to the OVERRIDDEN home must abbreviate to a bare \"~\", " +
+                       "which only holds if the overridden HOME (not NSHomeDirectory()) drove the comparison")
     }
 
     func test_attachWindow_placeholderTab_nilCwd_titleFallsBackToTerminal() {
@@ -156,6 +244,44 @@ final class AppDelegateAttachWindowPlaceholderTitleTests: XCTestCase {
 
         XCTAssertEqual(observedTab?.title, "~",
                        "A cwd exactly equal to the home directory must abbreviate to a bare \"~\"")
+    }
+
+    func test_attachSessionAsNewTab_placeholderTab_nestedCwd_underOverriddenHOME_titleIsAbbreviatedPath() {
+        let overriddenHome = makeOverriddenHomePath()
+        setenv("HOME", overriddenHome, 1)
+
+        let appDelegate = AppDelegate()
+        insertUnrelatedWindowController(into: appDelegate)
+        var observedTab: Tab?
+        appDelegate._attachSessionAsNewTabPlaceholderTabObserverForTesting = { observedTab = $0 }
+
+        let sessionID = "test-session-\(UUID().uuidString)"
+        let cwd = "\(overriddenHome)/sub"
+
+        appDelegate.attachSessionAsTab(sessionID: sessionID, cwd: cwd)
+
+        XCTAssertEqual(observedTab?.title, "~/sub",
+                       "Under an overridden HOME (as in the E2E harness), attachSessionAsNewTab's " +
+                       "placeholder title must abbreviate against THAT home, not the real NSHomeDirectory() " +
+                       "-- NSHomeDirectory() does not follow a HOME environment override")
+    }
+
+    func test_attachSessionAsNewTab_placeholderTab_cwdIsExactlyOverriddenHOME_titleIsBareTilde() {
+        let overriddenHome = makeOverriddenHomePath()
+        setenv("HOME", overriddenHome, 1)
+
+        let appDelegate = AppDelegate()
+        insertUnrelatedWindowController(into: appDelegate)
+        var observedTab: Tab?
+        appDelegate._attachSessionAsNewTabPlaceholderTabObserverForTesting = { observedTab = $0 }
+
+        let sessionID = "test-session-\(UUID().uuidString)"
+
+        appDelegate.attachSessionAsTab(sessionID: sessionID, cwd: overriddenHome)
+
+        XCTAssertEqual(observedTab?.title, "~",
+                       "A cwd exactly equal to the OVERRIDDEN home must abbreviate to a bare \"~\", " +
+                       "which only holds if the overridden HOME (not NSHomeDirectory()) drove the comparison")
     }
 
     func test_attachSessionAsNewTab_placeholderTab_nilCwd_titleFallsBackToTerminal() {

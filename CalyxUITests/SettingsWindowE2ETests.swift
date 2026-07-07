@@ -4,10 +4,19 @@
 // End-to-end coverage for the Settings window's toolbar-style pane
 // switcher (Calyx/Features/Settings/SettingsWindowController.swift,
 // SettingsPane.swift, SettingsRow.swift): opening Settings via the app
-// menu's "Preferences…" (Cmd+,) shows a toolbar with one button per
-// SettingsPane ("Appearance" / "Sessions" / "LSP"), each button carries
-// an image (a shipped defect had these render as text-only buttons),
-// clicking a button switches the window's content to that pane AND its
+// menu's Cmd+, item (source: `AppDelegate.swift`'s `appMenu.addItem
+// (withTitle: "Preferences…", ...)` -- field-verified that AppKit on
+// this macOS (26.x, post-Ventura "System Settings" rename) silently
+// relabels the standard Cmd+, app-menu item to "Settings…" at runtime
+// regardless of the string the source passes to `withTitle:`, so this
+// suite looks it up as "Settings…", not "Preferences…") shows a toolbar with one button per
+// SettingsPane ("Appearance" / "Sessions" / "LSP") -- a shipped defect
+// had these collapse into one degenerate merged header instead (no
+// per-item image, per `SettingsWindowController.setupContent()`'s own
+// doc comment; XCUITest cannot read an NSToolbarItem's NSImage directly,
+// see `test_settingsWindow_toolbarTabsHaveImagesAndSwitchContent`'s own
+// comment for what IS assertable here) -- clicking a button switches
+// the window's content to that pane AND its
 // title to the pane's own title (native NSTabViewController(tabStyle:
 // .toolbar) behavior), and each pane shows the control the user actually
 // came for.
@@ -36,19 +45,19 @@ import XCTest
 
 final class SettingsWindowE2ETests: CalyxUITestCase {
 
-    /// `app.activate()` first: field-verified (not assumed) that this
-    /// class's own launch, running right after another test class's app
-    /// instance just terminated in the same xctest process, can lose the
-    /// system menu bar to some other running Calyx process mid-click --
-    /// macOS only exposes the CURRENTLY ACTIVE app's menu bar via
-    /// Accessibility, and a background app's `NSApp.mainMenu` isn't
-    /// reachable at all while it isn't frontmost. A single retry (with a
-    /// fresh `activate()`) covers the case where the very first attempt
-    /// loses the race.
+    /// `app.activate()` first as cheap insurance against this class's
+    /// app launching right after another test class's app instance just
+    /// terminated in the same xctest process. The actual, confirmed
+    /// root cause of this suite's first RED run here was NOT a focus
+    /// race, though: it was looking up "Preferences…" when the item's
+    /// real runtime title is "Settings…" (see this file's header) --
+    /// confirmed by reading the failure's own attached accessibility
+    /// snapshot, which showed a perfectly healthy, fully-populated menu
+    /// bar with `identifier: 'openPreferences:', title: 'Settings…'`.
     private func openSettingsViaMenu() {
         app.activate()
         Thread.sleep(forTimeInterval: 0.5)
-        menuAction("Calyx", item: "Preferences…")
+        menuAction("Calyx", item: "Settings…")
     }
 
     /// A known control that only exists on `pane`'s own content
@@ -83,12 +92,15 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
         }
     }
 
-    /// Opens Settings, then for each of the three panes in order:
-    /// clicks its toolbar button, asserts the button exists AND carries
-    /// an image, asserts the window's title becomes that pane's title,
-    /// and asserts a pane-specific control is visible. Screenshots each
-    /// pane (plus the initial post-open state) to `CalyxUITestCase
-    /// .uiShotDir` for manual review.
+    /// Opens Settings, asserts the toolbar shows three distinct
+    /// individually-labeled buttons (not one merged header -- see this
+    /// method's own inline comment for why that, not an image-presence
+    /// check, is what's actually assertable here), then for each pane in
+    /// order: clicks its toolbar button, asserts the window's title
+    /// becomes that pane's title, and asserts a pane-specific control is
+    /// visible. Screenshots each pane (plus the initial post-open state)
+    /// to `CalyxUITestCase.uiShotDir` for manual review -- including of
+    /// the icons themselves, which only a human eye can confirm here.
     func test_settingsWindow_toolbarTabsHaveImagesAndSwitchContent() {
         XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not appear after launch.")
         app.activate()
@@ -131,18 +143,36 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
         )
         saveScreenshot(name: "settings-appearance-initial")
 
+        // Icon check: field-verified that XCUITest CANNOT read an
+        // NSToolbarItem's NSImage directly here -- a passing toolbar
+        // button's own accessibility subtree is a single leaf element
+        // (`title`/`label` only, no child `.images`, no distinguishing
+        // attribute), confirmed by attaching its `debugDescription` to a
+        // failing assertion during this suite's own development. What
+        // IS assertable, and what actually distinguishes the shipped
+        // defect (`SettingsWindowController.setupContent()`'s own doc
+        // comment: "the toolbar-style NSTabViewController renders a tab
+        // item with no image as a degenerate fat header instead of a
+        // proper toolbar button"): whether THREE separate,
+        // individually-labeled buttons exist at all, vs. one merged
+        // header. A screenshot is saved below for the one part of this
+        // (the icon glyphs themselves) that only a human eye can
+        // confirm.
+        let toolbarButtonLabels = Set(settingsWindow.toolbars.buttons.allElementsBoundByIndex.map { $0.label })
+        XCTAssertEqual(
+            toolbarButtonLabels, ["Appearance", "Sessions", "LSP"],
+            "Settings toolbar should expose three distinct, individually-labeled buttons " +
+            "(Appearance/Sessions/LSP), not a single merged/degenerate header. Actual labels " +
+            "found: \(toolbarButtonLabels). Window hierarchy: " +
+            "\(settingsWindow.debugDescription.prefix(2000))"
+        )
+
         for pane in ["Appearance", "Sessions", "LSP"] {
             let toolbarButton = settingsWindow.toolbars.buttons[pane]
             XCTAssertTrue(
                 waitFor(toolbarButton, timeout: 5),
                 "Settings toolbar has no button labeled \"\(pane)\". Window hierarchy: " +
                 "\(settingsWindow.debugDescription.prefix(2000))"
-            )
-            XCTAssertGreaterThan(
-                toolbarButton.images.count, 0,
-                "Settings toolbar's \"\(pane)\" button has no image child element -- it is " +
-                "rendering as a text-only button (the shipped defect this test pins the fix " +
-                "for: SettingsWindowController.setupContent() never sets `tabItem.image`)."
             )
 
             toolbarButton.click()

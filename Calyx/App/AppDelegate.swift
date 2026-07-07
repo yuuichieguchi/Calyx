@@ -600,7 +600,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let placeholderLeafID = UUID()
         let tab = Tab(
-            title: SessionTabTitle.fromCwd(cwd, home: NSHomeDirectory()),
+            // NSHomeDirectory() ignores a HOME env override (P4 root-resolver lesson); use the canonical resolver.
+            title: SessionTabTitle.fromCwd(cwd, home: SessionRootResolver().resolve()),
             pwd: cwd,
             splitTree: SplitTree(leafID: placeholderLeafID),
             sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID, host: host)]
@@ -809,7 +810,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let placeholderLeafID = UUID()
         let tab = Tab(
-            title: SessionTabTitle.fromCwd(cwd, home: NSHomeDirectory()),
+            // NSHomeDirectory() ignores a HOME env override (P4 root-resolver lesson); use the canonical resolver.
+            title: SessionTabTitle.fromCwd(cwd, home: SessionRootResolver().resolve()),
             pwd: cwd,
             splitTree: SplitTree(leafID: placeholderLeafID),
             sessionRefs: [placeholderLeafID: SessionRef(sessionID: sessionID, host: host)]

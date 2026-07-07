@@ -111,24 +111,66 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         app.windows.matching(NSPredicate(format: "NOT (title == %@)", "Sessions")).count
     }
 
-    /// Opens the session browser via the command palette's "Attach
-    /// Session…" command (`CalyxWindowController.swift`'s
+    /// The visible title (`tab.titleOverride ?? tab.title`, per
+    /// `SidebarContentView.swift`'s own `visibleTitle`) of every tab
+    /// currently shown in the SIDEBAR (not the horizontal tab bar --
+    /// see below for why), read from each row's own descendant
+    /// `StaticText.value` (this codebase's established pattern for
+    /// hosted-SwiftUI text: exposed via `value`, not plain `label` --
+    /// same as `SessionBrowserRowView`'s row text, per this file's own
+    /// header comment).
+    ///
+    /// Deliberately sidebar, NOT `CalyxUITestCase.countTabBarTabs()`'s
+    /// tab bar: field-verified across three separate accessibility
+    /// snapshots (Xcode's own auto-attached failure diagnostics) that
+    /// with the Session Browser panel ALSO open, the tab bar's own row
+    /// `Group` elements expose NEITHER their `calyx.tabBar.tab.<UUID>`
+    /// identifier NOR their `calyx.tabBar.tab.index.N` value under any
+    /// window-focus arrangement tried (a direct click, a query scoped to
+    /// the specific window element, and raising the window via the
+    /// standard "Window" menu were all tried and all still showed the
+    /// SAME missing attributes in the resulting snapshot) -- only the
+    /// row's own nested close-button `Image` carries an identifier. The
+    /// SIDEBAR's equivalent rows (`calyx.sidebar.tab.<UUID>`), by
+    /// contrast, exposed their identifiers cleanly in every one of those
+    /// same snapshots regardless of which window was key. Every existing
+    /// test using `countTabBarTabs()` elsewhere in this codebase only
+    /// ever has ONE window open at a time, so this suite is the first to
+    /// hit the tab bar's own limitation here.
+    private func sidebarTabTitles() -> Set<String> {
+        let rows = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier BEGINSWITH %@ AND NOT identifier ENDSWITH %@", "calyx.sidebar.tab.", ".closeButton"))
+        return Set(rows.allElementsBoundByIndex.map { row in
+            row.descendants(matching: .staticText).firstMatch.value as? String ?? ""
+        })
+    }
+
+    /// Opens the session browser via the command palette's "Session
+    /// Browser…" command (`CalyxWindowController.swift`'s
     /// `commandRegistry.register(PaletteCommand(id: "session.attach"
     /// ...))`, ungated -- unlike "New Remote Session…" it has no
     /// `isAvailable` closure, so it doesn't require
     /// `persistentSessionsEnabled` to be reachable, though this suite
     /// enables that setting anyway since the scenario itself needs
     /// persistent sessions). Filtering on a substring of the title
-    /// (not the full "Attach Session…" including its ellipsis) mirrors
+    /// (not the full "Session Browser…" including its ellipsis) mirrors
     /// `CommandPaletteUITests.test_executeCommand`'s own "New Tab"
-    /// pattern.
+    /// pattern. NOTE: this command was titled "Attach Session…" when
+    /// this suite was first written; it was renamed to "Session
+    /// Browser…" by the same production fix that made attach land as a
+    /// tab (commit 2bf60b307, "the palette command formerly titled
+    /// Attach Session... is now Session Browser... -- it only ever
+    /// opened the browser; the old name read as attach-this-tab") --
+    /// field-verified this rename broke this exact lookup (a run against
+    /// that commit failed here with the "Sessions" window never
+    /// appearing) before this string was updated to match.
     private func openSessionBrowserViaPalette() {
         openCommandPaletteViaMenu()
         let searchField = app.descendants(matching: .any)
             .matching(identifier: "calyx.commandPalette.searchField")
             .firstMatch
         XCTAssertTrue(waitFor(searchField), "Command palette search field did not appear.")
-        searchField.typeText("Attach Session")
+        searchField.typeText("Session Browser")
         Thread.sleep(forTimeInterval: 0.3)
         searchField.typeKey(.enter, modifierFlags: [])
     }
@@ -148,13 +190,29 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
     func test_sessionBrowser_attachDetachedSession_thenKillAnotherSession() {
         XCTAssertTrue(waitFor(app.windows.firstMatch), "App window did not appear after launch.")
 
-        // Baseline for the user-visible assertions added below (window
-        // count, new tab's title): captured before session B even
-        // exists, so a bug that opens an extra window OR changes the
-        // wrong window's tab count can't hide behind a baseline taken
-        // too late.
-        let mainWindowCountBeforeAttach = countMainWindows()
-        let tabCountBeforeAttach = countTabBarTabs()
+        // Resolved and validated ONCE, up front, in THIS RUNNER process
+        // (never re-read inside a pane's shell -- see PaneCLIExec.swift's
+        // header for why a bare `calyx-session`/`$CALYX_SESSION_BIN`
+        // inside a pane silently resolves against the real HOME instead
+        // of this test's isolated one). If `CALYX_SESSION_BIN` isn't set
+        // on THIS process's own environment, `sessionBinaryPath` is
+        // empty, and every pane command built below would start with a
+        // bare space before `--runtime-dir`, which zsh's pane shell
+        // reports as "command not found: --runtime-dir" -- a confusing
+        // failure this assertion catches immediately, with the actual
+        // cause named, instead of surfacing 15s later as "no output" or
+        // a bogus captured session id.
+        let sessionBinaryPath = CalyxUITestCase.builtSessionBinaryPath
+        XCTAssertFalse(
+            sessionBinaryPath.isEmpty,
+            "CALYX_SESSION_BIN is empty in this test runner's own process environment, " +
+            "so every calyx-session command this suite pastes into a pane would be " +
+            "missing its binary path entirely (the pane's login-reset shell has no " +
+            "such variable of its own to fall back on -- see PaneCLIExec.swift's " +
+            "header). Set CALYX_SESSION_BIN as a build setting/env var when invoking " +
+            "xcodebuild test, e.g. `xcodebuild test ... CALYX_SESSION_BIN=/path/to/" +
+            "calyx-session`."
+        )
 
         // Session A: the initial window's own persistent-session pane
         // registers with the daemon asynchronously; poll rather than
@@ -221,8 +279,13 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
             "`mkdir -p \(sessionBCwd)` from inside the pane did not report rc=0: " +
             "\(paneMkdirOutput)"
         )
+        // `sessionBinaryPath` single-quoted: this is the LITERAL path
+        // resolved runner-side above (never a `$CALYX_SESSION_BIN`
+        // reference evaluated inside the pane's own reset shell -- see
+        // this test's own up-front assertion and PaneCLIExec.swift's
+        // header for why that distinction matters here).
         let sessionBID = paneExec(
-            "\(CalyxUITestCase.builtSessionBinaryPath) \(calyxSessionRootFlags(homeDir: homeDir)) new --name sessionB --cwd \(sessionBCwd)",
+            "'\(sessionBinaryPath)' \(calyxSessionRootFlags(homeDir: homeDir)) new --name sessionB --cwd \(sessionBCwd)",
             counter: &execCounter
         )
         XCTAssertFalse(
@@ -304,6 +367,16 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
             "pane and should not show one."
         )
 
+        // Baseline for the user-visible assertions below (window count,
+        // new tab's title): captured HERE, immediately before the click
+        // that triggers the attach -- not at the very start of the test
+        // (field-verified: session A's own sidebar tab row has not
+        // necessarily rendered yet that early). By this point session
+        // A's pane has been driven through two pane-pasted commands
+        // already, so its row is definitely live.
+        let mainWindowCountBeforeAttach = countMainWindows()
+        let sidebarTitlesBeforeAttach = sidebarTabTitles()
+
         // Attach B: row-scoped lookup via its own accessibility
         // identifier (AccessibilityID.SessionBrowser.attachButton),
         // not the shared "Attach" label every row's button carries.
@@ -342,28 +415,43 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
         // be session B's cwd, tilde-abbreviated -- NOT the `Tab.init`
         // default `"Terminal"` that a title-less attach silently falls
         // back to (`AppDelegate.attachSessionAsNewTab` constructs
-        // `Tab(pwd: cwd, ...)` with no `title:` argument). `addTab`
-        // always appends (`TabGroup.addTab`), so the new tab is the one
-        // at `tabCountBeforeAttach` (the prior last index + 1, 0-based).
-        // Polled rather than checked once: this suite's own established
-        // idiom (`detachedBadgeCount` above) for a SwiftUI re-render
-        // that may lag one beat behind the ledger state this line
-        // itself just waited on.
+        // `Tab(pwd: cwd, ...)` with no `title:` argument). Read via the
+        // SIDEBAR (`sidebarTabTitles()`'s own doc comment explains why
+        // NOT the tab bar), as a set difference against the baseline
+        // captured above -- avoids needing to know the new tab's index
+        // or identifier, neither of which this suite can otherwise pin
+        // down independently of the very thing being tested. Polled
+        // rather than checked once: this suite's own established idiom
+        // (`detachedBadgeCount` above) for a SwiftUI re-render that may
+        // lag one beat behind the ledger state this line itself just
+        // waited on.
         let expectedTabTitle = tildeAbbreviated(sessionBCwd, home: homeDir)
-        let newTabValue = "calyx.tabBar.tab.index.\(tabCountBeforeAttach)"
-        let newTabElement = app.descendants(matching: .any)
-            .matching(NSPredicate(format: "value == %@", newTabValue))
-            .firstMatch
-        XCTAssertTrue(
-            waitFor(newTabElement, timeout: 10),
-            "No tab-bar element with index value \(newTabValue) appeared after attaching " +
-            "session B, meaning the tab count in session A's window never grew by one."
-        )
-        var newTabLabel = newTabElement.label
-        for _ in 0..<8 where newTabLabel != expectedTabTitle {
+        var sidebarTitlesAfterAttach = sidebarTabTitles()
+        for _ in 0..<8 where sidebarTitlesAfterAttach.count <= sidebarTitlesBeforeAttach.count {
             Thread.sleep(forTimeInterval: 1)
-            newTabLabel = newTabElement.label
+            sidebarTitlesAfterAttach = sidebarTabTitles()
         }
+        XCTAssertEqual(
+            sidebarTitlesAfterAttach.count, sidebarTitlesBeforeAttach.count + 1,
+            "Sidebar tab count did not grow by exactly one after attaching session B " +
+            "(before: \(sidebarTitlesBeforeAttach), after: \(sidebarTitlesAfterAttach))."
+        )
+        let newTitles = sidebarTitlesAfterAttach.subtracting(sidebarTitlesBeforeAttach)
+        XCTAssertEqual(
+            newTitles.count, 1,
+            "Expected exactly one new sidebar tab title after attaching session B; " +
+            "got \(newTitles) (before: \(sidebarTitlesBeforeAttach), after: " +
+            "\(sidebarTitlesAfterAttach))."
+        )
+        let newTabLabel = newTitles.first ?? "<none>"
+
+        // Saved BEFORE the strict title assertions below (not after):
+        // with `continueAfterFailure = false`, a screenshot placed after
+        // a failing assertion never gets taken at all. For the team
+        // lead to eyeball: the attached tab's actual rendered title,
+        // whatever it is right now.
+        saveScreenshot(name: "session-browser-attach-result")
+
         XCTAssertNotEqual(
             newTabLabel, "Terminal",
             "The tab attached for session B (cwd \(sessionBCwd)) still shows the " +
@@ -374,10 +462,6 @@ final class SessionBrowserAttachKillE2ETests: CalyxUITestCase {
             "The tab attached for session B should show its cwd, tilde-abbreviated " +
             "against this suite's own isolated HOME (\(homeDir!)), as its title."
         )
-
-        // For the team lead to eyeball: the attached tab's actual
-        // rendered title, whatever it is right now.
-        saveScreenshot(name: "session-browser-attach-result")
 
         // Re-invoking the palette command re-raises the SAME shared
         // `SessionBrowserWindowController.shared` window (`showWindow

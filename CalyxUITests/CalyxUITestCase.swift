@@ -94,22 +94,46 @@ class CalyxUITestCase: XCTestCase {
 
     /// Fixed scratch directory the team lead reads screenshots from by
     /// hand after a run -- NOT a general-purpose artifact location, so
-    /// don't add unrelated files here.
-    static let uiShotDir =
-        "/private/tmp/claude-501/-Users-eguchiyuuichi-projects-Calyx/89de745c-6981-4a74-a046-7082604214ca/scratchpad/ui-shots"
+    /// don't add unrelated files here. ONE level under `/tmp`,
+    /// deliberately -- field-verified (not assumed) that this depth
+    /// succeeds where a deeper, nested scratchpad path does not: the
+    /// sandboxed runner failed an equivalent nested `mkdir` under the
+    /// scratchpad with `NSCocoaErrorDomain Code=513 "Operation not
+    /// permitted"`, while a one-level `/tmp/<name>` directory (the same
+    /// depth `SessionBrowserAttachKillE2ETests`'s own per-test `homeDir`
+    /// already succeeds at creating, see that file's `setUp()`) works.
+    static let uiShotDir = "/tmp/cxshots"
 
     /// Saves a full-screen `XCUIScreen` screenshot (not a single
     /// element's, so window chrome/toolbar icons are visible exactly as
-    /// a human eyeballing the result would see them) as `<name>.png`
-    /// under `uiShotDir`. Best-effort: a write failure here must not
-    /// fail the calling test, since the screenshot itself isn't part of
-    /// what the test is asserting.
-    @discardableResult
-    func saveScreenshot(name: String) -> String {
-        try? FileManager.default.createDirectory(atPath: Self.uiShotDir, withIntermediateDirectories: true)
-        let path = "\(Self.uiShotDir)/\(name).png"
+    /// a human eyeballing the result would see them) named `name`, via
+    /// BOTH of two independent channels: (a) an `XCTAttachment`/`add(_:)`
+    /// on the current test -- always succeeds, lands in the run's
+    /// `.xcresult` regardless of sandboxing -- and (b) a raw PNG file
+    /// under `uiShotDir`, a plain one-level `/tmp` path a human can open
+    /// directly without extracting it from the `.xcresult` bundle first.
+    /// (b) is a best-effort supplement, not a substitute for (a): if the
+    /// write fails for any reason, this logs the failure and falls back
+    /// to the attachment alone rather than failing the test over a
+    /// diagnostic-only write.
+    func saveScreenshot(name: String) {
         let screenshot = XCUIScreen.main.screenshot()
-        try? screenshot.pngRepresentation.write(to: URL(fileURLWithPath: path))
-        return path
+
+        let attachment = XCTAttachment(screenshot: screenshot)
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
+
+        let filePath = "\(Self.uiShotDir)/\(name).png"
+        do {
+            try FileManager.default.createDirectory(atPath: Self.uiShotDir, withIntermediateDirectories: true)
+            try screenshot.pngRepresentation.write(to: URL(fileURLWithPath: filePath))
+            print("[saveScreenshot] \"\(name)\": attached to test result AND wrote \(filePath)")
+        } catch {
+            print(
+                "[saveScreenshot] \"\(name)\": attached to test result, but failed to " +
+                "write \(filePath) (\(error)) -- see the test's XCTAttachment instead."
+            )
+        }
     }
 }
