@@ -30,3 +30,4 @@ ghostty/zig-out/
 .build/
 Packages/
 Package.resolved
+scratchpad
