@@ -65,9 +65,20 @@ struct RecoveryBarView: View {
 /// `GlassTheme.chromeTint(...)` formula used below. Adding a second
 /// `.glassEffect` here stacked two passes of the identical tint in this
 /// one strip, reading visibly darker than the single-pass chrome above
-/// and below it (user-reported). This modifier now only supplies the
-/// bottom stroke + text/button legibility handling; the glass surface
-/// itself is inherited from `mainContent`.
+/// and below it (user-reported). This modifier now only supplies
+/// text/button legibility handling; the glass surface itself is
+/// inherited from `mainContent`.
+///
+/// Also deliberately has no bottom stroke in the glass path (unlike
+/// TabBarBackgroundModifier's own bottom stroke, which sits between the
+/// tab strip and the pane content below it): since this bar shares one
+/// continuous glass surface with the titlebar above AND the tab strip
+/// below (see above), a stroke on only one of its two edges read as an
+/// inconsistency (user-reported) -- the titlebar side already connects
+/// seamlessly, so the bar's own bottom edge should too. The
+/// reduceTransparency path keeps its plain `Divider()`: that flat,
+/// non-glass mode has no shared surface to stay seamless with, so it
+/// still needs an explicit separator.
 private struct RecoveryBarBackgroundModifier: ViewModifier {
     let reduceTransparency: Bool
     @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
@@ -95,11 +106,6 @@ private struct RecoveryBarBackgroundModifier: ViewModifier {
                 .overlay(alignment: .bottom) { Divider() }
         } else {
             content
-                .overlay(alignment: .bottom) {
-                    Rectangle()
-                        .fill(GlassTheme.specularStroke.opacity(0.28))
-                        .frame(height: 1)
-                }
                 .environment(\.colorScheme, chromeScheme)
                 .foregroundStyle(themePreset == "ghostty"
                     ? AnyShapeStyle(Color(nsColor: ghosttyProvider.ghosttyForeground))
