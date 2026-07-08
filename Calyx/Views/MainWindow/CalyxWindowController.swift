@@ -67,6 +67,23 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         hasPreservedSessionSnapshot: (NSApp.delegate as? AppDelegate)?.hasPreservedSessionSnapshot ?? false,
         onRestore: { (NSApp.delegate as? AppDelegate)?.recoverPreservedSession() }
     )
+    /// Cockpit approval banner's per-window view-model
+    /// (ApprovalBannerModel.swift). Unlike `recoveryBarModel` above, its
+    /// `ownsSurface`/`isKeyWindow` closures need `self` (to walk THIS
+    /// window's own `windowSession` / read THIS window's own key-window
+    /// state), so this cannot be a class-level default-value initializer
+    /// the way `recoveryBarModel` is -- Swift's two-phase init forbids
+    /// capturing `self` before every stored property is set and
+    /// `super.init` has run. `lazy var` sidesteps that entirely: its
+    /// initializer expression only runs on first access, by which point
+    /// this instance is always fully constructed, so `[weak self]` here
+    /// is safe without threading a post-`super.init()` assignment
+    /// through `init(window:windowSession:restoring:initialHost:)`.
+    lazy var approvalBannerModel: ApprovalBannerModel = ApprovalBannerModel(
+        store: .shared,
+        ownsSurface: { [weak self] id in self?.windowSessionOwnsSurface(id) ?? false },
+        isKeyWindow: { [weak self] in self?.window?.isKeyWindow ?? false }
+    )
     private var closingTabIDs: Set<UUID> = []
     #if DEBUG
     /// Test seam (P4 round-4 fix RED phase): read-only observability
@@ -1043,6 +1060,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             activeDiffSource: activeDiffSource,
             activeDiffReviewStore: activeDiffReviewStore,
             recoveryBarModel: recoveryBarModel,
+            approvalBannerModel: approvalBannerModel,
             sidebarMode: Binding(
                 get: { [weak self] in self?.windowSession.sidebarMode ?? .tabs },
                 set: { [weak self] in
@@ -1120,6 +1138,23 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// on to pick up an external `@Observable` change on its own). Not
     /// `private`: called from AppDelegate.swift, a different file.
     func refreshRecoveryBar() {
+        refreshHostingView()
+    }
+
+    /// Same "mutate observable state, then explicitly refresh" pattern
+    /// as `refreshRecoveryBar()` above -- called whenever
+    /// `ApprovalInboxStore` changes (relayed via the
+    /// `.calyxApprovalInboxChanged` notification, observed below) or
+    /// this window's key state changes: a window-agnostic (nil
+    /// `targetSurfaceID`) request's visibility depends on
+    /// `window.isKeyWindow`, which is plain `NSWindow` state, not itself
+    /// `@Observable`, so `windowDidBecomeKey`/`windowDidResignKey` must
+    /// also trigger this to re-evaluate `approvalBannerModel.current`.
+    @objc private func handleApprovalInboxChanged(_ notification: Notification) {
+        refreshApprovalBanner()
+    }
+
+    func refreshApprovalBanner() {
         refreshHostingView()
     }
 
@@ -1858,6 +1893,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .calyxFocusSurface, object: nil)
         center.addObserver(self, selector: #selector(handleSurfaceDestroyedForAgentMonitor(_:)),
                            name: .calyxSurfaceDestroyed, object: nil)
+        center.addObserver(self, selector: #selector(handleApprovalInboxChanged(_:)),
+                           name: .calyxApprovalInboxChanged, object: nil)
         center.addObserver(self, selector: #selector(handleShowChildExitedNotification(_:)),
                            name: .ghosttyShowChildExited, object: nil)
         center.addObserver(self, selector: #selector(handleConfirmingQuitDidEnd(_:)),
@@ -3216,6 +3253,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         return nil
     }
 
+    /// Whether THIS window's `windowSession` owns `surfaceID` -- backs
+    /// `approvalBannerModel`'s `ownsSurface` predicate, reusing
+    /// `findTab(surfaceID:)`'s existing walk rather than duplicating it.
+    private func windowSessionOwnsSurface(_ surfaceID: UUID) -> Bool {
+        findTab(surfaceID: surfaceID) != nil
+    }
+
     /// R6-E (r6-fix-spec.md, A2): activates the tab (and, by extension
     /// via `switchToTab(id:)`, its group) containing `surfaceID`,
     /// reusing this controller's existing tab-switch logic rather than
@@ -3269,6 +3313,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             focusedController?.setFocus(true)
             restoreFocus()
         }
+        // A window-agnostic (nil targetSurfaceID) approval request's
+        // visibility depends on `window.isKeyWindow` -- re-evaluate now
+        // that it just changed (see `refreshApprovalBanner()`'s own doc
+        // comment).
+        refreshApprovalBanner()
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -3277,6 +3326,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         if windowSession.showCommandPalette {
             dismissCommandPalette()
         }
+        refreshApprovalBanner()
     }
 
     /// Last-window pre-close prompt path: if closing this window would

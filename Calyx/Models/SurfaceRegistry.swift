@@ -45,6 +45,16 @@ final class SurfaceRegistry {
     /// instance.
     var sessionSurfaceMap: SessionSurfaceMap = .shared
 
+    /// Store `destroySurface(_:)` expires any still-pending Cockpit
+    /// approval request targeting a torn-down surface into (see
+    /// `ApprovalInboxStore.expireForSurface(_:)`) -- without this, such
+    /// a request's banner would stay invisible forever (no window owns a
+    /// destroyed surface) while its MCP caller waits out the full
+    /// timeout for a decision nobody can ever make. Defaults to the
+    /// shared singleton; tests inject an isolated instance, same
+    /// rationale as `commandLogStore`/`sessionSurfaceMap` above.
+    var approvalInboxStore: ApprovalInboxStore = .shared
+
     #if DEBUG
     /// Test-only storage for injected `SurfaceView` fixtures. Populated
     /// via `_testInsert(view:id:)` and consulted as a fallback by
@@ -177,6 +187,7 @@ final class SurfaceRegistry {
             // so `commandLogStore.markOrphaned(surfaceID:)` here is a
             // no-op for any id genuinely foreign to CommandLogStore too.
             orphanCommandsIfNotPersistent(surfaceID: id)
+            approvalInboxStore.expireForSurface(id)
             return
         }
         guard entry.state != .destroyed else { return }
@@ -200,6 +211,7 @@ final class SurfaceRegistry {
         logger.info("Surface destroyed: \(id)")
 
         orphanCommandsIfNotPersistent(surfaceID: id)
+        approvalInboxStore.expireForSurface(id)
 
         NotificationCenter.default.post(
             name: .calyxSurfaceDestroyed,

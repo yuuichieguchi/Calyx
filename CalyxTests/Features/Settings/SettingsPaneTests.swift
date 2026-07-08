@@ -81,6 +81,7 @@ final class SettingsPaneTests: XCTestCase {
         ("historyPersistence", .sessions),
         ("agentResume", .sessions),
         ("agentResumeAutoExecute", .sessions),
+        ("cockpitAutoApprove", .sessions),
         ("commandTracking", .sessions),
         ("openSessionBrowserButton", .sessions),
         ("openConfigFileFooter", .appearance),

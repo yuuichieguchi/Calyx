@@ -32,8 +32,8 @@ final class ApprovalInboxStoreTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeRequest(payload: String = "ls", createdAt: Date = Date()) -> ApprovalRequest {
-        ApprovalRequest(id: UUID(), source: .mcpTool(name: "pane_run"), targetSurfaceID: nil, payload: payload, createdAt: createdAt)
+    private func makeRequest(targetSurfaceID: UUID? = nil, payload: String = "ls", createdAt: Date = Date()) -> ApprovalRequest {
+        ApprovalRequest(id: UUID(), source: .mcpTool(name: "pane_run"), targetSurfaceID: targetSurfaceID, payload: payload, createdAt: createdAt)
     }
 
     /// Bounded scheduler-yield loop, so a concurrently-spawned `Task`
@@ -101,6 +101,57 @@ final class ApprovalInboxStoreTests: XCTestCase {
         let result = await task.value
         XCTAssertEqual(result, .denied, "decide(.denied) must resume the awaiter with .denied")
         XCTAssertTrue(store.pending.isEmpty, "a decided request must be removed from pending")
+    }
+
+    // MARK: - decide(ids:_:) batched
+
+    /// W6: the batched form must post `.calyxApprovalInboxChanged`
+    /// exactly ONCE for the whole batch, not once per resolved id --
+    /// backs `ApprovalBannerModel.alwaysAllow(id:)`'s drain, so it
+    /// triggers one refresh per open window instead of N.
+    func test_decideIDs_resolvesAllAndPostsExactlyOneNotification() async throws {
+        let store = ApprovalInboxStore()
+        let first = makeRequest(payload: "one")
+        let second = makeRequest(payload: "two")
+        let third = makeRequest(payload: "three")
+        store.submit(first)
+        store.submit(second)
+        store.submit(third)
+
+        let firstWaiter = Task { @MainActor in await store.awaitDecision(id: first.id, timeoutMs: 5_000) }
+        let secondWaiter = Task { @MainActor in await store.awaitDecision(id: second.id, timeoutMs: 5_000) }
+        let thirdWaiter = Task { @MainActor in await store.awaitDecision(id: third.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        let notifyCountBeforeBatch = store._testNotifyCount
+
+        store.decide(ids: [first.id, second.id, third.id], .allowed)
+
+        XCTAssertEqual(store._testNotifyCount - notifyCountBeforeBatch, 1,
+                       "decide(ids:_:) must post exactly one change notification for the whole batch, " +
+                       "not one per resolved id")
+        XCTAssertTrue(store.pending.isEmpty, "decide(ids:_:) must resolve every id in the batch")
+
+        let firstResult = await firstWaiter.value
+        let secondResult = await secondWaiter.value
+        let thirdResult = await thirdWaiter.value
+        XCTAssertEqual(firstResult, .allowed)
+        XCTAssertEqual(secondResult, .allowed)
+        XCTAssertEqual(thirdResult, .allowed)
+    }
+
+    func test_decideIDs_allStaleIDs_isNoOp_postsNoNotification() {
+        let store = ApprovalInboxStore()
+        let request = makeRequest()
+        store.submit(request)
+        store.decide(id: request.id, .allowed) // resolve it, so its id is now stale
+
+        let notifyCountBeforeBatch = store._testNotifyCount
+
+        store.decide(ids: [request.id], .denied)
+
+        XCTAssertEqual(store._testNotifyCount, notifyCountBeforeBatch,
+                       "a batch where every id is already stale must post no notification at all")
     }
 
     // MARK: - timeout / expiry
@@ -288,5 +339,49 @@ final class ApprovalInboxStoreTests: XCTestCase {
         let firstResult = await firstWaiter.value
         XCTAssertEqual(firstResult, .allowed,
                        "The first waiter must remain live and decidable after a second concurrent await bounced off")
+    }
+
+    // MARK: - expireForSurface
+
+    func test_expireForSurface_resumesOnlyTargetedWaiters_leavesOthersPending() async throws {
+        let store = ApprovalInboxStore()
+        let targetSurfaceID = UUID()
+        let otherSurfaceID = UUID()
+        let targeted = makeRequest(targetSurfaceID: targetSurfaceID, payload: "targeted")
+        let untargeted = makeRequest(targetSurfaceID: otherSurfaceID, payload: "other")
+        let windowAgnostic = makeRequest(targetSurfaceID: nil, payload: "agnostic")
+
+        store.submit(targeted)
+        store.submit(untargeted)
+        store.submit(windowAgnostic)
+
+        let targetedWaiter = Task { @MainActor in await store.awaitDecision(id: targeted.id, timeoutMs: 5_000) }
+        let otherWaiter = Task { @MainActor in await store.awaitDecision(id: untargeted.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        store.expireForSurface(targetSurfaceID)
+
+        let targetedResult = await targetedWaiter.value
+        XCTAssertEqual(targetedResult, .expired,
+                       "expireForSurface must resume a waiter targeting the destroyed surface with .expired")
+        XCTAssertEqual(Set(store.pending.map(\.id)), Set([untargeted.id, windowAgnostic.id]),
+                       "expireForSurface must remove only the request(s) targeting that surface, " +
+                       "leaving other-surface and window-agnostic requests pending")
+
+        store.decide(id: untargeted.id, .allowed)
+        let otherResult = await otherWaiter.value
+        XCTAssertEqual(otherResult, .allowed,
+                       "a request targeting a different surface must remain independently decidable")
+    }
+
+    func test_expireForSurface_unknownSurface_isNoOp() {
+        let store = ApprovalInboxStore()
+        let request = makeRequest(targetSurfaceID: UUID())
+        store.submit(request)
+
+        store.expireForSurface(UUID())
+
+        XCTAssertEqual(store.pending.map(\.id), [request.id],
+                       "expireForSurface for a surface with no matching pending request must not touch pending")
     }
 }

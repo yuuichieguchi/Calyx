@@ -21,6 +21,12 @@ struct MainContentView: View {
     /// CalyxWindowController) simply shows no bar, same as
     /// `hasPreservedSessionSnapshot == false`.
     var recoveryBarModel: RecoveryBarModel?
+    /// Cockpit approval banner (ApprovalBannerModel.swift), shown below
+    /// the recovery bar (if both are visible at once) as the second
+    /// child of the same `safeAreaInset` VStack. `nil` (no existing
+    /// caller besides CalyxWindowController) simply shows no banner,
+    /// same as `current == nil`.
+    var approvalBannerModel: ApprovalBannerModel?
 
     @Binding var sidebarMode: SidebarMode
     var gitChangesState: GitChangesState = .notLoaded
@@ -102,8 +108,13 @@ struct MainContentView: View {
     var body: some View {
         mainContent
             .safeAreaInset(edge: .top, spacing: 0) {
-                if let recoveryBarModel, recoveryBarModel.showRecoveryBar {
-                    RecoveryBarView(model: recoveryBarModel)
+                VStack(spacing: 0) {
+                    if let recoveryBarModel, recoveryBarModel.showRecoveryBar {
+                        RecoveryBarView(model: recoveryBarModel)
+                    }
+                    if let approvalBannerModel, let request = approvalBannerModel.current {
+                        ApprovalBannerView(model: approvalBannerModel, request: request)
+                    }
                 }
             }
     }

@@ -45,6 +45,17 @@
 
 import Foundation
 
+/// Posted after every mutation (submit/decide/expire/expireAll/
+/// expireForSurface). This codebase does not trust `NSHostingView` to
+/// auto-pick-up an `@Observable` change made from OUTSIDE the currently
+/// rendered view hierarchy (see `CalyxWindowController.refreshRecoveryBar()`'s
+/// own doc comment for the established "mutate observable state, then
+/// explicitly refresh" precedent this mirrors) -- every window observes
+/// this notification and force-refreshes its own approval banner.
+extension Notification.Name {
+    static let calyxApprovalInboxChanged = Notification.Name("com.calyx.approvalInbox.changed")
+}
+
 @MainActor
 @Observable
 final class ApprovalInboxStore {
@@ -74,6 +85,7 @@ final class ApprovalInboxStore {
     func submit(_ request: ApprovalRequest) {
         let insertIndex = pending.firstIndex { $0.createdAt > request.createdAt } ?? pending.count
         pending.insert(request, at: insertIndex)
+        notifyChanged()
     }
 
     // MARK: - decide
@@ -85,6 +97,30 @@ final class ApprovalInboxStore {
         guard let index = pending.firstIndex(where: { $0.id == id }) else { return }
         pending.remove(at: index)
         awaitersByID.removeValue(forKey: id)?.resume(with: decision)
+        notifyChanged()
+    }
+
+    /// Batched form of `decide(id:_:)`: resolves every id in `ids` with
+    /// `decision`, but posts `.calyxApprovalInboxChanged` exactly ONCE
+    /// after the whole batch, not once per id -- used by
+    /// `ApprovalBannerModel.alwaysAllow(id:)`'s backlog drain, so
+    /// clicking "Always Allow" with N other requests visible triggers
+    /// one refresh per open window, not N. Each id is looked up and
+    /// resolved independently, same no-op-if-not-pending contract as
+    /// `decide(id:_:)` -- a stale/already-resolved id in `ids` is simply
+    /// skipped, it does not abort the rest of the batch. A batch that
+    /// resolves nothing at all (every id already stale) posts no
+    /// notification.
+    func decide(ids: [UUID], _ decision: ApprovalDecision) {
+        var didChangeAnything = false
+        for id in ids {
+            guard let index = pending.firstIndex(where: { $0.id == id }) else { continue }
+            pending.remove(at: index)
+            awaitersByID.removeValue(forKey: id)?.resume(with: decision)
+            didChangeAnything = true
+        }
+        guard didChangeAnything else { return }
+        notifyChanged()
     }
 
     // MARK: - awaitDecision
@@ -161,6 +197,7 @@ final class ApprovalInboxStore {
             }
         }
         bridge.resume(with: .expired)
+        notifyChanged()
     }
 
     // MARK: - expireAll
@@ -170,6 +207,51 @@ final class ApprovalInboxStore {
             awaitersByID.removeValue(forKey: request.id)?.resume(with: .expired)
         }
         pending.removeAll()
+        notifyChanged()
+    }
+
+    // MARK: - expireForSurface
+
+    /// Expires every pending request targeting `surfaceID`, e.g. when
+    /// its underlying surface is torn down before a human decides.
+    /// Without this, a request whose target surface no longer exists
+    /// leaves its banner permanently invisible (no window owns a
+    /// destroyed surface -- see `ApprovalBannerModel.isVisible`), while
+    /// the original MCP caller keeps waiting out the full `timeoutMs`
+    /// for a decision nobody can ever make. Called from
+    /// `SurfaceRegistry.destroySurface(_:)`, mirroring that method's own
+    /// `orphanCommandsIfNotPersistent(surfaceID:)` cleanup for
+    /// `CommandLogStore`. A request with a nil `targetSurfaceID`
+    /// (window-agnostic) is never targeted by this and is unaffected.
+    func expireForSurface(_ surfaceID: UUID) {
+        let targeted = pending.filter { $0.targetSurfaceID == surfaceID }
+        guard !targeted.isEmpty else { return }
+        for request in targeted {
+            awaitersByID.removeValue(forKey: request.id)?.resume(with: .expired)
+        }
+        pending.removeAll { $0.targetSurfaceID == surfaceID }
+        notifyChanged()
+    }
+
+    // MARK: - change notification
+
+    #if DEBUG
+    /// Test seam: counts how many times `notifyChanged()` has actually
+    /// posted `.calyxApprovalInboxChanged`, so a test can assert a
+    /// batched operation (e.g. `decide(ids:_:)`) posts exactly once
+    /// regardless of how many requests it resolved, rather than once
+    /// per request -- mirrors this codebase's other DEBUG-only
+    /// test-observability seams (e.g.
+    /// `CalyxWindowController._closingTabIDsForTesting`). DO NOT use
+    /// from production code.
+    private(set) var _testNotifyCount = 0
+    #endif
+
+    private func notifyChanged() {
+        #if DEBUG
+        _testNotifyCount += 1
+        #endif
+        NotificationCenter.default.post(name: .calyxApprovalInboxChanged, object: self)
     }
 
     #if DEBUG
@@ -179,6 +261,7 @@ final class ApprovalInboxStore {
         }
         awaitersByID.removeAll()
         pending.removeAll()
+        _testNotifyCount = 0
     }
     #endif
 }
