@@ -37,7 +37,7 @@ final class CommandLogStore {
     /// Awaiters resolved by a specific record's completion. `awaitCompletion`
     /// always resolves to a concrete record id before registering here --
     /// see that method's doc comment.
-    private var awaitersByRecordID: [UUID: [CommandAwaitBridge]] = [:]
+    private var awaitersByRecordID: [UUID: [AwaitBridge<CommandRecord?>]] = [:]
 
     private struct PendingEnd {
         let cmdID: String
@@ -375,18 +375,19 @@ final class CommandLogStore {
     }
 
     /// Bounded wait for record `id` to leave `.running`, same race shape
-    /// as SessionDaemonClient.bounded(operation:onTimeout:): a
-    /// `CommandAwaitBridge` arbitrates exactly-once resume between three
-    /// call sites -- a matching store mutation (finalize/markOrphaned/
-    /// trimRing, all MainActor-isolated), the timeout Task (also
-    /// MainActor-isolated), and `withTaskCancellationHandler`'s onCancel,
-    /// which is NOT actor-isolated and may run concurrently with the
-    /// other two on a different thread. The timeout and cancellation
-    /// paths also unregister the bridge from `awaitersByRecordID` (the
-    /// real-completion path already does, via `resumeAwaiters`'s
-    /// `removeValue`) so a wait that's given up leaves no husk behind.
+    /// as SessionDaemonClient.bounded(operation:onTimeout:): an
+    /// `AwaitBridge<CommandRecord?>` arbitrates exactly-once resume
+    /// between three call sites -- a matching store mutation (finalize/
+    /// markOrphaned/trimRing, all MainActor-isolated), the timeout Task
+    /// (also MainActor-isolated), and `withTaskCancellationHandler`'s
+    /// onCancel, which is NOT actor-isolated and may run concurrently
+    /// with the other two on a different thread. The timeout and
+    /// cancellation paths also unregister the bridge from
+    /// `awaitersByRecordID` (the real-completion path already does, via
+    /// `resumeAwaiters`'s `removeValue`) so a wait that's given up
+    /// leaves no husk behind.
     private func waitForRecord(id: UUID, timeoutMs: Int) async -> CommandRecord? {
-        let bridge = CommandAwaitBridge()
+        let bridge = AwaitBridge<CommandRecord?>()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<CommandRecord?, Never>) in
                 awaitersByRecordID[id, default: []].append(bridge)
@@ -404,7 +405,7 @@ final class CommandLogStore {
                 }
             }
         } onCancel: {
-            bridge.cancel()
+            bridge.cancel(resumingWith: nil)
             Task { @MainActor in
                 self.unregisterAwaiter(bridge, id: id)
             }
@@ -414,7 +415,7 @@ final class CommandLogStore {
     /// Identity-based, idempotent removal -- safe to race a successful
     /// `resumeAwaiters` (which may have already removed the whole entry)
     /// from either the timeout Task or the non-isolated `onCancel` hop.
-    private func unregisterAwaiter(_ bridge: CommandAwaitBridge, id: UUID) {
+    private func unregisterAwaiter(_ bridge: AwaitBridge<CommandRecord?>, id: UUID) {
         guard var boxes = awaitersByRecordID[id] else { return }
         boxes.removeAll { $0 === bridge }
         if boxes.isEmpty {
@@ -487,53 +488,5 @@ final class CommandLogStore {
         awaitersByRecordID.removeAll()
         reader = nil
         now = { Date() }
-    }
-}
-
-/// Thread-safe exactly-once resume for a single `awaitCompletion` wait,
-/// same shape as SessionDaemonClient's SessionDaemonBoundedRaceBridge:
-/// `register`/`resume`/`cancel` may be called from any of `waitForRecord`'s
-/// three MainActor-or-not call sites, so the internal state is guarded
-/// by a lock rather than actor isolation. `@unchecked Sendable` is sound
-/// here for the same reason it is on `SessionDaemonBoundedRaceBridge`:
-/// every stored property is only ever touched inside `lock`.
-private final class CommandAwaitBridge: @unchecked Sendable {
-    private let lock = NSLock()
-    private var resumed = false
-    private var isCancelled = false
-    private var continuation: CheckedContinuation<CommandRecord?, Never>?
-    private var timeoutTask: Task<Void, Never>?
-
-    /// Returns whether `cancel()` already ran before this call -- the
-    /// caller must resume with nil immediately in that case, since
-    /// `cancel()` itself found no continuation yet to resume.
-    func register(continuation: CheckedContinuation<CommandRecord?, Never>, timeoutTask: Task<Void, Never>) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        self.continuation = continuation
-        self.timeoutTask = timeoutTask
-        return isCancelled
-    }
-
-    @discardableResult
-    func resume(with record: CommandRecord?) -> Bool {
-        lock.lock()
-        guard !resumed, let continuation else { lock.unlock(); return false }
-        resumed = true
-        self.continuation = nil
-        let task = timeoutTask
-        timeoutTask = nil
-        lock.unlock()
-        task?.cancel()
-        continuation.resume(returning: record)
-        return true
-    }
-
-    func cancel() {
-        lock.lock()
-        isCancelled = true
-        let hasRegistered = continuation != nil
-        lock.unlock()
-        guard hasRegistered else { return }
-        resume(with: nil)
     }
 }

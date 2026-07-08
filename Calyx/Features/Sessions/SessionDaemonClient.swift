@@ -90,6 +90,13 @@ enum SessionDaemonClientBoundTimeoutOverrides {
 /// caller whether the bridge was already cancelled by the time it ran,
 /// mirroring that type's own already-cancelled-before-register
 /// handling.
+///
+/// Deliberately separate from the generic `AwaitBridge<Value>` helper
+/// (`Calyx/Helpers/AwaitBridge.swift`): this type races two independent,
+/// separately-cancellable arms (`operationTask` AND `timeoutTask`) with
+/// winner-cancels-loser ordering (see `bounded(...)`'s own R10-C doc
+/// comment) and a closure-valued `onTimeout()` result, a three-way race
+/// shape `AwaitBridge`'s single fixed-fallback timeout arm doesn't cover.
 private final class SessionDaemonBoundedRaceBridge<T: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
     private var resumed = false
