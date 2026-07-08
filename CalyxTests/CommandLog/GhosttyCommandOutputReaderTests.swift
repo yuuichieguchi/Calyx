@@ -2,11 +2,13 @@
 //  GhosttyCommandOutputReaderTests.swift
 //  CalyxTests
 //
-//  TDD Red Phase for GhosttyCommandOutputReader.tailLines(_:count:), the
-//  pure line-slicing helper behind readScreenTailLines(surfaceID:count:).
-//  The instance methods (scrollbarTotal / readScreenTailLines) wrap
+//  Covers GhosttyCommandOutputReader's pure static helpers:
+//  tailLines(_:count:) (the line-slicing helper behind
+//  readScreenTailLines), lineCount(_:) (the active-row counter behind
+//  contentRowCount), and scrollbackRows(total:len:) (its history term).
+//  The instance methods (contentRowCount / readScreenTailLines) wrap
 //  ghostty FFI calls and cannot run in this unit-test host -- only the
-//  pure static function is covered here.
+//  pure static functions are covered here.
 //
 //  Contract: split `text` on "\n" via components(separatedBy:) (so a
 //  trailing newline yields a trailing empty component, preserved through
@@ -74,5 +76,47 @@ final class GhosttyCommandOutputReaderTests: XCTestCase {
         let result = GhosttyCommandOutputReader.tailLines("a\nb\nc", count: -1)
 
         XCTAssertEqual(result, "", "A negative count must clamp to 0 (empty suffix), not trap")
+    }
+
+    // MARK: - lineCount
+
+    func test_lineCount_emptyText_isZero() {
+        // components(separatedBy:) would report 1 for "" -- lineCount must
+        // special-case it to 0 so an empty active-screen dump contributes
+        // no rows to contentRowCount.
+        XCTAssertEqual(GhosttyCommandOutputReader.lineCount(""), 0)
+    }
+
+    func test_lineCount_singleLine_isOne() {
+        XCTAssertEqual(GhosttyCommandOutputReader.lineCount("prompt$ echo hi"), 1)
+    }
+
+    func test_lineCount_multipleLines_countsNewlineSeparatedRows() {
+        XCTAssertEqual(GhosttyCommandOutputReader.lineCount("a\nb\nc"), 3)
+    }
+
+    func test_lineCount_trailingNewline_countsTheTrailingEmptyComponent() {
+        // "a\nb\n".components(separatedBy: "\n") == ["a", "b", ""] -- the
+        // trailing newline yields a trailing empty component, so the count
+        // is 3, matching tailLines' documented components-based contract.
+        XCTAssertEqual(GhosttyCommandOutputReader.lineCount("a\nb\n"), 3)
+    }
+
+    // MARK: - scrollbackRows
+
+    func test_scrollbackRows_totalGreaterThanLen_isTheDifference() {
+        // Scrolled regime: total = viewport len + history rows.
+        XCTAssertEqual(GhosttyCommandOutputReader.scrollbackRows(total: 130, len: 24), 106)
+    }
+
+    func test_scrollbackRows_totalEqualsLen_isZero() {
+        // Pre-scroll regime: total == len (grid height), no history yet.
+        XCTAssertEqual(GhosttyCommandOutputReader.scrollbackRows(total: 24, len: 24), 0)
+    }
+
+    func test_scrollbackRows_totalLessThanLen_clampsToZeroWithoutUnderflow() {
+        // A degenerate/stale scrollbar update with total < len must not
+        // underflow the unsigned subtraction to a huge UInt64.
+        XCTAssertEqual(GhosttyCommandOutputReader.scrollbackRows(total: 10, len: 24), 0)
     }
 }

@@ -35,7 +35,7 @@
 //    nanosecond conversion) -- never exitCode, which is exclusively the
 //    script end event's (ghostty's OSC133 duration signal was tried and
 //    dropped, see finalize's own doc comment)
-//  - remapSurface moves records (clearing scrollbarTotalAtStart, since
+//  - remapSurface moves records (clearing contentRowCountAtStart, since
 //    the new surfaceID's scrollback counter is unrelated) and pending
 //    awaits to a new surfaceID
 //  - records(limit:state:) filtering
@@ -48,11 +48,11 @@ import XCTest
 
 @MainActor
 private final class FakeOutputReader: CommandOutputReading {
-    var totals: [UUID: UInt64] = [:]
+    var rowCounts: [UUID: UInt64] = [:]
     var tailLines: [UUID: String] = [:]
 
-    func scrollbarTotal(surfaceID: UUID) -> UInt64? {
-        totals[surfaceID]
+    func contentRowCount(surfaceID: UUID) -> UInt64? {
+        rowCounts[surfaceID]
     }
 
     func readScreenTailLines(surfaceID: UUID, count: Int) -> String? {
@@ -90,7 +90,7 @@ final class CommandLogStoreTests: XCTestCase {
         let store = CommandLogStore()
         let reader = FakeOutputReader()
         let surfaceID = UUID()
-        reader.totals[surfaceID] = 42
+        reader.rowCounts[surfaceID] = 42
         store.reader = reader
         let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
 
@@ -104,7 +104,7 @@ final class CommandLogStoreTests: XCTestCase {
         XCTAssertEqual(record.cwd, "/Users/dev/repo")
         XCTAssertEqual(record.startedAt, startedAt)
         XCTAssertEqual(record.state, .running)
-        XCTAssertEqual(record.scrollbarTotalAtStart, 42, "scrollbarTotalAtStart must come from the reader at ingest time")
+        XCTAssertEqual(record.contentRowCountAtStart, 42, "contentRowCountAtStart must come from the reader at ingest time")
         XCTAssertEqual(record.surfaceID, surfaceID)
     }
 
@@ -115,11 +115,11 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 100
+        reader.rowCounts[surfaceID] = 100
         let startedAt = Date(timeIntervalSince1970: 1_700_000_000)
         store.ingest(startEvent(cmdID: "cmd-2", ts: startedAt), surfaceID: surfaceID)
 
-        reader.totals[surfaceID] = 103
+        reader.rowCounts[surfaceID] = 103
         reader.tailLines[surfaceID] = "a\nb\nc"
         let endedAt = startedAt.addingTimeInterval(2)
         store.ingest(endEvent(cmdID: "cmd-2", exitCode: 7, ts: endedAt), surfaceID: surfaceID)
@@ -139,12 +139,12 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 50
+        reader.rowCounts[surfaceID] = 50
         store.ingest(startEvent(cmdID: "cmd-3"), surfaceID: surfaceID)
 
         // Alt-screen case: the scrollbar total is unchanged between start
         // and end (e.g. a full-screen TUI that never touched scrollback).
-        reader.totals[surfaceID] = 50
+        reader.rowCounts[surfaceID] = 50
         store.ingest(endEvent(cmdID: "cmd-3", exitCode: 0), surfaceID: surfaceID)
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
@@ -162,13 +162,13 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 50
+        reader.rowCounts[surfaceID] = 50
         store.ingest(startEvent(cmdID: "cmd-3b"), surfaceID: surfaceID)
 
         // The row counter advanced (delta > 0) but the reader's captured
         // tail is itself an empty string -- still a genuine, successful
         // capture of "no output", not a capture failure.
-        reader.totals[surfaceID] = 53
+        reader.rowCounts[surfaceID] = 53
         reader.tailLines[surfaceID] = ""
         store.ingest(endEvent(cmdID: "cmd-3b", exitCode: 0), surfaceID: surfaceID)
 
@@ -184,14 +184,14 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 50
+        reader.rowCounts[surfaceID] = 50
         store.ingest(startEvent(cmdID: "cmd-reader-nil-at-end"), surfaceID: surfaceID)
 
         // The surface became unknown to the reader by the time the
         // command ended (e.g. it was torn down) -- this must NOT be
         // silently treated as "unchanged total, zero output"; it's a
         // genuine capture failure, distinct from a real zero-row delta.
-        reader.totals.removeValue(forKey: surfaceID)
+        reader.rowCounts.removeValue(forKey: surfaceID)
         store.ingest(endEvent(cmdID: "cmd-reader-nil-at-end", exitCode: 0), surfaceID: surfaceID)
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
@@ -205,7 +205,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 10
+        reader.rowCounts[surfaceID] = 10
 
         store.ingest(endEvent(cmdID: "cmd-4", exitCode: 3), surfaceID: surfaceID)
         XCTAssertTrue(store.records(surfaceID: surfaceID, limit: nil, state: nil).isEmpty,
@@ -256,7 +256,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
 
         store.ingest(startEvent(cmdID: "reused-id", command: "first"), surfaceID: surfaceID)
         store.ingest(endEvent(cmdID: "reused-id", exitCode: 0), surfaceID: surfaceID)
@@ -281,7 +281,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
 
         let tsA = Date(timeIntervalSince1970: 1000)
         store.ingest(startEvent(cmdID: "reused-after-orphan", command: "first", ts: tsA), surfaceID: surfaceID)
@@ -390,7 +390,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 0
+        reader.rowCounts[surfaceID] = 0
         store.ingest(startEvent(cmdID: "cmd-8"), surfaceID: surfaceID)
 
         let lineCount = 4000
@@ -406,7 +406,7 @@ final class CommandLogStoreTests: XCTestCase {
         XCTAssertGreaterThan(bigText.utf8.count, CommandLogStore.outputByteCap,
                              "Precondition: the synthesized fixture must actually exceed the byte cap")
 
-        reader.totals[surfaceID] = UInt64(lineCount)
+        reader.rowCounts[surfaceID] = UInt64(lineCount)
         reader.tailLines[surfaceID] = bigText
         store.ingest(endEvent(cmdID: "cmd-8", exitCode: 0), surfaceID: surfaceID)
 
@@ -427,7 +427,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 0
+        reader.rowCounts[surfaceID] = 0
         store.ingest(startEvent(cmdID: "cmd-multibyte"), surfaceID: surfaceID)
 
         // "あ" is 3 bytes and "😀" is 4 bytes in UTF-8 -- neither aligns
@@ -440,7 +440,7 @@ final class CommandLogStoreTests: XCTestCase {
         XCTAssertGreaterThan(bigText.utf8.count, CommandLogStore.outputByteCap,
                              "Precondition: the fixture must exceed the byte cap")
 
-        reader.totals[surfaceID] = UInt64(lineCount)
+        reader.rowCounts[surfaceID] = UInt64(lineCount)
         reader.tailLines[surfaceID] = bigText
         store.ingest(endEvent(cmdID: "cmd-multibyte", exitCode: 0), surfaceID: surfaceID)
 
@@ -461,7 +461,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 5
+        reader.rowCounts[surfaceID] = 5
         store.ingest(startEvent(cmdID: "cmd-9"), surfaceID: surfaceID)
 
         let waiter = Task { @MainActor in
@@ -469,7 +469,7 @@ final class CommandLogStoreTests: XCTestCase {
         }
         await yieldToScheduler()
 
-        reader.totals[surfaceID] = 8
+        reader.rowCounts[surfaceID] = 8
         reader.tailLines[surfaceID] = "x\ny\nz"
         store.ingest(endEvent(cmdID: "cmd-9", exitCode: 0), surfaceID: surfaceID)
 
@@ -492,7 +492,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-timeout"), surfaceID: surfaceID)
         let commandID = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first).id
 
@@ -529,7 +529,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-neg-timeout"), surfaceID: surfaceID)
         let commandID = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first).id
 
@@ -543,7 +543,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-zero-timeout"), surfaceID: surfaceID)
         let commandID = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first).id
 
@@ -560,7 +560,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-husk"), surfaceID: surfaceID)
         let commandID = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first).id
 
@@ -582,7 +582,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-husk-cancel"), surfaceID: surfaceID)
         let commandID = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first).id
 
@@ -607,7 +607,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-reset"), surfaceID: surfaceID)
         let commandID = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first).id
 
@@ -627,7 +627,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-11-old"), surfaceID: surfaceID)
         store.ingest(startEvent(cmdID: "cmd-11-new"), surfaceID: surfaceID)
 
@@ -659,7 +659,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-12"), surfaceID: surfaceID)
 
         let waiter = Task { @MainActor in
@@ -684,7 +684,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         // ts 1_000ms / 1_500ms, expressed as the Date CommandEvent.decode
         // would produce from those raw epoch-millisecond values.
         let startedAt = Date(timeIntervalSince1970: 1.0)
@@ -701,7 +701,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
 
         // The end arrives (and buffers) before its matching start, with a
         // ts that's chronologically BEFORE the eventual start's own ts
@@ -726,7 +726,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
 
         let startedAt = Date(timeIntervalSince1970: 0)
         store.ingest(startEvent(cmdID: "cmd-overflow", ts: startedAt), surfaceID: surfaceID)
@@ -754,8 +754,8 @@ final class CommandLogStoreTests: XCTestCase {
         let oldSurfaceID = UUID()
         let newSurfaceID = UUID()
         store.reader = reader
-        reader.totals[oldSurfaceID] = 1
-        reader.totals[newSurfaceID] = 1
+        reader.rowCounts[oldSurfaceID] = 1
+        reader.rowCounts[newSurfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-14"), surfaceID: oldSurfaceID)
         let commandID = try XCTUnwrap(store.records(surfaceID: oldSurfaceID, limit: nil, state: nil).first).id
 
@@ -773,8 +773,8 @@ final class CommandLogStoreTests: XCTestCase {
 
         let newRecords = store.records(surfaceID: newSurfaceID, limit: nil, state: nil)
         XCTAssertEqual(newRecords.count, 1, "remapSurface must move the record to the new surfaceID")
-        XCTAssertNil(newRecords.first?.scrollbarTotalAtStart,
-                     "remapSurface must clear scrollbarTotalAtStart -- the new surfaceID has its own scrollback " +
+        XCTAssertNil(newRecords.first?.contentRowCountAtStart,
+                     "remapSurface must clear contentRowCountAtStart -- the new surfaceID has its own scrollback " +
                      "counter, so the old captured value is meaningless against it")
         XCTAssertTrue(store.records(surfaceID: oldSurfaceID, limit: nil, state: nil).isEmpty,
                      "remapSurface must leave nothing behind under the old surfaceID")
@@ -787,7 +787,7 @@ final class CommandLogStoreTests: XCTestCase {
                                     "made against its commandID, unaffected by the surface remap")
         XCTAssertEqual(awaited.cmdID, "cmd-14")
         XCTAssertNil(awaited.output, "Output capture is forfeited for a command remapped mid-flight " +
-                     "(scrollbarTotalAtStart was cleared)")
+                     "(contentRowCountAtStart was cleared)")
     }
 
     // MARK: - records(limit:state:) filtering
@@ -797,7 +797,7 @@ final class CommandLogStoreTests: XCTestCase {
         let reader = FakeOutputReader()
         let surfaceID = UUID()
         store.reader = reader
-        reader.totals[surfaceID] = 0
+        reader.rowCounts[surfaceID] = 0
 
         for i in 0..<3 {
             let cmdID = "finished-\(i)"

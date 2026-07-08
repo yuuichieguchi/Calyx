@@ -85,8 +85,19 @@ enum ShellIntegrationInstaller {
     /// file that overwrites either array wholesale clobbers this
     /// exactly as it would clobber ghostty's own hook, no worse) that
     /// POST start/end command-lifecycle events to the local Calyx IPC
-    /// server's `/command-event` endpoint, as a backgrounded+disowned
-    /// (`&!`) curl so the prompt is never delayed. Fails open
+    /// server's `/command-event` endpoint, as a bounded-SYNCHRONOUS curl
+    /// (`--connect-timeout 0.1 --max-time 0.3`, so ≤300ms worst case,
+    /// typically ~5-15ms). Synchronous, not backgrounded, because output
+    /// capture requires the server's start snapshot to happen-BEFORE the
+    /// command runs: a backgrounded start POST races the command, and for
+    /// any command faster than the curl round-trip (e.g. a ~12ms `echo`)
+    /// the output is already on screen before the snapshot is taken, so
+    /// the start count equals the end count and the captured delta is
+    /// empty. The server ingests before responding 204
+    /// (`CalyxMCPServer.routeCommandEvent`), so a completed foreground curl
+    /// guarantees the snapshot precedes execution; the endpoint-file
+    /// early-exit above keeps a dead server from ever spawning curl at all.
+    /// Fails open
     /// (CALYX_SURFACE_ID and CALYX_SESSION_ID both unset, or
     /// agent-endpoint.json missing/unreadable, is a silent no-op) and
     /// suppresses an end event for an empty Enter (no preexec fired, so
@@ -123,13 +134,13 @@ enum ShellIntegrationInstaller {
         port=$(command sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
         token=$(command sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
         [[ -n "$port" && -n "$token" ]] || return 0
-        command curl -s -m 1 \\
+        command curl -s --connect-timeout 0.1 --max-time 0.3 \\
             -X POST \\
             -H "Authorization: Bearer $token" \\
             -H "X-Calyx-Surface-ID: ${CALYX_SESSION_ID:-${CALYX_SURFACE_ID:-}}" \\
             -H 'Content-Type: application/json' \\
             --data-binary "$1" \\
-            "http://127.0.0.1:$port/command-event" > /dev/null 2>&1 &!
+            "http://127.0.0.1:$port/command-event" > /dev/null 2>&1 || return 0
     }
 
     _calyx_preexec() {
@@ -168,7 +179,9 @@ enum ShellIntegrationInstaller {
     /// and are never emitted for an empty Enter, confirmed against
     /// fish's own shipped documentation) mirroring calyx.zsh's shape:
     /// same fail-open guard, same agent-endpoint.json sed-extraction,
-    /// same backgrounded+disowned curl, same base64 encoding
+    /// same bounded-synchronous curl (`--connect-timeout 0.1 --max-time
+    /// 0.3`; see calyxZshBody's doc for why the start POST must be
+    /// synchronous rather than backgrounded), same base64 encoding
     /// (`command base64 | string join ''`, fish's own idiom for
     /// flattening base64's multi-line output back to one line, playing
     /// the same role as zsh's `tr -d '\\n'`).
@@ -196,14 +209,13 @@ enum ShellIntegrationInstaller {
         test -n "$port" -a -n "$token"; or return 0
         set -l surface_id "$CALYX_SESSION_ID"
         test -n "$surface_id"; or set surface_id "$CALYX_SURFACE_ID"
-        command curl -s -m 1 \\
+        command curl -s --connect-timeout 0.1 --max-time 0.3 \\
             -X POST \\
             -H "Authorization: Bearer $token" \\
             -H "X-Calyx-Surface-ID: $surface_id" \\
             -H 'Content-Type: application/json' \\
             --data-binary "$body" \\
-            "http://127.0.0.1:$port/command-event" > /dev/null 2>&1 &
-        disown
+            "http://127.0.0.1:$port/command-event" > /dev/null 2>&1; or return 0
     end
 
     function _calyx_preexec --on-event fish_preexec

@@ -34,11 +34,11 @@ import XCTest
 
 @MainActor
 private final class FakeOutputReader: CommandOutputReading {
-    var totals: [UUID: UInt64] = [:]
+    var rowCounts: [UUID: UInt64] = [:]
     var tailLines: [UUID: String] = [:]
 
-    func scrollbarTotal(surfaceID: UUID) -> UInt64? {
-        totals[surfaceID]
+    func contentRowCount(surfaceID: UUID) -> UInt64? {
+        rowCounts[surfaceID]
     }
 
     func readScreenTailLines(surfaceID: UUID, count: Int) -> String? {
@@ -147,9 +147,9 @@ final class MCPCommandLogBridgeTests: XCTestCase {
         let surfaceID = UUID()
 
         let startedAt1 = Date(timeIntervalSince1970: 1_700_000_000)
-        reader.totals[surfaceID] = 100
+        reader.rowCounts[surfaceID] = 100
         store.ingest(startEvent(cmdID: "cmd-1", command: "ls -la", cwd: "/tmp", ts: startedAt1), surfaceID: surfaceID)
-        reader.totals[surfaceID] = 103
+        reader.rowCounts[surfaceID] = 103
         reader.tailLines[surfaceID] = "a\nb\nc"
         // finalize() derives durationNanos from endedAt - startedAt (P2
         // GREEN: OSC133's unreliable exit code was dropped, so duration
@@ -322,9 +322,9 @@ final class MCPCommandLogBridgeTests: XCTestCase {
         store.reader = reader
         let bridge = MCPCommandLogBridge(store: store, sessionSurfaceMap: SessionSurfaceMap())
         let surfaceID = UUID()
-        reader.totals[surfaceID] = 10
+        reader.rowCounts[surfaceID] = 10
         store.ingest(startEvent(cmdID: "cmd-1"), surfaceID: surfaceID)
-        reader.totals[surfaceID] = 13
+        reader.rowCounts[surfaceID] = 13
         reader.tailLines[surfaceID] = "x\ny\nz"
         store.ingest(endEvent(cmdID: "cmd-1", exitCode: 0), surfaceID: surfaceID)
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
@@ -366,7 +366,7 @@ final class MCPCommandLogBridgeTests: XCTestCase {
         store.reader = reader
         let bridge = MCPCommandLogBridge(store: store, sessionSurfaceMap: SessionSurfaceMap())
         let surfaceID = UUID()
-        reader.totals[surfaceID] = 10
+        reader.rowCounts[surfaceID] = 10
         store.ingest(startEvent(cmdID: "cmd-1"), surfaceID: surfaceID)
         // Zero row delta (alt-screen case): output materializes as an
         // explicit empty CommandOutput, not nil (P1 contract).
@@ -392,9 +392,9 @@ final class MCPCommandLogBridgeTests: XCTestCase {
         store.reader = reader
         let bridge = MCPCommandLogBridge(store: store, sessionSurfaceMap: SessionSurfaceMap())
         let surfaceID = UUID()
-        reader.totals[surfaceID] = 1
+        reader.rowCounts[surfaceID] = 1
         store.ingest(startEvent(cmdID: "cmd-1"), surfaceID: surfaceID)
-        reader.totals[surfaceID] = 4
+        reader.rowCounts[surfaceID] = 4
         reader.tailLines[surfaceID] = "a\nb\nc"
         store.ingest(endEvent(cmdID: "cmd-1", exitCode: 7), surfaceID: surfaceID)
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)

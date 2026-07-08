@@ -85,7 +85,7 @@ final class CommandLogStore {
             durationNanos: nil,
             output: nil,
             state: .running,
-            scrollbarTotalAtStart: reader?.scrollbarTotal(surfaceID: surfaceID)
+            contentRowCountAtStart: reader?.contentRowCount(surfaceID: surfaceID)
         )
         appendCapped(record, surfaceID: surfaceID)
 
@@ -170,14 +170,18 @@ final class CommandLogStore {
     /// alt-screen TUI that never touched scrollback) or a positive delta
     /// whose captured tail happens to be empty -- materializes as an
     /// explicit empty `CommandOutput`, not nil, so callers can tell
-    /// "captured, nothing there" from "couldn't capture at all".
+    /// "captured, nothing there" from "couldn't capture at all". The
+    /// counter is `CommandOutputReading.contentRowCount` (content rows so
+    /// far), not ghostty's raw scrollbar total, so the delta reflects real
+    /// output rows even on a fresh, never-scrolled pane whose screen hasn't
+    /// filled yet.
     private func materializeOutput(surfaceID: UUID, record: CommandRecord) -> CommandOutput? {
-        guard let reader, let start = record.scrollbarTotalAtStart else { return nil }
+        guard let reader, let start = record.contentRowCountAtStart else { return nil }
         // The surface being unknown to the reader at end time (e.g. torn
         // down) is a genuine capture failure, not "unchanged total" --
         // falling back to `start` here would silently misreport it as a
         // real zero-row-delta output.
-        guard let end = reader.scrollbarTotal(surfaceID: surfaceID) else { return nil }
+        guard let end = reader.contentRowCount(surfaceID: surfaceID) else { return nil }
         guard end >= start else { return nil }
         guard end > start else {
             return CommandOutput(text: "", truncated: false, totalRows: 0)
@@ -455,11 +459,11 @@ final class CommandLogStore {
                 var copy = record
                 copy.surfaceID = new
                 // The new surfaceID is a different live GhosttySurface
-                // with its own scrollback counter -- the old counter
+                // with its own content-row counter -- the old counter
                 // captured at start is meaningless against it, so any
                 // still-running remapped command forfeits output capture
-                // (materializeOutput requires scrollbarTotalAtStart).
-                copy.scrollbarTotalAtStart = nil
+                // (materializeOutput requires contentRowCountAtStart).
+                copy.contentRowCountAtStart = nil
                 return copy
             }
             recordsBySurface[new, default: []].append(contentsOf: remapped)

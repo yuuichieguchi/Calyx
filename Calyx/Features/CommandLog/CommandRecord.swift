@@ -36,5 +36,5 @@ struct CommandRecord: Codable, Sendable, Identifiable {
     var durationNanos: UInt64?
     var output: CommandOutput?
     var state: State
-    var scrollbarTotalAtStart: UInt64?
+    var contentRowCountAtStart: UInt64?
 }
