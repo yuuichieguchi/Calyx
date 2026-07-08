@@ -106,6 +106,22 @@ final class CalyxMCPServer {
     /// `parseSurfaceID` fails to parse the header as a raw UUID.
     var sessionSurfaceMap: SessionSurfaceMap = .shared
 
+    /// The live-app view `pane_list`/`pane_split`/`tab_create` (and P5's
+    /// gated tools) dispatch through. Defaults to the real
+    /// `LiveCockpitAppAccess`; tests inject a fake so assertions don't
+    /// need a live `AppDelegate`/window, same rationale as
+    /// `agentRegistry`/`commandLogStore`/`sessionSurfaceMap`.
+    var cockpitAccess: CockpitAppAccessing = LiveCockpitAppAccess()
+
+    /// Lazily constructed, cached `MCPCockpitBridge` that Cockpit tool
+    /// calls dispatch through -- same `lazy` caveat as
+    /// `lazyCommandLogBridge`: only built on first actual Cockpit-tool
+    /// dispatch, by which point any test that overrides
+    /// `cockpitAccess`/`sessionSurfaceMap` has already done so.
+    private lazy var lazyCockpitBridge = MCPCockpitBridge(
+        access: cockpitAccess, sessionSurfaceMap: sessionSurfaceMap
+    )
+
     /// Records an agent hook event's self-reported session ID into the
     /// calyx-session daemon's per-session meta map (P4), so a later
     /// reattach can offer to resume the same CLI conversation. Defaults
@@ -1337,6 +1353,15 @@ final class CalyxMCPServer {
             )
         }
 
+        // Cockpit route — dispatched through `MCPCockpitBridge`.
+        if MCPRouter.isCockpitTool(name: toolName) {
+            return await handleCockpitToolCall(
+                id: id,
+                toolName: toolName,
+                params: params
+            )
+        }
+
         let arguments = extractDict(params, "arguments")
 
         switch toolName {
@@ -1656,6 +1681,27 @@ final class CalyxMCPServer {
         let arguments = extractDict(params, "arguments") ?? [:]
         do {
             let text = try await lazyCommandLogBridge.handleToolCall(name: toolName, arguments: arguments)
+            return toolSuccess(id: id, text: text)
+        } catch {
+            return toolError(id: id, text: error.localizedDescription)
+        }
+    }
+
+    // MARK: - Cockpit Tool Dispatch
+
+    /// Route a Cockpit tool call (`pane_list`/`pane_split`/`tab_create`
+    /// this round) to `MCPCockpitBridge`, mirroring
+    /// `handleTerminalToolCall`'s shape exactly: `MCPCockpitBridgeError`
+    /// also conforms to `LocalizedError`, so a single generic `catch`
+    /// builds the tool-error text from `error.localizedDescription`.
+    private func handleCockpitToolCall(
+        id: JSONRPCId,
+        toolName: String,
+        params: [String: AnyCodable]
+    ) async -> (statusCode: Int, body: Data?) {
+        let arguments = extractDict(params, "arguments") ?? [:]
+        do {
+            let text = try await lazyCockpitBridge.handleToolCall(name: toolName, arguments: arguments)
             return toolSuccess(id: id, text: text)
         } catch {
             return toolError(id: id, text: error.localizedDescription)

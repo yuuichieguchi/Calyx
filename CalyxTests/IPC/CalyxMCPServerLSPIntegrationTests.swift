@@ -342,12 +342,12 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
 
     // ==================== MCPRouter Catalogue Tests ====================
 
-    // 1. allTools combines IPC (6) + LSP (70) + terminal_* (3) = 79
-    //    (Round 7 removed ack_messages, P3 added the terminal_* surface).
+    // 1. allTools combines IPC (6) + LSP (70) + terminal_* (3) + Cockpit (3) = 82
+    //    (Round 7 removed ack_messages, P3 added the terminal_* surface, P4 added the Cockpit surface).
     func test_mcpRouter_allTools_includesIPCAndLSPTools() {
         let all = MCPRouter.allTools
-        XCTAssertEqual(all.count, 79,
-                       "allTools must enumerate 6 IPC + 70 LSP + 3 terminal_* = 79 tools")
+        XCTAssertEqual(all.count, 82,
+                       "allTools must enumerate 6 IPC + 70 LSP + 3 terminal_* + 3 Cockpit = 82 tools")
         let names = Set(all.map { $0.name })
         XCTAssertTrue(names.contains("register_peer"),
                       "allTools must include the IPC tool 'register_peer'")
@@ -470,8 +470,8 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
                       "tools/list must surface 'lsp_workspace_symbol'")
         XCTAssertTrue(names.contains("register_peer"),
                       "tools/list must still surface the IPC tools alongside LSP tools")
-        XCTAssertEqual(tools.count, 79,
-                       "tools/list must enumerate all 79 (6 IPC + 70 LSP + 3 terminal_*) tools")
+        XCTAssertEqual(tools.count, 82,
+                       "tools/list must enumerate all 82 (6 IPC + 70 LSP + 3 terminal_* + 3 Cockpit) tools")
     }
 
     // 5. instructions text mentions LSP tooling so MCP clients can discover it.
