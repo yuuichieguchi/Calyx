@@ -58,6 +58,22 @@ final class WeakValueRegistry<Key: Hashable, Value: AnyObject> {
         return boxes[key]?.value
     }
 
+    /// Reverse lookup: the key whose (pruned, still-live) weak-boxed
+    /// value is identical (`===`) to `value`. Kept inside
+    /// `WeakValueRegistry` rather than exposing box iteration to callers,
+    /// so the weak-box internals stay encapsulated -- O(n) entries, fine
+    /// at the pane/surface counts this engine is used at. Pruning on
+    /// every read (here and in `value(for:)`) is O(n) too, on a path
+    /// (`SurfacePropertyStore`'s per-notification title/pwd resolution)
+    /// that can fire once per OSC 7/title write -- acceptable at normal
+    /// pane counts; revisit (e.g. prune on a timer instead of every
+    /// read) if a shell that title-spams at very high pane counts ever
+    /// makes this measurably hot.
+    func key(forValue value: Value) -> Key? {
+        pruneStaleBoxes()
+        return boxes.first(where: { $0.value.value === value })?.key
+    }
+
     /// Drops every entry whose weak `value` has already been released
     /// (its object deallocated without an explicit `unregister`), so a
     /// caller that forgets to unregister doesn't grow this dictionary
@@ -67,6 +83,14 @@ final class WeakValueRegistry<Key: Hashable, Value: AnyObject> {
     private func pruneStaleBoxes() {
         boxes = boxes.filter { _, box in box.value != nil }
     }
+
+    #if DEBUG
+    /// Test-only: drops every entry regardless of liveness. DO NOT use
+    /// from production code.
+    func removeAll() {
+        boxes.removeAll()
+    }
+    #endif
 }
 
 @MainActor
@@ -74,6 +98,17 @@ final class SurfaceLocator {
     static let shared = SurfaceLocator()
 
     private let registry = WeakValueRegistry<UUID, GhosttySurfaceController>()
+
+    /// Second weak index, surfaceID -> live `SurfaceView`, kept in
+    /// lockstep with `registry` (registered/unregistered at the same
+    /// call sites in `SurfaceRegistry`). Added for `SurfacePropertyStore`
+    /// (Cockpit's app-wide per-surface title/cwd tracker): its
+    /// `.ghosttySetTitle`/`.ghosttySetPwd` handlers only ever see a
+    /// `SurfaceView` (the notification's `object`), with no owning
+    /// Tab/SurfaceRegistry of their own to resolve it against -- the
+    /// same cross-tab/cross-window gap `registry` above already exists
+    /// to fill, just in the opposite direction.
+    private let viewsByID = WeakValueRegistry<UUID, SurfaceView>()
 
     init() {}
 
@@ -88,4 +123,29 @@ final class SurfaceLocator {
     func controller(for id: UUID) -> GhosttySurfaceController? {
         registry.value(for: id)
     }
+
+    func registerView(id: UUID, view: SurfaceView) {
+        viewsByID.register(id, value: view)
+    }
+
+    func unregisterView(id: UUID) {
+        viewsByID.unregister(id)
+    }
+
+    func id(forView view: SurfaceView) -> UUID? {
+        viewsByID.key(forValue: view)
+    }
+
+    #if DEBUG
+    /// Test-only: clears both the controller and view weak indices.
+    /// `SurfaceLocator.shared` is a global singleton that persists
+    /// across test cases within the same process -- entries registered
+    /// by `SurfaceRegistry._testInsert` (or `createSurface`) in one test
+    /// would otherwise leak into an unrelated test's lookups. DO NOT use
+    /// from production code.
+    func _testReset() {
+        registry.removeAll()
+        viewsByID.removeAll()
+    }
+    #endif
 }

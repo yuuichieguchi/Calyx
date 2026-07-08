@@ -120,6 +120,7 @@ final class SurfaceRegistry {
             state: .attached
         )
         SurfaceLocator.shared.register(id: id, controller: controller)
+        SurfaceLocator.shared.registerView(id: id, view: surfaceView)
 
         logger.info("Surface created and registered: \(id)")
         return id
@@ -188,6 +189,19 @@ final class SurfaceRegistry {
             // no-op for any id genuinely foreign to CommandLogStore too.
             orphanCommandsIfNotPersistent(surfaceID: id)
             approvalInboxStore.expireForSurface(id)
+            // P3 review (F4): symmetric with the main destroy path below
+            // -- unregisterView + the .calyxSurfaceDestroyed post must
+            // ALSO run here so SurfacePropertyStore prunes a
+            // _testInsert-only surface's recorded title/cwd on destroy,
+            // not just a real registry entry's. Safe unconditionally
+            // (not #if DEBUG): both are no-ops for an id neither
+            // SurfaceLocator nor any observer has ever seen.
+            SurfaceLocator.shared.unregisterView(id: id)
+            NotificationCenter.default.post(
+                name: .calyxSurfaceDestroyed,
+                object: nil,
+                userInfo: ["surfaceID": id]
+            )
             return
         }
         guard entry.state != .destroyed else { return }
@@ -208,6 +222,7 @@ final class SurfaceRegistry {
 
         entries.removeValue(forKey: id)
         SurfaceLocator.shared.unregister(id: id)
+        SurfaceLocator.shared.unregisterView(id: id)
         logger.info("Surface destroyed: \(id)")
 
         orphanCommandsIfNotPersistent(surfaceID: id)
@@ -325,6 +340,7 @@ final class SurfaceRegistry {
     /// over test-only entries. DO NOT use from production code.
     func _testInsert(view: SurfaceView, id: UUID) {
         _testViewsByID[id] = view
+        SurfaceLocator.shared.registerView(id: id, view: view)
     }
     #endif
 }

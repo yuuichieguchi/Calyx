@@ -236,6 +236,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         registerNotificationObservers()
         installKeyMonitor()
         installGlobalEventTap()
+        SurfacePropertyStore.shared.startObserving()
 
         browserTabBroker.appDelegate = self
         let browserHandler = BrowserToolHandler(broker: browserTabBroker)
