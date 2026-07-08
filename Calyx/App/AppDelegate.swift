@@ -143,6 +143,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         GhosttyResourcesDirEnvironment.apply(resolvedPath)
     }
 
+    #if DEBUG
+    /// Test seam: overrides the root `ShellIntegrationInstaller.install`
+    /// writes into, instead of
+    /// `ShellIntegrationInstaller.defaultInstallDirectory`. DO NOT use
+    /// from production code.
+    var _shellIntegrationRootForTesting: URL?
+    #endif
+
+    /// If command tracking is enabled (`CommandTrackingSettings
+    /// .trackingEnabled`), installs Calyx's own zsh/fish command-log
+    /// shell integration scripts and points this process's environment
+    /// at them (`CalyxShellIntegrationEnvironment.apply(rootDirectory:)`)
+    /// -- every surface's child shell inherits this process's own
+    /// environment fresh at launch, so a toggle change takes effect from
+    /// the next NEW terminal without an app restart, matching
+    /// `applyGhosttyResourcesDirEnvironmentIfNeeded()`'s own env-based
+    /// injection point. Run right after that method so both env
+    /// mutations land before `GhosttyAppController.shared` is ever
+    /// touched.
+    func applyCalyxShellIntegrationIfEnabled() {
+        guard CommandTrackingSettings.trackingEnabled else { return }
+        #if DEBUG
+        let root = _shellIntegrationRootForTesting ?? ShellIntegrationInstaller.defaultInstallDirectory
+        #else
+        let root = ShellIntegrationInstaller.defaultInstallDirectory
+        #endif
+        ShellIntegrationActivation.activateIfPossible(root: root)
+    }
+
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -167,11 +196,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // launch unchanged.
         if LaunchEnvironmentPolicy.isUnitTestHost() { return }
 
+        // Wire the real Ghostty-FFI-backed output reader now that we're
+        // definitely not in the unit-test host (a GhosttyCommandOutputReader
+        // read touches live ghostty FFI, unsafe there).
+        CommandLogStore.shared.reader = GhosttyCommandOutputReader()
+
         // Must run before GhosttyAppController.shared's first access below:
         // ghostty forwards shell-integration scripts to surface children
         // only when GHOSTTY_RESOURCES_DIR is already set in this process's
         // own environment at engine init.
         applyGhosttyResourcesDirEnvironmentIfNeeded()
+        applyCalyxShellIntegrationIfEnabled()
 
         // Add CLI to PATH for terminals launched within Calyx
         if let binPath = Bundle.main.resourceURL?.appendingPathComponent("bin").path {

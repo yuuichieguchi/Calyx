@@ -28,6 +28,23 @@ final class SurfaceRegistry {
 
     private var entries: [UUID: RegistryEntry] = [:]
 
+    /// Store `destroySurface(_:)` orphans a torn-down surface's running
+    /// commands into (gated on `sessionSurfaceMap`, see that property's
+    /// doc comment). Defaults to the shared singleton; tests inject an
+    /// isolated instance so assertions don't leak state across cases --
+    /// same rationale as `CalyxMCPServer.agentRegistry`.
+    var commandLogStore: CommandLogStore = .shared
+
+    /// Session-surface map `destroySurface(_:)` consults to gate command
+    /// orphaning: a surface still tracked here (a persistent-session
+    /// pane) keeps its commands `.running` -- the daemon-side session
+    /// survives the pane's teardown, and a later reconnect resumes it
+    /// (see `CalyxWindowController`'s reconnect path, which
+    /// `remapSurface`s the same records onto the fresh surfaceID).
+    /// Defaults to the shared singleton; tests inject an isolated
+    /// instance.
+    var sessionSurfaceMap: SessionSurfaceMap = .shared
+
     #if DEBUG
     /// Test-only storage for injected `SurfaceView` fixtures. Populated
     /// via `_testInsert(view:id:)` and consulted as a fallback by
@@ -92,6 +109,7 @@ final class SurfaceRegistry {
             controller: controller,
             state: .attached
         )
+        SurfaceLocator.shared.register(id: id, controller: controller)
 
         logger.info("Surface created and registered: \(id)")
         return id
@@ -150,6 +168,15 @@ final class SurfaceRegistry {
             // afterward, matching what destroying a real entry does.
             _testViewsByID.removeValue(forKey: id)
             #endif
+            // No live entry to defer/already-destroyed-check against --
+            // the command-log orphan gating below doesn't depend on one
+            // (see its own comment on `orphanCommandsIfNotPersistent`).
+            // Safe even for an `id` this particular registry never owned
+            // (e.g. a stale/foreign call): each surfaceID is owned by
+            // exactly one Tab's SurfaceRegistry for its whole lifetime,
+            // so `commandLogStore.markOrphaned(surfaceID:)` here is a
+            // no-op for any id genuinely foreign to CommandLogStore too.
+            orphanCommandsIfNotPersistent(surfaceID: id)
             return
         }
         guard entry.state != .destroyed else { return }
@@ -169,13 +196,30 @@ final class SurfaceRegistry {
         entry.controller.requestClose()
 
         entries.removeValue(forKey: id)
+        SurfaceLocator.shared.unregister(id: id)
         logger.info("Surface destroyed: \(id)")
+
+        orphanCommandsIfNotPersistent(surfaceID: id)
 
         NotificationCenter.default.post(
             name: .calyxSurfaceDestroyed,
             object: nil,
             userInfo: ["surfaceID": id]
         )
+    }
+
+    /// Orphans `id`'s running commands UNLESS it's still tracked in
+    /// `sessionSurfaceMap` (a persistent-session pane, whose daemon-side
+    /// session survives this pane's teardown -- see `sessionSurfaceMap`'s
+    /// own doc comment). `CalyxWindowController.performReconnect` calls
+    /// `CommandLogStore.shared.remapSurface(old:new:)` (and
+    /// `SessionSurfaceMap.shared.replaceSurface`) BEFORE tearing down the
+    /// old surface, so by the time a persistent-session pane's own
+    /// reconnect reaches here, its records have already moved off `id`
+    /// entirely and this is a no-op either way.
+    private func orphanCommandsIfNotPersistent(surfaceID id: UUID) {
+        guard sessionSurfaceMap.sessionID(for: id) == nil else { return }
+        commandLogStore.markOrphaned(surfaceID: id)
     }
 
     func completeDragAndDestroyIfNeeded(_ id: UUID) {

@@ -94,9 +94,10 @@
 //  Coverage:
 //  - (A) each of the four switches has SettingsWindowController.shared
 //    as its `.target` and its own expected handler selector as `.action`
-//  - (A) exactly 4 switches exist in the Sessions pane's own view
+//  - (A) exactly 5 switches exist in the Sessions pane's own view
 //    subtree, in SettingsRow's declared top-to-bottom order
-//    (openSessionBrowserButton is a button, not a switch, so excluded)
+//    (openSessionBrowserButton is a button, not a switch, so excluded;
+//    P4 added a 5th, commandTracking)
 //  - (B) sessionToggleInitialState(for:) reads true/false exactly from
 //    each row's own backing SessionSettings value
 //
@@ -140,20 +141,25 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
         return result
     }
 
-    func test_sessionsToggleSwitches_exactlyFour_inRowOrder() throws {
+    // P4 added a 5th Sessions-pane switch (commandTracking, wired and
+    // covered independently by CommandTrackingSettingsToggleWiringTests)
+    // -- renamed from ...exactlyFour... and the count/message updated
+    // accordingly so this pin stays accurate rather than self-contradicting
+    // its own name.
+    func test_sessionsToggleSwitches_exactlyFive_inRowOrder() throws {
         let switches = collectSwitches(in: try sessionsPaneView())
 
         XCTAssertEqual(
-            switches.count, 4,
-            "The Sessions pane must show exactly 4 switches (persistentSessions/historyPersistence/" +
-            "agentResume/agentResumeAutoExecute -- openSessionBrowserButton is a button, not a switch). " +
-            "Found \(switches.count)."
+            switches.count, 5,
+            "The Sessions pane must show exactly 5 switches (persistentSessions/historyPersistence/" +
+            "agentResume/agentResumeAutoExecute/commandTracking -- openSessionBrowserButton is a button, " +
+            "not a switch). Found \(switches.count)."
         )
     }
 
     func test_sessionsToggleSwitches_haveTargetAndActionWired() throws {
         let switches = collectSwitches(in: try sessionsPaneView())
-        try XCTSkipIf(switches.count != 4, "covered, and already failing, by the count pin above")
+        try XCTSkipIf(switches.count != 5, "covered, and already failing, by the count pin above")
 
         // SettingsRow's own declared order for the Sessions pane, filtered
         // to the four switch-backed rows (SettingsPaneTests.expectedRows

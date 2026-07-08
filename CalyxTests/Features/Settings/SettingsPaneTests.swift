@@ -11,11 +11,11 @@
 //  evidence.
 //
 //  WHY A ROW -> PANE MODEL: SettingsWindowController.swift currently
-//  builds one long NSStackView with 13 UI elements (3 theme-color rows,
-//  1 glass row, 1 scrolling row, 2 LSP rows, 4 session-toggle rows, 1
+//  builds one long NSStackView with 14 UI elements (3 theme-color rows,
+//  1 glass row, 1 scrolling row, 2 LSP rows, 5 session-toggle rows, 1
 //  session-browser button, 1 open-config-file/help footer) with no seam
 //  for grouping them into panes. SettingsRow enumerates every one of
-//  those 13 elements explicitly and pins its target pane, so the tab
+//  those 14 elements explicitly and pins its target pane, so the tab
 //  restructure cannot silently drop a setting in the shuffle -- the
 //  regression risk the user flagged from the screenshot review.
 //
@@ -81,6 +81,7 @@ final class SettingsPaneTests: XCTestCase {
         ("historyPersistence", .sessions),
         ("agentResume", .sessions),
         ("agentResumeAutoExecute", .sessions),
+        ("commandTracking", .sessions),
         ("openSessionBrowserButton", .sessions),
         ("openConfigFileFooter", .appearance),
     ]

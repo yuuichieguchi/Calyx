@@ -122,11 +122,70 @@ pub(crate) fn resolve_shell_integration_env(
     let resources_dir = get_env("GHOSTTY_RESOURCES_DIR");
     let shell_path = get_env("SHELL").unwrap_or_default();
     let original_zdotdir = get_env("ZDOTDIR");
-    shell_integration_env(
+    let mut env = shell_integration_env(
         &shell_path,
         resources_dir.as_deref(),
         original_zdotdir.as_deref(),
-    )
+    );
+    let zsh = is_zsh(&shell_path);
+
+    // When ghostty's own integration doesn't apply at all (no resources
+    // dir -- e.g. ghostty integration disabled, or attach running
+    // outside a ghostty-launched surface entirely), `shell_integration_env`
+    // above returned nothing at all, INCLUDING no ZDOTDIR -- so even if
+    // the attach client's own env already has ZDOTDIR pointed at Calyx's
+    // own installed zsh dir (CalyxShellIntegrationEnvironment.apply,
+    // independent of ghostty), that value would never reach the
+    // persistent-session daemon's spawned shell. Relay it verbatim
+    // (unmodified -- NOT remapped to a ghostty bundle path, since there
+    // is none) in that case, zsh shells only: matches the plan's own
+    // "ghostty統合が無効な環境ではzshがCalyxの.zshenvを直接読み、同じコード
+    // が単独で成立する" design -- Calyx's own chain must stand alone
+    // without any ghostty involvement. Gated on `resources_dir.is_none()`
+    // specifically so this never collides with the ZDOTDIR
+    // `shell_integration_env` already pushed above when a resources dir
+    // IS present (that's the ghostty-bundle-path ZDOTDIR, a different
+    // value serving a different chain).
+    if resources_dir.is_none() && zsh {
+        if let Some(zdotdir) = &original_zdotdir {
+            env.push(("ZDOTDIR".to_string(), zdotdir.clone()));
+        }
+    }
+
+    // Calyx's own zsh command-log shell integration
+    // (ShellIntegrationInstaller.swift / CalyxShellIntegrationEnvironment.swift)
+    // installs an entirely separate .zshenv-based restore chain, independent
+    // of ghostty's own GHOSTTY_ZSH_ZDOTDIR chain above -- so this forwards
+    // verbatim, unconditionally on the ghostty-specific resources_dir
+    // gating, whenever the attach client's own env has it (inherited from
+    // Calyx.app's own process env, set by CalyxShellIntegrationEnvironment
+    // .apply). Without this, a persistent-session daemon shell has nothing
+    // to read CALYX_ZSH_ZDOTDIR from once execution reaches Calyx's own
+    // .zshenv, and falls back to $HOME instead of the user's true original
+    // ZDOTDIR. Gated on `is_zsh` (this module's existing convention, same
+    // as `shell_integration_env`'s own gate) -- CALYX_ZSH_ZDOTDIR is a
+    // zsh-specific concept, a stray env var in a bash/fish shell.
+    if zsh {
+        if let Some(calyx_zsh_zdotdir) = get_env("CALYX_ZSH_ZDOTDIR") {
+            env.push(("CALYX_ZSH_ZDOTDIR".to_string(), calyx_zsh_zdotdir));
+        }
+    }
+
+    // XDG_DATA_DIRS: fish's own vendor_conf.d discovery mechanism
+    // (CalyxShellIntegrationEnvironment.apply also appends Calyx's own
+    // root to it), entirely orthogonal to ghostty's zsh-specific ZDOTDIR
+    // chain above -- forwarded verbatim, unconditionally on shell type
+    // AND on resources_dir, whenever the client's own env has it. Without
+    // this, a persistent-session daemon's fish shell never sees Calyx's
+    // fish vendor_conf.d entry at all, even though an ordinary (non-
+    // persistent, directly ghostty-launched) fish pane picks it up fine
+    // via plain process-env inheritance -- this closes that gap for the
+    // daemon-hosted case specifically.
+    if let Some(xdg_data_dirs) = get_env("XDG_DATA_DIRS") {
+        env.push(("XDG_DATA_DIRS".to_string(), xdg_data_dirs));
+    }
+
+    env
 }
 
 /// `true` if `shell_path`'s basename is exactly `zsh` (mirrors
@@ -341,6 +400,188 @@ mod tests {
             Vec::<(String, String)>::new(),
             "no GHOSTTY_RESOURCES_DIR in the client's env should inject nothing \
              and must not panic, even for a zsh $SHELL"
+        );
+    }
+
+    // ==================== P4: CALYX_ZSH_ZDOTDIR forwarding ====================
+    // Calyx's own zsh command-log shell integration installs its own
+    // .zshenv-based restore chain (ShellIntegrationInstaller.swift /
+    // CalyxShellIntegrationEnvironment.swift on the Swift side), entirely
+    // distinct from ghostty's own GHOSTTY_ZSH_ZDOTDIR chain exercised
+    // above. THE BUG: a persistent-session pane's attach client never
+    // forwards CALYX_ZSH_ZDOTDIR into the daemon-hosted shell's own env,
+    // so Calyx's own restore chain (see the P4 plan's zsh ZDOTDIR relay
+    // design) has nothing to read from in that shell and can never
+    // restore the user's real ZDOTDIR there. Gated on is_zsh (review
+    // finding #8) -- this test's $SHELL is already zsh, so that gate
+    // doesn't change this test's own expectation; the negative variant
+    // right below it is what actually pins the gate.
+
+    #[test]
+    fn resolve_shell_integration_env_forwards_calyx_zsh_zdotdir_verbatim_when_present() {
+        let fake_env: BTreeMap<&str, &str> = [
+            ("GHOSTTY_RESOURCES_DIR", "/opt/ghostty-resources"),
+            ("SHELL", "/bin/zsh"),
+            ("ZDOTDIR", "/Users/alice/.config/zsh"),
+            ("CALYX_ZSH_ZDOTDIR", "/Users/alice/.config/calyx-zsh"),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = resolve_shell_integration_env(|key| fake_env.get(key).map(|v| v.to_string()));
+
+        let expected: BTreeMap<String, String> = [
+            (
+                "ZDOTDIR".to_string(),
+                "/opt/ghostty-resources/shell-integration/zsh".to_string(),
+            ),
+            (
+                "GHOSTTY_ZSH_ZDOTDIR".to_string(),
+                "/Users/alice/.config/zsh".to_string(),
+            ),
+            (
+                "GHOSTTY_SHELL_FEATURES".to_string(),
+                "cursor:blink,path,title".to_string(),
+            ),
+            (
+                "GHOSTTY_RESOURCES_DIR".to_string(),
+                "/opt/ghostty-resources".to_string(),
+            ),
+            (
+                "CALYX_ZSH_ZDOTDIR".to_string(),
+                "/Users/alice/.config/calyx-zsh".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            as_map(result),
+            expected,
+            "CALYX_ZSH_ZDOTDIR must be forwarded verbatim alongside the existing ghostty zsh env, so \
+             Calyx's own zsh integration restore chain has somewhere to read from in a persistent-session \
+             daemon shell -- today it is dropped entirely"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_integration_env_does_not_forward_calyx_zsh_zdotdir_for_non_zsh_shell() {
+        let fake_env: BTreeMap<&str, &str> = [
+            ("SHELL", "/usr/bin/fish"),
+            ("CALYX_ZSH_ZDOTDIR", "/Users/alice/.config/calyx-zsh"),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = resolve_shell_integration_env(|key| fake_env.get(key).map(|v| v.to_string()));
+
+        assert!(
+            as_map(result).get("CALYX_ZSH_ZDOTDIR").is_none(),
+            "CALYX_ZSH_ZDOTDIR is a zsh-specific concept; a non-zsh $SHELL (fish here) must never \
+             receive it as a stray env var"
+        );
+    }
+
+    // ==================== P4 review: ZDOTDIR relay without ghostty ====================
+    // THE BUG: with no GHOSTTY_RESOURCES_DIR at all (ghostty integration
+    // disabled, or attach running outside ghostty), shell_integration_env
+    // returns nothing -- including no ZDOTDIR -- so even though the
+    // attach client's own env already has ZDOTDIR pointed at Calyx's own
+    // installed zsh dir (CalyxShellIntegrationEnvironment.apply, which
+    // runs independently of ghostty), that value never reached the
+    // persistent-session daemon's spawned shell. Calyx's own chain is
+    // supposed to stand alone without ghostty involvement (per the plan),
+    // so this relays the client's own ZDOTDIR verbatim in that case.
+
+    #[test]
+    fn resolve_shell_integration_env_relays_client_zdotdir_verbatim_when_no_resources_dir_for_zsh() {
+        let fake_env: BTreeMap<&str, &str> = [
+            ("SHELL", "/bin/zsh"),
+            ("ZDOTDIR", "/Users/alice/Library/Application Support/Calyx/shell-integration/zsh"),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = resolve_shell_integration_env(|key| fake_env.get(key).map(|v| v.to_string()));
+
+        assert_eq!(
+            as_map(result).get("ZDOTDIR").map(String::as_str),
+            Some("/Users/alice/Library/Application Support/Calyx/shell-integration/zsh"),
+            "with no ghostty resources dir, Calyx's own chain must still stand alone: the client's \
+             own ZDOTDIR (already pointed at Calyx's installed zsh dir) must relay verbatim into a \
+             persistent-session daemon shell's env, unmodified -- there is no ghostty bundle path to \
+             remap it to"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_integration_env_does_not_relay_zdotdir_for_non_zsh_shell_without_resources_dir() {
+        let fake_env: BTreeMap<&str, &str> = [
+            ("SHELL", "/usr/bin/fish"),
+            ("ZDOTDIR", "/Users/alice/Library/Application Support/Calyx/shell-integration/zsh"),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = resolve_shell_integration_env(|key| fake_env.get(key).map(|v| v.to_string()));
+
+        assert!(
+            as_map(result).get("ZDOTDIR").is_none(),
+            "the ZDOTDIR relay (no resources dir case) is zsh-specific -- ZDOTDIR means nothing to \
+             fish, so a non-zsh $SHELL must not receive it"
+        );
+    }
+
+    // ==================== P4 review: XDG_DATA_DIRS forwarding ====================
+    // Fish's own vendor_conf.d discovery mechanism -- entirely orthogonal
+    // to ghostty's zsh-specific ZDOTDIR chain, so forwarded unconditionally
+    // on shell type AND on resources_dir, whenever present.
+
+    #[test]
+    fn resolve_shell_integration_env_forwards_xdg_data_dirs_verbatim_alongside_zsh_env() {
+        let fake_env: BTreeMap<&str, &str> = [
+            ("GHOSTTY_RESOURCES_DIR", "/opt/ghostty-resources"),
+            ("SHELL", "/bin/zsh"),
+            ("XDG_DATA_DIRS", "/opt/calyx/shell-integration:/usr/local/share:/usr/share"),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = resolve_shell_integration_env(|key| fake_env.get(key).map(|v| v.to_string()));
+
+        assert_eq!(
+            as_map(result).get("XDG_DATA_DIRS").map(String::as_str),
+            Some("/opt/calyx/shell-integration:/usr/local/share:/usr/share"),
+            "XDG_DATA_DIRS must forward verbatim alongside the existing ghostty zsh env when present"
+        );
+    }
+
+    #[test]
+    fn resolve_shell_integration_env_forwards_xdg_data_dirs_for_fish_persistent_panes_without_resources_dir() {
+        // THE BUG this specific case fixes: a persistent-session fish
+        // pane has no GHOSTTY_RESOURCES_DIR at all (fish never went
+        // through ghostty's zsh-specific setup to begin with), so before
+        // this fix XDG_DATA_DIRS -- the ONLY mechanism fish uses to
+        // discover Calyx's vendor_conf.d entry -- was never forwarded,
+        // leaving a persistent-session daemon's fish shell with no
+        // command-log integration at all, even though an ordinary
+        // (non-persistent) ghostty-launched fish pane picks it up fine
+        // via plain process-env inheritance.
+        let fake_env: BTreeMap<&str, &str> = [
+            ("SHELL", "/usr/bin/fish"),
+            ("XDG_DATA_DIRS", "/opt/calyx/shell-integration:/usr/local/share:/usr/share"),
+        ]
+        .into_iter()
+        .collect();
+
+        let result = resolve_shell_integration_env(|key| fake_env.get(key).map(|v| v.to_string()));
+
+        assert_eq!(
+            as_map(result).get("XDG_DATA_DIRS").map(String::as_str),
+            Some("/opt/calyx/shell-integration:/usr/local/share:/usr/share"),
+            "XDG_DATA_DIRS must forward for a fish persistent-session pane even with no ghostty \
+             resources dir at all -- fixes fish persistent panes never picking up Calyx's own \
+             vendor_conf.d entry"
         );
     }
 }
