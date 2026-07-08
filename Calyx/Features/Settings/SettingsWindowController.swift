@@ -23,6 +23,15 @@ class SettingsWindowController: NSWindowController {
     private static let paneWidth: CGFloat = 560
     private static let paneContentInset: CGFloat = 24
 
+    #if DEBUG
+    /// Test seam: overrides the root `commandTrackingDidChange(_:)`
+    /// resolves against, instead of
+    /// `ShellIntegrationInstaller.defaultInstallDirectory` -- same shape
+    /// as `AppDelegate._shellIntegrationRootForTesting`. DO NOT use from
+    /// production code.
+    var _shellIntegrationRootForTesting: URL?
+    #endif
+
     private init() {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: Self.paneWidth, height: 400),
@@ -97,6 +106,8 @@ class SettingsWindowController: NSWindowController {
                 title: nil,
                 subtitle: "Persistent terminal sessions survive a crash or quit and can be reattached later, from this window or from the session browser."
             )
+        case .commandTracking:
+            return SectionHeading(title: "Command Tracking", subtitle: "Changes apply to new terminals only.")
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .themeColorWell, .themeColorHex, .lspRequireConfirmation,
@@ -155,6 +166,8 @@ class SettingsWindowController: NSWindowController {
             return agentResumeRow()
         case .agentResumeAutoExecute:
             return agentResumeAutoExecuteRow()
+        case .commandTracking:
+            return commandTrackingRow()
         case .openSessionBrowserButton:
             return sessionBrowserButtonRow()
         case .openConfigFileFooter:
@@ -246,6 +259,7 @@ class SettingsWindowController: NSWindowController {
         case .historyPersistence: return SessionSettings.historyPersistenceEnabled
         case .agentResume: return SessionSettings.agentResumeEnabled
         case .agentResumeAutoExecute: return SessionSettings.agentResumeAutoExecute
+        case .commandTracking: return CommandTrackingSettings.trackingEnabled
         default: return false
         }
     }
@@ -284,6 +298,15 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.target = self
         toggleSwitch.action = #selector(agentResumeAutoExecuteDidChange(_:))
         return controlRow(label: "Auto-execute resume (skip confirmation)", control: toggleSwitch)
+    }
+
+    private func commandTrackingRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.commandTrackingSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .commandTracking) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(commandTrackingDidChange(_:))
+        return controlRow(label: "Track shell commands", control: toggleSwitch)
     }
 
     private func sessionBrowserButtonRow() -> NSView {
@@ -433,6 +456,27 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentResumeAutoExecuteDidChange(_ sender: NSSwitch) {
         SessionSettings.agentResumeAutoExecute = (sender.state == .on)
+    }
+
+    /// Flipping ON installs+applies immediately (new panes only --
+    /// already-running shells keep whatever hooks/env they already
+    /// loaded). Flipping OFF only stops future env injection
+    /// (`CalyxShellIntegrationEnvironment.remove`); the `/command-event`
+    /// endpoint itself keeps accepting so an already-running pane's
+    /// hooks don't half-die mid-session.
+    @objc private func commandTrackingDidChange(_ sender: NSSwitch) {
+        let enabled = sender.state == .on
+        CommandTrackingSettings.trackingEnabled = enabled
+        #if DEBUG
+        let root = _shellIntegrationRootForTesting ?? ShellIntegrationInstaller.defaultInstallDirectory
+        #else
+        let root = ShellIntegrationInstaller.defaultInstallDirectory
+        #endif
+        if enabled {
+            ShellIntegrationActivation.activateIfPossible(root: root)
+        } else {
+            CalyxShellIntegrationEnvironment.remove(rootDirectory: root)
+        }
     }
 
     @objc private func openSessionBrowser(_ sender: Any?) {
