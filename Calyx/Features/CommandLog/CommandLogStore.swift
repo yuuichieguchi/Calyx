@@ -80,7 +80,8 @@ final class CommandLogStore {
         // decode(from:) guarantees command_b64 was present on a .start
         // event; a hand-built CommandEvent (as tests construct) that
         // violates that invariant is simply dropped rather than crashing.
-        guard let command = event.command else { return }
+        guard let rawCommand = event.command else { return }
+        let command = SecretRedactor.redact(rawCommand)
         let cwd = event.cwd ?? ""
         let startedAt = event.ts ?? now()
 
@@ -207,7 +208,7 @@ final class CommandLogStore {
         guard let text = reader.readScreenTailLines(surfaceID: surfaceID, count: Int(delta)), !text.isEmpty else {
             return CommandOutput(text: "", truncated: false, totalRows: 0)
         }
-        return Self.truncatedOutput(text: text, totalRows: Int(delta))
+        return Self.truncatedOutput(text: SecretRedactor.redact(text), totalRows: Int(delta))
     }
 
     /// Keeps the head and tail halves of `text` under `outputByteCap`

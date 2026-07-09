@@ -975,4 +975,79 @@ final class CommandLogStoreTests: XCTestCase {
         let limited = store.records(surfaceID: surfaceID, limit: 2, state: nil)
         XCTAssertEqual(limited.count, 2, "limit: 2 must cap the returned records to 2")
     }
+
+    // MARK: - Secret redaction
+
+    func test_ingestStart_secretishCommand_storedCommandIsRedacted() throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+
+        store.ingest(startEvent(cmdID: "cmd-secret-start", command: "export MY_TOKEN=abc123"), surfaceID: surfaceID)
+
+        let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
+        XCTAssertEqual(record.command, "export MY_TOKEN=[redacted]")
+        XCTAssertFalse(record.command.contains("abc123"), "the raw secret value must never reach the stored record")
+    }
+
+    func test_finalize_outputContainingSecrets_storedOutputIsRedacted() throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[surfaceID] = 0
+        store.ingest(startEvent(cmdID: "cmd-secret-output"), surfaceID: surfaceID)
+
+        reader.rowCounts[surfaceID] = 2
+        reader.tailLines[surfaceID] = "OPENAI_API_KEY=sk-test1234567890abcdefghij\nplain line"
+        store.ingest(endEvent(cmdID: "cmd-secret-output", exitCode: 0), surfaceID: surfaceID)
+
+        let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
+        let output = try XCTUnwrap(record.output, "a positive row delta with a non-empty tail must materialize output")
+        XCTAssertTrue(output.text.contains("OPENAI_API_KEY=[redacted]"))
+        XCTAssertFalse(output.text.contains("sk-test1234567890abcdefghij"), "the raw secret value must never reach stored output")
+        XCTAssertTrue(output.text.contains("plain line"), "non-secret content must survive redaction untouched")
+    }
+
+    func test_finalize_secretAtTruncationBoundary_redactedBeforeTruncation() throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[surfaceID] = 0
+        store.ingest(startEvent(cmdID: "cmd-boundary"), surfaceID: surfaceID)
+
+        // A valid ghp_ token (40 raw bytes: "ghp_" + 36 alnum) positioned
+        // so it straddles the ~127KB head-budget cut that
+        // truncatedOutput(text:totalRows:) makes once text exceeds
+        // CommandLogStore.outputByteCap -- redaction must happen BEFORE
+        // that cut is computed, so no raw fragment of the token can
+        // survive on either side of it, regardless of exactly where the
+        // cut lands.
+        let token = "ghp_iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+        XCTAssertEqual(token.utf8.count, 40, "precondition: token must be 40 raw bytes long")
+        let before = String(repeating: "x", count: 131_028)
+        let after = String(repeating: "y", count: 168_932)
+        let bigText = before + token + after
+        XCTAssertGreaterThan(bigText.utf8.count, CommandLogStore.outputByteCap,
+                             "Precondition: the fixture must exceed the byte cap")
+
+        reader.rowCounts[surfaceID] = 1
+        reader.tailLines[surfaceID] = bigText
+        store.ingest(endEvent(cmdID: "cmd-boundary", exitCode: 0), surfaceID: surfaceID)
+
+        let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
+        let output = try XCTUnwrap(record.output, "a large tail must still materialize output, just truncated")
+
+        XCTAssertTrue(output.truncated, "output exceeding the byte cap must still be marked truncated")
+        for start in 0...(token.count - 12) {
+            let windowStart = token.index(token.startIndex, offsetBy: start)
+            let windowEnd = token.index(windowStart, offsetBy: 12)
+            let window = String(token[windowStart..<windowEnd])
+            XCTAssertFalse(output.text.contains(window),
+                           "no 12-char raw-token fragment must survive truncation -- redaction must happen " +
+                           "BEFORE the byte-cap cut, not after")
+        }
+    }
 }
