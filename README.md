@@ -16,7 +16,7 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **Layout Restore** -- tabs, splits, and working directories auto-saved and restored on restart
 - **Persistent Sessions** -- opt-in daemon-backed sessions (`calyx-session`) that survive quit and crash; the toggle applies only to panes opened after it is enabled; reattach from the Session Browser (`Cmd+Shift+B`); a recovery bar offers the preserved session when auto-restore is skipped or fails; opt-in on-disk history
 - **Remote Sessions** -- persistent sessions on SSH hosts picked from `~/.ssh/config`; one-time daemon deploy via `calyx-session remote-install <host>`
-- **Agent Resume** -- reattached sessions can offer to resume the agent CLI conversation that was running (Settings -> Sessions)
+- **Agent Resume** -- reattached sessions can offer to resume the agent CLI conversation that was running (Settings -> Agents)
 - **Desktop Notifications** -- OSC 9/99/777 support with rate limiting
 - **Browser Integration** -- WKWebView tabs alongside terminal tabs (http/https only, non-persistent storage, popup blocking)
 - **Scrollback Search** -- `Cmd+F` to search terminal scrollback with match highlighting, `Cmd+G`/`Cmd+Shift+G` to navigate matches
@@ -30,6 +30,8 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 - **AI Agent IPC** -- MCP server for communication between AI agent instances (Claude Code, Codex CLI, OpenCode, Hermes) across tabs and panes ([demo video](https://www.youtube.com/watch?v=Xty0ad9gGcM))
 - **Agents Sidebar** -- live status view for connected AI agents (Claude Code, Codex, OpenCode, Hermes) with per-agent state (blocked/working/idle/done), unread message badge, last-seen timestamp, and click-to-focus pane
 - **LSP Proxy MCP** -- exposes language server features such as hover, definition, references, rename, and diagnostics to AI agents over the same MCP server as AI Agent IPC. Missing servers can be auto-installed via Settings.
+- **Agent Cockpit** -- MCP tools that let agents drive Calyx: `pane_list`, `pane_split`, `tab_create` run immediately; `pane_run`, `pane_send_keys`, `palette_execute` require per-request approval via an in-window banner (opt-in auto-approve in Settings -> Agents)
+- **Command Log** -- records shell commands and their output (zsh/fish shell integration, auto-installed) and exposes `terminal_list_commands`, `terminal_read_output`, `terminal_await_command` MCP tools to agents; records stay in memory only
 - **Scriptable Browser** -- 25 CLI commands for browser automation (like cmux): snapshot, click, fill, eval, screenshot, wait, get-attribute, get-links, get-inputs, is-visible, hover, scroll. No enable step needed. `calyx` CLI bundled in the app
 - **Ghostty config compatibility** -- reads `~/.config/ghostty/config` (most keys hot-reload on save; see Settings for Calyx-managed keys)
 - **Compose Overlay** -- floating text editor over the terminal for comfortable multiline input (`Cmd+Shift+E`), useful for writing long commands or AI prompts ([demo video](https://www.youtube.com/watch?v=qhwYnk8adF4))
@@ -109,6 +111,8 @@ AI agent instances (Claude Code, Codex CLI, OpenCode, Hermes) running in differe
 Config is auto-written to `~/.claude.json`, `~/.codex/config.toml`, `~/.config/opencode/{opencode.json,AGENTS.md}`, and `~/.hermes/config.yaml` when the respective tool is installed. Restart running agent instances to pick up the new MCP server.
 
 Available MCP tools: `register_peer`, `list_peers`, `send_message`, `broadcast`, `receive_messages`, `get_peer_status`. `receive_messages` deletes each message from the inbox as it returns it, so a message is only ever delivered once.
+
+The same server exposes cockpit tools that control Calyx (`pane_list`, `pane_split`, `tab_create`; approval-gated: `pane_run`, `pane_send_keys`, `palette_execute`) and command-log tools (`terminal_list_commands`, `terminal_read_output`, `terminal_await_command`; requires the zsh/fish shell integration, installed automatically while Settings -> Agents -> **Track shell commands** is on).
 
 To disable, open the command palette and run **Disable AI Agent IPC**.
 
