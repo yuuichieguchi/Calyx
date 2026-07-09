@@ -11,12 +11,14 @@ import Foundation
 enum SettingsPane: CaseIterable {
     case appearance
     case sessions
+    case agents
     case lsp
 
     var title: String {
         switch self {
         case .appearance: return "Appearance"
         case .sessions: return "Sessions"
+        case .agents: return "Agents"
         case .lsp: return "LSP"
         }
     }
@@ -28,6 +30,7 @@ enum SettingsPane: CaseIterable {
         switch self {
         case .appearance: return "paintbrush"
         case .sessions: return "terminal"
+        case .agents: return "sparkles"
         case .lsp: return "gearshape.2"
         }
     }

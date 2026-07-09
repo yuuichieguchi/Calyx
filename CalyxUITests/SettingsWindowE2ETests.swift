@@ -10,7 +10,7 @@
 // relabels the standard Cmd+, app-menu item to "Settings…" at runtime
 // regardless of the string the source passes to `withTitle:`, so this
 // suite looks it up as "Settings…", not "Preferences…") shows a toolbar with one button per
-// SettingsPane ("Appearance" / "Sessions" / "LSP") -- a shipped defect
+// SettingsPane ("Appearance" / "Sessions" / "Agents" / "LSP") -- a shipped defect
 // had these collapse into one degenerate merged header instead (no
 // per-item image, per `SettingsWindowController.setupContent()`'s own
 // doc comment; XCUITest cannot read an NSToolbarItem's NSImage directly,
@@ -80,6 +80,13 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
                 "first row in the Sessions pane) found on the Sessions pane.",
                 file: file, line: line
             )
+        case "Agents":
+            XCTAssertTrue(
+                waitFor(app.switches.firstMatch, timeout: 5),
+                "No switch (agent resume toggle, SettingsRow.agentResume -- " +
+                "first row in the Agents pane) found on the Agents pane.",
+                file: file, line: line
+            )
         case "LSP":
             XCTAssertTrue(
                 waitFor(app.switches.firstMatch, timeout: 5),
@@ -131,8 +138,8 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
         // The window is expected to open already showing the first
         // pane (Appearance) -- SettingsWindowController.setupContent()
         // adds tab items in SettingsPane.allCases order (Appearance,
-        // Sessions, LSP) with no explicit initial-selection override, so
-        // NSTabViewController defaults to index 0.
+        // Sessions, Agents, LSP) with no explicit initial-selection
+        // override, so NSTabViewController defaults to index 0.
         XCTAssertEqual(
             settingsWindow.title, "Appearance",
             "Settings window's title on first open should be \"Appearance\" (the first " +
@@ -153,21 +160,21 @@ final class SettingsWindowE2ETests: CalyxUITestCase {
         // defect (`SettingsWindowController.setupContent()`'s own doc
         // comment: "the toolbar-style NSTabViewController renders a tab
         // item with no image as a degenerate fat header instead of a
-        // proper toolbar button"): whether THREE separate,
+        // proper toolbar button"): whether FOUR separate,
         // individually-labeled buttons exist at all, vs. one merged
         // header. A screenshot is saved below for the one part of this
         // (the icon glyphs themselves) that only a human eye can
         // confirm.
         let toolbarButtonLabels = Set(settingsWindow.toolbars.buttons.allElementsBoundByIndex.map { $0.label })
         XCTAssertEqual(
-            toolbarButtonLabels, ["Appearance", "Sessions", "LSP"],
-            "Settings toolbar should expose three distinct, individually-labeled buttons " +
-            "(Appearance/Sessions/LSP), not a single merged/degenerate header. Actual labels " +
+            toolbarButtonLabels, ["Appearance", "Sessions", "Agents", "LSP"],
+            "Settings toolbar should expose four distinct, individually-labeled buttons " +
+            "(Appearance/Sessions/Agents/LSP), not a single merged/degenerate header. Actual labels " +
             "found: \(toolbarButtonLabels). Window hierarchy: " +
             "\(settingsWindow.debugDescription.prefix(2000))"
         )
 
-        for pane in ["Appearance", "Sessions", "LSP"] {
+        for pane in ["Appearance", "Sessions", "Agents", "LSP"] {
             let toolbarButton = settingsWindow.toolbars.buttons[pane]
             XCTAssertTrue(
                 waitFor(toolbarButton, timeout: 5),
