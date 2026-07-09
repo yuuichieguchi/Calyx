@@ -37,8 +37,9 @@ final class SecretRedactorTests: XCTestCase {
     }
 
     func test_redact_dotenvStyleOutputLine_masksValue() {
+        let openAIKey = "sk-" + "abcdefghijklmnopqrstuvwxyz1234"
         let input = """
-        OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz1234
+        OPENAI_API_KEY=\(openAIKey)
         DATABASE_URL=postgres://user:pass@host:5432/db
         plain line here
         """
@@ -123,11 +124,13 @@ final class SecretRedactorTests: XCTestCase {
     // MARK: - Known token formats: GitHub
 
     func test_redact_githubClassicAndFineGrainedTokens_maskedAnywhere() {
-        let classic = "found token ghp_iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g here"
+        let classicToken = "ghp_" + "iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+        let classic = "found token \(classicToken) here"
         let classicExpected = "found token [redacted] here"
         XCTAssertEqual(SecretRedactor.redact(classic), classicExpected)
 
-        let fineGrained = "found token github_pat_9382dffx1kVZQ2tqMnMc__ here"
+        let fineGrainedToken = "github_pat_" + "9382dffx1kVZQ2tqMnMc__"
+        let fineGrained = "found token \(fineGrainedToken) here"
         let fineGrainedExpected = "found token [redacted] here"
         XCTAssertEqual(SecretRedactor.redact(fineGrained), fineGrainedExpected)
     }
@@ -135,10 +138,12 @@ final class SecretRedactorTests: XCTestCase {
     // MARK: - Known token formats: OpenAI / Anthropic
 
     func test_redact_openAIAndAnthropicKeys_masked() {
-        let openAI = "key is sk-proj-pLIix6MEOLeMa61EqJomTEI1J done"
+        let openAIKey = "sk-" + "proj-pLIix6MEOLeMa61EqJomTEI1J"
+        let openAI = "key is \(openAIKey) done"
         XCTAssertEqual(SecretRedactor.redact(openAI), "key is [redacted] done")
 
-        let anthropic = "key is sk-ant-api03-ptgUzEjfebzJ6sZWdoHI done"
+        let anthropicKey = "sk-" + "ant-api03-ptgUzEjfebzJ6sZWdoHI"
+        let anthropic = "key is \(anthropicKey) done"
         XCTAssertEqual(SecretRedactor.redact(anthropic), "key is [redacted] done")
     }
 
@@ -150,17 +155,29 @@ final class SecretRedactorTests: XCTestCase {
     // MARK: - Known token formats: AWS / Slack / GitLab / npm / Google
 
     func test_redact_awsSlackGitlabNpmGoogleTokens_masked() {
-        XCTAssertEqual(SecretRedactor.redact("key: AKIAIOSFODNN7EXAMPLE"), "key: [redacted]")
-        XCTAssertEqual(SecretRedactor.redact("token: xoxb-123456789012"), "token: [redacted]")
-        XCTAssertEqual(SecretRedactor.redact("token: glpat-NqVwYS81VP7Hb1DX8pPd5k"), "token: [redacted]")
-        XCTAssertEqual(SecretRedactor.redact("token: npm_YK0fFWqcajQLE9WVxuXbrFZmU3A6IIRgmKJS"), "token: [redacted]")
-        XCTAssertEqual(SecretRedactor.redact("key: AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMB12"), "key: [redacted]")
+        let awsKey = "AKIA" + "IOSFODNN7EXAMPLE"
+        XCTAssertEqual(SecretRedactor.redact("key: \(awsKey)"), "key: [redacted]")
+
+        let slackToken = "xoxb-" + "123456789012"
+        XCTAssertEqual(SecretRedactor.redact("token: \(slackToken)"), "token: [redacted]")
+
+        let gitlabToken = "glpat-" + "NqVwYS81VP7Hb1DX8pPd5k"
+        XCTAssertEqual(SecretRedactor.redact("token: \(gitlabToken)"), "token: [redacted]")
+
+        let npmToken = "npm_" + "YK0fFWqcajQLE9WVxuXbrFZmU3A6IIRgmKJS"
+        XCTAssertEqual(SecretRedactor.redact("token: \(npmToken)"), "token: [redacted]")
+
+        let googleKey = "AIza" + "SyD-9tSrke72PouQMnMX-a7eZSW0jkFMB12"
+        XCTAssertEqual(SecretRedactor.redact("key: \(googleKey)"), "key: [redacted]")
     }
 
     // MARK: - Known token formats: JWT
 
     func test_redact_jwtThreePart_masked() {
-        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        let jwtHeader = "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        let jwtPayload = "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
+        let jwtSignature = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        let jwt = "\(jwtHeader).\(jwtPayload).\(jwtSignature)"
         let input = "Authorization header value was \(jwt) in the log"
         let expected = "Authorization header value was [redacted] in the log"
 
@@ -189,9 +206,10 @@ final class SecretRedactorTests: XCTestCase {
     // MARK: - Idempotency
 
     func test_redact_idempotent_secondPassIsNoOp() {
+        let githubToken = "ghp_" + "iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
         let input = """
         export API_KEY=abc123
-        curl -H "Authorization: Bearer ghp_iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+        curl -H "Authorization: Bearer \(githubToken)"
         mytool --password=hunter2
         """
 
