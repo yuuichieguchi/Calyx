@@ -55,6 +55,9 @@
 //    dropped, not buffered or re-finalized; markOrphaned mid-gap resumes
 //    the awaiter with the orphaned record and the late job then attaches
 //    nothing
+//  - isFinalizing(id:) reads true for a record mid-async-redaction-gap,
+//    false once drained, and false for a genuinely still-running or
+//    unknown id
 //
 
 import XCTest
@@ -1159,6 +1162,37 @@ final class CommandLogStoreTests: XCTestCase {
                        "the late-arriving output job must not overwrite an already-orphaned record's state")
         XCTAssertNil(afterDrain.output, "the late-arriving output job must not attach output to an " +
                      "already-orphaned record")
+    }
+
+    func test_isFinalizing_trueDuringAsyncRedactionGap_falseAfterDrain() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[surfaceID] = 0
+        store.ingest(startEvent(cmdID: "cmd-isfinalizing"), surfaceID: surfaceID)
+        let commandID = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first).id
+
+        XCTAssertFalse(store.isFinalizing(id: commandID),
+                        "a genuinely still-running record (no end event yet) must not read as finalizing")
+
+        // A non-empty capture defers redaction to an async job -- see
+        // CommandLogStore.finalize's doc comment -- so immediately after
+        // this ingest (same MainActor turn, no yield), the record must
+        // read as finalizing until the job attaches output.
+        reader.rowCounts[surfaceID] = 1
+        reader.tailLines[surfaceID] = "some output"
+        store.ingest(endEvent(cmdID: "cmd-isfinalizing", exitCode: 0), surfaceID: surfaceID)
+
+        XCTAssertTrue(store.isFinalizing(id: commandID),
+                       "immediately after a non-empty capture's end event, the record must read as " +
+                       "finalizing until its async redaction job attaches output")
+
+        await store._testAwaitOutputJobsDrained()
+
+        XCTAssertFalse(store.isFinalizing(id: commandID),
+                        "once the job drains and attaches output, the record must no longer read as finalizing")
+        XCTAssertFalse(store.isFinalizing(id: UUID()), "an unknown id must simply read false, not throw or trap")
     }
 
     func test_finalizeAsyncJob_afterDrainHook_recordFinishedWithRedactedOutput() async throws {

@@ -525,6 +525,16 @@ final class CommandLogStore {
         return recordsBySurface[surfaceID]?[index]
     }
 
+    /// Read-only view of `finalizingRecordIDs` membership, for a consumer
+    /// like `MCPCommandLogBridge` to distinguish "genuinely still
+    /// running" from "ended, redaction pending" -- see that set's own doc
+    /// comment for the full rationale. `id` need not belong to any
+    /// tracked record; an unknown or non-finalizing id simply reads
+    /// `false`.
+    func isFinalizing(id: UUID) -> Bool {
+        finalizingRecordIDs.contains(id)
+    }
+
     /// Linear scan across every surface's records -- `finalize` no
     /// longer needs this (its callers already have `surfaceID` in hand),
     /// so this is now `record(id:)`'s sole caller.
