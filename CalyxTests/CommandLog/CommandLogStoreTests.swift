@@ -49,6 +49,12 @@
 //    the new surfaceID's scrollback counter is unrelated) and pending
 //    awaits to a new surfaceID
 //  - records(limit:state:) filtering
+//  - a non-empty output capture defers redaction/truncation to an async
+//    job (state stays .running externally until it attaches output via
+//    _testAwaitOutputJobsDrained); a duplicate end arriving mid-gap is
+//    dropped, not buffered or re-finalized; markOrphaned mid-gap resumes
+//    the awaiter with the orphaned record and the late job then attaches
+//    nothing
 //
 
 import XCTest
@@ -120,7 +126,7 @@ final class CommandLogStoreTests: XCTestCase {
 
     // MARK: - Ingest: start + end
 
-    func test_ingestStartThenEnd_producesFinishedRecordWithMaterializedOutput() throws {
+    func test_ingestStartThenEnd_producesFinishedRecordWithMaterializedOutput() async throws {
         let store = CommandLogStore()
         let reader = FakeOutputReader()
         let surfaceID = UUID()
@@ -133,6 +139,10 @@ final class CommandLogStoreTests: XCTestCase {
         reader.tailLines[surfaceID] = "a\nb\nc"
         let endedAt = startedAt.addingTimeInterval(2)
         store.ingest(endEvent(cmdID: "cmd-2", exitCode: 7, ts: endedAt), surfaceID: surfaceID)
+        // A non-empty capture redacts/truncates off the MainActor -- see
+        // CommandLogStore.finalize's doc comment -- so the record isn't
+        // observably .finished until this drain hook returns.
+        await store._testAwaitOutputJobsDrained()
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
         XCTAssertEqual(record.state, .finished)
@@ -395,7 +405,7 @@ final class CommandLogStoreTests: XCTestCase {
 
     // MARK: - Output truncation
 
-    func test_outputExceedingByteCap_isTruncatedWithHeadAndTailPreserved() throws {
+    func test_outputExceedingByteCap_isTruncatedWithHeadAndTailPreserved() async throws {
         let store = CommandLogStore()
         let reader = FakeOutputReader()
         let surfaceID = UUID()
@@ -419,6 +429,9 @@ final class CommandLogStoreTests: XCTestCase {
         reader.rowCounts[surfaceID] = UInt64(lineCount)
         reader.tailLines[surfaceID] = bigText
         store.ingest(endEvent(cmdID: "cmd-8", exitCode: 0), surfaceID: surfaceID)
+        // A non-empty capture redacts/truncates off the MainActor -- see
+        // CommandLogStore.finalize's doc comment.
+        await store._testAwaitOutputJobsDrained()
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
         let output = try XCTUnwrap(record.output, "A large tail must still materialize output, just truncated")
@@ -432,7 +445,7 @@ final class CommandLogStoreTests: XCTestCase {
                      "Truncated output must contain a human-readable truncation marker line")
     }
 
-    func test_outputTruncation_multibyteCutBoundary_noReplacementCharacterInserted() throws {
+    func test_outputTruncation_multibyteCutBoundary_noReplacementCharacterInserted() async throws {
         let store = CommandLogStore()
         let reader = FakeOutputReader()
         let surfaceID = UUID()
@@ -453,6 +466,9 @@ final class CommandLogStoreTests: XCTestCase {
         reader.rowCounts[surfaceID] = UInt64(lineCount)
         reader.tailLines[surfaceID] = bigText
         store.ingest(endEvent(cmdID: "cmd-multibyte", exitCode: 0), surfaceID: surfaceID)
+        // A non-empty capture redacts/truncates off the MainActor -- see
+        // CommandLogStore.finalize's doc comment.
+        await store._testAwaitOutputJobsDrained()
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
         let output = try XCTUnwrap(record.output)
@@ -991,7 +1007,7 @@ final class CommandLogStoreTests: XCTestCase {
         XCTAssertFalse(record.command.contains("abc123"), "the raw secret value must never reach the stored record")
     }
 
-    func test_finalize_outputContainingSecrets_storedOutputIsRedacted() throws {
+    func test_finalize_outputContainingSecrets_storedOutputIsRedacted() async throws {
         let store = CommandLogStore()
         let reader = FakeOutputReader()
         let surfaceID = UUID()
@@ -1002,6 +1018,9 @@ final class CommandLogStoreTests: XCTestCase {
         reader.rowCounts[surfaceID] = 2
         reader.tailLines[surfaceID] = "OPENAI_API_KEY=sk-test1234567890abcdefghij\nplain line"
         store.ingest(endEvent(cmdID: "cmd-secret-output", exitCode: 0), surfaceID: surfaceID)
+        // A non-empty capture redacts off the MainActor -- see
+        // CommandLogStore.finalize's doc comment.
+        await store._testAwaitOutputJobsDrained()
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
         let output = try XCTUnwrap(record.output, "a positive row delta with a non-empty tail must materialize output")
@@ -1010,7 +1029,7 @@ final class CommandLogStoreTests: XCTestCase {
         XCTAssertTrue(output.text.contains("plain line"), "non-secret content must survive redaction untouched")
     }
 
-    func test_finalize_secretAtTruncationBoundary_redactedBeforeTruncation() throws {
+    func test_finalize_secretAtTruncationBoundary_redactedBeforeTruncation() async throws {
         let store = CommandLogStore()
         let reader = FakeOutputReader()
         let surfaceID = UUID()
@@ -1036,6 +1055,9 @@ final class CommandLogStoreTests: XCTestCase {
         reader.rowCounts[surfaceID] = 1
         reader.tailLines[surfaceID] = bigText
         store.ingest(endEvent(cmdID: "cmd-boundary", exitCode: 0), surfaceID: surfaceID)
+        // A non-empty capture redacts/truncates off the MainActor -- see
+        // CommandLogStore.finalize's doc comment.
+        await store._testAwaitOutputJobsDrained()
 
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
         let output = try XCTUnwrap(record.output, "a large tail must still materialize output, just truncated")
@@ -1049,5 +1071,125 @@ final class CommandLogStoreTests: XCTestCase {
                            "no 12-char raw-token fragment must survive truncation -- redaction must happen " +
                            "BEFORE the byte-cap cut, not after")
         }
+    }
+
+    // MARK: - Async output redaction
+
+    func test_ingestEnd_duplicateEndDuringAsyncRedactionGap_isDroppedNotBuffered() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[surfaceID] = 0
+        store.ingest(startEvent(cmdID: "cmd-dup-gap", command: "first"), surfaceID: surfaceID)
+
+        // A non-empty capture defers redaction to an async job -- see
+        // CommandLogStore.finalize's doc comment -- so the record is still
+        // internally "finalizing" (though externally .running) right
+        // after this ingest, before the drain hook below runs.
+        reader.rowCounts[surfaceID] = 1
+        reader.tailLines[surfaceID] = "some output"
+        store.ingest(endEvent(cmdID: "cmd-dup-gap", exitCode: 0), surfaceID: surfaceID)
+
+        // A duplicate/late end for the SAME cmd_id, arriving while the
+        // first end's output redaction is still in flight, must be
+        // dropped -- neither re-finalizing the original record nor
+        // buffered as a pending end (which would let the new start just
+        // below get spuriously auto-finalized by it).
+        store.ingest(endEvent(cmdID: "cmd-dup-gap", exitCode: 99), surfaceID: surfaceID)
+
+        // A new start reusing the same cmd_id, arriving well within the
+        // pending-end TTL, must create a genuinely fresh running record --
+        // not be swallowed by the "already running" dedup (the original
+        // record is only finalizing, not truly still running) and not be
+        // spuriously finalized by the buffered duplicate end.
+        store.ingest(startEvent(cmdID: "cmd-dup-gap", command: "second"), surfaceID: surfaceID)
+        let newRecord = try XCTUnwrap(
+            store.records(surfaceID: surfaceID, limit: nil, state: nil).first { $0.command == "second" }
+        )
+        XCTAssertEqual(newRecord.state, .running,
+                       "the new start must stay running, not be spuriously finalized by the dropped duplicate end")
+
+        await store._testAwaitOutputJobsDrained()
+
+        let firstRecord = try XCTUnwrap(
+            store.records(surfaceID: surfaceID, limit: nil, state: nil).first { $0.command == "first" }
+        )
+        XCTAssertEqual(firstRecord.state, .finished, "the original record's own async job must still complete normally")
+        XCTAssertEqual(firstRecord.exitCode, 0,
+                       "the duplicate end's exitCode (99) must never have re-finalized the original record")
+    }
+
+    func test_markOrphaned_duringAsyncRedactionGap_resumesAwaiterWithOrphanedRecord_lateJobAttachesNothing() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[surfaceID] = 0
+        store.ingest(startEvent(cmdID: "cmd-orphan-gap"), surfaceID: surfaceID)
+        let commandID = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first).id
+
+        let waiter = Task { @MainActor in
+            await store.awaitCompletion(surfaceID: surfaceID, commandID: commandID, timeoutMs: 5000)
+        }
+        await yieldToScheduler()
+
+        // Non-empty capture -> the async output-redaction job is
+        // scheduled but has not yet run (still on this same MainActor
+        // turn) when markOrphaned below tears the surface down.
+        reader.rowCounts[surfaceID] = 1
+        reader.tailLines[surfaceID] = "OPENAI_API_KEY=sk-test1234567890abcdefghij"
+        store.ingest(endEvent(cmdID: "cmd-orphan-gap", exitCode: 0), surfaceID: surfaceID)
+
+        store.markOrphaned(surfaceID: surfaceID)
+
+        let result = await waiter.value
+        let orphaned = try XCTUnwrap(result, "an in-flight awaitCompletion must resume once its record is " +
+                                      "orphaned, even while its output redaction job is still pending")
+        XCTAssertEqual(orphaned.state, .orphaned)
+        XCTAssertNil(orphaned.output, "the record must be observed as orphaned with no output -- the pending " +
+                      "redaction job must not have attached output before markOrphaned resumed the awaiter")
+
+        // The late-arriving job must drop silently rather than resurrect
+        // the record as .finished after it was already orphaned.
+        await store._testAwaitOutputJobsDrained()
+
+        let afterDrain = try XCTUnwrap(store.record(id: commandID))
+        XCTAssertEqual(afterDrain.state, .orphaned,
+                       "the late-arriving output job must not overwrite an already-orphaned record's state")
+        XCTAssertNil(afterDrain.output, "the late-arriving output job must not attach output to an " +
+                     "already-orphaned record")
+    }
+
+    func test_finalizeAsyncJob_afterDrainHook_recordFinishedWithRedactedOutput() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[surfaceID] = 0
+        store.ingest(startEvent(cmdID: "cmd-async-drain"), surfaceID: surfaceID)
+
+        reader.rowCounts[surfaceID] = 1
+        reader.tailLines[surfaceID] = "OPENAI_API_KEY=sk-test1234567890abcdefghij"
+        store.ingest(endEvent(cmdID: "cmd-async-drain", exitCode: 0), surfaceID: surfaceID)
+
+        // Immediately after ingestEnd (same MainActor turn, no await yet),
+        // the async output-redaction job cannot have run -- the record
+        // must not yet be observably .finished.
+        let midGap = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
+        XCTAssertEqual(midGap.state, .running,
+                       "output redaction for a non-empty capture must run asynchronously, not synchronously " +
+                       "inside ingest")
+        XCTAssertNil(midGap.output, "output must not be attached until the async job completes")
+
+        await store._testAwaitOutputJobsDrained()
+
+        let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
+        XCTAssertEqual(record.state, .finished,
+                       "after the drain hook, the async job must have completed and attached output")
+        let output = try XCTUnwrap(record.output)
+        XCTAssertTrue(output.text.contains("OPENAI_API_KEY=[redacted]"))
+        XCTAssertFalse(output.text.contains("sk-test1234567890abcdefghij"),
+                       "the raw secret value must never reach stored output")
     }
 }

@@ -157,6 +157,11 @@ final class MCPCommandLogBridgeTests: XCTestCase {
         // timestamps) -- a 2s gap here must read back as duration_ms 2000.
         let endedAt1 = startedAt1.addingTimeInterval(2)
         store.ingest(endEvent(cmdID: "cmd-1", exitCode: 0, ts: endedAt1), surfaceID: surfaceID)
+        // cmd-1's non-empty capture defers redaction/truncation to an
+        // async job -- see CommandLogStore.finalize's doc comment -- so
+        // it isn't observably .finished (with output attached) until
+        // this drain hook returns.
+        await store._testAwaitOutputJobsDrained()
 
         let startedAt2 = startedAt1.addingTimeInterval(10)
         store.ingest(startEvent(cmdID: "cmd-2", command: "npm run dev", cwd: "/Users/dev/repo", ts: startedAt2), surfaceID: surfaceID)
@@ -327,6 +332,9 @@ final class MCPCommandLogBridgeTests: XCTestCase {
         reader.rowCounts[surfaceID] = 13
         reader.tailLines[surfaceID] = "x\ny\nz"
         store.ingest(endEvent(cmdID: "cmd-1", exitCode: 0), surfaceID: surfaceID)
+        // Non-empty capture defers redaction/truncation to an async job --
+        // see CommandLogStore.finalize's doc comment.
+        await store._testAwaitOutputJobsDrained()
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
 
         let result = try await bridge.handleToolCall(
