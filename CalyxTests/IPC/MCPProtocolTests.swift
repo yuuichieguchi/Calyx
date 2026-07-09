@@ -200,10 +200,10 @@ final class MCPProtocolTests: XCTestCase {
     func test_toolsListResponse_containsAllTools() throws {
         // Arrange — `tools/list` advertises the combined IPC + LSP +
         // terminal_* + Cockpit surface (6 IPC + 70 LSP + 3 terminal_* +
-        // 3 Cockpit = 82 tools; Round 7 removed ack_messages, P3 added
-        // the terminal_* surface, P4 added the Cockpit surface). Each
-        // IPC name must be present and the LSP catalogue must be
-        // surfaced alongside.
+        // 6 Cockpit = 85 tools; Round 7 removed ack_messages, P3 added
+        // the terminal_* surface, P4 added the ungated Cockpit tools,
+        // P5 added the 3 gated ones). Each IPC name must be present and
+        // the LSP catalogue must be surfaced alongside.
         let id = JSONRPCId.int(2)
         let expectedIPCTools: Set<String> = [
             "register_peer", "list_peers", "send_message",
@@ -228,8 +228,8 @@ final class MCPProtocolTests: XCTestCase {
                       "Tools list must contain every IPC tool; got: \(actualNames)")
         XCTAssertTrue(actualNames.contains("lsp_hover"),
                       "Tools list must surface the LSP tool catalogue alongside IPC tools")
-        XCTAssertEqual(toolsResult.tools.count, 82,
-                       "Tools list must contain 6 IPC + 70 LSP + 3 terminal_* + 3 Cockpit = 82 tools")
+        XCTAssertEqual(toolsResult.tools.count, 85,
+                       "Tools list must contain 6 IPC + 70 LSP + 3 terminal_* + 6 Cockpit = 85 tools")
     }
 
     // ==================== Round 7: ack_messages removed; receive is ====================

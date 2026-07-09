@@ -28,6 +28,16 @@
 //    nil commandID resolves the newest running record at call time, or
 //    returns nil immediately if none is running; a timed-out or
 //    cancelled wait unregisters its awaiter, leaving no husk behind
+//  - awaitNextCompletion resolves the earliest record on a surface whose
+//    startedAt is strictly after a given cutoff and has reached
+//    .finished -- immediately if one already qualifies, else waiting for
+//    a future finalize; an already-running-but-earlier record must never
+//    satisfy it, even if it finishes first; a wait survives remapSurface
+//    (carried old->new, resolving on the new surface's finalize) and is
+//    resumed nil promptly by markOrphaned (nothing will ever finish on a
+//    gone surface) -- but NOT by ring eviction, which only ages out one
+//    already-irrelevant record and doesn't invalidate a wait for the
+//    next one
 //  - markOrphaned transitions running records and resumes pending awaits
 //  - finalize derives durationNanos from endedAt - startedAt, clamped to
 //    [0, a plausibility ceiling] -- 0 for clock skew, the ceiling for a
@@ -652,6 +662,96 @@ final class CommandLogStoreTests: XCTestCase {
                        "A nil commandID must wait on the NEWEST running record at call time, not the oldest")
     }
 
+    // MARK: - awaitNextCompletion
+
+    func test_awaitNextCompletion_correlatesToCommandStartedAfterT_notEarlierStillRunning() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[surfaceID] = 1
+        let oldStartedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        store.ingest(startEvent(cmdID: "cmd-old", ts: oldStartedAt), surfaceID: surfaceID)
+
+        let startedAfter = oldStartedAt.addingTimeInterval(1)
+
+        let waiter = Task { @MainActor in
+            await store.awaitNextCompletion(surfaceID: surfaceID, startedAfter: startedAfter, timeoutMs: 5000)
+        }
+        await yieldToScheduler()
+
+        // Finish the OLDER command first -- it started BEFORE startedAfter,
+        // so this must NOT satisfy the waiter (unlike
+        // awaitCompletion(commandID: nil)'s eager newest-running-record
+        // resolution, which has no such predicate and would latch onto
+        // this one).
+        store.ingest(endEvent(cmdID: "cmd-old", exitCode: 0, ts: oldStartedAt.addingTimeInterval(0.5)), surfaceID: surfaceID)
+        await yieldToScheduler()
+
+        // Now start and finish a NEWER command -- this is the one the
+        // waiter must actually resolve against.
+        let newStartedAt = startedAfter.addingTimeInterval(1)
+        store.ingest(startEvent(cmdID: "cmd-new", ts: newStartedAt), surfaceID: surfaceID)
+        store.ingest(endEvent(cmdID: "cmd-new", exitCode: 0, ts: newStartedAt.addingTimeInterval(0.5)), surfaceID: surfaceID)
+
+        let result = await waiter.value
+        let record = try XCTUnwrap(result, "awaitNextCompletion must resume once a command started after startedAfter finishes")
+        XCTAssertEqual(record.cmdID, "cmd-new",
+                       "must correlate to the command that started AFTER startedAfter, not an earlier already-running one")
+    }
+
+    func test_awaitNextCompletion_alreadyFinishedRecord_returnsImmediately() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[surfaceID] = 1
+        let startedAfter = Date(timeIntervalSince1970: 1_700_000_000)
+        let startedAt = startedAfter.addingTimeInterval(1)
+        store.ingest(startEvent(cmdID: "cmd-already-done", ts: startedAt), surfaceID: surfaceID)
+        store.ingest(endEvent(cmdID: "cmd-already-done", exitCode: 0, ts: startedAt.addingTimeInterval(0.5)), surfaceID: surfaceID)
+
+        let start = Date()
+        let result = await store.awaitNextCompletion(surfaceID: surfaceID, startedAfter: startedAfter, timeoutMs: 5000)
+        let elapsed = Date().timeIntervalSince(start)
+
+        let record = try XCTUnwrap(result)
+        XCTAssertEqual(record.cmdID, "cmd-already-done")
+        XCTAssertLessThan(elapsed, 0.1, "an already-finished qualifying record must resolve immediately, not wait")
+    }
+
+    func test_awaitNextCompletion_timeoutElapsesWithNothingStarting_returnsNilAfterWaiting() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+
+        let start = Date()
+        let result = await store.awaitNextCompletion(surfaceID: surfaceID, startedAfter: Date(), timeoutMs: 200)
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertNil(result, "nothing ever started after startedAfter, so awaitNextCompletion must time out to nil")
+        XCTAssertGreaterThanOrEqual(elapsed, 0.15,
+                                    "must wait close to the full timeoutMs before giving up, not return immediately")
+    }
+
+    func test_testReset_resumesSuspendedAwaitNextCompletionWithNil() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+
+        let waiter = Task { @MainActor in
+            await store.awaitNextCompletion(surfaceID: surfaceID, startedAfter: Date(), timeoutMs: 5000)
+        }
+        await yieldToScheduler()
+
+        store._testReset()
+
+        let result = await waiter.value
+        XCTAssertNil(result, "_testReset must resume any suspended awaitNextCompletion with nil instead of leaving it to hang")
+    }
+
     // MARK: - markOrphaned
 
     func test_markOrphaned_transitionsRunningRecordsAndResumesAwaiters() async throws {
@@ -675,6 +775,27 @@ final class CommandLogStoreTests: XCTestCase {
         let waiterResult = await waiter.value
         let awaited = try XCTUnwrap(waiterResult, "A pending awaitCompletion must resume once its record is orphaned")
         XCTAssertEqual(awaited.state, .orphaned)
+    }
+
+    func test_markOrphaned_resumesInFlightAwaitNextCompletionWithNilPromptly() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let surfaceID = UUID()
+        store.reader = reader
+
+        let waiter = Task { @MainActor in
+            await store.awaitNextCompletion(surfaceID: surfaceID, startedAfter: Date(), timeoutMs: 5000)
+        }
+        await yieldToScheduler()
+
+        let start = Date()
+        store.markOrphaned(surfaceID: surfaceID)
+        let result = await waiter.value
+        let elapsed = Date().timeIntervalSince(start)
+
+        XCTAssertNil(result, "markOrphaned must resume a pending awaitNextCompletion with nil -- no command " +
+                     "will ever finish on a gone surface")
+        XCTAssertLessThan(elapsed, 0.1, "must resolve promptly on markOrphaned, not idle out the full timeout")
     }
 
     // MARK: - duration derivation
@@ -788,6 +909,40 @@ final class CommandLogStoreTests: XCTestCase {
         XCTAssertEqual(awaited.cmdID, "cmd-14")
         XCTAssertNil(awaited.output, "Output capture is forfeited for a command remapped mid-flight " +
                      "(contentRowCountAtStart was cleared)")
+    }
+
+    func test_remapSurface_movesInFlightAwaitNextCompletionWaiter_resolvesOnNewSurfaceFinalize() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        let oldSurfaceID = UUID()
+        let newSurfaceID = UUID()
+        store.reader = reader
+        reader.rowCounts[oldSurfaceID] = 1
+        reader.rowCounts[newSurfaceID] = 1
+
+        let startedAfter = Date(timeIntervalSince1970: 1_700_000_000)
+
+        let waiter = Task { @MainActor in
+            await store.awaitNextCompletion(surfaceID: oldSurfaceID, startedAfter: startedAfter, timeoutMs: 5000)
+        }
+        await yieldToScheduler()
+
+        store.remapSurface(old: oldSurfaceID, new: newSurfaceID)
+
+        // The command starts and finishes AFTER the remap, under the new
+        // surfaceID -- if the waiter were stranded under oldSurfaceID
+        // (not carried over by remapSurface), this finalize would never
+        // reach it and the wait would idle out the full timeout instead
+        // of resolving, giving the caller a false {"status":"timeout"}
+        // despite the command actually succeeding.
+        let startedAt = startedAfter.addingTimeInterval(1)
+        store.ingest(startEvent(cmdID: "cmd-remap", ts: startedAt), surfaceID: newSurfaceID)
+        store.ingest(endEvent(cmdID: "cmd-remap", exitCode: 0, ts: startedAt.addingTimeInterval(0.5)), surfaceID: newSurfaceID)
+
+        let result = await waiter.value
+        let record = try XCTUnwrap(result, "a remapped in-flight awaitNextCompletion must resolve on the new " +
+                                   "surface's finalize, not strand under the old one")
+        XCTAssertEqual(record.cmdID, "cmd-remap")
     }
 
     // MARK: - records(limit:state:) filtering

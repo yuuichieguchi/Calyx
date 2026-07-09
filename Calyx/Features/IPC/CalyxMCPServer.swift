@@ -113,13 +113,27 @@ final class CalyxMCPServer {
     /// `agentRegistry`/`commandLogStore`/`sessionSurfaceMap`.
     var cockpitAccess: CockpitAppAccessing = LiveCockpitAppAccess()
 
+    /// The approval inbox P5's gated Cockpit tools (pane_run/
+    /// pane_send_keys/palette_execute) submit into when
+    /// `ApprovalPolicy.requiresApproval()`, via `lazyCockpitBridge`'s own
+    /// `gate(toolName:targetSurfaceID:payload:)`. Defaults to the shared
+    /// singleton; tests inject an isolated instance, same rationale as
+    /// `agentRegistry`/`commandLogStore`/`sessionSurfaceMap`/
+    /// `cockpitAccess`. This is a security-critical seam: `stop()`
+    /// synchronously drains every pending request via `expireAll()` (see
+    /// that method), so a stopped server never strands an MCP caller
+    /// waiting on a decision nobody can make anymore.
+    var approvalInbox: ApprovalInboxStore = .shared
+
     /// Lazily constructed, cached `MCPCockpitBridge` that Cockpit tool
     /// calls dispatch through -- same `lazy` caveat as
     /// `lazyCommandLogBridge`: only built on first actual Cockpit-tool
     /// dispatch, by which point any test that overrides
-    /// `cockpitAccess`/`sessionSurfaceMap` has already done so.
+    /// `cockpitAccess`/`sessionSurfaceMap`/`approvalInbox`/
+    /// `agentRegistry`/`commandLogStore` has already done so.
     private lazy var lazyCockpitBridge = MCPCockpitBridge(
-        access: cockpitAccess, sessionSurfaceMap: sessionSurfaceMap
+        access: cockpitAccess, sessionSurfaceMap: sessionSurfaceMap,
+        approvals: approvalInbox, agentRegistry: agentRegistry, commandLogStore: commandLogStore
     )
 
     /// Records an agent hook event's self-reported session ID into the
@@ -852,6 +866,11 @@ final class CalyxMCPServer {
         // (or a start()-triggered restart) leaves stale rows on screen
         // for panes the registry will never hear from again.
         agentRegistry.reset()
+        // Synchronously drains every pending Cockpit approval request so
+        // a stopped server never strands an MCP caller waiting on a
+        // decision nobody can make anymore -- see
+        // `CalyxMCPServerCockpitToolsTests.test_serverStop_expiresPendingApprovals`.
+        approvalInbox.expireAll()
         Task { await store.cleanup() }
 
         // LSP bridge teardown. `stop()` is synchronous to match the
