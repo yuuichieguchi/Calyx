@@ -23,14 +23,12 @@ struct ApprovalBannerView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     /// Routed through `ControlCharacterDisplay.render` same as
-    /// `request.payload` below -- `name` comes from the same untrusted
-    /// MCP-tool-call provenance as `payload`, so it must not be able to
-    /// smuggle a hidden/spoofing payload into the header just because
-    /// it's a different field on `ApprovalRequest`.
+    /// `request.payload` below -- `displayToolName` comes from the same
+    /// untrusted tool-call provenance as `payload`, so it must not be
+    /// able to smuggle a hidden/spoofing payload into the header just
+    /// because it's a different field on `ApprovalRequest`.
     private var toolName: String {
-        switch request.source {
-        case .mcpTool(let name): return ControlCharacterDisplay.render(name)
-        }
+        ControlCharacterDisplay.render(request.displayToolName)
     }
 
     /// Short, human-scannable target label -- the first 8 characters of
