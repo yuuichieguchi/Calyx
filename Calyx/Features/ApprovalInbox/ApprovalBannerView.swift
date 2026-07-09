@@ -50,23 +50,18 @@ struct ApprovalBannerView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(headerText)
-                .font(.callout)
-                .fontWeight(.semibold)
+        HStack(alignment: .top, spacing: 16) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headerText)
+                    .font(.callout)
+                    .fontWeight(.semibold)
 
-            ScrollView {
-                Text(ControlCharacterDisplay.render(request.payload))
-                    .font(.system(.callout, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .accessibilityIdentifier(AccessibilityID.ApprovalBanner.payload)
+                payloadView
             }
-            .frame(maxHeight: 120)
+
+            Spacer(minLength: 16)
 
             HStack {
-                Spacer()
-
                 Button("Deny") {
                     model.deny(id: request.id)
                 }
@@ -88,9 +83,40 @@ struct ApprovalBannerView: View {
             }
         }
         .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
         .modifier(RecoveryBarBackgroundModifier(reduceTransparency: reduceTransparency))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.ApprovalBanner.container)
+    }
+
+    /// Content-hugging payload: a one-line command must never reserve
+    /// blank space (a ScrollView is normally GREEDY -- it claims its
+    /// full proposed height even when its content is a single short
+    /// line, which is what made the banner a mostly-blank band before
+    /// this fix). `.fixedSize(vertical: true)` makes the ScrollView
+    /// report its CONTENT height upward into this view's parent instead
+    /// of the proposed one, so a one-line payload renders one line tall;
+    /// `.frame(maxHeight: 120)`, applied BEFORE `.fixedSize` (so it
+    /// clamps what content height gets reported), caps that at ~120pt so
+    /// a long payload (bounded at 2000 characters by
+    /// `ControlCharacterDisplay.render`'s own cap) still scrolls instead
+    /// of growing the banner unbounded. Deliberately not
+    /// `ViewThatFits(in: .vertical)` (an earlier attempt): a `.frame(
+    /// maxHeight:)` wrapping the whole `ViewThatFits` proposes that same
+    /// ~120pt height to WHICHEVER branch is chosen, including a
+    /// plain-text branch -- floating a short line inside a still-120pt
+    /// box instead of shrinking to it.
+    private var payloadView: some View {
+        ScrollView(.vertical) { payloadText }
+            .frame(maxHeight: 120)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var payloadText: some View {
+        Text(ControlCharacterDisplay.render(request.payload))
+            .font(.system(.callout, design: .monospaced))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .textSelection(.enabled)
+            .accessibilityIdentifier(AccessibilityID.ApprovalBanner.payload)
     }
 }
