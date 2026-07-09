@@ -14,11 +14,15 @@
 //    zero records (shell_integration false), field-correct oldest-first
 //    JSON (incl. ISO8601 started_at, duration_ms conversion), a
 //    session-ID surface_id, limit (newest-N), state filtering, an
-//    unrecognized state filter, an out-of-range/fractional limit
+//    unrecognized state filter, an out-of-range/fractional limit, a
+//    record mid-async-redaction-gap (exit_code/ended_at/duration_ms
+//    omitted while state still reads running; present again once drained)
 //  - terminal_read_output: unknown/non-string command_id, output
 //    present, output nil (output_unavailable, no text key), output
 //    empty (text "", total_rows 0) -- the P1 empty-vs-nil distinction
-//    must survive serialization
+//    must survive serialization; a record mid-async-redaction-gap
+//    (output_pending true, no output_unavailable/text, real text once
+//    drained)
 //  - terminal_await_command: already-finished command_id, no running
 //    record + nil command_id (fast {"status":"timeout"}), a running
 //    record whose end arrives during the wait, timeout_ms clamping
@@ -201,6 +205,51 @@ final class MCPCommandLogBridgeTests: XCTestCase {
         XCTAssertNil(dict2["exit_code"], "A running record must not carry an exit_code")
     }
 
+    func test_list_duringAsyncRedactionGap_omitsFinishedOnlyFieldsKeepsStateRunning() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        store.reader = reader
+        let bridge = MCPCommandLogBridge(store: store, sessionSurfaceMap: SessionSurfaceMap())
+        let surfaceID = UUID()
+        reader.rowCounts[surfaceID] = 0
+        store.ingest(startEvent(cmdID: "cmd-gap"), surfaceID: surfaceID)
+
+        // A non-empty capture defers redaction/truncation to an async job
+        // -- see CommandLogStore.finalize's doc comment -- so right after
+        // this ingest (same MainActor turn, no yield), the record has
+        // already ended (endedAt/exitCode/durationNanos set) but is still
+        // internally "finalizing" and externally reads state: running.
+        reader.rowCounts[surfaceID] = 1
+        reader.tailLines[surfaceID] = "some output"
+        store.ingest(endEvent(cmdID: "cmd-gap", exitCode: 5), surfaceID: surfaceID)
+
+        let midGapResult = try await bridge.handleToolCall(
+            name: "terminal_list_commands", arguments: ["surface_id": surfaceID.uuidString]
+        )
+        let midGapCommands = try XCTUnwrap(try jsonDict(midGapResult)["commands"] as? [[String: Any]])
+        let midGapEntry = try XCTUnwrap(midGapCommands.first)
+        XCTAssertEqual(midGapEntry["state"] as? String, "running",
+                       "mid-gap, the record's externally-visible state must still read running")
+        XCTAssertNil(midGapEntry["exit_code"],
+                     "a mid-gap entry must not carry exit_code while state still reads running")
+        XCTAssertNil(midGapEntry["ended_at"],
+                     "a mid-gap entry must not carry ended_at while state still reads running")
+        XCTAssertNil(midGapEntry["duration_ms"],
+                     "a mid-gap entry must not carry duration_ms while state still reads running")
+
+        await store._testAwaitOutputJobsDrained()
+
+        let drainedResult = try await bridge.handleToolCall(
+            name: "terminal_list_commands", arguments: ["surface_id": surfaceID.uuidString]
+        )
+        let drainedCommands = try XCTUnwrap(try jsonDict(drainedResult)["commands"] as? [[String: Any]])
+        let drainedEntry = try XCTUnwrap(drainedCommands.first)
+        XCTAssertEqual(drainedEntry["state"] as? String, "finished", "after the drain hook, state must read finished")
+        XCTAssertEqual(drainedEntry["exit_code"] as? Int, 5, "after the drain hook, exit_code must be present and correct")
+        XCTAssertNotNil(drainedEntry["ended_at"], "after the drain hook, ended_at must be present")
+        XCTAssertNotNil(drainedEntry["duration_ms"], "after the drain hook, duration_ms must be present")
+    }
+
     func test_list_sessionIDArgument_resolvesViaSessionSurfaceMap() async throws {
         let store = CommandLogStore()
         let sessionMap = SessionSurfaceMap()
@@ -346,6 +395,47 @@ final class MCPCommandLogBridgeTests: XCTestCase {
         XCTAssertEqual(json["text"] as? String, "x\ny\nz")
         XCTAssertEqual(json["truncated"] as? Bool, false)
         XCTAssertEqual(json["total_rows"] as? Int, 3)
+    }
+
+    func test_readOutput_duringAsyncRedactionGap_returnsOutputPendingNotUnavailable() async throws {
+        let store = CommandLogStore()
+        let reader = FakeOutputReader()
+        store.reader = reader
+        let bridge = MCPCommandLogBridge(store: store, sessionSurfaceMap: SessionSurfaceMap())
+        let surfaceID = UUID()
+        reader.rowCounts[surfaceID] = 0
+        store.ingest(startEvent(cmdID: "cmd-gap"), surfaceID: surfaceID)
+
+        // A non-empty capture defers redaction/truncation to an async job
+        // -- see CommandLogStore.finalize's doc comment -- so right after
+        // this ingest (same MainActor turn, no yield), capture actually
+        // succeeded but is merely awaiting redaction.
+        reader.rowCounts[surfaceID] = 1
+        reader.tailLines[surfaceID] = "some output"
+        store.ingest(endEvent(cmdID: "cmd-gap", exitCode: 0), surfaceID: surfaceID)
+        let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
+
+        let midGapResult = try await bridge.handleToolCall(
+            name: "terminal_read_output", arguments: ["command_id": record.id.uuidString]
+        )
+        let midGapJSON = try jsonDict(midGapResult)
+        XCTAssertEqual(midGapJSON["command_id"] as? String, record.id.uuidString)
+        XCTAssertEqual(midGapJSON["output_pending"] as? Bool, true,
+                       "mid-gap, capture actually succeeded and is merely awaiting redaction -- must report " +
+                       "a truthful pending indicator, not output_unavailable")
+        XCTAssertNil(midGapJSON["output_unavailable"],
+                     "capture was not impossible mid-gap, so output_unavailable must not appear")
+        XCTAssertNil(midGapJSON["text"], "no text key while output is still pending")
+
+        await store._testAwaitOutputJobsDrained()
+
+        let drainedResult = try await bridge.handleToolCall(
+            name: "terminal_read_output", arguments: ["command_id": record.id.uuidString]
+        )
+        let drainedJSON = try jsonDict(drainedResult)
+        XCTAssertEqual(drainedJSON["text"] as? String, "some output",
+                       "after the drain hook, the real captured text must be returned")
+        XCTAssertNil(drainedJSON["output_pending"], "output_pending must not linger once output is attached")
     }
 
     func test_readOutput_nilOutput_returnsOutputUnavailableWithNoTextKey() async throws {

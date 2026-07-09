@@ -92,7 +92,9 @@ final class MCPCommandLogBridge {
             description: "Read a specific command's captured output by its id (from "
                 + "terminal_list_commands / terminal_await_command). Alt-screen or zero-output commands "
                 + "return an empty text with total_rows 0. output_unavailable: true means capture was "
-                + "impossible (distinct from a genuinely empty capture).",
+                + "impossible (distinct from a genuinely empty capture). output_pending: true means the "
+                + "command has already finished and its output is merely still being redacted -- retry "
+                + "shortly.",
             inputSchema: MCPRouter.schema(
                 properties: [
                     "command_id": MCPRouter.prop("string", "The command's id, as returned by terminal_list_commands / terminal_await_command"),
@@ -189,6 +191,15 @@ final class MCPCommandLogBridge {
         guard let commandID = UUID(uuidString: rawCommandID),
               let record = store.record(id: commandID) else {
             throw MCPCommandLogBridgeError.unknownCommandID(rawCommandID)
+        }
+        // Ended but still awaiting the async redaction job (see
+        // CommandLogStore.finalize's doc comment): capture actually
+        // succeeded, so output_unavailable (reserved for a genuinely
+        // impossible capture) would be a false statement here -- report a
+        // truthful pending indicator instead, before ever looking at
+        // record.output (which is still nil for this same reason).
+        if store.isFinalizing(id: record.id) {
+            return jsonString(["command_id": record.id.uuidString, "output_pending": true])
         }
         return jsonString(outputDict(commandID: record.id, output: record.output))
     }
@@ -324,8 +335,22 @@ final class MCPCommandLogBridge {
     /// `terminal_list_commands` entry shape: output METADATA
     /// (`output_total_rows` / `output_truncated`) only, never the
     /// captured text itself.
+    ///
+    /// While `record` has ended but is still awaiting its async
+    /// redaction job (see `CommandLogStore.finalize`'s doc comment),
+    /// `record.state` deliberately still reads `.running` -- so
+    /// `baseRecordDict`'s `exit_code`/`ended_at`/`duration_ms` (all
+    /// finished-only fields) are stripped back out here to keep the
+    /// entry self-consistent with that `.running` state, matching the
+    /// "a running record must not carry an exit_code" invariant that
+    /// already holds for a genuinely still-running record.
     private func listEntryDict(_ record: CommandRecord) -> [String: Any] {
         var dict = Self.baseRecordDict(record)
+        if store.isFinalizing(id: record.id) {
+            dict.removeValue(forKey: "exit_code")
+            dict.removeValue(forKey: "ended_at")
+            dict.removeValue(forKey: "duration_ms")
+        }
         if let output = record.output {
             dict["output_total_rows"] = output.totalRows
             dict["output_truncated"] = output.truncated
