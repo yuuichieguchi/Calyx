@@ -23,11 +23,42 @@ final class CommandLogStore {
     static let ringCapacity = 200
     static let pendingEndCapacityPerSurface = 32
     static let pendingEndTTL: TimeInterval = 10
-    static let outputByteCap = 256 * 1024
+    /// `nonisolated`: read by `truncatedOutput(text:totalRows:)`, which
+    /// itself must be callable from the off-MainActor output-redaction
+    /// job (see `scheduleOutputJob`'s doc comment) -- a plain `static
+    /// let` on this `@MainActor` class would otherwise be MainActor-
+    /// isolated too and unreachable from that job's `Task.detached`
+    /// closure. Safe: an immutable `Int` needs no synchronization.
+    nonisolated static let outputByteCap = 256 * 1024
 
     /// Marker line inserted between the kept head and tail halves of a
     /// truncated output, per `truncatedOutput(text:totalRows:)`.
-    private static let truncationMarker = "\n…[truncated]…\n"
+    /// `nonisolated` for the same reason as `outputByteCap` above.
+    private nonisolated static let truncationMarker = "\n…[truncated]…\n"
+
+    /// Record ids whose end event has already been ingested and whose
+    /// output is currently being redacted off the MainActor (see
+    /// `finalize`'s doc comment) -- the record's own `state` deliberately
+    /// STAYS `.running` for this whole span (so `terminal_list_commands`
+    /// et al. see an in-flight command, not a half-finished `.finished`
+    /// one), so this set is what actually distinguishes "genuinely still
+    /// running" from "ended, redaction pending" for the internal
+    /// dedup logic in `ingestStart`/`ingestEnd` that must not treat a
+    /// finalizing record as available to re-finalize or as still open
+    /// for a duplicate start. Cleared for a given id the moment that id
+    /// stops being reachable as a live, still-`.running`-looking record
+    /// -- by `attachOutput` on normal completion, or by `markOrphaned`/
+    /// `trimRing` if the record is torn down/evicted mid-gap, or by
+    /// `_testReset`.
+    private var finalizingRecordIDs: Set<UUID> = []
+
+    /// One in-flight async output-redaction `Task` per id in
+    /// `finalizingRecordIDs`, keyed the same way -- exists solely so
+    /// `_testAwaitOutputJobsDrained()` can await every job currently
+    /// running instead of a test guessing a fixed `Task.yield()` count.
+    /// Removed (unconditionally, regardless of whether the job actually
+    /// attached anything) by `attachOutput` once the job completes.
+    private var outputJobs: [UUID: Task<Void, Never>] = [:]
 
     private var recordsBySurface: [UUID: [CommandRecord]] = [:]
     /// End events that arrived before their matching start, keyed by the
@@ -80,12 +111,20 @@ final class CommandLogStore {
         // decode(from:) guarantees command_b64 was present on a .start
         // event; a hand-built CommandEvent (as tests construct) that
         // violates that invariant is simply dropped rather than crashing.
-        guard let command = event.command else { return }
+        guard let rawCommand = event.command else { return }
+        let command = SecretRedactor.redact(rawCommand)
         let cwd = event.cwd ?? ""
         let startedAt = event.ts ?? now()
 
+        // A record that's `.running` but already ingested its end event
+        // and is only awaiting its async output-redaction job (see
+        // `finalize`'s doc comment) must NOT count as "already running"
+        // here: excluding it lets a genuinely fresh start that reuses the
+        // same cmd_id (the shell integration recycled the counter) create
+        // its own new record right away, exactly as it would have before
+        // output redaction moved off the synchronous ingest path.
         let alreadyRunning = recordsBySurface[surfaceID]?.contains {
-            $0.cmdID == event.cmdID && $0.state == .running
+            $0.cmdID == event.cmdID && $0.state == .running && !finalizingRecordIDs.contains($0.id)
         } ?? false
         if alreadyRunning { return }
 
@@ -117,7 +156,13 @@ final class CommandLogStore {
             // let a LATER start that reuses the same cmd_id (a real
             // possibility -- shell integrations commonly recycle a
             // counter) get spuriously auto-finalized by this stale end
-            // the moment it starts.
+            // the moment it starts. "Already finalized" here also covers
+            // a record whose end event was ingested but whose output is
+            // still being redacted off the MainActor (`finalizingRecordIDs`
+            // -- see `finalize`'s doc comment): `runningRecord` excludes
+            // it, and `hasNonRunningRecord` below still counts it as
+            // ended, so a duplicate end arriving during that gap is
+            // dropped exactly the same way, not buffered or re-finalized.
             guard !hasNonRunningRecord(surfaceID: surfaceID, cmdID: event.cmdID) else { return }
             bufferPendingEnd(event, surfaceID: surfaceID)
             return
@@ -143,22 +188,43 @@ final class CommandLogStore {
     /// This fixed, round-trip-safe constant sidesteps that entirely.
     private static let maximumPlausibleDurationSeconds: Double = 1_000_000_000
 
-    /// Transitions a running record to `.finished`: applies the script's
-    /// own exit code, derives `durationNanos` from `endedAt - startedAt`
-    /// clamped to `[0, maximumPlausibleDurationSeconds]` -- 0 for clock
-    /// skew (an `endedAt` at or before `startedAt` must never underflow
-    /// the unsigned nanosecond count), the ceiling for a wildly-implausible
-    /// `endedAt` (e.g. a garbage-but-decode-plausible `ts`, which would
-    /// otherwise overflow `UInt64` on the `* 1_000_000_000` conversion
-    /// below and fatal-trap the whole app on one authenticated
-    /// `/command-event` POST) -- materializes output, and resumes any
-    /// awaiters. This is the ONLY place `durationNanos` is ever set:
-    /// ghostty's own OSC133 command-finished signal reports an unreliable
-    /// exit code (ghostty always sends 0 for "unknown", indistinguishable
-    /// from a real success) and was dropped entirely in favor of this --
-    /// deriving duration from the shell integration's own start/end
-    /// timestamps is both simpler and always correct to millisecond
-    /// precision.
+    /// Transitions a running record's `endedAt`/`exitCode`/`durationNanos`
+    /// (applying the script's own exit code; deriving `durationNanos` from
+    /// `endedAt - startedAt` clamped to `[0, maximumPlausibleDurationSeconds]`
+    /// -- 0 for clock skew (an `endedAt` at or before `startedAt` must never
+    /// underflow the unsigned nanosecond count), the ceiling for a
+    /// wildly-implausible `endedAt` (e.g. a garbage-but-decode-plausible
+    /// `ts`, which would otherwise overflow `UInt64` on the
+    /// `* 1_000_000_000` conversion below and fatal-trap the whole app on
+    /// one authenticated `/command-event` POST)) synchronously on the
+    /// MainActor, same as always -- this is the ONLY place `durationNanos`
+    /// is ever set: ghostty's own OSC133 command-finished signal reports an
+    /// unreliable exit code (ghostty always sends 0 for "unknown",
+    /// indistinguishable from a real success) and was dropped entirely in
+    /// favor of this -- deriving duration from the shell integration's own
+    /// start/end timestamps is both simpler and always correct to
+    /// millisecond precision.
+    ///
+    /// Output capture then reads `captureOutput`'s result and branches:
+    ///
+    /// - `.immediate`: capture was impossible, or produced a genuine
+    ///   (possibly empty) result with nothing to redact -- finish
+    ///   synchronously right here (attach output, `state = .finished`,
+    ///   resume awaiters) exactly as before this method's output handling
+    ///   moved off the MainActor, no queue hop for these trivial cases.
+    /// - `.deferred`: a non-empty capture. `SecretRedactor.redact` +
+    ///   `truncatedOutput` together cost real CPU on an adversarial input
+    ///   (~0.4s for a 256KB command output) that must not block the
+    ///   MainActor, so `scheduleOutputJob` hands the text off to a
+    ///   `Task.detached` and this method returns immediately WITHOUT
+    ///   flipping `state` to `.finished` yet -- the record is marked
+    ///   `finalizingRecordIDs` and stays externally `.running` (observable
+    ///   as such via e.g. `terminal_list_commands`) until that job's
+    ///   `attachOutput` completes the transition asynchronously. This is
+    ///   safe because every awaiter-facing API (`awaitCompletion`,
+    ///   `awaitNextCompletion`) only ever resolves a record once `state`
+    ///   actually reaches `.finished` (or `.orphaned`) -- a record is never
+    ///   observable as `.finished` without its output already attached.
     private func finalize(surfaceID: UUID, recordID: UUID, scriptExitCode: Int32?, endedAt: Date) {
         guard var records = recordsBySurface[surfaceID],
               let index = records.firstIndex(where: { $0.id == recordID }) else { return }
@@ -170,44 +236,121 @@ final class CommandLogStore {
         let elapsedSeconds = endedAt.timeIntervalSince(record.startedAt)
         let clampedSeconds = min(max(elapsedSeconds, 0), Self.maximumPlausibleDurationSeconds)
         record.durationNanos = UInt64(clampedSeconds * 1_000_000_000)
-        record.output = materializeOutput(surfaceID: surfaceID, record: record)
-        record.state = .finished
 
-        records[index] = record
-        recordsBySurface[surfaceID] = records
-        resumeAwaiters(for: record)
-        resumeNextCompletionAwaiters(for: record, surfaceID: surfaceID)
+        switch captureOutput(surfaceID: surfaceID, record: record) {
+        case .immediate(let output):
+            record.output = output
+            record.state = .finished
+            records[index] = record
+            recordsBySurface[surfaceID] = records
+            resumeAwaiters(for: record)
+            resumeNextCompletionAwaiters(for: record, surfaceID: surfaceID)
+        case .deferred(let text, let totalRows):
+            records[index] = record
+            recordsBySurface[surfaceID] = records
+            finalizingRecordIDs.insert(record.id)
+            scheduleOutputJob(recordID: record.id, rawText: text, totalRows: totalRows)
+        }
     }
 
     // MARK: - Output materialization
 
-    /// Capture is impossible (nil) only when there's no reader, no
-    /// captured starting counter, or the surface's counter somehow went
-    /// backwards. Every other case -- a genuine zero-row delta (e.g. an
-    /// alt-screen TUI that never touched scrollback) or a positive delta
-    /// whose captured tail happens to be empty -- materializes as an
-    /// explicit empty `CommandOutput`, not nil, so callers can tell
-    /// "captured, nothing there" from "couldn't capture at all". The
-    /// counter is `CommandOutputReading.contentRowCount` (content rows so
-    /// far), not ghostty's raw scrollbar total, so the delta reflects real
-    /// output rows even on a fresh, never-scrolled pane whose screen hasn't
-    /// filled yet.
-    private func materializeOutput(surfaceID: UUID, record: CommandRecord) -> CommandOutput? {
-        guard let reader, let start = record.contentRowCountAtStart else { return nil }
+    /// Result of `captureOutput`: either a value ready to attach
+    /// synchronously, or raw (unredacted, untruncated) text that still
+    /// needs the CPU-bound redact/truncate work `finalize` defers to an
+    /// async job -- see that method's own doc comment.
+    private enum CapturedOutput {
+        case immediate(CommandOutput?)
+        case deferred(text: String, totalRows: Int)
+    }
+
+    /// Capture is impossible (`.immediate(nil)`) only when there's no
+    /// reader, no captured starting counter, or the surface's counter
+    /// somehow went backwards. A genuine zero-row delta (e.g. an alt-screen
+    /// TUI that never touched scrollback) or a positive delta whose
+    /// captured tail happens to be empty also resolve immediately, as an
+    /// explicit empty `CommandOutput` -- not nil, so callers can tell
+    /// "captured, nothing there" from "couldn't capture at all" -- since
+    /// there is nothing to redact either way. Only a genuinely non-empty
+    /// capture is `.deferred` to the async job. The counter is
+    /// `CommandOutputReading.contentRowCount` (content rows so far), not
+    /// ghostty's raw scrollbar total, so the delta reflects real output
+    /// rows even on a fresh, never-scrolled pane whose screen hasn't filled
+    /// yet.
+    private func captureOutput(surfaceID: UUID, record: CommandRecord) -> CapturedOutput {
+        guard let reader, let start = record.contentRowCountAtStart else { return .immediate(nil) }
         // The surface being unknown to the reader at end time (e.g. torn
         // down) is a genuine capture failure, not "unchanged total" --
         // falling back to `start` here would silently misreport it as a
         // real zero-row-delta output.
-        guard let end = reader.contentRowCount(surfaceID: surfaceID) else { return nil }
-        guard end >= start else { return nil }
+        guard let end = reader.contentRowCount(surfaceID: surfaceID) else { return .immediate(nil) }
+        guard end >= start else { return .immediate(nil) }
         guard end > start else {
-            return CommandOutput(text: "", truncated: false, totalRows: 0)
+            return .immediate(CommandOutput(text: "", truncated: false, totalRows: 0))
         }
         let delta = end - start
         guard let text = reader.readScreenTailLines(surfaceID: surfaceID, count: Int(delta)), !text.isEmpty else {
-            return CommandOutput(text: "", truncated: false, totalRows: 0)
+            return .immediate(CommandOutput(text: "", truncated: false, totalRows: 0))
         }
-        return Self.truncatedOutput(text: text, totalRows: Int(delta))
+        return .deferred(text: text, totalRows: Int(delta))
+    }
+
+    /// Runs `SecretRedactor.redact` + `truncatedOutput` off the MainActor
+    /// via `Task.detached` -- matching `AppDelegate`'s own precedent for
+    /// escaping MainActor inheritance (see that file's `SyncBridgeBox` doc
+    /// comment): a plain, non-detached `Task { }` created from this
+    /// MainActor-isolated method would simply queue onto MainActor's own
+    /// turn rather than actually moving the CPU work off it. `rawText`/
+    /// `totalRows` are captured by value (both `Sendable`), and `self` only
+    /// weakly, since the job must not keep the store alive past its own
+    /// usefulness; `attachOutput` is this class's own MainActor-isolated
+    /// method, so `await self?.attachOutput(...)` is the hop back once the
+    /// redact/truncate work finishes.
+    private func scheduleOutputJob(recordID: UUID, rawText: String, totalRows: Int) {
+        let job = Task.detached { [weak self] in
+            let redacted = SecretRedactor.redact(rawText)
+            let output = Self.truncatedOutput(text: redacted, totalRows: totalRows)
+            await self?.attachOutput(recordID: recordID, output: output)
+        }
+        outputJobs[recordID] = job
+    }
+
+    /// Completes the async job `scheduleOutputJob` started for `recordID`:
+    /// unconditionally drops this job from `outputJobs` (this is the sole
+    /// removal site, regardless of outcome below), then re-verifies the
+    /// record is STILL the one this job was scheduled for before mutating
+    /// anything -- covering every race the async gap opens between
+    /// `finalize` scheduling this job and it landing back on the
+    /// MainActor:
+    ///
+    /// - `markOrphaned` may have transitioned the record to `.orphaned`
+    ///   during the gap (removing it from `finalizingRecordIDs` itself) --
+    ///   its awaiters are already resumed with the orphaned record, so this
+    ///   must not attach output to it afterward. Caught by the
+    ///   `finalizingRecordIDs.remove` membership check below.
+    /// - `trimRing` may have evicted the record from the ring entirely
+    ///   during the gap (also clearing `finalizingRecordIDs` for it) -- same
+    ///   membership check catches this.
+    /// - `remapSurface` may have moved the record to a different
+    ///   surfaceID during the gap -- `locate(recordID:)` scans every
+    ///   surface by id, so the attach still lands correctly there without
+    ///   this method needing to know the new surfaceID up front.
+    /// - `_testReset` clears `finalizingRecordIDs` (and every record)
+    ///   entirely -- the membership check drops this job before it can
+    ///   touch any fresh post-reset state.
+    private func attachOutput(recordID: UUID, output: CommandOutput) {
+        outputJobs.removeValue(forKey: recordID)
+        guard finalizingRecordIDs.remove(recordID) != nil else { return }
+        guard let (surfaceID, index) = locate(recordID: recordID),
+              var records = recordsBySurface[surfaceID] else { return }
+        var record = records[index]
+        guard record.state == .running else { return }
+        record.output = output
+        record.state = .finished
+        records[index] = record
+        recordsBySurface[surfaceID] = records
+        resumeAwaiters(for: record)
+        resumeNextCompletionAwaiters(for: record, surfaceID: surfaceID)
     }
 
     /// Keeps the head and tail halves of `text` under `outputByteCap`
@@ -218,8 +361,10 @@ final class CommandLogStore {
     /// stranded at a cut edge before decoding -- otherwise
     /// `String(decoding:as:)` would repair it with a U+FFFD replacement
     /// character, which both corrupts the text and can push the final
-    /// byte count back over the cap.
-    private static func truncatedOutput(text: String, totalRows: Int) -> CommandOutput {
+    /// byte count back over the cap. `nonisolated`: called from
+    /// `scheduleOutputJob`'s `Task.detached` closure, off the MainActor --
+    /// see that method's doc comment.
+    private nonisolated static func truncatedOutput(text: String, totalRows: Int) -> CommandOutput {
         guard text.utf8.count > outputByteCap else {
             return CommandOutput(text: text, truncated: false, totalRows: totalRows)
         }
@@ -243,8 +388,9 @@ final class CommandLogStore {
     /// bytes) so `bytes` never ends mid-scalar. `bytes` is always a
     /// prefix of a valid Swift `String`'s own UTF-8 view, so the only
     /// way `String(bytes:encoding:)` can fail here is an incomplete
-    /// trailing sequence -- never a genuinely malformed one.
-    private static func trimmingIncompleteUTF8Suffix(_ bytes: [UInt8]) -> [UInt8] {
+    /// trailing sequence -- never a genuinely malformed one. `nonisolated`,
+    /// same reason as `truncatedOutput` above.
+    private nonisolated static func trimmingIncompleteUTF8Suffix(_ bytes: [UInt8]) -> [UInt8] {
         var candidate = bytes
         var trimmed = 0
         while trimmed < 3, !candidate.isEmpty, String(bytes: candidate, encoding: .utf8) == nil {
@@ -256,8 +402,9 @@ final class CommandLogStore {
 
     /// Drops at most 3 leading bytes so `bytes` never begins mid-scalar
     /// (an orphaned continuation-byte run left over from a cut lead
-    /// byte). Same reasoning as `trimmingIncompleteUTF8Suffix`.
-    private static func trimmingIncompleteUTF8Prefix(_ bytes: [UInt8]) -> [UInt8] {
+    /// byte). Same reasoning as `trimmingIncompleteUTF8Suffix`, including
+    /// `nonisolated`.
+    private nonisolated static func trimmingIncompleteUTF8Prefix(_ bytes: [UInt8]) -> [UInt8] {
         var candidate = bytes
         var trimmed = 0
         while trimmed < 3, !candidate.isEmpty, String(bytes: candidate, encoding: .utf8) == nil {
@@ -295,8 +442,15 @@ final class CommandLogStore {
         pendingEndsBySurface[surfaceID] = pending
     }
 
+    /// A record counts as "non-running" (already ended) either because its
+    /// `state` genuinely left `.running`, or because it's mid-async-output-
+    /// redaction (`finalizingRecordIDs` -- see `finalize`'s doc comment):
+    /// its end event was already ingested even though `state` deliberately
+    /// still reads `.running` for external observers during that gap.
     private func hasNonRunningRecord(surfaceID: UUID, cmdID: String) -> Bool {
-        recordsBySurface[surfaceID]?.contains { $0.cmdID == cmdID && $0.state != .running } ?? false
+        recordsBySurface[surfaceID]?.contains {
+            $0.cmdID == cmdID && ($0.state != .running || finalizingRecordIDs.contains($0.id))
+        } ?? false
     }
 
     // MARK: - Ring buffer
@@ -313,6 +467,14 @@ final class CommandLogStore {
     /// `.orphaned` and its awaiters resumed (same semantics as
     /// `markOrphaned`), so a command whose record ages out of the ring
     /// resolves its waiter instead of leaving it to hang until timeout.
+    /// This also covers a record whose output is still being redacted
+    /// off the MainActor when it's evicted (`finalizingRecordIDs` --
+    /// see `finalize`'s doc comment): it's still `.running` by the same
+    /// externally-visible reasoning, so it's caught by the `where`
+    /// clause below and orphaned exactly like any other still-running
+    /// eviction; removing its id from `finalizingRecordIDs` here makes
+    /// the async job that's still running for it a no-op once it lands
+    /// back on the MainActor (see `attachOutput`'s doc comment).
     private func trimRing(surfaceID: UUID) {
         guard var records = recordsBySurface[surfaceID], records.count > Self.ringCapacity else { return }
         let overflow = records.count - Self.ringCapacity
@@ -321,12 +483,21 @@ final class CommandLogStore {
         recordsBySurface[surfaceID] = records
         for index in evicted.indices where evicted[index].state == .running {
             evicted[index].state = .orphaned
+            finalizingRecordIDs.remove(evicted[index].id)
             resumeAwaiters(for: evicted[index])
         }
     }
 
+    /// Excludes a record whose output is still being redacted off the
+    /// MainActor (`finalizingRecordIDs` -- see `finalize`'s doc comment):
+    /// its end event was already ingested, so it must not be treated as
+    /// available to finalize again by `ingestEnd`, even though its
+    /// `state` deliberately still reads `.running` for external
+    /// observers during that gap.
     private func runningRecord(surfaceID: UUID, cmdID: String) -> CommandRecord? {
-        recordsBySurface[surfaceID]?.first { $0.cmdID == cmdID && $0.state == .running }
+        recordsBySurface[surfaceID]?.first {
+            $0.cmdID == cmdID && $0.state == .running && !finalizingRecordIDs.contains($0.id)
+        }
     }
 
     private func newestRunningRecord(surfaceID: UUID) -> CommandRecord? {
@@ -591,6 +762,15 @@ final class CommandLogStore {
         var transitioned: [CommandRecord] = []
         for index in records.indices where records[index].state == .running {
             records[index].state = .orphaned
+            // A record whose output is still being redacted off the
+            // MainActor (`finalizingRecordIDs` -- see `finalize`'s doc
+            // comment) is caught by this same `where` clause, since it's
+            // still externally `.running`. Removing it here means the
+            // late-arriving async job's `attachOutput` finds it no longer
+            // finalizing and drops silently, instead of clobbering the
+            // orphaned record (whose awaiters are resumed right below,
+            // with output still nil) after the fact.
+            finalizingRecordIDs.remove(records[index].id)
             transitioned.append(records[index])
         }
         recordsBySurface[surfaceID] = records
@@ -610,7 +790,14 @@ final class CommandLogStore {
                 // with its own content-row counter -- the old counter
                 // captured at start is meaningless against it, so any
                 // still-running remapped command forfeits output capture
-                // (materializeOutput requires contentRowCountAtStart).
+                // (captureOutput requires contentRowCountAtStart). A
+                // record whose output is still being redacted off the
+                // MainActor when the remap happens (`finalizingRecordIDs`)
+                // is unaffected by this: its text was already captured and
+                // handed to the async job before the remap, so
+                // `attachOutput`'s `locate(recordID:)` -- a scan across
+                // every surface by id -- finds it under `new` and
+                // completes normally there; no special-casing needed here.
                 copy.contentRowCountAtStart = nil
                 return copy
             }
@@ -639,6 +826,16 @@ final class CommandLogStore {
     /// still-suspended `awaitCompletion` waiter is resumed with nil
     /// BEFORE the awaiter storage is cleared, so it fails fast instead
     /// of hanging on a continuation nothing will ever resume again.
+    /// Clearing `finalizingRecordIDs` here means any async output-
+    /// redaction job still in flight for a pre-reset record drops
+    /// silently when it eventually lands on `attachOutput` (the
+    /// membership check there fails), rather than mutating anything
+    /// about the fresh post-reset state -- the job's own `Task` isn't
+    /// cancelled, but it has nothing left it's allowed to touch. Jobs
+    /// themselves are left in `outputJobs` (not cleared) so a test that
+    /// still holds a reference to one from before the reset can await it
+    /// via `_testAwaitOutputJobsDrained()` and observe it complete as a
+    /// no-op.
     func _testReset() {
         for boxes in awaitersByRecordID.values {
             for box in boxes { box.resume(with: nil) }
@@ -650,7 +847,22 @@ final class CommandLogStore {
         pendingEndsBySurface.removeAll()
         awaitersByRecordID.removeAll()
         nextCompletionAwaitersBySurface.removeAll()
+        finalizingRecordIDs.removeAll()
         reader = nil
         now = { Date() }
+    }
+
+    /// Test seam: awaits every async output-redaction job currently
+    /// in-flight (one per id in `finalizingRecordIDs` at some point --
+    /// see `scheduleOutputJob`), so a test can deterministically observe
+    /// the post-redaction MainActor attach step (`attachOutput`) instead
+    /// of guessing a fixed `Task.yield()` count. Snapshots `outputJobs`
+    /// before awaiting, same idiom as iterating any other collection
+    /// this class mutates during the loop body's suspension points.
+    func _testAwaitOutputJobsDrained() async {
+        let jobs = Array(outputJobs.values)
+        for job in jobs {
+            await job.value
+        }
     }
 }
