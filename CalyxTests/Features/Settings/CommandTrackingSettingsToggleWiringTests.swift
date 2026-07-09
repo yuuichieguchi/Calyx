@@ -7,11 +7,18 @@
 //  own header for the full rationale of each half's reachability), plus
 //  a third part (C) this file adds on top of that shape:
 //
+//  ROUND-3 UPDATE (user-directed Settings restructure): commandTracking
+//  moved off the Sessions pane onto the new Agents pane along with
+//  agentResume/agentResumeAutoExecute/cockpitAutoApprove -- everywhere
+//  below originally said "Sessions pane"/`.pane == .sessions` (P4-era,
+//  still accurate as history) now reads "Agents pane"/`.pane == .agents`
+//  to match where the row actually lives today.
+//
 //  (A) TARGET/ACTION WIRING -- against the REAL SettingsWindowController
-//  .shared singleton's Sessions pane view tree, located by its OWN
+//  .shared singleton's Agents pane view tree, located by its OWN
 //  accessibility identifier (not positional index), so this file is
 //  independent of wherever the Green phase places the new row relative
-//  to the four existing session toggles.
+//  to the other agent-related toggles.
 //
 //  (B) INITIAL-STATE SEEDING -- against
 //  SettingsWindowController.sessionToggleInitialState(for:), the same
@@ -36,7 +43,8 @@
 //  Proposed API:
 //
 //    SettingsRow.swift: add `case commandTracking` to the enum, routed
-//    to `.pane == .sessions`.
+//    to `.pane == .sessions` at the time (round-3 moved it to `.agents`
+//    -- see this file's header).
 //
 //    AccessibilityID.swift, enum Settings: add
 //    `static let commandTrackingSwitch = "calyx.settings.sessions.commandTrackingSwitch"`
@@ -68,17 +76,17 @@ final class CommandTrackingSettingsToggleWiringTests: XCTestCase {
 
     // MARK: - (A) target/action wiring, via the real singleton's built view tree
 
-    private func sessionsPaneView() throws -> NSView {
+    private func agentsPaneView() throws -> NSView {
         let tabViewController = try XCTUnwrap(
             SettingsWindowController.shared.window?.contentViewController as? NSTabViewController,
             "SettingsWindowController's window must host an NSTabViewController as its content"
         )
-        let sessionsIndex = try XCTUnwrap(
-            SettingsPane.allCases.firstIndex(of: .sessions),
-            "SettingsPane must have a .sessions case"
+        let agentsIndex = try XCTUnwrap(
+            SettingsPane.allCases.firstIndex(of: .agents),
+            "SettingsPane must have a .agents case"
         )
-        let tabItem = tabViewController.tabViewItems[sessionsIndex]
-        return try XCTUnwrap(tabItem.viewController?.view, "The Sessions tab item must host a real view controller")
+        let tabItem = tabViewController.tabViewItems[agentsIndex]
+        return try XCTUnwrap(tabItem.viewController?.view, "The Agents tab item must host a real view controller")
     }
 
     /// Depth-first walk collecting every NSSwitch in `view`'s subview
@@ -102,8 +110,8 @@ final class CommandTrackingSettingsToggleWiringTests: XCTestCase {
 
     func test_commandTrackingSwitch_existsWithTargetAndActionWired() throws {
         let toggleSwitch = try XCTUnwrap(
-            findSwitch(identifier: AccessibilityID.Settings.commandTrackingSwitch, in: try sessionsPaneView()),
-            "the Sessions pane must contain exactly one switch with the commandTrackingSwitch accessibility identifier"
+            findSwitch(identifier: AccessibilityID.Settings.commandTrackingSwitch, in: try agentsPaneView()),
+            "the Agents pane must contain exactly one switch with the commandTrackingSwitch accessibility identifier"
         )
 
         XCTAssertTrue(
@@ -147,7 +155,7 @@ final class CommandTrackingSettingsToggleWiringTests: XCTestCase {
         addTeardownBlock { SettingsWindowController.shared._shellIntegrationRootForTesting = nil }
 
         let toggleSwitch = try XCTUnwrap(
-            findSwitch(identifier: AccessibilityID.Settings.commandTrackingSwitch, in: try sessionsPaneView())
+            findSwitch(identifier: AccessibilityID.Settings.commandTrackingSwitch, in: try agentsPaneView())
         )
 
         toggleSwitch.state = .on

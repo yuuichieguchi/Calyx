@@ -98,25 +98,30 @@ class SettingsWindowController: NSWindowController {
             return SectionHeading(title: "Scrolling", subtitle: nil)
         case .lspAutoInstall:
             return SectionHeading(
-                title: nil,
+                title: "Auto-Install",
                 subtitle: "Calyx hosts language servers and exposes them to AI agents over MCP. When a server is missing, Calyx can install it automatically."
             )
         case .persistentSessions:
             return SectionHeading(
-                title: nil,
+                title: "Persistence",
                 subtitle: "Persistent terminal sessions survive a crash or quit and can be reattached later, from this window or from the session browser."
+            )
+        case .agentResume:
+            return SectionHeading(
+                title: "Agent Resume",
+                subtitle: "When a persistent session reattaches to a saved AI agent CLI conversation, offer to resume it."
+            )
+        case .cockpitAutoApprove:
+            return SectionHeading(
+                title: "Command Approval",
+                subtitle: "Applies to agent-initiated pane commands (run, send keys, palette). Off = ask every time."
             )
         case .commandTracking:
             return SectionHeading(title: "Command Tracking", subtitle: "Changes apply to new terminals only.")
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
-        case .cockpitAutoApprove:
-            return SectionHeading(
-                title: nil,
-                subtitle: "Applies to agent-initiated pane commands (run, send keys, palette). Off = ask every time."
-            )
         case .themeColorWell, .themeColorHex, .lspRequireConfirmation,
-             .historyPersistence, .agentResume, .agentResumeAutoExecute,
+             .historyPersistence, .agentResumeAutoExecute,
              .openSessionBrowserButton:
             return nil
         }

@@ -28,7 +28,12 @@
 //  what the Appearance pane manages, so that is its natural home.
 //
 //  PANE ORDER: Appearance, Sessions, LSP -- the order the user's own
-//  restructure request listed them in.
+//  restructure request listed them in. Agents (round-3 Red phase, user-
+//  directed information-architecture fix) was inserted right after
+//  Sessions: its rows (agentResume/agentResumeAutoExecute/
+//  cockpitAutoApprove/commandTracking) all moved out of Sessions, which
+//  had become a dumping ground with mismatched section typography (only
+//  "Command Tracking" carried a full SectionHeading -- user-flagged).
 //
 //  ICON COVERAGE (round-2 Red phase, user-reported defect): the Settings
 //  toolbar's tabStyle (.toolbar, SettingsWindowController.setupContent())
@@ -51,14 +56,16 @@ final class SettingsPaneTests: XCTestCase {
 
     // MARK: - Pane identity, order, titles
 
-    func test_settingsPane_orderIsAppearanceThenSessionsThenLSP() {
-        XCTAssertEqual(SettingsPane.allCases, [.appearance, .sessions, .lsp],
-                       "Pane order must match the user's requested restructure order")
+    func test_settingsPane_orderIsAppearanceThenSessionsThenAgentsThenLSP() {
+        XCTAssertEqual(SettingsPane.allCases, [.appearance, .sessions, .agents, .lsp],
+                       "Pane order must match the user's requested restructure order -- Agents sits right " +
+                       "after Sessions, since its rows moved out of that pane")
     }
 
     func test_settingsPane_titles() {
         XCTAssertEqual(SettingsPane.appearance.title, "Appearance")
         XCTAssertEqual(SettingsPane.sessions.title, "Sessions")
+        XCTAssertEqual(SettingsPane.agents.title, "Agents")
         XCTAssertEqual(SettingsPane.lsp.title, "LSP")
     }
 
@@ -79,10 +86,10 @@ final class SettingsPaneTests: XCTestCase {
         ("lspRequireConfirmation", .lsp),
         ("persistentSessions", .sessions),
         ("historyPersistence", .sessions),
-        ("agentResume", .sessions),
-        ("agentResumeAutoExecute", .sessions),
-        ("cockpitAutoApprove", .sessions),
-        ("commandTracking", .sessions),
+        ("agentResume", .agents),
+        ("agentResumeAutoExecute", .agents),
+        ("cockpitAutoApprove", .agents),
+        ("commandTracking", .agents),
         ("openSessionBrowserButton", .sessions),
         ("openConfigFileFooter", .appearance),
     ]
@@ -110,6 +117,7 @@ final class SettingsPaneTests: XCTestCase {
     func test_settingsPane_iconSymbolNames() {
         XCTAssertEqual(SettingsPane.appearance.icon, "paintbrush")
         XCTAssertEqual(SettingsPane.sessions.icon, "terminal")
+        XCTAssertEqual(SettingsPane.agents.icon, "sparkles")
         XCTAssertEqual(SettingsPane.lsp.icon, "gearshape.2")
     }
 

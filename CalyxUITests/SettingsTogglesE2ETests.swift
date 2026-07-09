@@ -3,12 +3,15 @@
 //
 // Clones SettingsSessionsToggleE2ETests's click-quit-relaunch-readback
 // journey (see that file's own header for the full incident rationale)
-// for the 6 switches its own suite left uncovered: historyPersistence,
-// agentResume, agentResumeAutoExecute (Sessions pane, already carried a
-// stable accessibility identifier before this cycle) plus smoothScrolling
-// (Appearance pane), lspAutoInstall, lspRequireConfirmation (LSP pane) --
-// newly identified this cycle (AccessibilityID.Settings.*, wired onto
-// their NSSwitch controls in SettingsWindowController.swift).
+// for the 6 switches its own suite left uncovered: historyPersistence
+// (Sessions pane, already carried a stable accessibility identifier
+// before this cycle), agentResume, agentResumeAutoExecute (moved to the
+// new Agents pane by a later Settings restructure -- same stable
+// identifiers, still prefixed `calyx.settings.sessions.*`) plus
+// smoothScrolling (Appearance pane), lspAutoInstall,
+// lspRequireConfirmation (LSP pane) -- newly identified this cycle
+// (AccessibilityID.Settings.*, wired onto their NSSwitch controls in
+// SettingsWindowController.swift).
 //
 // HERMETICITY GAP FOUND WHILE WRITING THIS (investigated, not assumed):
 // unlike the four Sessions-pane switches, which all read/write through
@@ -245,14 +248,14 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
     func test_agentResumeSwitch_persistsAcrossRelaunch() {
         assertTogglePersistsAcrossRelaunch(
             identifier: "calyx.settings.sessions.agentResumeSwitch",
-            pane: "Sessions"
+            pane: "Agents"
         )
     }
 
     func test_agentResumeAutoExecuteSwitch_persistsAcrossRelaunch() {
         assertTogglePersistsAcrossRelaunch(
             identifier: "calyx.settings.sessions.agentResumeAutoExecuteSwitch",
-            pane: "Sessions"
+            pane: "Agents"
         )
     }
 

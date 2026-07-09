@@ -35,9 +35,10 @@ enum SettingsRow: String, CaseIterable {
             return .appearance
         case .lspAutoInstall, .lspRequireConfirmation:
             return .lsp
-        case .persistentSessions, .historyPersistence, .agentResume,
-             .agentResumeAutoExecute, .cockpitAutoApprove, .commandTracking, .openSessionBrowserButton:
+        case .persistentSessions, .historyPersistence, .openSessionBrowserButton:
             return .sessions
+        case .agentResume, .agentResumeAutoExecute, .cockpitAutoApprove, .commandTracking:
+            return .agents
         }
     }
 }
