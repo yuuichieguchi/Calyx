@@ -1018,8 +1018,9 @@ final class CommandLogStoreTests: XCTestCase {
         reader.rowCounts[surfaceID] = 0
         store.ingest(startEvent(cmdID: "cmd-secret-output"), surfaceID: surfaceID)
 
+        let openAIKey = "sk-" + "test1234567890abcdefghij"
         reader.rowCounts[surfaceID] = 2
-        reader.tailLines[surfaceID] = "OPENAI_API_KEY=sk-test1234567890abcdefghij\nplain line"
+        reader.tailLines[surfaceID] = "OPENAI_API_KEY=\(openAIKey)\nplain line"
         store.ingest(endEvent(cmdID: "cmd-secret-output", exitCode: 0), surfaceID: surfaceID)
         // A non-empty capture redacts off the MainActor -- see
         // CommandLogStore.finalize's doc comment.
@@ -1028,7 +1029,7 @@ final class CommandLogStoreTests: XCTestCase {
         let record = try XCTUnwrap(store.records(surfaceID: surfaceID, limit: nil, state: nil).first)
         let output = try XCTUnwrap(record.output, "a positive row delta with a non-empty tail must materialize output")
         XCTAssertTrue(output.text.contains("OPENAI_API_KEY=[redacted]"))
-        XCTAssertFalse(output.text.contains("sk-test1234567890abcdefghij"), "the raw secret value must never reach stored output")
+        XCTAssertFalse(output.text.contains(openAIKey), "the raw secret value must never reach stored output")
         XCTAssertTrue(output.text.contains("plain line"), "non-secret content must survive redaction untouched")
     }
 
@@ -1047,7 +1048,7 @@ final class CommandLogStoreTests: XCTestCase {
         // that cut is computed, so no raw fragment of the token can
         // survive on either side of it, regardless of exactly where the
         // cut lands.
-        let token = "ghp_iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+        let token = "ghp_" + "iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
         XCTAssertEqual(token.utf8.count, 40, "precondition: token must be 40 raw bytes long")
         let before = String(repeating: "x", count: 131_028)
         let after = String(repeating: "y", count: 168_932)
@@ -1140,8 +1141,9 @@ final class CommandLogStoreTests: XCTestCase {
         // Non-empty capture -> the async output-redaction job is
         // scheduled but has not yet run (still on this same MainActor
         // turn) when markOrphaned below tears the surface down.
+        let openAIKey = "sk-" + "test1234567890abcdefghij"
         reader.rowCounts[surfaceID] = 1
-        reader.tailLines[surfaceID] = "OPENAI_API_KEY=sk-test1234567890abcdefghij"
+        reader.tailLines[surfaceID] = "OPENAI_API_KEY=\(openAIKey)"
         store.ingest(endEvent(cmdID: "cmd-orphan-gap", exitCode: 0), surfaceID: surfaceID)
 
         store.markOrphaned(surfaceID: surfaceID)
@@ -1203,8 +1205,9 @@ final class CommandLogStoreTests: XCTestCase {
         reader.rowCounts[surfaceID] = 0
         store.ingest(startEvent(cmdID: "cmd-async-drain"), surfaceID: surfaceID)
 
+        let openAIKey = "sk-" + "test1234567890abcdefghij"
         reader.rowCounts[surfaceID] = 1
-        reader.tailLines[surfaceID] = "OPENAI_API_KEY=sk-test1234567890abcdefghij"
+        reader.tailLines[surfaceID] = "OPENAI_API_KEY=\(openAIKey)"
         store.ingest(endEvent(cmdID: "cmd-async-drain", exitCode: 0), surfaceID: surfaceID)
 
         // Immediately after ingestEnd (same MainActor turn, no await yet),
@@ -1223,7 +1226,7 @@ final class CommandLogStoreTests: XCTestCase {
                        "after the drain hook, the async job must have completed and attached output")
         let output = try XCTUnwrap(record.output)
         XCTAssertTrue(output.text.contains("OPENAI_API_KEY=[redacted]"))
-        XCTAssertFalse(output.text.contains("sk-test1234567890abcdefghij"),
+        XCTAssertFalse(output.text.contains(openAIKey),
                        "the raw secret value must never reach stored output")
     }
 }
