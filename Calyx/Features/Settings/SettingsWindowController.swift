@@ -110,6 +110,11 @@ class SettingsWindowController: NSWindowController {
             return SectionHeading(title: "Command Tracking", subtitle: "Changes apply to new terminals only.")
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
+        case .cockpitAutoApprove:
+            return SectionHeading(
+                title: nil,
+                subtitle: "Applies to agent-initiated pane commands (run, send keys, palette). Off = ask every time."
+            )
         case .themeColorWell, .themeColorHex, .lspRequireConfirmation,
              .historyPersistence, .agentResume, .agentResumeAutoExecute,
              .openSessionBrowserButton:
@@ -166,6 +171,8 @@ class SettingsWindowController: NSWindowController {
             return agentResumeRow()
         case .agentResumeAutoExecute:
             return agentResumeAutoExecuteRow()
+        case .cockpitAutoApprove:
+            return cockpitAutoApproveRow()
         case .commandTracking:
             return commandTrackingRow()
         case .openSessionBrowserButton:
@@ -259,6 +266,7 @@ class SettingsWindowController: NSWindowController {
         case .historyPersistence: return SessionSettings.historyPersistenceEnabled
         case .agentResume: return SessionSettings.agentResumeEnabled
         case .agentResumeAutoExecute: return SessionSettings.agentResumeAutoExecute
+        case .cockpitAutoApprove: return CockpitSettings.autoApproveEnabled
         case .commandTracking: return CommandTrackingSettings.trackingEnabled
         default: return false
         }
@@ -298,6 +306,15 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.target = self
         toggleSwitch.action = #selector(agentResumeAutoExecuteDidChange(_:))
         return controlRow(label: "Auto-execute resume (skip confirmation)", control: toggleSwitch)
+    }
+
+    private func cockpitAutoApproveRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.cockpitAutoApproveSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .cockpitAutoApprove) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(cockpitAutoApproveDidChange(_:))
+        return controlRow(label: "Auto-approve agent commands", control: toggleSwitch)
     }
 
     private func commandTrackingRow() -> NSView {
@@ -456,6 +473,10 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentResumeAutoExecuteDidChange(_ sender: NSSwitch) {
         SessionSettings.agentResumeAutoExecute = (sender.state == .on)
+    }
+
+    @objc private func cockpitAutoApproveDidChange(_ sender: NSSwitch) {
+        CockpitSettings.autoApproveEnabled = (sender.state == .on)
     }
 
     /// Flipping ON installs+applies immediately (new panes only --

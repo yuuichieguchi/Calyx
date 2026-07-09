@@ -217,7 +217,7 @@ final class MCPCommandLogBridge {
         ) else {
             return jsonString(["status": "timeout"])
         }
-        return jsonString(fullRecordDict(record))
+        return jsonString(Self.fullRecordDict(record))
     }
 
     // MARK: - surface_id resolution
@@ -285,7 +285,11 @@ final class MCPCommandLogBridge {
 
     // MARK: - Record serialization
 
-    private static let iso8601: ISO8601DateFormatter = {
+    /// Not `private`: reused by `MCPCockpitBridge.handlePaneRun`'s
+    /// `await: true` path (`fullRecordDict`, below, and this shared
+    /// timestamp formatter) so the two bridges serialize a
+    /// `CommandRecord` identically.
+    static let iso8601: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter
@@ -295,8 +299,8 @@ final class MCPCommandLogBridge {
     /// Optional fields (`exit_code`, `ended_at`, `duration_ms`) are
     /// omitted entirely when unset, rather than serialized as JSON
     /// `null` -- a running record must not carry an `exit_code` key at
-    /// all.
-    private func baseRecordDict(_ record: CommandRecord) -> [String: Any] {
+    /// all. Not `private`: see `fullRecordDict`'s own note.
+    static func baseRecordDict(_ record: CommandRecord) -> [String: Any] {
         var dict: [String: Any] = [
             "id": record.id.uuidString,
             "cmd_id": record.cmdID,
@@ -321,7 +325,7 @@ final class MCPCommandLogBridge {
     /// (`output_total_rows` / `output_truncated`) only, never the
     /// captured text itself.
     private func listEntryDict(_ record: CommandRecord) -> [String: Any] {
-        var dict = baseRecordDict(record)
+        var dict = Self.baseRecordDict(record)
         if let output = record.output {
             dict["output_total_rows"] = output.totalRows
             dict["output_truncated"] = output.truncated
@@ -330,8 +334,12 @@ final class MCPCommandLogBridge {
     }
 
     /// `terminal_await_command` result shape: the full record, including
-    /// the captured output text (unlike the list-entry shape above).
-    private func fullRecordDict(_ record: CommandRecord) -> [String: Any] {
+    /// the captured output text (unlike the list-entry shape above). Not
+    /// `private`: `MCPCockpitBridge.handlePaneRun`'s `await: true` path
+    /// calls this directly so `pane_run`'s awaited-completion JSON shape
+    /// matches `terminal_await_command`'s exactly, rather than
+    /// duplicating the field set.
+    static func fullRecordDict(_ record: CommandRecord) -> [String: Any] {
         var dict = baseRecordDict(record)
         applyOutputFields(record.output, to: &dict)
         return dict
@@ -340,7 +348,7 @@ final class MCPCommandLogBridge {
     /// `terminal_read_output` result shape.
     private func outputDict(commandID: UUID, output: CommandOutput?) -> [String: Any] {
         var dict: [String: Any] = ["command_id": commandID.uuidString]
-        applyOutputFields(output, to: &dict)
+        Self.applyOutputFields(output, to: &dict)
         return dict
     }
 
@@ -348,8 +356,8 @@ final class MCPCommandLogBridge {
     /// `outputDict`: a present (possibly empty) `CommandOutput` becomes
     /// `text`/`truncated`/`total_rows`; a nil output (capture was
     /// impossible) becomes `output_unavailable: true` with no `text` key
-    /// at all.
-    private func applyOutputFields(_ output: CommandOutput?, to dict: inout [String: Any]) {
+    /// at all. Not `private`: see `fullRecordDict`'s own note.
+    static func applyOutputFields(_ output: CommandOutput?, to dict: inout [String: Any]) {
         if let output {
             dict["text"] = output.text
             dict["truncated"] = output.truncated

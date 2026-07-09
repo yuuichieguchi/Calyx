@@ -45,6 +45,16 @@ final class SurfaceRegistry {
     /// instance.
     var sessionSurfaceMap: SessionSurfaceMap = .shared
 
+    /// Store `destroySurface(_:)` expires any still-pending Cockpit
+    /// approval request targeting a torn-down surface into (see
+    /// `ApprovalInboxStore.expireForSurface(_:)`) -- without this, such
+    /// a request's banner would stay invisible forever (no window owns a
+    /// destroyed surface) while its MCP caller waits out the full
+    /// timeout for a decision nobody can ever make. Defaults to the
+    /// shared singleton; tests inject an isolated instance, same
+    /// rationale as `commandLogStore`/`sessionSurfaceMap` above.
+    var approvalInboxStore: ApprovalInboxStore = .shared
+
     #if DEBUG
     /// Test-only storage for injected `SurfaceView` fixtures. Populated
     /// via `_testInsert(view:id:)` and consulted as a fallback by
@@ -110,6 +120,7 @@ final class SurfaceRegistry {
             state: .attached
         )
         SurfaceLocator.shared.register(id: id, controller: controller)
+        SurfaceLocator.shared.registerView(id: id, view: surfaceView)
 
         logger.info("Surface created and registered: \(id)")
         return id
@@ -177,6 +188,20 @@ final class SurfaceRegistry {
             // so `commandLogStore.markOrphaned(surfaceID:)` here is a
             // no-op for any id genuinely foreign to CommandLogStore too.
             orphanCommandsIfNotPersistent(surfaceID: id)
+            approvalInboxStore.expireForSurface(id)
+            // P3 review (F4): symmetric with the main destroy path below
+            // -- unregisterView + the .calyxSurfaceDestroyed post must
+            // ALSO run here so SurfacePropertyStore prunes a
+            // _testInsert-only surface's recorded title/cwd on destroy,
+            // not just a real registry entry's. Safe unconditionally
+            // (not #if DEBUG): both are no-ops for an id neither
+            // SurfaceLocator nor any observer has ever seen.
+            SurfaceLocator.shared.unregisterView(id: id)
+            NotificationCenter.default.post(
+                name: .calyxSurfaceDestroyed,
+                object: nil,
+                userInfo: ["surfaceID": id]
+            )
             return
         }
         guard entry.state != .destroyed else { return }
@@ -197,9 +222,11 @@ final class SurfaceRegistry {
 
         entries.removeValue(forKey: id)
         SurfaceLocator.shared.unregister(id: id)
+        SurfaceLocator.shared.unregisterView(id: id)
         logger.info("Surface destroyed: \(id)")
 
         orphanCommandsIfNotPersistent(surfaceID: id)
+        approvalInboxStore.expireForSurface(id)
 
         NotificationCenter.default.post(
             name: .calyxSurfaceDestroyed,
@@ -313,6 +340,7 @@ final class SurfaceRegistry {
     /// over test-only entries. DO NOT use from production code.
     func _testInsert(view: SurfaceView, id: UUID) {
         _testViewsByID[id] = view
+        SurfaceLocator.shared.registerView(id: id, view: view)
     }
     #endif
 }

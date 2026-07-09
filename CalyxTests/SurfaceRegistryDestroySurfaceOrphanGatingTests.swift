@@ -17,6 +17,14 @@
 //  Coverage:
 //  - No SessionSurfaceMap entry -> running commands become .orphaned
 //  - SessionSurfaceMap entry present -> running commands stay .running
+//  - (Cockpit P2 review finding W4) destroySurface also calls the
+//    injectable approvalInboxStore's expireForSurface(_:), same
+//    "defaults to .shared, test-injectable" DI shape as
+//    commandLogStore/sessionSurfaceMap -- proven here the same way, via
+//    the no-live-entry path (the only path testable without a real
+//    ghostty surface controller; both destroySurface call sites invoke
+//    approvalInboxStore.expireForSurface(id) identically, so exercising
+//    either exercises the wiring itself).
 //
 
 import XCTest
@@ -62,5 +70,31 @@ final class SurfaceRegistryDestroySurfaceOrphanGatingTests: XCTestCase {
                        "destroySurface on a surface still tracked in SessionSurfaceMap (a persistent " +
                        "session pane) must leave its running commands untouched -- the daemon-side " +
                        "session survives the pane's teardown")
+    }
+
+    func test_destroySurface_expiresApprovalRequestsTargetingTheDestroyedSurface() async throws {
+        let registry = SurfaceRegistry()
+        let approvalStore = ApprovalInboxStore()
+        registry.approvalInboxStore = approvalStore
+
+        let surfaceID = UUID()
+        let request = ApprovalRequest(
+            id: UUID(), source: .mcpTool(name: "pane_run"), targetSurfaceID: surfaceID, payload: "ls", createdAt: Date()
+        )
+        approvalStore.submit(request)
+
+        let waiter = Task { @MainActor in
+            await approvalStore.awaitDecision(id: request.id, timeoutMs: 5_000)
+        }
+        for _ in 0..<50 { await Task.yield() }
+
+        registry.destroySurface(surfaceID)
+
+        let result = await waiter.value
+        XCTAssertEqual(result, .expired,
+                       "destroySurface must call approvalInboxStore.expireForSurface(id), resolving any " +
+                       "in-flight awaitDecision for a request targeting the destroyed surface with .expired")
+        XCTAssertTrue(approvalStore.pending.isEmpty,
+                      "destroySurface must remove the expired request from pending")
     }
 }

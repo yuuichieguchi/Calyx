@@ -84,6 +84,7 @@ enum AccessibilityID {
         static let smoothScrollingSwitch = "calyx.settings.appearance.smoothScrollingSwitch"
         static let lspAutoInstallSwitch = "calyx.settings.lsp.lspAutoInstallSwitch"
         static let lspRequireConfirmationSwitch = "calyx.settings.lsp.lspRequireConfirmationSwitch"
+        static let cockpitAutoApproveSwitch = "calyx.settings.sessions.cockpitAutoApproveSwitch"
     }
     enum SessionBrowser {
         static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }
@@ -105,6 +106,19 @@ enum AccessibilityID {
         static let container = "calyx.recoveryBar.container"
         static let restoreButton = "calyx.recoveryBar.restoreButton"
         static let dismissButton = "calyx.recoveryBar.dismissButton"
+    }
+    /// Cockpit approval banner, shown at the top of a window when
+    /// ApprovalBannerModel.current is non-nil (see ApprovalBannerModel,
+    /// Calyx/Features/ApprovalInbox/). Same `calyx.approvalBanner.*`
+    /// shape as RecoveryBar (a container + its action buttons), plus a
+    /// `payload` identifier so an XCUITest suite can assert the rendered
+    /// (control-character-escaped) command text.
+    enum ApprovalBanner {
+        static let container = "calyx.approvalBanner.container"
+        static let allowButton = "calyx.approvalBanner.allowButton"
+        static let denyButton = "calyx.approvalBanner.denyButton"
+        static let alwaysAllowButton = "calyx.approvalBanner.alwaysAllowButton"
+        static let payload = "calyx.approvalBanner.payload"
     }
     enum Diff {
         static let container = "calyx.diff"

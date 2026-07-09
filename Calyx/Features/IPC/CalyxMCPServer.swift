@@ -106,6 +106,36 @@ final class CalyxMCPServer {
     /// `parseSurfaceID` fails to parse the header as a raw UUID.
     var sessionSurfaceMap: SessionSurfaceMap = .shared
 
+    /// The live-app view `pane_list`/`pane_split`/`tab_create` (and P5's
+    /// gated tools) dispatch through. Defaults to the real
+    /// `LiveCockpitAppAccess`; tests inject a fake so assertions don't
+    /// need a live `AppDelegate`/window, same rationale as
+    /// `agentRegistry`/`commandLogStore`/`sessionSurfaceMap`.
+    var cockpitAccess: CockpitAppAccessing = LiveCockpitAppAccess()
+
+    /// The approval inbox P5's gated Cockpit tools (pane_run/
+    /// pane_send_keys/palette_execute) submit into when
+    /// `ApprovalPolicy.requiresApproval()`, via `lazyCockpitBridge`'s own
+    /// `gate(toolName:targetSurfaceID:payload:)`. Defaults to the shared
+    /// singleton; tests inject an isolated instance, same rationale as
+    /// `agentRegistry`/`commandLogStore`/`sessionSurfaceMap`/
+    /// `cockpitAccess`. This is a security-critical seam: `stop()`
+    /// synchronously drains every pending request via `expireAll()` (see
+    /// that method), so a stopped server never strands an MCP caller
+    /// waiting on a decision nobody can make anymore.
+    var approvalInbox: ApprovalInboxStore = .shared
+
+    /// Lazily constructed, cached `MCPCockpitBridge` that Cockpit tool
+    /// calls dispatch through -- same `lazy` caveat as
+    /// `lazyCommandLogBridge`: only built on first actual Cockpit-tool
+    /// dispatch, by which point any test that overrides
+    /// `cockpitAccess`/`sessionSurfaceMap`/`approvalInbox`/
+    /// `agentRegistry`/`commandLogStore` has already done so.
+    private lazy var lazyCockpitBridge = MCPCockpitBridge(
+        access: cockpitAccess, sessionSurfaceMap: sessionSurfaceMap,
+        approvals: approvalInbox, agentRegistry: agentRegistry, commandLogStore: commandLogStore
+    )
+
     /// Records an agent hook event's self-reported session ID into the
     /// calyx-session daemon's per-session meta map (P4), so a later
     /// reattach can offer to resume the same CLI conversation. Defaults
@@ -836,6 +866,11 @@ final class CalyxMCPServer {
         // (or a start()-triggered restart) leaves stale rows on screen
         // for panes the registry will never hear from again.
         agentRegistry.reset()
+        // Synchronously drains every pending Cockpit approval request so
+        // a stopped server never strands an MCP caller waiting on a
+        // decision nobody can make anymore -- see
+        // `CalyxMCPServerCockpitToolsTests.test_serverStop_expiresPendingApprovals`.
+        approvalInbox.expireAll()
         Task { await store.cleanup() }
 
         // LSP bridge teardown. `stop()` is synchronous to match the
@@ -1337,6 +1372,15 @@ final class CalyxMCPServer {
             )
         }
 
+        // Cockpit route — dispatched through `MCPCockpitBridge`.
+        if MCPRouter.isCockpitTool(name: toolName) {
+            return await handleCockpitToolCall(
+                id: id,
+                toolName: toolName,
+                params: params
+            )
+        }
+
         let arguments = extractDict(params, "arguments")
 
         switch toolName {
@@ -1656,6 +1700,27 @@ final class CalyxMCPServer {
         let arguments = extractDict(params, "arguments") ?? [:]
         do {
             let text = try await lazyCommandLogBridge.handleToolCall(name: toolName, arguments: arguments)
+            return toolSuccess(id: id, text: text)
+        } catch {
+            return toolError(id: id, text: error.localizedDescription)
+        }
+    }
+
+    // MARK: - Cockpit Tool Dispatch
+
+    /// Route a Cockpit tool call (`pane_list`/`pane_split`/`tab_create`
+    /// this round) to `MCPCockpitBridge`, mirroring
+    /// `handleTerminalToolCall`'s shape exactly: `MCPCockpitBridgeError`
+    /// also conforms to `LocalizedError`, so a single generic `catch`
+    /// builds the tool-error text from `error.localizedDescription`.
+    private func handleCockpitToolCall(
+        id: JSONRPCId,
+        toolName: String,
+        params: [String: AnyCodable]
+    ) async -> (statusCode: Int, body: Data?) {
+        let arguments = extractDict(params, "arguments") ?? [:]
+        do {
+            let text = try await lazyCockpitBridge.handleToolCall(name: toolName, arguments: arguments)
             return toolSuccess(id: id, text: text)
         } catch {
             return toolError(id: id, text: error.localizedDescription)

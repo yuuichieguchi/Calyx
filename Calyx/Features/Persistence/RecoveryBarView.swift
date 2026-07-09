@@ -79,7 +79,15 @@ struct RecoveryBarView: View {
 /// reduceTransparency path keeps its plain `Divider()`: that flat,
 /// non-glass mode has no shared surface to stay seamless with, so it
 /// still needs an explicit separator.
-private struct RecoveryBarBackgroundModifier: ViewModifier {
+///
+/// Reused as-is by `ApprovalBannerView` (Cockpit P2): both bars are
+/// hosted inside the same `MainContentView.body`'s `safeAreaInset(edge:
+/// .top)` VStack, sharing the identical continuous glass surface this
+/// modifier's own doc comment above describes -- widened from `private`
+/// to internal for that reuse, despite the RecoveryBar-specific name
+/// (only two usages so far; see this codebase's rule-of-three
+/// convention for why this isn't extracted further/renamed yet).
+struct RecoveryBarBackgroundModifier: ViewModifier {
     let reduceTransparency: Bool
     @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
     @AppStorage("themeColorPreset") private var themePreset = "original"

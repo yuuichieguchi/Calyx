@@ -37,7 +37,23 @@ final class CommandLogStore {
     /// Awaiters resolved by a specific record's completion. `awaitCompletion`
     /// always resolves to a concrete record id before registering here --
     /// see that method's doc comment.
-    private var awaitersByRecordID: [UUID: [CommandAwaitBridge]] = [:]
+    private var awaitersByRecordID: [UUID: [AwaitBridge<CommandRecord?>]] = [:]
+    /// Awaiters for `awaitNextCompletion`, keyed by surface rather than a
+    /// concrete record id -- unlike `awaitCompletion(commandID: nil)`,
+    /// which resolves its wait target EAGERLY at call time, this method's
+    /// whole point is to correlate against a command that may not have
+    /// even produced a `.running` record yet (see `awaitNextCompletion`'s
+    /// own doc comment), so there is no record id to key off of until one
+    /// actually finalizes and satisfies the predicate.
+    private var nextCompletionAwaitersBySurface: [UUID: [NextCompletionAwaiter]] = [:]
+
+    /// One pending `awaitNextCompletion` registration: `startedAfter` is
+    /// the predicate `finalize` checks each newly-finished record
+    /// against; `bridge` is resumed with the first satisfying record.
+    private struct NextCompletionAwaiter {
+        let startedAfter: Date
+        let bridge: AwaitBridge<CommandRecord?>
+    }
 
     private struct PendingEnd {
         let cmdID: String
@@ -160,6 +176,7 @@ final class CommandLogStore {
         records[index] = record
         recordsBySurface[surfaceID] = records
         resumeAwaiters(for: record)
+        resumeNextCompletionAwaiters(for: record, surfaceID: surfaceID)
     }
 
     // MARK: - Output materialization
@@ -375,18 +392,19 @@ final class CommandLogStore {
     }
 
     /// Bounded wait for record `id` to leave `.running`, same race shape
-    /// as SessionDaemonClient.bounded(operation:onTimeout:): a
-    /// `CommandAwaitBridge` arbitrates exactly-once resume between three
-    /// call sites -- a matching store mutation (finalize/markOrphaned/
-    /// trimRing, all MainActor-isolated), the timeout Task (also
-    /// MainActor-isolated), and `withTaskCancellationHandler`'s onCancel,
-    /// which is NOT actor-isolated and may run concurrently with the
-    /// other two on a different thread. The timeout and cancellation
-    /// paths also unregister the bridge from `awaitersByRecordID` (the
-    /// real-completion path already does, via `resumeAwaiters`'s
-    /// `removeValue`) so a wait that's given up leaves no husk behind.
+    /// as SessionDaemonClient.bounded(operation:onTimeout:): an
+    /// `AwaitBridge<CommandRecord?>` arbitrates exactly-once resume
+    /// between three call sites -- a matching store mutation (finalize/
+    /// markOrphaned/trimRing, all MainActor-isolated), the timeout Task
+    /// (also MainActor-isolated), and `withTaskCancellationHandler`'s
+    /// onCancel, which is NOT actor-isolated and may run concurrently
+    /// with the other two on a different thread. The timeout and
+    /// cancellation paths also unregister the bridge from
+    /// `awaitersByRecordID` (the real-completion path already does, via
+    /// `resumeAwaiters`'s `removeValue`) so a wait that's given up
+    /// leaves no husk behind.
     private func waitForRecord(id: UUID, timeoutMs: Int) async -> CommandRecord? {
-        let bridge = CommandAwaitBridge()
+        let bridge = AwaitBridge<CommandRecord?>()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<CommandRecord?, Never>) in
                 awaitersByRecordID[id, default: []].append(bridge)
@@ -404,17 +422,132 @@ final class CommandLogStore {
                 }
             }
         } onCancel: {
-            bridge.cancel()
+            bridge.cancel(resumingWith: nil)
             Task { @MainActor in
                 self.unregisterAwaiter(bridge, id: id)
             }
         }
     }
 
+    // MARK: - awaitNextCompletion
+
+    /// Like `awaitCompletion(commandID: nil)`, but immune to the
+    /// correlation race that method has when a caller sends a command and
+    /// immediately awaits its completion while still holding MainActor
+    /// synchronously: `awaitCompletion` resolves its wait target EAGERLY,
+    /// via `newestRunningRecord(surfaceID:)` AT CALL TIME -- but the
+    /// shell integration ingests the new command's own `.start` event
+    /// asynchronously (a separate `/command-event` POST that can't be
+    /// processed until the caller yields MainActor back), so at call time
+    /// that record may not exist yet. The result is either an immediate
+    /// nil (nothing running yet) or, worse, latching onto a DIFFERENT,
+    /// already-running command's record.
+    ///
+    /// This method instead resolves to the EARLIEST record on `surfaceID`
+    /// whose `startedAt` is strictly after `startedAfter` and has reached
+    /// `.finished` -- returning immediately if one already qualifies in
+    /// the ring at call time, else suspending and re-checking the
+    /// predicate against every record `finalize` transitions to
+    /// `.finished` from here on, resolving the first match. A caller that
+    /// captures `startedAfter` immediately before sending its own command
+    /// is therefore guaranteed to correlate to THAT command's own record,
+    /// never a stale or unrelated one. `timeoutMs` is clamped to
+    /// `[0, 3_600_000]`, same as `awaitCompletion`.
+    ///
+    /// Resume triggers: a qualifying `finalize`, `remapSurface` (which
+    /// carries an in-flight waiter old->new rather than resuming it, so a
+    /// reconnect mid-wait doesn't strand it), `markOrphaned` (resumes nil
+    /// -- the surface is gone, nothing will ever finish there), this
+    /// call's own timeout, and `expireAll`/`_testReset`. Deliberately NOT
+    /// a trigger: `trimRing`'s ring-capacity eviction -- this method waits
+    /// for the NEXT qualifying command, not a specific already-resolved
+    /// record, so one particular record aging out of the ring doesn't
+    /// invalidate a wait that's still watching for a future finalize.
+    func awaitNextCompletion(surfaceID: UUID, startedAfter: Date, timeoutMs: Int) async -> CommandRecord? {
+        let timeoutMs = min(max(timeoutMs, 0), 3_600_000)
+        if let existing = earliestFinishedRecord(surfaceID: surfaceID, startedAfter: startedAfter) {
+            return existing
+        }
+        return await waitForNextCompletion(surfaceID: surfaceID, startedAfter: startedAfter, timeoutMs: timeoutMs)
+    }
+
+    private func earliestFinishedRecord(surfaceID: UUID, startedAfter: Date) -> CommandRecord? {
+        recordsBySurface[surfaceID]?.first { $0.state == .finished && $0.startedAt > startedAfter }
+    }
+
+    /// Same three-call-site race shape as `waitForRecord` (a matching
+    /// `finalize`, the timeout Task, and `withTaskCancellationHandler`'s
+    /// non-isolated `onCancel`), reusing the same `AwaitBridge` machinery
+    /// -- the only difference is registering under `surfaceID` with a
+    /// `startedAfter` predicate instead of a resolved record id, since no
+    /// concrete id exists to wait on yet.
+    private func waitForNextCompletion(surfaceID: UUID, startedAfter: Date, timeoutMs: Int) async -> CommandRecord? {
+        let bridge = AwaitBridge<CommandRecord?>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<CommandRecord?, Never>) in
+                nextCompletionAwaitersBySurface[surfaceID, default: []].append(
+                    NextCompletionAwaiter(startedAfter: startedAfter, bridge: bridge)
+                )
+                let timeoutTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(timeoutMs) * 1_000_000)
+                    guard !Task.isCancelled else { return }
+                    self.unregisterNextCompletionAwaiter(bridge, surfaceID: surfaceID)
+                    bridge.resume(with: nil)
+                }
+                let alreadyCancelled = bridge.register(continuation: continuation, timeoutTask: timeoutTask)
+                if alreadyCancelled {
+                    timeoutTask.cancel()
+                    unregisterNextCompletionAwaiter(bridge, surfaceID: surfaceID)
+                    bridge.resume(with: nil)
+                }
+            }
+        } onCancel: {
+            bridge.cancel(resumingWith: nil)
+            Task { @MainActor in
+                self.unregisterNextCompletionAwaiter(bridge, surfaceID: surfaceID)
+            }
+        }
+    }
+
+    /// Identity-based, idempotent removal -- same rationale as
+    /// `unregisterAwaiter`.
+    private func unregisterNextCompletionAwaiter(_ bridge: AwaitBridge<CommandRecord?>, surfaceID: UUID) {
+        guard var awaiters = nextCompletionAwaitersBySurface[surfaceID] else { return }
+        awaiters.removeAll { $0.bridge === bridge }
+        if awaiters.isEmpty {
+            nextCompletionAwaitersBySurface.removeValue(forKey: surfaceID)
+        } else {
+            nextCompletionAwaitersBySurface[surfaceID] = awaiters
+        }
+    }
+
+    /// Called from `finalize` for every newly-`.finished` record: resumes
+    /// (and removes) every pending `awaitNextCompletion` waiter on
+    /// `surfaceID` whose `startedAfter` predicate `record` satisfies,
+    /// leaving any non-satisfied waiter registered to keep watching later
+    /// finalizes (or eventually its own timeout).
+    private func resumeNextCompletionAwaiters(for record: CommandRecord, surfaceID: UUID) {
+        guard let awaiters = nextCompletionAwaitersBySurface[surfaceID] else { return }
+        var remaining: [NextCompletionAwaiter] = []
+        remaining.reserveCapacity(awaiters.count)
+        for awaiter in awaiters {
+            if record.startedAt > awaiter.startedAfter {
+                awaiter.bridge.resume(with: record)
+            } else {
+                remaining.append(awaiter)
+            }
+        }
+        if remaining.isEmpty {
+            nextCompletionAwaitersBySurface.removeValue(forKey: surfaceID)
+        } else {
+            nextCompletionAwaitersBySurface[surfaceID] = remaining
+        }
+    }
+
     /// Identity-based, idempotent removal -- safe to race a successful
     /// `resumeAwaiters` (which may have already removed the whole entry)
     /// from either the timeout Task or the non-isolated `onCancel` hop.
-    private func unregisterAwaiter(_ bridge: CommandAwaitBridge, id: UUID) {
+    private func unregisterAwaiter(_ bridge: AwaitBridge<CommandRecord?>, id: UUID) {
         guard var boxes = awaitersByRecordID[id] else { return }
         boxes.removeAll { $0 === bridge }
         if boxes.isEmpty {
@@ -439,6 +572,21 @@ final class CommandLogStore {
     // MARK: - markOrphaned
 
     func markOrphaned(surfaceID: UUID) {
+        // No command will ever finish on this surface again (it's the
+        // "the pane is gone" signal -- see this method's callers), so any
+        // in-flight awaitNextCompletion has nothing left to wait for.
+        // Resume with nil immediately rather than idling out the full
+        // timeout: unlike remapSurface (a live surface continuing under a
+        // new id, where the wait must survive), this surface is done.
+        // Deliberately BEFORE the early-return below: a surface can have
+        // a live awaitNextCompletion waiter (registered for a command
+        // that hasn't started yet) while having NO records at all yet,
+        // so this must not be skipped just because `recordsBySurface`
+        // has nothing for `surfaceID`.
+        if let awaiters = nextCompletionAwaitersBySurface.removeValue(forKey: surfaceID) {
+            for awaiter in awaiters { awaiter.bridge.resume(with: nil) }
+        }
+
         guard var records = recordsBySurface[surfaceID] else { return }
         var transitioned: [CommandRecord] = []
         for index in records.indices where records[index].state == .running {
@@ -472,6 +620,19 @@ final class CommandLogStore {
         if let oldPending = pendingEndsBySurface.removeValue(forKey: old) {
             pendingEndsBySurface[new, default: []].append(contentsOf: oldPending)
         }
+        // Carry over any in-flight awaitNextCompletion waiter too, same as
+        // the record/pending-end registries above -- a command started
+        // before the reconnect genuinely continues running under `new`
+        // (its own record was just remapped, right above), so the wait
+        // must survive the remap and resolve on that record's eventual
+        // finalize under `new`, not be stranded under `old` where no
+        // further finalize will ever arrive for it. MOVE, never
+        // resume-with-nil: unlike markOrphaned (where the surface is
+        // gone and nothing will ever finish), a remap is a live surface
+        // continuing under a new id.
+        if let oldAwaiters = nextCompletionAwaitersBySurface.removeValue(forKey: old) {
+            nextCompletionAwaitersBySurface[new, default: []].append(contentsOf: oldAwaiters)
+        }
     }
 
     /// Test seam: real implementation resets all in-memory state. Any
@@ -482,58 +643,14 @@ final class CommandLogStore {
         for boxes in awaitersByRecordID.values {
             for box in boxes { box.resume(with: nil) }
         }
+        for awaiters in nextCompletionAwaitersBySurface.values {
+            for awaiter in awaiters { awaiter.bridge.resume(with: nil) }
+        }
         recordsBySurface.removeAll()
         pendingEndsBySurface.removeAll()
         awaitersByRecordID.removeAll()
+        nextCompletionAwaitersBySurface.removeAll()
         reader = nil
         now = { Date() }
-    }
-}
-
-/// Thread-safe exactly-once resume for a single `awaitCompletion` wait,
-/// same shape as SessionDaemonClient's SessionDaemonBoundedRaceBridge:
-/// `register`/`resume`/`cancel` may be called from any of `waitForRecord`'s
-/// three MainActor-or-not call sites, so the internal state is guarded
-/// by a lock rather than actor isolation. `@unchecked Sendable` is sound
-/// here for the same reason it is on `SessionDaemonBoundedRaceBridge`:
-/// every stored property is only ever touched inside `lock`.
-private final class CommandAwaitBridge: @unchecked Sendable {
-    private let lock = NSLock()
-    private var resumed = false
-    private var isCancelled = false
-    private var continuation: CheckedContinuation<CommandRecord?, Never>?
-    private var timeoutTask: Task<Void, Never>?
-
-    /// Returns whether `cancel()` already ran before this call -- the
-    /// caller must resume with nil immediately in that case, since
-    /// `cancel()` itself found no continuation yet to resume.
-    func register(continuation: CheckedContinuation<CommandRecord?, Never>, timeoutTask: Task<Void, Never>) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        self.continuation = continuation
-        self.timeoutTask = timeoutTask
-        return isCancelled
-    }
-
-    @discardableResult
-    func resume(with record: CommandRecord?) -> Bool {
-        lock.lock()
-        guard !resumed, let continuation else { lock.unlock(); return false }
-        resumed = true
-        self.continuation = nil
-        let task = timeoutTask
-        timeoutTask = nil
-        lock.unlock()
-        task?.cancel()
-        continuation.resume(returning: record)
-        return true
-    }
-
-    func cancel() {
-        lock.lock()
-        isCancelled = true
-        let hasRegistered = continuation != nil
-        lock.unlock()
-        guard hasRegistered else { return }
-        resume(with: nil)
     }
 }

@@ -67,6 +67,23 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         hasPreservedSessionSnapshot: (NSApp.delegate as? AppDelegate)?.hasPreservedSessionSnapshot ?? false,
         onRestore: { (NSApp.delegate as? AppDelegate)?.recoverPreservedSession() }
     )
+    /// Cockpit approval banner's per-window view-model
+    /// (ApprovalBannerModel.swift). Unlike `recoveryBarModel` above, its
+    /// `ownsSurface`/`isKeyWindow` closures need `self` (to walk THIS
+    /// window's own `windowSession` / read THIS window's own key-window
+    /// state), so this cannot be a class-level default-value initializer
+    /// the way `recoveryBarModel` is -- Swift's two-phase init forbids
+    /// capturing `self` before every stored property is set and
+    /// `super.init` has run. `lazy var` sidesteps that entirely: its
+    /// initializer expression only runs on first access, by which point
+    /// this instance is always fully constructed, so `[weak self]` here
+    /// is safe without threading a post-`super.init()` assignment
+    /// through `init(window:windowSession:restoring:initialHost:)`.
+    lazy var approvalBannerModel: ApprovalBannerModel = ApprovalBannerModel(
+        store: .shared,
+        ownsSurface: { [weak self] id in self?.windowSessionOwnsSurface(id) ?? false },
+        isKeyWindow: { [weak self] in self?.window?.isKeyWindow ?? false }
+    )
     private var closingTabIDs: Set<UUID> = []
     #if DEBUG
     /// Test seam (P4 round-4 fix RED phase): read-only observability
@@ -1043,6 +1060,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             activeDiffSource: activeDiffSource,
             activeDiffReviewStore: activeDiffReviewStore,
             recoveryBarModel: recoveryBarModel,
+            approvalBannerModel: approvalBannerModel,
             sidebarMode: Binding(
                 get: { [weak self] in self?.windowSession.sidebarMode ?? .tabs },
                 set: { [weak self] in
@@ -1120,6 +1138,23 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// on to pick up an external `@Observable` change on its own). Not
     /// `private`: called from AppDelegate.swift, a different file.
     func refreshRecoveryBar() {
+        refreshHostingView()
+    }
+
+    /// Same "mutate observable state, then explicitly refresh" pattern
+    /// as `refreshRecoveryBar()` above -- called whenever
+    /// `ApprovalInboxStore` changes (relayed via the
+    /// `.calyxApprovalInboxChanged` notification, observed below) or
+    /// this window's key state changes: a window-agnostic (nil
+    /// `targetSurfaceID`) request's visibility depends on
+    /// `window.isKeyWindow`, which is plain `NSWindow` state, not itself
+    /// `@Observable`, so `windowDidBecomeKey`/`windowDidResignKey` must
+    /// also trigger this to re-evaluate `approvalBannerModel.current`.
+    @objc private func handleApprovalInboxChanged(_ notification: Notification) {
+        refreshApprovalBanner()
+    }
+
+    func refreshApprovalBanner() {
         refreshHostingView()
     }
 
@@ -1226,7 +1261,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// caller's shape) is unchanged, a local tab exactly as before this
     /// parameter existed. Reached by `AppDelegate.spawnRemoteSessionTab
     /// (host:)` when a key window controller already exists.
-    func createNewTab(inheritedConfig: Any? = nil, host: String? = nil) {
+    ///
+    /// `spawnCwd` (Cockpit `tab_create`): forwarded to
+    /// `resolveNewTabSpawnCwd(override:)`, which returns the pre-Cockpit
+    /// `activeTab?.pwd ?? NSHomeDirectory()` expression unchanged when
+    /// `nil` (every existing caller's shape).
+    func createNewTab(inheritedConfig: Any? = nil, host: String? = nil, spawnCwd: String? = nil) {
         guard let app = GhosttyAppController.shared.app,
               let window = self.window,
               let group = windowSession.activeGroup else { return }
@@ -1243,7 +1283,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         guard let surfaceID = createManagedSurface(
             tab: tab, app: app, config: config,
-            passthroughPwd: nil, spawnCwd: activeTab?.pwd ?? NSHomeDirectory(), origin: .tab, host: host
+            passthroughPwd: nil, spawnCwd: resolveNewTabSpawnCwd(override: spawnCwd), origin: .tab, host: host
         ) else {
             logger.error("Failed to create surface for new tab")
             return
@@ -1264,6 +1304,202 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         restoreFocus()
         retargetComposeOverlayIfNeeded()
         requestSave()
+    }
+
+    // MARK: - Cockpit Seams
+    //
+    // Backs LiveCockpitAppAccess (Calyx/Features/Cockpit/CockpitAppAccess.swift)
+    // -- see CalyxTests/Cockpit/CockpitAppAccessSeamTests.swift for the
+    // specced contract these satisfy.
+
+    /// Extracted from `handleNewSplitNotification`'s body (same
+    /// createManagedSurface + splitTree.insert shape), but taking a
+    /// `surfaceID` directly (Cockpit's `pane_split` has no
+    /// `SurfaceView`/notification to key off of) and an explicit `app`
+    /// parameter rather than resolving `GhosttyAppController.shared.app`
+    /// internally -- that global is `nil` in this test host (same
+    /// constraint `createManagedSurface` was already adjusted for, see
+    /// `CalyxWindowControllerCreateManagedSurfaceRemoteHostTests`'s
+    /// header), so an internally-resolving `performSplit` could never be
+    /// driven by a unit test even once correctly implemented. Returns
+    /// `nil` when `surfaceID` isn't a leaf in any tab this window owns,
+    /// without touching the tree or creating a surface.
+    ///
+    /// `config` defaults to `nil` (Cockpit callers never have a
+    /// pre-built ghostty config); `handleNewSplitNotification` passes its
+    /// own `inherited_config` userInfo value through here unchanged so
+    /// that notification-triggered splits keep inheriting the source
+    /// surface's font size/theme exactly as before this method was
+    /// extracted -- a trailing defaulted parameter rather than dropping
+    /// that behavior, since no test exercises it either way.
+    func performSplit(
+        surfaceID: UUID,
+        direction: SplitDirection,
+        app: ghostty_app_t,
+        config: ghostty_surface_config_s? = nil
+    ) -> UUID? {
+        guard let tab = findTab(bySplitLeaf: surfaceID) else { return nil }
+
+        var resolvedConfig = config ?? GhosttyFFI.surfaceConfigNew()
+        if let window = self.window {
+            resolvedConfig.scale_factor = Double(window.backingScaleFactor)
+        }
+
+        guard let newSurfaceID = createManagedSurface(
+            tab: tab, app: app, config: resolvedConfig,
+            passthroughPwd: nil, spawnCwd: tab.pwd ?? NSHomeDirectory(), inheritedCwd: tab.pwd, origin: .tab
+        ) else {
+            return nil
+        }
+
+        let (newTree, _) = tab.splitTree.insert(at: surfaceID, direction: direction, newID: newSurfaceID)
+        tab.splitTree = newTree
+
+        splitContainerView?.updateLayout(tree: tab.splitTree)
+
+        if let newView = tab.registry.view(for: newSurfaceID) {
+            window?.makeFirstResponder(newView)
+        }
+
+        return newSurfaceID
+    }
+
+    /// Factored out of `createNewTab`'s inline `spawnCwd:` argument
+    /// (`activeTab?.pwd ?? NSHomeDirectory()`) so Cockpit's `tab_create`
+    /// cwd override is directly unit-testable without
+    /// `GhosttyAppController.shared.app` (nil in this test host --
+    /// `createNewTab` itself can't be driven end-to-end here, same
+    /// constraint `AppDelegateSpawnRemoteSessionTabWindowLookupTests`
+    /// already documented for this identical guard). `override` is
+    /// trimmed of leading/trailing whitespace AND newlines first (an
+    /// agent-constructed payload built from raw shell output, e.g.
+    /// `$(pwd)`, plausibly carries a trailing `\n`); a non-nil override
+    /// takes priority UNLESS the trimmed result is empty (an MCP caller
+    /// passing `""`/`"\n"` almost certainly means "no override", not
+    /// "spawn at the empty path" -- treated the same as `nil`), then
+    /// expanded via `expandingTildeInPath` since it comes straight from
+    /// an MCP caller rather than already-resolved UI state; a nil (or
+    /// blank) override preserves createNewTab's pre-Cockpit behavior
+    /// exactly. Does not validate the resulting path exists -- P4's job.
+    func resolveNewTabSpawnCwd(override: String?) -> String {
+        guard let override else { return activeTab?.pwd ?? NSHomeDirectory() }
+        let trimmed = override.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return activeTab?.pwd ?? NSHomeDirectory() }
+        return NSString(string: trimmed).expandingTildeInPath
+    }
+
+    /// Shared by every synthetic-Return submission path
+    /// (`cockpitSendCommand`, `sendComposeText`'s AI-agent branch,
+    /// `sendReviewToAgent`): a pasted trailing newline alone is not
+    /// reliably treated as Return by bracketed-paste-aware shells (see
+    /// `AppDelegate.offerAgentResume`'s doc comment, ~line 2484, for the
+    /// verified-against-ghostty-core rationale), so the first synthetic
+    /// Return is always deferred 0.5s to let the paste complete before
+    /// confirming it; `double` (AI-agent targets: confirm the paste, then
+    /// submit) sends a second Return 0.5s after that. Preserves the exact
+    /// timing/order the two precedent call sites already had.
+    private func sendSyntheticReturn(controller: GhosttySurfaceController, double: Bool) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            var keyEvent = ghostty_input_key_s()
+            keyEvent.keycode = 0x24 // macOS keycode for Return/Enter
+            keyEvent.mods = GHOSTTY_MODS_NONE
+            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+            keyEvent.text = nil
+            keyEvent.unshifted_codepoint = 0
+            keyEvent.composing = false
+
+            keyEvent.action = GHOSTTY_ACTION_PRESS
+            controller.sendKey(keyEvent)
+            keyEvent.action = GHOSTTY_ACTION_RELEASE
+            controller.sendKey(keyEvent)
+
+            guard double else { return }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                keyEvent.action = GHOSTTY_ACTION_PRESS
+                controller.sendKey(keyEvent)
+                keyEvent.action = GHOSTTY_ACTION_RELEASE
+                controller.sendKey(keyEvent)
+            }
+        }
+    }
+
+    /// Every Cockpit write path enters through `cockpitSendCommand`/
+    /// `cockpitSendKeys`, so P5's approval gate has ONE choke point per
+    /// write kind.
+    ///
+    /// Sends `command` to `surfaceID`'s live surface via
+    /// `GhosttySurfaceController.sendText` (GhosttySurface.swift), which
+    /// resolves to ghostty's clipboard-paste completion path rather than
+    /// a raw keystroke stream -- deliberate, see `sendSyntheticReturn`'s
+    /// own doc comment for why a real synthetic keypress (not the pasted
+    /// text alone) is required to submit. Resolves its tab via
+    /// `findTab(bySplitLeaf:)` (F3's unified pane-identity check, the
+    /// same one `ownsSplitLeaf`/`performSplit` use), not the
+    /// registry-based `findTab(surfaceID:)` -- so a `surfaceID`
+    /// `LiveCockpitAppAccess.paneExists`/`listPanes` reports as a pane
+    /// is never rejected here for a different reason. Returns whether
+    /// `surfaceID` resolved to a live surface in this window at all --
+    /// not whether the deferred keypresses eventually ran.
+    ///
+    /// No test drives this in P3 -- see CockpitAppAccessSeamTests.swift's
+    /// header for why (same `GhosttyAppController.shared.app`/live-surface
+    /// constraint as the rest of this section). P5 gates every caller of
+    /// this on human approval; P6 covers it end-to-end.
+    func cockpitSendCommand(surfaceID: UUID, command: String, doubleReturn: Bool) -> Bool {
+        guard let tab = findTab(bySplitLeaf: surfaceID),
+              let controller = tab.registry.controller(for: surfaceID) else {
+            return false
+        }
+
+        controller.sendText(command)
+        sendSyntheticReturn(controller: controller, double: doubleReturn)
+
+        return true
+    }
+
+    /// Every Cockpit write path enters through `cockpitSendCommand`/
+    /// `cockpitSendKeys`, so P5's approval gate has ONE choke point per
+    /// write kind.
+    ///
+    /// Sends raw `text` to `surfaceID`'s live surface via
+    /// `GhosttySurfaceController.sendText`, with NO synthetic Return --
+    /// unlike `cockpitSendCommand` (command submission), this backs
+    /// Cockpit's `pane_send_keys` tool, which injects arbitrary key/paste
+    /// input the caller controls the framing of. Resolves its tab via
+    /// `findTab(bySplitLeaf:)`, same as `cockpitSendCommand` -- see that
+    /// method's doc comment for why. Returns whether `surfaceID`
+    /// resolved to a live surface in this window at all.
+    func cockpitSendKeys(surfaceID: UUID, text: String) -> Bool {
+        guard let tab = findTab(bySplitLeaf: surfaceID),
+              let controller = tab.registry.controller(for: surfaceID) else {
+            return false
+        }
+
+        controller.sendText(text)
+        return true
+    }
+
+    /// Looks up `id` in this window's `commandRegistry` and, only if
+    /// `isAvailable()` is true, records usage and runs its handler --
+    /// unlike `CommandPaletteView.executeSelected()` (which relies on
+    /// `search(query:)` having already filtered unavailable commands out
+    /// before the user could ever select one), an MCP caller can name any
+    /// command id directly with no such filter upstream, so this seam
+    /// must gate on `isAvailable()` itself rather than trust the caller.
+    /// `nil` when no command with `id` is registered at all; `executed:
+    /// false` when found but currently unavailable (its handler is never
+    /// called in that case) -- `LiveCockpitAppAccess.executePaletteCommand`
+    /// turns the two into `.paletteCommandNotFound`/`.paletteCommandUnavailable`
+    /// respectively.
+    func cockpitExecutePaletteCommand(id: String) -> (command: PaletteCommand, executed: Bool)? {
+        guard let command = commandRegistry.allCommands.first(where: { $0.id == id }) else { return nil }
+        guard command.isAvailable() else { return (command, false) }
+
+        commandRegistry.recordUsage(command.id)
+        command.handler()
+
+        return (command, true)
     }
 
     /// Wires an already-constructed tab (built by `AppDelegate
@@ -1713,31 +1949,19 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         controller.sendText(text)
 
-        var keyEvent = ghostty_input_key_s()
-        keyEvent.keycode = 0x24
-        keyEvent.mods = GHOSTTY_MODS_NONE
-        keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-        keyEvent.text = nil
-        keyEvent.unshifted_codepoint = 0
-        keyEvent.composing = false
-
         if isAgent {
             // AI agent: same timing as sendReviewToAgent (confirm paste + submit)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                keyEvent.action = GHOSTTY_ACTION_PRESS
-                controller.sendKey(keyEvent)
-                keyEvent.action = GHOSTTY_ACTION_RELEASE
-                controller.sendKey(keyEvent)
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                    keyEvent.action = GHOSTTY_ACTION_PRESS
-                    controller.sendKey(keyEvent)
-                    keyEvent.action = GHOSTTY_ACTION_RELEASE
-                    controller.sendKey(keyEvent)
-                }
-            }
+            sendSyntheticReturn(controller: controller, double: true)
         } else {
             // Regular terminal: single Enter, immediate
+            var keyEvent = ghostty_input_key_s()
+            keyEvent.keycode = 0x24
+            keyEvent.mods = GHOSTTY_MODS_NONE
+            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
+            keyEvent.text = nil
+            keyEvent.unshifted_codepoint = 0
+            keyEvent.composing = false
+
             keyEvent.action = GHOSTTY_ACTION_PRESS
             controller.sendKey(keyEvent)
             keyEvent.action = GHOSTTY_ACTION_RELEASE
@@ -1858,6 +2082,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .calyxFocusSurface, object: nil)
         center.addObserver(self, selector: #selector(handleSurfaceDestroyedForAgentMonitor(_:)),
                            name: .calyxSurfaceDestroyed, object: nil)
+        center.addObserver(self, selector: #selector(handleApprovalInboxChanged(_:)),
+                           name: .calyxApprovalInboxChanged, object: nil)
         center.addObserver(self, selector: #selector(handleShowChildExitedNotification(_:)),
                            name: .ghosttyShowChildExited, object: nil)
         center.addObserver(self, selector: #selector(handleConfirmingQuitDidEnd(_:)),
@@ -1942,31 +2168,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             splitDir = .horizontal
         }
 
-        var config: ghostty_surface_config_s
-        if let inheritedConfig = notification.userInfo?["inherited_config"] as? ghostty_surface_config_s {
-            config = inheritedConfig
-        } else {
-            config = GhosttyFFI.surfaceConfigNew()
-        }
-        if let window = self.window {
-            config.scale_factor = Double(window.backingScaleFactor)
-        }
+        let inheritedConfig = notification.userInfo?["inherited_config"] as? ghostty_surface_config_s
 
-        guard let newSurfaceID = createManagedSurface(
-            tab: tab, app: app, config: config,
-            passthroughPwd: nil, spawnCwd: tab.pwd ?? NSHomeDirectory(), inheritedCwd: tab.pwd, origin: .tab
-        ) else {
+        if performSplit(surfaceID: surfaceID, direction: splitDir, app: app, config: inheritedConfig) == nil {
             logger.error("Failed to create split surface")
-            return
-        }
-
-        let (newTree, _) = tab.splitTree.insert(at: surfaceID, direction: splitDir, newID: newSurfaceID)
-        tab.splitTree = newTree
-
-        splitContainerView?.updateLayout(tree: tab.splitTree)
-
-        if let newView = tab.registry.view(for: newSurfaceID) {
-            window?.makeFirstResponder(newView)
         }
     }
 
@@ -3216,6 +3421,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         return nil
     }
 
+    /// Whether THIS window's `windowSession` owns `surfaceID` -- backs
+    /// `approvalBannerModel`'s `ownsSurface` predicate, reusing
+    /// `findTab(surfaceID:)`'s existing walk rather than duplicating it.
+    private func windowSessionOwnsSurface(_ surfaceID: UUID) -> Bool {
+        findTab(surfaceID: surfaceID) != nil
+    }
+
     /// R6-E (r6-fix-spec.md, A2): activates the tab (and, by extension
     /// via `switchToTab(id:)`, its group) containing `surfaceID`,
     /// reusing this controller's existing tab-switch logic rather than
@@ -3228,6 +3440,33 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     func activateTabContaining(surfaceID: UUID) {
         guard let tab = findTab(surfaceID: surfaceID) else { return }
         switchToTab(id: tab.id)
+    }
+
+    /// Unlike `findTab(surfaceID:)` (which checks `tab.registry`
+    /// membership), this checks `tab.splitTree` leaf membership instead
+    /// -- `performSplit`'s Cockpit callers only ever learn a pane id from
+    /// `listPanes()`'s own splitTree-leaf enumeration, which can name a
+    /// leaf whose registry entry a test double never populated (see
+    /// CockpitAppAccessSeamTests.swift), so this must match splitTree,
+    /// the same source of truth `listPanes()` itself reads from.
+    private func findTab(bySplitLeaf surfaceID: UUID) -> Tab? {
+        for group in windowSession.groups {
+            for tab in group.tabs where tab.splitTree.allLeafIDs().contains(surfaceID) {
+                return tab
+            }
+        }
+        return nil
+    }
+
+    /// Whether `surfaceID` is a live pane in THIS window -- i.e. a leaf
+    /// in some tab's current `splitTree`. Cockpit's single source of
+    /// pane identity (see `CockpitAppAccessing`'s own doc comment):
+    /// `LiveCockpitAppAccess.paneExists`/every pane operation resolve
+    /// the owning window/tab the same way `findTab(bySplitLeaf:)` does,
+    /// so "listed by listPanes" and "operable" are the same membership
+    /// test by construction, not two independently-maintained checks.
+    func ownsSplitLeaf(_ surfaceID: UUID) -> Bool {
+        findTab(bySplitLeaf: surfaceID) != nil
     }
 
     /// Like `findTab(surfaceID:)`, but also returns the owning group —
@@ -3269,6 +3508,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             focusedController?.setFocus(true)
             restoreFocus()
         }
+        // A window-agnostic (nil targetSurfaceID) approval request's
+        // visibility depends on `window.isKeyWindow` -- re-evaluate now
+        // that it just changed (see `refreshApprovalBanner()`'s own doc
+        // comment).
+        refreshApprovalBanner()
     }
 
     func windowDidResignKey(_ notification: Notification) {
@@ -3277,6 +3521,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         if windowSession.showCommandPalette {
             dismissCommandPalette()
         }
+        refreshApprovalBanner()
     }
 
     /// Last-window pre-close prompt path: if closing this window would
@@ -3883,30 +4128,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
 
         controller.sendText(payload)
-        // Send Enter twice as key events: first to confirm paste, second to submit
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            var keyEvent = ghostty_input_key_s()
-            keyEvent.keycode = 0x24 // macOS keycode for Return/Enter
-            keyEvent.mods = GHOSTTY_MODS_NONE
-            keyEvent.consumed_mods = GHOSTTY_MODS_NONE
-            keyEvent.text = nil
-            keyEvent.unshifted_codepoint = 0
-            keyEvent.composing = false
-
-            // First Enter
-            keyEvent.action = GHOSTTY_ACTION_PRESS
-            controller.sendKey(keyEvent)
-            keyEvent.action = GHOSTTY_ACTION_RELEASE
-            controller.sendKey(keyEvent)
-
-            // Second Enter
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                keyEvent.action = GHOSTTY_ACTION_PRESS
-                controller.sendKey(keyEvent)
-                keyEvent.action = GHOSTTY_ACTION_RELEASE
-                controller.sendKey(keyEvent)
-            }
-        }
+        // Send Enter twice: first to confirm paste, second to submit
+        sendSyntheticReturn(controller: controller, double: true)
 
         // Switch to the target terminal tab
         switchToTab(id: targetTab.id)

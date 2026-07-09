@@ -172,10 +172,19 @@ struct MCPRouter: Sendable {
         MCPCommandLogBridge.tools
     }
 
-    /// Combined IPC + LSP + terminal_* tool catalogue. Used by
+    /// Cockpit tool catalogue: pane_list / pane_split / tab_create
+    /// (ungated, P4) plus pane_run / pane_send_keys / palette_execute
+    /// (human-approval gated, P5). Delegates to `MCPCockpitBridge.tools`,
+    /// same rationale as `lspTools`/`terminalTools` delegating to their
+    /// own bridges.
+    static var cockpitTools: [MCPTool] {
+        MCPCockpitBridge.tools
+    }
+
+    /// Combined IPC + LSP + terminal_* + Cockpit tool catalogue. Used by
     /// `tools/list` to advertise every tool the server can dispatch.
     static var allTools: [MCPTool] {
-        tools + lspTools + terminalTools
+        tools + lspTools + terminalTools + cockpitTools
     }
 
     /// Classifier — does `name` belong to the LSP tool surface?
@@ -190,6 +199,17 @@ struct MCPRouter: Sendable {
     /// `isLSPTool`.
     static func isTerminalTool(name: String) -> Bool {
         name.hasPrefix("terminal_")
+    }
+
+    /// Classifier — does `name` belong to the Cockpit tool surface?
+    /// Unlike `isLSPTool`/`isTerminalTool` (prefix-based, since those
+    /// surfaces share a common namespace), Cockpit's six tool names
+    /// (`pane_list`, `pane_split`, `tab_create`, `pane_run`,
+    /// `pane_send_keys`, `palette_execute`) don't share one prefix, so
+    /// this checks `MCPCockpitBridge.toolNames` membership directly
+    /// instead.
+    static func isCockpitTool(name: String) -> Bool {
+        MCPCockpitBridge.toolNames.contains(name)
     }
 
     /// Opening paragraph shared by both instructions variants below.
@@ -244,6 +264,8 @@ struct MCPRouter: Sendable {
         "Browser automation tools (browser_*) are available when browser scripting is enabled via the Command Palette. Use browser_snapshot to inspect pages and browser_click/browser_fill to interact with elements. Element refs (@e1, @e2) from snapshots can be used as selectors.",
         "LSP language tools (lsp_*) are available when the LSP bridge is started. Use lsp_hover to inspect type information and documentation at a position in a file. Use lsp_definition / lsp_declaration / lsp_type_definition / lsp_implementation for navigation. Use lsp_references for finding usages. Use lsp_completion for autocomplete and lsp_workspace_symbol for cross-file symbol search. All LSP tools require workspace_root, language_id, and (most of them) file/line/column arguments.",
         "Terminal command-history tools (terminal_*) are available when shell integration is installed (zsh and fish only, currently). Use terminal_list_commands to list the commands recorded for a surface, oldest-first, terminal_read_output to fetch a specific command's captured output, and terminal_await_command to block until a running command finishes or the timeout elapses. terminal_await_command returns {\"status\": \"timeout\"} on timeout — simply call it again to keep waiting. terminal_list_commands and terminal_await_command's surface_id argument also accepts a calyx-session ID in place of the raw surface UUID (terminal_read_output takes command_id instead and has no surface_id argument).",
+        "Cockpit pane-discovery and layout tools are always available. Use pane_list to enumerate every terminal pane across all open Calyx windows (pane identity is split-tree leaf membership, so any pane it reports is guaranteed operable), pane_split to split an existing pane into two, and tab_create to open a new tab (optionally in a named group and/or at a specific working directory — this visibly changes focus in the live app window). pane_split's surface_id argument also accepts a calyx-session ID in place of the raw surface UUID.",
+        "Cockpit also offers three execution tools: pane_run runs a command in a pane (paste text plus Return), pane_send_keys sends raw text verbatim with no Return appended, and palette_execute runs a command-palette entry by its id. All three also accept a calyx-session ID in surface_id, same as pane_split. Each requires in-app human approval unless auto-approve is enabled, so the call can suspend until a person acts on it; {\"status\": \"denied\"} and {\"status\": \"approval_timeout\"} are normal, non-error results, not failures to retry — after a denied result, do not retry the same action without new user intent.",
     ]
 
     /// Static, trusted instructions text for a connection with no

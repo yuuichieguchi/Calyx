@@ -23,6 +23,7 @@ enum SettingsRow: String, CaseIterable {
     case historyPersistence
     case agentResume
     case agentResumeAutoExecute
+    case cockpitAutoApprove
     case commandTracking
     case openSessionBrowserButton
     case openConfigFileFooter
@@ -35,7 +36,7 @@ enum SettingsRow: String, CaseIterable {
         case .lspAutoInstall, .lspRequireConfirmation:
             return .lsp
         case .persistentSessions, .historyPersistence, .agentResume,
-             .agentResumeAutoExecute, .commandTracking, .openSessionBrowserButton:
+             .agentResumeAutoExecute, .cockpitAutoApprove, .commandTracking, .openSessionBrowserButton:
             return .sessions
         }
     }

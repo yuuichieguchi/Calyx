@@ -142,33 +142,45 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
     }
 
     // P4 added a 5th Sessions-pane switch (commandTracking, wired and
-    // covered independently by CommandTrackingSettingsToggleWiringTests)
-    // -- renamed from ...exactlyFour... and the count/message updated
-    // accordingly so this pin stays accurate rather than self-contradicting
-    // its own name.
-    func test_sessionsToggleSwitches_exactlyFive_inRowOrder() throws {
+    // covered independently by CommandTrackingSettingsToggleWiringTests);
+    // P2 (Cockpit) added a 6th (cockpitAutoApprove, placed after the
+    // agent-resume rows in SettingsRow's declared order) -- renamed from
+    // ...exactlyFive... and the count/message updated accordingly so
+    // this pin stays accurate rather than self-contradicting its own
+    // name.
+    func test_sessionsToggleSwitches_exactlySix_inRowOrder() throws {
         let switches = collectSwitches(in: try sessionsPaneView())
 
         XCTAssertEqual(
-            switches.count, 5,
-            "The Sessions pane must show exactly 5 switches (persistentSessions/historyPersistence/" +
-            "agentResume/agentResumeAutoExecute/commandTracking -- openSessionBrowserButton is a button, " +
-            "not a switch). Found \(switches.count)."
+            switches.count, 6,
+            "The Sessions pane must show exactly 6 switches (persistentSessions/historyPersistence/" +
+            "agentResume/agentResumeAutoExecute/cockpitAutoApprove/commandTracking -- " +
+            "openSessionBrowserButton is a button, not a switch). Found \(switches.count)."
         )
     }
 
+    // P2 (Cockpit) review finding F6: this zip previously only covered
+    // the first 4 switches, so the newly-added 5th (cockpitAutoApprove)
+    // had NO wiring assertion at all here -- an unwired dead toggle
+    // would have shipped green. Extended to include it.
+    // commandTracking (the 6th, last switch) is intentionally NOT
+    // duplicated here -- it's already independently covered by
+    // CommandTrackingSettingsToggleWiringTests.test_commandTrackingSwitch_existsWithTargetAndActionWired
+    // (identifier-based lookup, position-independent), so all 6 switches'
+    // target+action are asserted somewhere across the two files.
     func test_sessionsToggleSwitches_haveTargetAndActionWired() throws {
         let switches = collectSwitches(in: try sessionsPaneView())
-        try XCTSkipIf(switches.count != 5, "covered, and already failing, by the count pin above")
+        try XCTSkipIf(switches.count != 6, "covered, and already failing, by the count pin above")
 
         // SettingsRow's own declared order for the Sessions pane, filtered
-        // to the four switch-backed rows (SettingsPaneTests.expectedRows
-        // pins this exact ordering).
+        // to the switch-backed rows (SettingsPaneTests.expectedRows pins
+        // this exact ordering).
         let expected: [(name: String, selectorName: String)] = [
             ("persistentSessions", "persistentSessionsDidChange:"),
             ("historyPersistence", "historyPersistenceDidChange:"),
             ("agentResume", "agentResumeDidChange:"),
             ("agentResumeAutoExecute", "agentResumeAutoExecuteDidChange:"),
+            ("cockpitAutoApprove", "cockpitAutoApproveDidChange:"),
         ]
 
         for (toggleSwitch, (name, selectorName)) in zip(switches, expected) {
