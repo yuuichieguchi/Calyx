@@ -55,6 +55,15 @@ final class SurfaceRegistry {
     /// rationale as `commandLogStore`/`sessionSurfaceMap` above.
     var approvalInboxStore: ApprovalInboxStore = .shared
 
+    /// Memory `destroySurface(_:)` clears the destroyed surface's own
+    /// pane-scoped Always-Allow entries out of (see
+    /// `AgentHookApprovalMemory.clearPaneEntries(surfaceID:)`), so
+    /// pane-scoped memory never outlives the pane it was recorded for.
+    /// Cross-scoped memory (not keyed by surfaceID) is untouched by this
+    /// call. Defaults to the shared singleton; tests inject an isolated
+    /// instance, same rationale as `approvalInboxStore` above.
+    var agentHookApprovalMemory: AgentHookApprovalMemory = .shared
+
     #if DEBUG
     /// Test-only storage for injected `SurfaceView` fixtures. Populated
     /// via `_testInsert(view:id:)` and consulted as a fallback by
@@ -189,6 +198,7 @@ final class SurfaceRegistry {
             // no-op for any id genuinely foreign to CommandLogStore too.
             orphanCommandsIfNotPersistent(surfaceID: id)
             approvalInboxStore.expireForSurface(id)
+            agentHookApprovalMemory.clearPaneEntries(surfaceID: id)
             // P3 review (F4): symmetric with the main destroy path below
             // -- unregisterView + the .calyxSurfaceDestroyed post must
             // ALSO run here so SurfacePropertyStore prunes a
@@ -227,6 +237,7 @@ final class SurfaceRegistry {
 
         orphanCommandsIfNotPersistent(surfaceID: id)
         approvalInboxStore.expireForSurface(id)
+        agentHookApprovalMemory.clearPaneEntries(surfaceID: id)
 
         NotificationCenter.default.post(
             name: .calyxSurfaceDestroyed,

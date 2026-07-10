@@ -25,6 +25,11 @@
 //    ghostty surface controller; both destroySurface call sites invoke
 //    approvalInboxStore.expireForSurface(id) identically, so exercising
 //    either exercises the wiring itself).
+//  - (Stage E) destroySurface also calls the injectable
+//    agentHookApprovalMemory's clearPaneEntries(surfaceID:), same DI
+//    shape as approvalInboxStore above -- proven via the no-live-entry
+//    path too, and distinguished from an (incorrect) clearAll() call by
+//    asserting a cross-scoped entry survives the destroy.
 //
 
 import XCTest
@@ -96,5 +101,27 @@ final class SurfaceRegistryDestroySurfaceOrphanGatingTests: XCTestCase {
                        "in-flight awaitDecision for a request targeting the destroyed surface with .expired")
         XCTAssertTrue(approvalStore.pending.isEmpty,
                       "destroySurface must remove the expired request from pending")
+    }
+
+    func test_destroySurface_clearsAgentHookApprovalMemoryPaneEntries_butNotCrossMemory() {
+        let registry = SurfaceRegistry()
+        let memory = AgentHookApprovalMemory()
+        registry.agentHookApprovalMemory = memory
+
+        let surfaceID = UUID()
+        let otherSurfaceID = UUID()
+        memory.rememberPane(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash")
+        memory.rememberCross(kind: AgentEntry.claudeCodeKind, toolName: "Write")
+        XCTAssertTrue(memory.isAutoAllowed(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                     "precondition: the pane memory was recorded before destroySurface")
+
+        registry.destroySurface(surfaceID)
+
+        XCTAssertFalse(memory.isAutoAllowed(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                       "destroySurface must call agentHookApprovalMemory.clearPaneEntries(surfaceID:), " +
+                       "removing the destroyed surface's own pane entry")
+        XCTAssertTrue(memory.isAutoAllowed(surfaceID: otherSurfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Write"),
+                     "destroySurface must leave CROSS-scoped memory untouched -- it must call " +
+                     "clearPaneEntries(surfaceID:), not clearAll()")
     }
 }

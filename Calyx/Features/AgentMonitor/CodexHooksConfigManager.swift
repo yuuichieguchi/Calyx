@@ -56,16 +56,17 @@ struct CodexHooksConfigManager: Sendable {
     // MARK: - Public API
 
     /// Replaces Calyx's managed block in `configPath` with a freshly built
-    /// one for `scriptPath`'s 6 target events, preserving everything else
-    /// in the file verbatim. Idempotent: re-running strips the prior
-    /// managed block (wherever it is) before appending the new one at EOF,
-    /// rather than duplicating it.
-    static func installHooks(scriptPath: String, configPath: String? = nil) throws {
-        guard !scriptPath.contains("'") else {
+    /// one for `scriptPath`'s 6 target events plus `approvalScriptPath`'s
+    /// extra synchronous `PreToolUse` pair, preserving everything else in
+    /// the file verbatim. Idempotent: re-running strips the prior managed
+    /// block (wherever it is) before appending the new one at EOF, rather
+    /// than duplicating it.
+    static func installHooks(scriptPath: String, approvalScriptPath: String, configPath: String? = nil) throws {
+        guard !scriptPath.contains("'"), !approvalScriptPath.contains("'") else {
             // TOML literal strings (`'...'`) have no escape mechanism, and
             // `command = '"<scriptPath>" codex'` relies on one — a `'` in
-            // scriptPath would truncate the literal early and corrupt the
-            // TOML.
+            // either scriptPath would truncate the literal early and
+            // corrupt the TOML.
             throw CodexHooksConfigError.invalidScriptPath
         }
 
@@ -93,7 +94,7 @@ struct CodexHooksConfigManager: Sendable {
             if !result.hasSuffix("\n") { result += "\n" }
             if !result.hasSuffix("\n\n") { result += "\n" }
         }
-        result += managedBlock(scriptPath: scriptPath) + "\n"
+        result += managedBlock(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath) + "\n"
 
         guard let data = result.data(using: .utf8) else {
             throw CodexHooksConfigError.writeFailed("UTF-8 encoding failed")
@@ -159,9 +160,26 @@ struct CodexHooksConfigManager: Sendable {
         """
     }
 
-    private static func managedBlock(scriptPath: String) -> String {
+    /// `PreToolUse`'s extra synchronous approval entry — a second
+    /// `[[hooks.PreToolUse]]` pair alongside the one `hookEntry` already
+    /// writes for it, POSTing through `calyx-approval-hook` instead of
+    /// `calyx-agent-hook`, with a timeout of
+    /// `ApprovalHookTiming.hookEntryTimeoutSeconds` (600) rather than the
+    /// monitor entries' fire-and-forget `5`.
+    private static func approvalHookEntry(approvalScriptPath: String) -> String {
+        """
+        [[hooks.PreToolUse]]
+        [[hooks.PreToolUse.hooks]]
+        type = "command"
+        command = '"\(approvalScriptPath)" \(AgentEntry.codexKind)'
+        timeout = \(ApprovalHookTiming.hookEntryTimeoutSeconds)
+        """
+    }
+
+    private static func managedBlock(scriptPath: String, approvalScriptPath: String) -> String {
         let eventEntries = targetEvents.map { hookEntry(eventName: $0, scriptPath: scriptPath) }
-        return ([beginLine] + eventEntries + [endLine]).joined(separator: "\n")
+        return ([beginLine] + eventEntries + [approvalHookEntry(approvalScriptPath: approvalScriptPath)] + [endLine])
+            .joined(separator: "\n")
     }
 
     // MARK: - Private: Managed Block Removal
@@ -213,9 +231,10 @@ struct CodexHooksConfigManager: Sendable {
     /// body, for the orphan-BEGIN self-heal in `removingManagedBlock`: a
     /// blank line, a `#` comment, a `[[hooks.*]]` array-of-tables header, or
     /// a `type` / `command` (only when its value references
-    /// `AgentHookScript.fileName`, i.e. it's plausibly one of Calyx's own
-    /// command entries, not unrelated user TOML that happens to have a
-    /// `command` key) / `timeout` key line.
+    /// `AgentHookScript.fileName` or `ApprovalHookScript.fileName`, i.e.
+    /// it's plausibly one of Calyx's own command entries, not unrelated
+    /// user TOML that happens to have a `command` key) / `timeout` key
+    /// line.
     private static func isCalyxGeneratedBlockLine(_ line: String) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         if trimmed.isEmpty { return true }
@@ -227,7 +246,8 @@ struct CodexHooksConfigManager: Sendable {
         if trimmed.range(of: #"^timeout\s*=\s*\d+$"#, options: .regularExpression) != nil {
             return true
         }
-        if trimmed.hasPrefix("command"), trimmed.contains(AgentHookScript.fileName) {
+        if trimmed.hasPrefix("command"),
+           trimmed.contains(AgentHookScript.fileName) || trimmed.contains(ApprovalHookScript.fileName) {
             return true
         }
         return false

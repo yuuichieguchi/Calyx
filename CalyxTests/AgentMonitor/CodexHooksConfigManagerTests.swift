@@ -41,6 +41,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
     private var tempDir: String!
     private var configPath: String!
     private var scriptPath: String!
+    private var approvalScriptPath: String!
 
     private static let expectedEvents = [
         "SessionStart", "UserPromptSubmit", "PreToolUse",
@@ -59,6 +60,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         try! FileManager.default.createDirectory(atPath: tempDir, withIntermediateDirectories: true)
         configPath = tempDir + "/config.toml"
         scriptPath = tempDir + "/bin/calyx-agent-hook"
+        approvalScriptPath = tempDir + "/bin/calyx-approval-hook"
     }
 
     override func tearDown() {
@@ -91,10 +93,14 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         "command = '\"\(scriptPath!)\" codex'"
     }
 
+    private var expectedApprovalCommandLine: String {
+        "command = '\"\(approvalScriptPath!)\" codex'"
+    }
+
     // MARK: - installHooks: fresh file
 
     func test_installHooks_newFile_writesAllSixEventPairsWithCommandEntry() throws {
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
 
         let content = readConfig()
         XCTAssertTrue(content.contains(Self.beginLine), "Managed block must start with the BEGIN marker")
@@ -108,13 +114,24 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         }
 
         XCTAssertEqual(occurrences(of: expectedCommandLine, in: content), Self.expectedEvents.count,
-                       "Each of the 6 events must get its own exact literal-string command entry")
-        XCTAssertEqual(occurrences(of: "type = \"command\"", in: content), Self.expectedEvents.count)
-        XCTAssertEqual(occurrences(of: "timeout = 5", in: content), Self.expectedEvents.count)
+                       "Each of the 6 events must still get its own exact monitor command entry")
+        XCTAssertEqual(occurrences(of: "type = \"command\"", in: content), Self.expectedEvents.count + 1,
+                       "6 monitor entries plus PreToolUse's extra synchronous approval entry")
+        XCTAssertEqual(occurrences(of: "timeout = 5", in: content), Self.expectedEvents.count,
+                       "Only the 6 monitor entries use timeout = 5")
+
+        // Stage C: PreToolUse alone gets a second [[hooks.PreToolUse]] pair
+        // for the new synchronous approval entry.
+        XCTAssertEqual(occurrences(of: "[[hooks.PreToolUse]]", in: content), 2,
+                       "PreToolUse must have two array-of-tables pairs: the monitor entry and the approval entry")
+        XCTAssertEqual(occurrences(of: expectedApprovalCommandLine, in: content), 1,
+                       "PreToolUse's approval entry must POST through calyx-approval-hook with the codex argv")
+        XCTAssertEqual(occurrences(of: "timeout = 600", in: content), 1,
+                       "The approval entry's timeout must be 600 (ApprovalHookTiming.hookEntryTimeoutSeconds)")
     }
 
     func test_installHooks_eachEventPairsTableThenHooksTableInOrder() throws {
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
         let content = readConfig()
 
         for eventName in Self.expectedEvents {
@@ -142,7 +159,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         """
         writeConfig(existing)
 
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
 
         let content = readConfig()
         XCTAssertTrue(content.contains("profile = \"default\""), "User's root key must be preserved")
@@ -163,15 +180,17 @@ final class CodexHooksConfigManagerTests: XCTestCase {
     // MARK: - installHooks: idempotency
 
     func test_installHooks_reinstall_isIdempotent() throws {
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
 
         let content = readConfig()
         XCTAssertEqual(occurrences(of: Self.beginLine, in: content), 1,
                        "Reinstalling must not duplicate the BEGIN marker")
         XCTAssertEqual(occurrences(of: Self.endLine, in: content), 1)
         XCTAssertEqual(occurrences(of: expectedCommandLine, in: content), Self.expectedEvents.count,
-                       "Reinstalling must not duplicate per-event command entries")
+                       "Reinstalling must not duplicate per-event monitor command entries")
+        XCTAssertEqual(occurrences(of: expectedApprovalCommandLine, in: content), 1,
+                       "Reinstalling must not duplicate the PreToolUse approval command entry")
     }
 
     // MARK: - removeHooks
@@ -184,7 +203,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         url = "http://localhost:9999/mcp"
         """
         writeConfig(existing)
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
 
         // Sanity: install must actually have added the managed block —
         // otherwise the assertions below would trivially pass against
@@ -234,7 +253,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         // Sanity: confirm removeHooks actually does something when a
         // managed block IS present — otherwise cases A/B above would be
         // indistinguishable from a permanently no-op implementation.
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
         XCTAssertTrue(readConfig().contains(Self.beginLine), "Precondition: install must add the managed block")
         try CodexHooksConfigManager.removeHooks(configPath: configPath)
         XCTAssertFalse(readConfig().contains(Self.beginLine), "removeHooks must remove an actual managed block")
@@ -266,7 +285,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         """
         writeConfig(existing)
 
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
 
         let content = readConfig()
         XCTAssertTrue(content.contains("profile = \"default\""),
@@ -280,6 +299,41 @@ final class CodexHooksConfigManagerTests: XCTestCase {
                        "alongside the freshly-wrapped one")
         XCTAssertEqual(occurrences(of: expectedCommandLine, in: content), Self.expectedEvents.count,
                        "A clean reinstall must still write exactly one command entry per event")
+    }
+
+    // isCalyxGeneratedBlockLine must also recognize a command line
+    // referencing calyx-approval-hook (not just calyx-agent-hook), so an
+    // orphan BEGIN left over from a Calyx version that already installed
+    // the approval entry self-heals cleanly too, rather than leaving the
+    // stale approval command line behind as unrecognized "real user
+    // content".
+    func test_installHooks_orphanBeginMarker_withStaleApprovalCommand_selfHeals() throws {
+        let staleApprovalPath = tempDir + "/old-install/calyx-approval-hook"
+        let existing = """
+        profile = "default"
+        \(Self.beginLine)
+        [[hooks.PreToolUse]]
+        [[hooks.PreToolUse.hooks]]
+        type = "command"
+        command = '"\(staleApprovalPath)" codex'
+        timeout = 600
+        """
+        writeConfig(existing)
+
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertTrue(content.contains("profile = \"default\""),
+                      "Unrelated content before the orphan block must survive")
+        XCTAssertFalse(content.contains(staleApprovalPath),
+                       "The orphaned approval entry's stale path must be stripped, not left duplicated")
+        XCTAssertEqual(occurrences(of: Self.beginLine, in: content), 1,
+                       "Self-healing an orphan BEGIN (with a stale approval entry) and reinstalling " +
+                       "must leave exactly one BEGIN marker")
+        XCTAssertEqual(occurrences(of: "[[hooks.PreToolUse]]", in: content), 2,
+                       "A clean reinstall must still write both PreToolUse pairs (monitor + approval)")
+        XCTAssertEqual(occurrences(of: expectedApprovalCommandLine, in: content), 1,
+                       "The freshly-wrapped approval entry must reference the current approvalScriptPath")
     }
 
     func test_removeHooks_orphanBeginImmediatelyFollowedByUserContent_onlyStripsOwnBlockLines() throws {
@@ -323,7 +377,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         FileManager.default.createFile(atPath: realFile, contents: Data("".utf8))
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: realFile)
 
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
 
         let realContent = try String(contentsOfFile: realFile, encoding: .utf8)
         XCTAssertTrue(realContent.contains(Self.beginLine),
@@ -351,7 +405,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         try FileManager.default.createSymbolicLink(atPath: middleLink, withDestinationPath: finalTarget)
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: middleLink)
 
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
 
         let realContent = try String(contentsOfFile: finalTarget, encoding: .utf8)
         XCTAssertTrue(realContent.contains(Self.beginLine),
@@ -385,8 +439,23 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         let badScriptPath = tempDir + "/it's-a-path/calyx-agent-hook"
 
         XCTAssertThrowsError(
-            try CodexHooksConfigManager.installHooks(scriptPath: badScriptPath, configPath: configPath),
+            try CodexHooksConfigManager.installHooks(
+                scriptPath: badScriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath
+            ),
             "A scriptPath containing a single quote would break the TOML literal string and must be rejected"
+        )
+    }
+
+    // Single-quote guard applies to approvalScriptPath too -- it's embedded
+    // in the exact same TOML literal-string shape as scriptPath.
+    func test_installHooks_approvalScriptPathContainingSingleQuote_throws() {
+        let badApprovalScriptPath = tempDir + "/it's-a-path/calyx-approval-hook"
+
+        XCTAssertThrowsError(
+            try CodexHooksConfigManager.installHooks(
+                scriptPath: scriptPath, approvalScriptPath: badApprovalScriptPath, configPath: configPath
+            ),
+            "An approvalScriptPath containing a single quote would break the TOML literal string and must be rejected"
         )
     }
 
@@ -396,7 +465,7 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         XCTAssertFalse(CodexHooksConfigManager.areHooksInstalled(configPath: configPath),
                        "No config file yet -> hooks must not be reported as installed")
 
-        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, configPath: configPath)
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
 
         XCTAssertTrue(CodexHooksConfigManager.areHooksInstalled(configPath: configPath),
                       "After installHooks, hooks must be reported as installed")

@@ -65,6 +65,17 @@ final class CalyxMCPServer {
         return fmt
     }()
 
+    /// The `/approval-request` route's path, shared by `route(request:)`'s
+    /// own switch case and `dispatchRoute`'s guard so the one path string
+    /// that gates the connection-drop watch exists in exactly one place.
+    private static let approvalRequestPath = "/approval-request"
+
+    /// Shared request-body size cap (bytes), checked BEFORE decode, by
+    /// both `routeCommandEvent` and `routeApprovalRequest` -- one 256 KiB
+    /// ceiling for every event-ingestion route on this server, rather
+    /// than two independently-maintained copies of the same literal.
+    private static let maxEventBodyBytes = 262_144
+
     // MARK: - Init
 
     init() {}
@@ -124,6 +135,45 @@ final class CalyxMCPServer {
     /// that method), so a stopped server never strands an MCP caller
     /// waiting on a decision nobody can make anymore.
     var approvalInbox: ApprovalInboxStore = .shared
+
+    /// Session-scoped "Always Allow" memory `routeApprovalRequest`
+    /// consults (after the global-auto-approve short-circuit, before
+    /// submitting to `approvalInbox`): a pane- or cross-scoped hit
+    /// short-circuits to 200 with an allow body, same as global
+    /// auto-approve, without ever reaching the inbox. Defaults to the
+    /// shared singleton; tests inject an isolated instance, same
+    /// rationale as `approvalInbox` above. `stop()` clears it via
+    /// `clearAll()`, mirroring that method's own `approvalInbox.expireAll()`.
+    var agentHookApprovalMemory: AgentHookApprovalMemory = .shared
+
+    /// Whether a resolved surface UUID corresponds to a still-live pane
+    /// anywhere in the app -- consulted by `routeApprovalRequest`
+    /// immediately before it would otherwise submit to `approvalInbox`
+    /// (R4): a stale/forged/torn-down surface short-circuits to 200 with
+    /// an EMPTY body, submitting nothing and posting no notification,
+    /// rather than queuing a request whose banner no window could ever
+    /// show (see `ApprovalBannerModel.isVisible` -- nothing owns a
+    /// surface that doesn't exist) while the hook script long-polls for
+    /// a decision nobody can ever make. Defaults to
+    /// `LiveCockpitAppAccess.paneExists(_:)` -- the same canonical
+    /// "does this surface exist" check `MCPCockpitBridge`'s `pane_run`/
+    /// `pane_send_keys` already gate on before ever bothering a human
+    /// (see `CockpitAppAccessing`'s own doc comment for why `paneExists`,
+    /// not a second, separately-maintained membership check, is the one
+    /// source of truth for pane identity). Test-overridable, same
+    /// rationale as `approvalInbox`/`agentHookApprovalMemory` above.
+    var approvalSurfaceExists: (UUID) -> Bool = { LiveCockpitAppAccess().paneExists($0) }
+
+    /// The timeout `POST /approval-request`'s long-poll (`routeApprovalRequest`)
+    /// gives `approvalInbox.awaitDecision` before resolving `.expired`.
+    /// Defaults to `ApprovalHookTiming.serverTimeoutMs` (see that enum's
+    /// header comment for the full nesting rationale against the hook
+    /// script's own curl timeout and the CLI's hook-entry timeout);
+    /// test-overridable so tests can drive the timeout path in well
+    /// under a second rather than actually waiting out the real
+    /// production value, same rationale as `MCPCockpitBridge`'s own
+    /// `approvalTimeoutMs`.
+    var approvalRequestTimeoutMs: Int = ApprovalHookTiming.serverTimeoutMs
 
     /// Lazily constructed, cached `MCPCockpitBridge` that Cockpit tool
     /// calls dispatch through -- same `lazy` caveat as
@@ -208,6 +258,8 @@ final class CalyxMCPServer {
             return await routeAgentEvent(request: request)
         case ("POST", "/command-event"):
             return await routeCommandEvent(request: request)
+        case ("POST", Self.approvalRequestPath):
+            return await routeApprovalRequest(request: request)
         default:
             return HTTPParser.response(statusCode: 404, body: nil)
         }
@@ -290,6 +342,22 @@ final class CalyxMCPServer {
         return sessionSurfaceMap.surfaceID(for: raw)
     }
 
+    /// Resolves `X-Calyx-Agent-Kind`, trimming whitespace and falling
+    /// back to `AgentEntry.claudeCodeKind` when the header is absent OR
+    /// present-but-blank (e.g. a proxy/plugin bug that sends
+    /// `X-Calyx-Agent-Kind: ` with no value), rather than letting an
+    /// empty-string kind reach the registry, the sidebar, or the
+    /// approval inbox. Shared by `routeAgentEvent` and
+    /// `routeApprovalRequest` so the same header is resolved identically
+    /// on both routes.
+    private func agentKind(from headers: [String: String]) -> String {
+        if let trimmed = header(named: "X-Calyx-Agent-Kind", in: headers)?
+            .trimmingCharacters(in: .whitespaces), !trimmed.isEmpty {
+            return trimmed
+        }
+        return AgentEntry.claudeCodeKind
+    }
+
     private func routeAgentEvent(request: HTTPRequest) async -> HTTPResponse {
         guard let authToken = bearerToken(from: request.headers), authToken == token else {
             return HTTPParser.response(statusCode: 401, body: nil)
@@ -303,17 +371,7 @@ final class CalyxMCPServer {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
 
-        // Trim whitespace and fall back to claude-code when the header is
-        // absent OR present-but-blank (e.g. a proxy/plugin bug that sends
-        // `X-Calyx-Agent-Kind: ` with no value), rather than letting an
-        // empty-string kind reach the registry and the sidebar.
-        let kind: String
-        if let trimmed = header(named: "X-Calyx-Agent-Kind", in: request.headers)?
-            .trimmingCharacters(in: .whitespaces), !trimmed.isEmpty {
-            kind = trimmed
-        } else {
-            kind = AgentEntry.claudeCodeKind
-        }
+        let kind = agentKind(from: request.headers)
         agentRegistry.handleHookEvent(event, surfaceID: surfaceID, kind: kind)
         // P4: record the agent's self-reported session ID (when
         // present) into the calyx-session daemon's per-session meta so
@@ -330,8 +388,8 @@ final class CalyxMCPServer {
 
     /// Ingests a shell integration's command-lifecycle event
     /// (`CommandEvent`) into `commandLogStore`. Contract (Green phase):
-    /// bearer token check (401) -> body present and <= 262_144 bytes,
-    /// cap checked BEFORE decode (400 missing / 413 oversized) ->
+    /// bearer token check (401) -> body present and <= maxEventBodyBytes
+    /// bytes, cap checked BEFORE decode (400 missing / 413 oversized) ->
     /// `CommandEvent.decode(from:)` (400 on nil) -> `X-Calyx-Surface-ID`
     /// header: missing/empty is a malformed-client 400, but a
     /// present-and-non-empty header that `resolveSurfaceID(from:)` still
@@ -351,7 +409,7 @@ final class CalyxMCPServer {
         guard let body = request.body else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
-        guard body.count <= 262_144 else {
+        guard body.count <= Self.maxEventBodyBytes else {
             return HTTPParser.response(statusCode: 413, body: nil)
         }
 
@@ -373,6 +431,153 @@ final class CalyxMCPServer {
 
         commandLogStore.ingest(event, surfaceID: surfaceID)
         return HTTPParser.response(statusCode: 204, body: nil)
+    }
+
+    /// Handles `POST /approval-request`, the long-poll endpoint the
+    /// `calyx-approval-hook` script blocks on from a CLI agent's
+    /// PreToolUse hook while a human decides whether to allow its next
+    /// tool call. Contract, in order: bearer auth (401) -> body present
+    /// (400) -> body.count <= maxEventBodyBytes, checked BEFORE decode
+    /// (413, mirrors `routeCommandEvent`) -> `AgentHookToolCall.decode` (400)
+    /// -> `resolveSurfaceID` (400) -> an unrecognized `X-Calyx-Agent-Kind`
+    /// (anything other than claude-code/codex) short-circuits to 200
+    /// with an EMPTY body, never submitting anything ->
+    /// `CockpitSettings.agentHookApprovalEnabled` being off does the
+    /// same -> global auto-approve (`!ApprovalPolicy.requiresApproval()`)
+    /// short-circuits to 200 with an ALLOW body, also without ever
+    /// submitting -> a Stage E `agentHookApprovalMemory.isAutoAllowed`
+    /// hit (pane OR cross scope) short-circuits the same way, also
+    /// without submitting -> R4: an `approvalSurfaceExists` miss (a
+    /// stale/forged/torn-down surface) short-circuits the same inert way
+    /// as the unrecognized-kind case above, also without submitting ->
+    /// otherwise submits an `ApprovalRequest(source: .agentHook(...))`,
+    /// posts one user notification (its `body` run through
+    /// `SecretRedactor.redact` first -- see that call site's own comment
+    /// for why only the notification, never the banner, is redacted),
+    /// and long-polls `approvalInbox.awaitDecisionHonoringCancellation`.
+    ///
+    /// Three invariants a future change here must preserve:
+    ///
+    /// (a) THE RESPONSE BODY IS THE HOOK'S STDOUT, BYTE FOR BYTE --
+    ///     Claude Code / Codex parse it directly as their own
+    ///     PreToolUse hook JSON contract (see
+    ///     `AgentHookPermissionResponse`'s header comment). Nothing here
+    ///     may wrap, prepend, or otherwise reshape it.
+    ///
+    /// (b) Fail-safe mapping: every path that resolves without a genuine
+    ///     human decision (timed-out long-poll, `server.stop()`'s drain,
+    ///     or this call's own Task being cancelled mid-poll) maps to
+    ///     `.expired`, which `AgentHookPermissionResponse` renders as
+    ///     "ask" for claude-code (defer to Claude Code's own prompt) or
+    ///     an empty body for codex (no "ask" analog there) -- NEVER
+    ///     "allow". `awaitDecisionHonoringCancellation` is what re-maps an
+    ///     `.allowed` decision that raced a concurrent cancellation of
+    ///     this call's own Task to `.expired` -- see that method's own
+    ///     doc comment on `ApprovalInboxStore` (the same re-check
+    ///     `MCPCockpitBridge.gate` also goes through, centralized there
+    ///     rather than duplicated in both places).
+    ///
+    /// (c) A hook killed client-side (curl's own `-m` deadline, the CLI's
+    ///     hook-entry timeout, or the whole hook process being killed
+    ///     outright, e.g. by SIGKILL) drops this connection out from
+    ///     under the still-suspended long-poll. `dispatchRoute`'s sentinel
+    ///     receive (scoped to this endpoint only -- see that method's own
+    ///     doc comment for the real detection mechanism, and why a
+    ///     `stateUpdateHandler`-based approach does NOT work here) is what
+    ///     notices the drop and cancels the `Task` running this call,
+    ///     which propagates into `approvalInbox.awaitDecision`'s
+    ///     cancellation handler and expires the pending request through
+    ///     the same mechanism as a timeout, clearing its banner. A
+    ///     decision that still resolves `.allowed` for such an
+    ///     already-abandoned call is harmless: no hook process is left to
+    ///     read this response, and nothing executes server-side as a
+    ///     result of it -- execution happens inside the CLI agent's own
+    ///     process, driven entirely by whatever it read from its own
+    ///     hook's stdout.
+    private func routeApprovalRequest(request: HTTPRequest) async -> HTTPResponse {
+        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+            return HTTPParser.response(statusCode: 401, body: nil)
+        }
+
+        guard let body = request.body else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+        guard body.count <= Self.maxEventBodyBytes else {
+            return HTTPParser.response(statusCode: 413, body: nil)
+        }
+
+        guard let call = AgentHookToolCall.decode(from: body) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        guard let surfaceID = resolveSurfaceID(from: request.headers) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        let kind = agentKind(from: request.headers)
+        guard kind == AgentEntry.claudeCodeKind || kind == AgentEntry.codexKind else {
+            // An agent CLI Calyx doesn't have a hook-response contract
+            // for at all (see `AgentHookPermissionResponse`'s own
+            // fail-safe contract) -- never submit to the inbox for one.
+            return HTTPParser.response(statusCode: 200, body: nil)
+        }
+
+        guard CockpitSettings.agentHookApprovalEnabled else {
+            return HTTPParser.response(statusCode: 200, body: nil)
+        }
+
+        guard ApprovalPolicy.requiresApproval() else {
+            return HTTPParser.response(
+                statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
+            )
+        }
+
+        if agentHookApprovalMemory.isAutoAllowed(surfaceID: surfaceID, kind: kind, toolName: call.toolName) {
+            return HTTPParser.response(
+                statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
+            )
+        }
+
+        // R4: a valid-FORMAT surface UUID no live surface registry
+        // actually knows about (pane already closed, or a stale/forged
+        // header) -- inert pass-through, same as the unrecognized-kind
+        // guard above, rather than queuing a request whose banner no
+        // window could ever show.
+        guard approvalSurfaceExists(surfaceID) else {
+            return HTTPParser.response(statusCode: 200, body: nil)
+        }
+
+        let requestID = UUID()
+        approvalInbox.submit(ApprovalRequest(
+            id: requestID,
+            source: .agentHook(toolName: call.toolName, kind: kind, summary: call.summary),
+            targetSurfaceID: surfaceID,
+            payload: call.payload,
+            createdAt: Date()
+        ))
+        // R3 fix-pin: the notification body is redacted through
+        // SecretRedactor -- the same redaction CommandLogStore already
+        // runs text through before persistence (see that type's own
+        // header comment) -- because a notification can leak into places
+        // (Notification Center history, a screen someone else can see)
+        // the human never explicitly chose to expose a raw secret to.
+        // The BANNER, in contrast, deliberately keeps `call.summary`
+        // verbatim (via `ApprovalRequest.displayPayload` /
+        // `.agentHook`'s own `summary`) -- the human approving this
+        // exact tool call must see exactly what they're being asked to
+        // approve, unredacted; `ControlCharacterDisplay` there guards a
+        // different concern (terminal-control-character spoofing), not
+        // secret leakage. NotificationSanitizer still runs inside
+        // sendNotification itself -- no need to sanitize title/body for
+        // that separate concern here.
+        NotificationManager.shared.sendNotification(
+            title: "\(AgentEntry.displayName(forKind: kind)) wants to run \(call.toolName)",
+            body: SecretRedactor.redact("\(call.toolName): \(call.summary)"),
+            tabID: surfaceID
+        )
+
+        let decision = await approvalInbox.awaitDecisionHonoringCancellation(id: requestID, timeoutMs: approvalRequestTimeoutMs)
+        return HTTPParser.response(statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: decision))
     }
 
     /// Case-insensitive `Authorization: Bearer <token>` extraction, shared
@@ -871,6 +1076,11 @@ final class CalyxMCPServer {
         // decision nobody can make anymore -- see
         // `CalyxMCPServerCockpitToolsTests.test_serverStop_expiresPendingApprovals`.
         approvalInbox.expireAll()
+        // Clears every Always-Allow memory recorded this session so a
+        // restarted server never silently auto-allows a request the
+        // human never actually decided to trust across a stop/start
+        // boundary -- see AgentHookApprovalMemory's own header comment.
+        agentHookApprovalMemory.clearAll()
         Task { await store.cleanup() }
 
         // LSP bridge teardown. `stop()` is synchronous to match the
@@ -1153,7 +1363,7 @@ final class CalyxMCPServer {
     private func finishRequest(connection: NWConnection, buffer: Data, accumulator: ReceiveAccumulator) async {
         do {
             let httpRequest = try HTTPParser.parse(buffer)
-            let httpResponse = await self.route(request: httpRequest)
+            let httpResponse = await self.dispatchRoute(connection: connection, request: httpRequest, accumulator: accumulator)
             self.sendHTTPResponse(connection: connection, httpResponse: httpResponse, accumulator: accumulator)
         } catch let error as HTTPParseError {
             let statusCode: Int
@@ -1165,6 +1375,84 @@ final class CalyxMCPServer {
             self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: statusCode, body: nil), accumulator: accumulator)
         } catch {
             self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 500, body: nil), accumulator: accumulator)
+        }
+    }
+
+    /// Runs `route(request:)`, additionally wiring a connection-drop
+    /// watch scoped to `POST /approval-request` ONLY (both method AND
+    /// path -- a stray non-POST request to the same path just falls
+    /// through to the plain `await route(request:)` path below, same as
+    /// every other route, and gets its ordinary 404 with no Task+sentinel
+    /// wrapping): that endpoint alone can suspend for up to
+    /// `approvalRequestTimeoutMs` (~9.5 minutes)
+    /// awaiting a human decision, so it alone needs to notice the peer
+    /// disappearing mid-poll (the hook process getting killed by curl's
+    /// own `-m` deadline or the CLI's hook-entry timeout) and cancel its
+    /// own `route(request:)` Task — cancellation propagates into
+    /// `approvalInbox.awaitDecision`'s cancellation handler, expiring
+    /// the pending request and clearing its banner (see
+    /// `routeApprovalRequest`'s own doc comment, point (c)). Every other
+    /// route still runs via the plain `await route(request:)` path below
+    /// completely unchanged — none of them block on a human, so none of
+    /// them need this.
+    ///
+    /// THE REAL MECHANISM (empirically verified, replacing an earlier
+    /// `connection.stateUpdateHandler`-based attempt that never actually
+    /// fired): with no `receive()` outstanding on a connection,
+    /// `NWConnection` does NOT report a peer's graceful FIN via
+    /// `stateUpdateHandler` at all — a SIGKILLed curl process on loopback
+    /// also produces a plain FIN, not a distinguishable error state. The
+    /// only way this framework ever surfaces either is a `receive()`
+    /// completing with `isComplete == true` or a non-nil `error`, which
+    /// can only happen while a `receive()` call is actually outstanding.
+    /// So this keeps a SENTINEL `connection.receive` call outstanding for
+    /// the whole lifetime of `routeTask`'s suspension: once it completes
+    /// with `isComplete`/`error` — and only while `accumulator.didRespond`
+    /// is still `false` — it cancels `routeTask`. A sentinel completing
+    /// AFTER `didRespond` (e.g. because `sendHTTPResponse`'s own
+    /// `connection.cancel()` also completes this same outstanding
+    /// receive) is a deliberate no-op, gated on the same `didRespond`
+    /// flag `sendHTTPResponse` itself uses as its single source of truth.
+    /// Any bytes the sentinel actually reads are discarded and the
+    /// sentinel simply re-arms itself — this connection never supports
+    /// pipelining (`Connection: close`), so there is nothing meaningful
+    /// to parse out of a non-terminal read here, but the watch must stay
+    /// outstanding afterward or a later genuine drop would go right back
+    /// to being undetectable.
+    private func dispatchRoute(
+        connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator
+    ) async -> HTTPResponse {
+        guard request.method == "POST", request.path == Self.approvalRequestPath else {
+            return await route(request: request)
+        }
+
+        let routeTask = Task { @MainActor in
+            await self.route(request: request)
+        }
+
+        armApprovalRequestConnectionDropSentinel(connection: connection, routeTask: routeTask, accumulator: accumulator)
+
+        return await routeTask.value
+    }
+
+    /// The sentinel receive `dispatchRoute` arms for `/approval-request`
+    /// — see that method's own doc comment for the full rationale. Kept
+    /// as its own recursive method (mirroring `receiveUntilComplete`'s
+    /// shape) rather than inline in `dispatchRoute`, so the re-arm-on-
+    /// non-terminal-data step reads as a plain recursive call instead of
+    /// a nested closure capturing itself.
+    private func armApprovalRequestConnectionDropSentinel(
+        connection: NWConnection, routeTask: Task<HTTPResponse, Never>, accumulator: ReceiveAccumulator
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: HTTPParser.maxHeaderSize + HTTPParser.maxBodySize) { [weak self] _, _, isComplete, error in
+            Task { @MainActor in
+                guard let self, !accumulator.didRespond else { return }
+                guard isComplete || error != nil else {
+                    self.armApprovalRequestConnectionDropSentinel(connection: connection, routeTask: routeTask, accumulator: accumulator)
+                    return
+                }
+                routeTask.cancel()
+            }
         }
     }
 

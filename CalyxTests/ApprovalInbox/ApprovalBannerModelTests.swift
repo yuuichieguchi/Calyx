@@ -22,9 +22,38 @@
 //    whatever request `current` has since advanced to
 //  - alwaysAllow(id:) turns on CockpitSettings.autoApproveEnabled,
 //    decides the clicked id .allowed, AND drains every other request
-//    already visible to this window in the same action
+//    already visible to this window in the same action -- for an
+//    `.mcpTool`-sourced request (unchanged, Stage E), but NEVER a queued
+//    `.agentHook`-sourced request on that same drain, even targeting the
+//    same surface (source-scoped, see
+//    test_alwaysAllow_mcpToolSource_doesNotDrainQueuedAgentHookRequest_onSameSurface).
+//    For an `.agentHook`-sourced request (Stage E, NEW), alwaysAllow(id:)
+//    instead records PANE Always-Allow memory (surfaceID, kind,
+//    toolName) via the injected `memory`, batch-allows only pending
+//    requests sharing that EXACT tuple, and never touches
+//    CockpitSettings.autoApproveEnabled at all
+//  - allowAllPending() (Stage E, NEW) decides EVERY pending request in
+//    the store .allowed, store-wide, with no window/ownership filter at
+//    all -- leaves no Always-Allow memory behind and never touches any
+//    setting
+//  - alwaysAllowAcrossPanes(id:) (Stage E, NEW; only meaningful for an
+//    `.agentHook`-sourced request) records CROSS Always-Allow memory
+//    (kind, toolName only -- no surfaceID) via the injected `memory`,
+//    then batch-allows every pending request store-wide sharing that
+//    (kind, toolName), regardless of window/pane, leaving a
+//    different-tool request pending and never touching any setting
 //  - pendingCountForWindow counts only requests this window owns
 //    (mirrors current's ownership filter, for a "+N more" affordance)
+//
+//  Stage E init change: ApprovalBannerModel's initializer gains a new
+//  `memory: AgentHookApprovalMemory` parameter, defaulted to `.shared`
+//  (mirrors this codebase's `= .shared`-defaulted seam convention, e.g.
+//  `CalyxMCPServer.approvalInbox`/`agentRegistry`) -- every PRE-EXISTING
+//  test below that never mentions `.agentHook` or the new actions
+//  continues to construct `ApprovalBannerModel(store:ownsSurface:isKeyWindow:)`
+//  unchanged and is unaffected; only the new tests below inject an
+//  isolated `AgentHookApprovalMemory()` instance explicitly, so no test
+//  leaks Always-Allow memory into another via the shared singleton.
 //
 
 import XCTest
@@ -37,6 +66,24 @@ final class ApprovalBannerModelTests: XCTestCase {
 
     private func makeRequest(targetSurfaceID: UUID?, payload: String = "ls", createdAt: Date = Date()) -> ApprovalRequest {
         ApprovalRequest(id: UUID(), source: .mcpTool(name: "pane_run"), targetSurfaceID: targetSurfaceID, payload: payload, createdAt: createdAt)
+    }
+
+    /// Stage E helper: an `.agentHook`-sourced request, the source
+    /// variant `alwaysAllow(id:)`/`alwaysAllowAcrossPanes(id:)` key their
+    /// new memory-recording behavior off of.
+    private func makeAgentHookRequest(
+        targetSurfaceID: UUID?,
+        kind: String = AgentEntry.claudeCodeKind,
+        toolName: String = "Bash",
+        createdAt: Date = Date()
+    ) -> ApprovalRequest {
+        ApprovalRequest(
+            id: UUID(),
+            source: .agentHook(toolName: toolName, kind: kind, summary: "ls -la /tmp"),
+            targetSurfaceID: targetSurfaceID,
+            payload: "{\"command\":\"ls -la /tmp\"}",
+            createdAt: createdAt
+        )
     }
 
     /// Bounded scheduler-yield loop, so a concurrently-spawned `Task`
@@ -269,6 +316,55 @@ final class ApprovalBannerModelTests: XCTestCase {
                        "alwaysAllow(id:) must leave a request targeting a surface this window doesn't own pending")
     }
 
+    /// R2 fix-pin: the `.mcpTool` branch of `alwaysAllow(id:)` drains
+    /// every OTHER pending request visible to this window with NO source
+    /// filter -- so a queued `.agentHook` request targeting the SAME
+    /// surface must NOT be swept up in an mcpTool click's drain. Only
+    /// that agentHook request's own (separate) always-allow action may
+    /// ever decide it -- see the `.agentHook` branch below, which records
+    /// its own pane/cross memory instead of touching the global setting.
+    func test_alwaysAllow_mcpToolSource_doesNotDrainQueuedAgentHookRequest_onSameSurface() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.alwaysAllowMcpToolDoesNotDrainAgentHook"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled, "precondition: the isolated suite starts with auto-approve off")
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let surfaceID = UUID()
+        let mcpToolRequest = makeRequest(
+            targetSurfaceID: surfaceID, payload: "pane_run", createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let agentHookRequest = makeAgentHookRequest(
+            targetSurfaceID: surfaceID, toolName: "Bash", createdAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        store.submit(mcpToolRequest)
+        store.submit(agentHookRequest)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true }, memory: memory)
+
+        let waiterMcp = Task { @MainActor in await store.awaitDecision(id: mcpToolRequest.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.alwaysAllow(id: mcpToolRequest.id)
+
+        XCTAssertTrue(CockpitSettings.autoApproveEnabled,
+                      "the mcpTool branch must still flip global auto-approve, unchanged")
+        XCTAssertEqual(store.pending.map(\.id), [agentHookRequest.id],
+                       "alwaysAllow(id:) on an .mcpTool request must decide only that request, leaving a " +
+                       "queued .agentHook request on the SAME surface pending -- it has its own, separate " +
+                       "always-allow action")
+        XCTAssertFalse(memory.isAutoAllowed(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                       "the mcpTool branch must never record agent-hook Always-Allow memory as a side effect")
+
+        let resultMcp = await waiterMcp.value
+        XCTAssertEqual(resultMcp, .allowed)
+
+        // Drain the still-pending agentHook request so this test doesn't
+        // leak a suspended awaitDecision waiter.
+        store.decide(id: agentHookRequest.id, .allowed)
+    }
+
     // MARK: - pendingCountForWindow
 
     func test_pendingCountForWindow_countsOnlyOwnedRequests() {
@@ -283,5 +379,233 @@ final class ApprovalBannerModelTests: XCTestCase {
 
         XCTAssertEqual(model.pendingCountForWindow, 2,
                        "pendingCountForWindow must count only requests targeting a surface this window owns")
+    }
+
+    // MARK: - alwaysAllow(id:) for an .agentHook-sourced request (Stage E)
+
+    /// Distinguishes the NEW agentHook branch from the existing mcpTool
+    /// branch above: instead of flipping the global auto-approve
+    /// setting, it must record PANE memory scoped to the clicked
+    /// request's own (targetSurfaceID, kind, toolName).
+    func test_alwaysAllow_agentHookSource_recordsPaneMemory_neverTouchesGlobalAutoApprove() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.alwaysAllowAgentHookPaneMemory"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled, "precondition: the isolated suite starts with auto-approve off")
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let surfaceID = UUID()
+        let foreignSurfaceID = UUID()
+        let clicked = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "Bash")
+        store.submit(clicked)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true }, memory: memory)
+
+        let waiter = Task { @MainActor in await store.awaitDecision(id: clicked.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.alwaysAllow(id: clicked.id)
+
+        XCTAssertTrue(memory.isAutoAllowed(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                     "alwaysAllow(id:) for an agentHook request must record PANE memory for the clicked " +
+                     "request's own (targetSurfaceID, kind, toolName)")
+        XCTAssertFalse(memory.isAutoAllowed(surfaceID: foreignSurfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                       "the recorded memory must be scoped to the clicked request's own surface, not every surface")
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled,
+                       "an agentHook alwaysAllow(id:) must NOT flip the global auto-approve toggle -- it only " +
+                       "records scoped Always-Allow memory")
+
+        let result = await waiter.value
+        XCTAssertEqual(result, .allowed, "alwaysAllow(id:) must still resolve the clicked request as allowed")
+    }
+
+    /// The batch-drain half of the same behavior: only a pending request
+    /// sharing the clicked request's EXACT (targetSurfaceID, kind,
+    /// toolName) is drained -- a different tool on the SAME pane, and
+    /// the SAME tool on a DIFFERENT pane, are each independently left
+    /// pending.
+    func test_alwaysAllow_agentHookSource_drainsOnlySamePaneSameToolPending() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.alwaysAllowAgentHookDrain"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let surfaceID = UUID()
+        let foreignSurfaceID = UUID()
+
+        let clicked = makeAgentHookRequest(
+            targetSurfaceID: surfaceID, toolName: "Bash", createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let samePaneSameTool = makeAgentHookRequest(
+            targetSurfaceID: surfaceID, toolName: "Bash", createdAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        let samePaneDifferentTool = makeAgentHookRequest(
+            targetSurfaceID: surfaceID, toolName: "Write", createdAt: Date(timeIntervalSince1970: 1_700_000_200)
+        )
+        let differentPaneSameTool = makeAgentHookRequest(
+            targetSurfaceID: foreignSurfaceID, toolName: "Bash", createdAt: Date(timeIntervalSince1970: 1_700_000_300)
+        )
+        store.submit(clicked)
+        store.submit(samePaneSameTool)
+        store.submit(samePaneDifferentTool)
+        store.submit(differentPaneSameTool)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true }, memory: memory)
+
+        let waiterClicked = Task { @MainActor in await store.awaitDecision(id: clicked.id, timeoutMs: 5_000) }
+        let waiterSamePane = Task { @MainActor in await store.awaitDecision(id: samePaneSameTool.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.alwaysAllow(id: clicked.id)
+
+        XCTAssertEqual(Set(store.pending.map(\.id)), Set([samePaneDifferentTool.id, differentPaneSameTool.id]),
+                       "alwaysAllow(id:) must drain only pending requests sharing the clicked request's exact " +
+                       "(targetSurfaceID, kind, toolName) -- a different tool on the same pane, and the same " +
+                       "tool on a different pane, must both stay pending")
+
+        let resultClicked = await waiterClicked.value
+        let resultSamePane = await waiterSamePane.value
+        XCTAssertEqual(resultClicked, .allowed)
+        XCTAssertEqual(resultSamePane, .allowed, "the same-pane-same-tool backlog match must also be drained allowed")
+    }
+
+    // MARK: - allowAllPending() (Stage E, NEW)
+
+    func test_allowAllPending_drainsEveryPendingRequestStoreWide_leavesNoMemory_neverTouchesSettings() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.allowAllPending"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled, "precondition: the isolated suite starts with auto-approve off")
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let ownedSurfaceID = UUID()
+        let foreignSurfaceID = UUID()
+
+        let ownedMcp = makeRequest(targetSurfaceID: ownedSurfaceID, payload: "owned-mcp")
+        let foreignMcp = makeRequest(targetSurfaceID: foreignSurfaceID, payload: "foreign-mcp")
+        let foreignAgentHook = makeAgentHookRequest(targetSurfaceID: foreignSurfaceID, toolName: "Bash")
+        let windowAgnostic = makeRequest(targetSurfaceID: nil, payload: "agnostic")
+        store.submit(ownedMcp)
+        store.submit(foreignMcp)
+        store.submit(foreignAgentHook)
+        store.submit(windowAgnostic)
+
+        // isKeyWindow is false, so the window-agnostic request would
+        // normally be invisible to this window too -- proving
+        // allowAllPending() applies NO visibility filter at all.
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == ownedSurfaceID }, isKeyWindow: { false }, memory: memory)
+
+        let requests = [ownedMcp, foreignMcp, foreignAgentHook, windowAgnostic]
+        let waiters = requests.map { request in
+            Task { @MainActor in await store.awaitDecision(id: request.id, timeoutMs: 5_000) }
+        }
+        await yieldToScheduler()
+
+        model.allowAllPending()
+
+        XCTAssertTrue(store.pending.isEmpty,
+                      "allowAllPending() must drain EVERY pending request store-wide, including ones this " +
+                      "window neither owns nor could otherwise see")
+
+        for waiter in waiters {
+            let result = await waiter.value
+            XCTAssertEqual(result, .allowed)
+        }
+
+        XCTAssertFalse(memory.isAutoAllowed(surfaceID: foreignSurfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                       "allowAllPending() must leave no Always-Allow memory behind")
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled,
+                       "allowAllPending() must never touch the global auto-approve setting")
+    }
+
+    // MARK: - alwaysAllowAcrossPanes(id:) (Stage E, NEW)
+
+    func test_alwaysAllowAcrossPanes_recordsCrossMemory_drainsSameToolStoreWide_leavesDifferentToolPending() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.alwaysAllowAcrossPanes"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled, "precondition: the isolated suite starts with auto-approve off")
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let surfaceA = UUID()
+        let surfaceB = UUID()
+
+        let clicked = makeAgentHookRequest(
+            targetSurfaceID: surfaceA, toolName: "Bash", createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let sameToolOtherPane = makeAgentHookRequest(
+            targetSurfaceID: surfaceB, toolName: "Bash", createdAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        let differentTool = makeAgentHookRequest(
+            targetSurfaceID: surfaceA, toolName: "Write", createdAt: Date(timeIntervalSince1970: 1_700_000_200)
+        )
+        store.submit(clicked)
+        store.submit(sameToolOtherPane)
+        store.submit(differentTool)
+
+        // This window owns only surfaceA -- surfaceB is a pane it does
+        // NOT own, proving alwaysAllowAcrossPanes(id:) applies no window
+        // filter at all.
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceA }, isKeyWindow: { true }, memory: memory)
+
+        let waiterClicked = Task { @MainActor in await store.awaitDecision(id: clicked.id, timeoutMs: 5_000) }
+        let waiterOtherPane = Task { @MainActor in await store.awaitDecision(id: sameToolOtherPane.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.alwaysAllowAcrossPanes(id: clicked.id)
+
+        XCTAssertTrue(memory.isAutoAllowed(surfaceID: UUID(), kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                     "alwaysAllowAcrossPanes(id:) must record CROSS memory for (kind, toolName), auto-allowing " +
+                     "an arbitrary surface it has never seen before")
+        XCTAssertEqual(store.pending.map(\.id), [differentTool.id],
+                       "alwaysAllowAcrossPanes(id:) must drain every pending request sharing the clicked " +
+                       "request's (kind, toolName) store-wide, regardless of window ownership, leaving a " +
+                       "different tool pending")
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled,
+                       "alwaysAllowAcrossPanes(id:) must never touch the global auto-approve setting")
+
+        let resultClicked = await waiterClicked.value
+        let resultOtherPane = await waiterOtherPane.value
+        XCTAssertEqual(resultClicked, .allowed)
+        XCTAssertEqual(resultOtherPane, .allowed,
+                       "a same-tool request on a pane this window doesn't own must still be drained")
+    }
+
+    // MARK: - AccessibilityID coverage for the new cross-actions menu (Stage E, spec-level only)
+    //
+    // SwiftUI Menu rendering itself is not unit-testable (no production
+    // view code exercised here) -- this only pins that the new
+    // identifiers exist, are distinct from each other and from the
+    // pre-existing ApprovalBanner identifiers, and follow the same
+    // "calyx.approvalBanner.*" prefix convention as
+    // container/allowButton/denyButton/alwaysAllowButton/payload above.
+
+    func test_accessibilityID_approvalBanner_crossActionsMenuIdentifiers_existAndAreDistinct() {
+        let newIdentifiers = [
+            AccessibilityID.ApprovalBanner.crossActionsMenu,
+            AccessibilityID.ApprovalBanner.allowAllPendingItem,
+            AccessibilityID.ApprovalBanner.alwaysAllowAllPanesItem,
+        ]
+
+        for identifier in newIdentifiers {
+            XCTAssertTrue(identifier.hasPrefix("calyx.approvalBanner."),
+                         "\(identifier) must follow the existing calyx.approvalBanner.* naming convention")
+        }
+
+        let preExistingIdentifiers = [
+            AccessibilityID.ApprovalBanner.container,
+            AccessibilityID.ApprovalBanner.allowButton,
+            AccessibilityID.ApprovalBanner.denyButton,
+            AccessibilityID.ApprovalBanner.alwaysAllowButton,
+            AccessibilityID.ApprovalBanner.payload,
+        ]
+        XCTAssertEqual(Set(newIdentifiers).intersection(preExistingIdentifiers), [],
+                       "the 3 new identifiers must be distinct from every pre-existing ApprovalBanner identifier")
+        XCTAssertEqual(Set(newIdentifiers).count, newIdentifiers.count,
+                       "the 3 new identifiers must also be distinct from each other")
     }
 }

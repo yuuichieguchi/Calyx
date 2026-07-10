@@ -114,10 +114,16 @@ class SettingsWindowController: NSWindowController {
         case .cockpitAutoApprove:
             return SectionHeading(
                 title: "Command Approval",
-                subtitle: "Applies to agent-initiated pane commands (run, send keys, palette). Off = ask every time."
+                subtitle: "Applies to agent-initiated pane commands (run, send keys, palette) and to CLI agents' "
+                    + "(Claude Code, Codex) tool-call approval requests. Off = ask every time."
             )
         case .commandTracking:
             return SectionHeading(title: "Command Tracking", subtitle: "Changes apply to new terminals only.")
+        case .agentHookApproval:
+            return SectionHeading(
+                title: "Agent Hook Approval",
+                subtitle: "Routes CLI agents' (Claude Code, Codex) tool-permission prompts to the Calyx approval banner. Off = agents prompt in their own pane, as before."
+            )
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .themeColorWell, .themeColorHex, .lspRequireConfirmation,
@@ -180,6 +186,8 @@ class SettingsWindowController: NSWindowController {
             return cockpitAutoApproveRow()
         case .commandTracking:
             return commandTrackingRow()
+        case .agentHookApproval:
+            return agentHookApprovalRow()
         case .openSessionBrowserButton:
             return sessionBrowserButtonRow()
         case .openConfigFileFooter:
@@ -273,6 +281,7 @@ class SettingsWindowController: NSWindowController {
         case .agentResumeAutoExecute: return SessionSettings.agentResumeAutoExecute
         case .cockpitAutoApprove: return CockpitSettings.autoApproveEnabled
         case .commandTracking: return CommandTrackingSettings.trackingEnabled
+        case .agentHookApproval: return CockpitSettings.agentHookApprovalEnabled
         default: return false
         }
     }
@@ -329,6 +338,15 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.target = self
         toggleSwitch.action = #selector(commandTrackingDidChange(_:))
         return controlRow(label: "Track shell commands", control: toggleSwitch)
+    }
+
+    private func agentHookApprovalRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.agentHookApprovalSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .agentHookApproval) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(agentHookApprovalDidChange(_:))
+        return controlRow(label: "Show agent tool prompts in the approval banner", control: toggleSwitch)
     }
 
     private func sessionBrowserButtonRow() -> NSView {
@@ -505,6 +523,10 @@ class SettingsWindowController: NSWindowController {
         }
     }
 
+    @objc private func agentHookApprovalDidChange(_ sender: NSSwitch) {
+        CockpitSettings.agentHookApprovalEnabled = (sender.state == .on)
+    }
+
     @objc private func openSessionBrowser(_ sender: Any?) {
         SessionBrowserWindowController.shared.showBrowser()
     }
@@ -679,17 +701,38 @@ private final class SettingsTabViewController: NSTabViewController {
     }
 }
 
-/// Hosts one SettingsPane's content stack at a fixed width, sized to fit
-/// the stack's content height. NSTabViewController (tabStyle .toolbar)
-/// resizes the Settings window to each tab's preferredContentSize on
-/// selection, so panes with fewer rows produce a shorter window instead
-/// of a fixed-height scroll view.
+/// Hosts one SettingsPane's content stack at a fixed width, inside a
+/// vertically scrolling NSScrollView. NSTabViewController (tabStyle
+/// .toolbar) resizes the Settings window to each tab's
+/// preferredContentSize on selection: a pane whose content fits within
+/// the screen sizes the window exactly to that content (the scroller
+/// stays auto-hidden, so this is visually identical to a plain
+/// fixed-height view), while a pane taller than the screen's visible
+/// height instead caps the window there and reveals the scroller, so
+/// its trailing rows stay reachable instead of being clipped below the
+/// window with no way to scroll to them.
 @MainActor
 private final class SettingsPaneContentViewController: NSViewController {
+
+    /// Vertical space reserved for the window's title bar, the Settings
+    /// toolbar, and top/bottom margins when a pane's natural content
+    /// height must be capped to the screen's visible height.
+    private static let verticalChrome: CGFloat = 120
+    /// Floor under the height cap so a missing/tiny screen can never
+    /// collapse the window to something unusably short.
+    private static let minimumContentHeight: CGFloat = 200
+
+    /// The scroll view's document view. Flipped so content starts at the
+    /// top and scrolls downward, like every other macOS scroll view,
+    /// instead of NSView's default bottom-left-origin coordinate system.
+    private final class FlippedDocumentView: NSView {
+        override var isFlipped: Bool { true }
+    }
 
     private let contentStack: NSStackView
     private let width: CGFloat
     private let contentInset: CGFloat
+    private let documentView = FlippedDocumentView()
 
     init(contentStack: NSStackView, width: CGFloat, contentInset: CGFloat) {
         self.contentStack = contentStack
@@ -702,24 +745,69 @@ private final class SettingsPaneContentViewController: NSViewController {
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
 
     override func loadView() {
-        let container = NSView()
-        container.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(contentStack)
+        documentView.translatesAutoresizingMaskIntoConstraints = false
+        documentView.addSubview(contentStack)
 
+        // Same constraints as the previous fixed-height container: pinned
+        // to the document view's edges at `contentInset`, with a fixed
+        // width. This alone fully determines the document view's own
+        // width (== `width`, matching the scroll view's content width so
+        // it never scrolls horizontally) and its height (driven
+        // intrinsically by the stack), with no separate width constraint
+        // needed between the document view and the scroll view.
         NSLayoutConstraint.activate([
-            contentStack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: contentInset),
-            contentStack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -contentInset),
-            contentStack.topAnchor.constraint(equalTo: container.topAnchor, constant: contentInset),
-            contentStack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -contentInset),
+            contentStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: contentInset),
+            contentStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -contentInset),
+            contentStack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: contentInset),
+            contentStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -contentInset),
             contentStack.widthAnchor.constraint(equalToConstant: width - 2 * contentInset),
         ])
 
-        self.view = container
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.contentView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.documentView = documentView
+
+        self.view = scrollView
     }
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        view.layoutSubtreeIfNeeded()
-        preferredContentSize = NSSize(width: width, height: view.fittingSize.height)
+        documentView.layoutSubtreeIfNeeded()
+        let naturalHeight = documentView.fittingSize.height
+        let maxHeight = (NSScreen.main?.visibleFrame.height ?? naturalHeight) - Self.verticalChrome
+        let cappedHeight = max(Self.minimumContentHeight, min(naturalHeight, maxHeight))
+        preferredContentSize = NSSize(width: width, height: cappedHeight)
+    }
+
+    /// Grow (or shrink) the window to this pane's `preferredContentSize`
+    /// height. NSTabViewController sizes each selected pane's view to its
+    /// `preferredContentSize`, but when a pane is loaded lazily on tab
+    /// selection it reads that size before this controller has computed it
+    /// and so leaves the window at the previously shown (shorter) pane's
+    /// height: the taller pane's scroll view then overflows the window's
+    /// bottom edge, and because its clip view fills that same overflowing
+    /// frame there is no scroll range, so the pane's trailing rows are
+    /// clipped off-screen with no way to reach them. Matching the window's
+    /// content height to the pane here shows the whole pane on any screen
+    /// tall enough for it, and leaves the scroll view to scroll only when
+    /// the screen-height cap made the window shorter than the content.
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        guard let window = view.window else { return }
+        var contentRect = window.contentRect(forFrameRect: window.frame)
+        let targetHeight = preferredContentSize.height
+        guard abs(contentRect.height - targetHeight) > 0.5 else { return }
+        // Keep the title bar fixed and grow/shrink downward: in AppKit's
+        // bottom-left window coordinates that means moving the origin by
+        // the height delta as the height changes.
+        contentRect.origin.y += contentRect.height - targetHeight
+        contentRect.size.height = targetHeight
+        window.setFrame(window.frameRect(forContentRect: contentRect), display: true, animate: false)
     }
 }

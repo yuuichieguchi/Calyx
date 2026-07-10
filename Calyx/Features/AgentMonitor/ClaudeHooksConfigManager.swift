@@ -43,7 +43,14 @@ struct ClaudeHooksConfigManager: Sendable {
     /// preserving the user's own existing hook entries and unrelated
     /// top-level keys. Idempotent: re-running replaces Calyx's own prior
     /// entries rather than duplicating them.
-    static func installHooks(scriptPath: String, configPath: String? = nil) throws {
+    ///
+    /// `PreToolUse` alone gets a second Calyx-owned command entry: the
+    /// pre-existing async monitor entry (`scriptPath`, unchanged shape)
+    /// plus a new synchronous approval entry (`approvalScriptPath`, no
+    /// `"async"` key, timeout `ApprovalHookTiming.hookEntryTimeoutSeconds`)
+    /// that blocks the tool call until Calyx's own `/approval-request`
+    /// long-poll resolves. Every other event still gets exactly one entry.
+    static func installHooks(scriptPath: String, approvalScriptPath: String, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
 
         var config = try ConfigFileUtils.readConfigWithBackup(path: path)
@@ -51,7 +58,10 @@ struct ClaudeHooksConfigManager: Sendable {
         var hooks = config["hooks"] as? [String: Any] ?? [:]
 
         for target in targetEvents {
-            let newGroup = commandGroup(scriptPath: scriptPath, matcher: target.matcher)
+            let entries = commandEntries(
+                scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, eventName: target.name
+            )
+            let newGroup = commandGroup(entries: entries, matcher: target.matcher)
 
             guard let existingValue = hooks[target.name] else {
                 hooks[target.name] = [newGroup]
@@ -156,11 +166,36 @@ struct ClaudeHooksConfigManager: Sendable {
         ]
     }
 
+    /// The synchronous approval entry: no `"async"` key at all (its
+    /// stdout is the actual permission decision, so it must block), and
+    /// a timeout of `ApprovalHookTiming.hookEntryTimeoutSeconds` (600) —
+    /// the outermost deadline in the approval hook chain (see
+    /// `ApprovalHookTiming`'s doc comment).
+    private static func approvalCommandEntry(approvalScriptPath: String) -> [String: Any] {
+        [
+            "type": "command",
+            "command": "\"\(approvalScriptPath)\"",
+            "timeout": ApprovalHookTiming.hookEntryTimeoutSeconds,
+        ]
+    }
+
+    /// The Calyx-owned command entries for one target event: `PreToolUse`
+    /// gets both the async monitor entry and the synchronous approval
+    /// entry; every other event gets only the monitor entry.
+    private static func commandEntries(
+        scriptPath: String, approvalScriptPath: String, eventName: String
+    ) -> [[String: Any]] {
+        guard eventName == "PreToolUse" else {
+            return [commandEntry(scriptPath: scriptPath)]
+        }
+        return [commandEntry(scriptPath: scriptPath), approvalCommandEntry(approvalScriptPath: approvalScriptPath)]
+    }
+
     /// Builds the matcher-group Calyx installs for one target event:
-    /// `{"matcher": <matcher>, "hooks": [<commandEntry>]}`, omitting the
+    /// `{"matcher": <matcher>, "hooks": <entries>}`, omitting the
     /// `"matcher"` key entirely when `matcher` is `nil`.
-    private static func commandGroup(scriptPath: String, matcher: String?) -> [String: Any] {
-        var group: [String: Any] = ["hooks": [commandEntry(scriptPath: scriptPath)]]
+    private static func commandGroup(entries: [[String: Any]], matcher: String?) -> [String: Any] {
+        var group: [String: Any] = ["hooks": entries]
         if let matcher {
             group["matcher"] = matcher
         }
@@ -184,8 +219,11 @@ struct ClaudeHooksConfigManager: Sendable {
     }
 
     /// A command entry is Calyx's own when its `command` path's last
-    /// component is `calyx-agent-hook` — independent of the surrounding
-    /// quoting and of the directory it was installed into.
+    /// component is `calyx-agent-hook` or `calyx-approval-hook` —
+    /// independent of the surrounding quoting and of the directory it
+    /// was installed into.
+    private static let ownScriptFileNames: Set<String> = [AgentHookScript.fileName, ApprovalHookScript.fileName]
+
     private static func isOwnCommandEntry(_ entry: [String: Any]) -> Bool {
         guard entry["type"] as? String == "command",
               let command = entry["command"] as? String else {
@@ -195,7 +233,7 @@ struct ClaudeHooksConfigManager: Sendable {
         if path.hasPrefix("\""), path.hasSuffix("\""), path.count >= 2 {
             path = String(path.dropFirst().dropLast())
         }
-        return (path as NSString).lastPathComponent == AgentHookScript.fileName
+        return ownScriptFileNames.contains((path as NSString).lastPathComponent)
     }
 
     // MARK: - Private: Config Path

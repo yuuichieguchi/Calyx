@@ -46,4 +46,24 @@ struct CockpitSettings: Sendable {
             store.set(newValue, forKey: autoApproveEnabledKey)
         }
     }
+
+    static let agentHookApprovalEnabledKey = "calyx.cockpit.agentHookApprovalEnabled"
+
+    /// Gates whether `CalyxMCPServer`'s `POST /approval-request` endpoint
+    /// (a CLI agent's PreToolUse hook call, e.g. Claude Code / Codex)
+    /// ever submits a request to the approval inbox at all --
+    /// independent of `autoApproveEnabled` above, which only decides
+    /// what happens to a request once it has already reached the inbox.
+    /// Documented default: `false` when the key has never been written
+    /// -- CLI agent hook approval is opt-in.
+    static var agentHookApprovalEnabled: Bool {
+        get {
+            // Same native absent-key default as `autoApproveEnabled`
+            // above -- no explicit object(forKey:) == nil check needed.
+            store.bool(forKey: agentHookApprovalEnabledKey)
+        }
+        set {
+            store.set(newValue, forKey: agentHookApprovalEnabledKey)
+        }
+    }
 }

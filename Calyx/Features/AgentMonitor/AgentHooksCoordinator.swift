@@ -24,19 +24,22 @@ struct AgentHooksCoordinator: Sendable {
 
     // MARK: - Public API
 
-    /// Installs `calyx-agent-hook` once, then wires each tool's own
-    /// hook/plugin configuration to invoke it (Claude Code, Codex) or to
-    /// POST directly (OpenCode). A `calyx-agent-hook` install failure only
-    /// marks Claude Code / Codex `.failed` when that tool is actually
-    /// installed (its config directory exists) — an uninstalled tool
-    /// reports `.skipped` exactly as it would have regardless of the
-    /// script error, rather than a misleading `.failed`. Does not block
-    /// OpenCode, whose plugin talks to the IPC endpoint over `fetch`
-    /// rather than through the shared shell script.
+    /// Installs `calyx-agent-hook` and `calyx-approval-hook` once, then
+    /// wires each tool's own hook/plugin configuration to invoke them
+    /// (Claude Code, Codex) or to POST directly (OpenCode). Either
+    /// script's install failure only marks Claude Code / Codex `.failed`
+    /// when that tool is actually installed (its config directory
+    /// exists) — an uninstalled tool reports `.skipped` exactly as it
+    /// would have regardless of the script error, rather than a
+    /// misleading `.failed`. Does not block OpenCode, whose plugin talks
+    /// to the IPC endpoint over `fetch` rather than through the shared
+    /// shell scripts.
     static func install() -> AgentHooksResult {
         let scriptPath: String
+        let approvalScriptPath: String
         do {
             scriptPath = try AgentHookScript.install(toDirectory: AgentHookScript.defaultInstallDirectory)
+            approvalScriptPath = try ApprovalHookScript.install(toDirectory: AgentHookScript.defaultInstallDirectory)
         } catch {
             return AgentHooksResult(
                 claudeCode: scriptFailureStatus(error, directory: AgentToolPaths.claudeConfigDirectory),
@@ -46,8 +49,8 @@ struct AgentHooksCoordinator: Sendable {
         }
 
         return AgentHooksResult(
-            claudeCode: installClaudeCode(scriptPath: scriptPath),
-            codex: installCodex(scriptPath: scriptPath),
+            claudeCode: installClaudeCode(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath),
+            codex: installCodex(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath),
             openCode: installOpenCode()
         )
     }
@@ -66,12 +69,12 @@ struct AgentHooksCoordinator: Sendable {
 
     // MARK: - Private: Claude Code
 
-    private static func installClaudeCode(scriptPath: String) -> ConfigStatus {
+    private static func installClaudeCode(scriptPath: String, approvalScriptPath: String) -> ConfigStatus {
         guard ConfigFileUtils.directoryExists(at: AgentToolPaths.claudeConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         return captureStatus {
-            try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath)
+            try ClaudeHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath)
         }
     }
 
@@ -92,12 +95,12 @@ struct AgentHooksCoordinator: Sendable {
 
     // MARK: - Private: Codex
 
-    private static func installCodex(scriptPath: String) -> ConfigStatus {
+    private static func installCodex(scriptPath: String, approvalScriptPath: String) -> ConfigStatus {
         guard ConfigFileUtils.directoryExists(at: AgentToolPaths.codexConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         return captureStatus {
-            try CodexHooksConfigManager.installHooks(scriptPath: scriptPath)
+            try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath)
         }
     }
 

@@ -279,4 +279,26 @@ final class SettingsTogglesE2ETests: CalyxUITestCase {
             pane: "LSP"
         )
     }
+
+    /// Pins the Agents pane's "Agent Hook Approval" toggle (its own
+    /// heading + wrapping subtitle pushed this pane to be the tallest of
+    /// all Settings panes) as actually reachable and operable, not merely
+    /// present in the AX tree: SettingsPaneContentViewController sizes
+    /// the Settings window to each pane's `view.fittingSize.height` with
+    /// no scroll view (see SettingsWindowController.swift), so a pane
+    /// taller than the screen clips its own trailing content below the
+    /// window's bottom edge with no way to reach it.
+    func test_agentHookApprovalSwitch_isReachableAndTogglesOnAgentsPane() {
+        waitForMenuBarAndWindow()
+        openSettingsPane("Agents")
+
+        let toggleElement = toggle(identifier: "calyx.settings.sessions.agentHookApprovalSwitch")
+        XCTAssertTrue(waitFor(toggleElement, timeout: 5), "agentHookApproval switch not found on Agents pane.")
+        // The bug: the switch exists in the AX tree but is clipped below the
+        // window with no scroll view, so it is not hittable / cannot be clicked.
+        XCTAssertTrue(toggleElement.isHittable, "agentHookApproval switch is present but not hittable — it is clipped outside the Settings window (no scroll).")
+        let before = toggleElement.value as? Int
+        toggleElement.click()
+        XCTAssertNotEqual(toggleElement.value as? Int, before, "Clicking the switch must flip its visible state.")
+    }
 }
