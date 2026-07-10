@@ -8,6 +8,13 @@
 // CockpitSettings.autoApproveEnabled toggle -- that setting stays a
 // separate, coarser escape hatch.
 //
+// Trust model, stated plainly: surfaceID and kind here are whatever the
+// client-supplied request headers say, with no independent verification
+// of either -- this server's loopback bind plus its bearer token are the
+// WHOLE authorization boundary, so any process holding that token can
+// claim any surfaceID/kind and therefore any Always-Allow scope this
+// memory grants.
+//
 // Two independent scopes, deliberately NOT unified into one keyspace:
 // - PANE scope (rememberPane): auto-allows only the exact (surfaceID,
 //   kind, toolName) tuple -- "always allow THIS tool in THIS pane".

@@ -70,6 +70,12 @@ final class CalyxMCPServer {
     /// that gates the connection-drop watch exists in exactly one place.
     private static let approvalRequestPath = "/approval-request"
 
+    /// Shared request-body size cap (bytes), checked BEFORE decode, by
+    /// both `routeCommandEvent` and `routeApprovalRequest` -- one 256 KiB
+    /// ceiling for every event-ingestion route on this server, rather
+    /// than two independently-maintained copies of the same literal.
+    private static let maxEventBodyBytes = 262_144
+
     // MARK: - Init
 
     init() {}
@@ -382,8 +388,8 @@ final class CalyxMCPServer {
 
     /// Ingests a shell integration's command-lifecycle event
     /// (`CommandEvent`) into `commandLogStore`. Contract (Green phase):
-    /// bearer token check (401) -> body present and <= 262_144 bytes,
-    /// cap checked BEFORE decode (400 missing / 413 oversized) ->
+    /// bearer token check (401) -> body present and <= maxEventBodyBytes
+    /// bytes, cap checked BEFORE decode (400 missing / 413 oversized) ->
     /// `CommandEvent.decode(from:)` (400 on nil) -> `X-Calyx-Surface-ID`
     /// header: missing/empty is a malformed-client 400, but a
     /// present-and-non-empty header that `resolveSurfaceID(from:)` still
@@ -403,7 +409,7 @@ final class CalyxMCPServer {
         guard let body = request.body else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
-        guard body.count <= 262_144 else {
+        guard body.count <= Self.maxEventBodyBytes else {
             return HTTPParser.response(statusCode: 413, body: nil)
         }
 
@@ -431,8 +437,8 @@ final class CalyxMCPServer {
     /// `calyx-approval-hook` script blocks on from a CLI agent's
     /// PreToolUse hook while a human decides whether to allow its next
     /// tool call. Contract, in order: bearer auth (401) -> body present
-    /// (400) -> body.count <= 262_144, checked BEFORE decode (413,
-    /// mirrors `routeCommandEvent`) -> `AgentHookToolCall.decode` (400)
+    /// (400) -> body.count <= maxEventBodyBytes, checked BEFORE decode
+    /// (413, mirrors `routeCommandEvent`) -> `AgentHookToolCall.decode` (400)
     /// -> `resolveSurfaceID` (400) -> an unrecognized `X-Calyx-Agent-Kind`
     /// (anything other than claude-code/codex) short-circuits to 200
     /// with an EMPTY body, never submitting anything ->
@@ -496,7 +502,7 @@ final class CalyxMCPServer {
         guard let body = request.body else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
-        guard body.count <= 262_144 else {
+        guard body.count <= Self.maxEventBodyBytes else {
             return HTTPParser.response(statusCode: 413, body: nil)
         }
 
@@ -1373,8 +1379,12 @@ final class CalyxMCPServer {
     }
 
     /// Runs `route(request:)`, additionally wiring a connection-drop
-    /// watch scoped to `/approval-request` ONLY: that endpoint alone can
-    /// suspend for up to `approvalRequestTimeoutMs` (~9.5 minutes)
+    /// watch scoped to `POST /approval-request` ONLY (both method AND
+    /// path -- a stray non-POST request to the same path just falls
+    /// through to the plain `await route(request:)` path below, same as
+    /// every other route, and gets its ordinary 404 with no Task+sentinel
+    /// wrapping): that endpoint alone can suspend for up to
+    /// `approvalRequestTimeoutMs` (~9.5 minutes)
     /// awaiting a human decision, so it alone needs to notice the peer
     /// disappearing mid-poll (the hook process getting killed by curl's
     /// own `-m` deadline or the CLI's hook-entry timeout) and cancel its
@@ -1412,7 +1422,7 @@ final class CalyxMCPServer {
     private func dispatchRoute(
         connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator
     ) async -> HTTPResponse {
-        guard request.path == Self.approvalRequestPath else {
+        guard request.method == "POST", request.path == Self.approvalRequestPath else {
             return await route(request: request)
         }
 
