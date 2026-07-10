@@ -48,15 +48,32 @@ struct ApprovalBannerView: View {
     }
 
     /// Stage E: the CLI's own tool name alone (e.g. "Bash"), NOT
-    /// `displayToolName`'s "Kind · toolName" combination -- used only by
-    /// the cross-actions menu's "Always Allow <toolName> in All Panes"
-    /// label below. `nil` for an `.mcpTool`-sourced request, which never
-    /// shows that menu at all. Routed through `ControlCharacterDisplay.render`
-    /// same as `toolName` above -- it comes from the same untrusted
-    /// tool-call provenance.
-    private var agentHookToolNameForMenu: String? {
+    /// `displayToolName`'s "Kind · toolName" combination -- used to title
+    /// BOTH the main action row's pane-scoped "Always Allow <toolName> in
+    /// This Pane" button (see `alwaysAllowButtonTitle` below) and the
+    /// cross-actions menu's "Always Allow <toolName> in All Panes" label,
+    /// so the two actions read as a parallel This-Pane/All-Panes contrast
+    /// naming the same tool. `nil` for an `.mcpTool`-sourced request,
+    /// which never shows the menu and keeps the main button's plain
+    /// "Always Allow" label (see `alwaysAllowButtonTitle`). Routed through
+    /// `ControlCharacterDisplay.render` same as `toolName` above -- it
+    /// comes from the same untrusted tool-call provenance.
+    private var agentHookToolName: String? {
         guard case .agentHook(let toolName, _, _) = request.source else { return nil }
         return ControlCharacterDisplay.render(toolName)
+    }
+
+    /// Stage E: the main action row's middle button's label. For an
+    /// `.agentHook`-sourced request, `model.alwaysAllow(id:)` records
+    /// PANE-scoped memory (this tool, THIS pane) -- so the label names
+    /// the tool and says "This Pane" to contrast with the cross-actions
+    /// menu's "Always Allow <toolName> in All Panes" item, which records
+    /// CROSS memory instead. For an `.mcpTool`-sourced request the same
+    /// button flips the global cockpit auto-approve toggle, so it keeps
+    /// the unqualified "Always Allow" label.
+    private var alwaysAllowButtonTitle: String {
+        guard let agentHookToolName else { return "Always Allow" }
+        return "Always Allow \(agentHookToolName) in This Pane"
     }
 
     private var headerText: String {
@@ -85,7 +102,7 @@ struct ApprovalBannerView: View {
                 .controlSize(.small)
                 .accessibilityIdentifier(AccessibilityID.ApprovalBanner.denyButton)
 
-                Button("Always Allow") {
+                Button(alwaysAllowButtonTitle) {
                     model.alwaysAllow(id: request.id)
                 }
                 .controlSize(.small)
@@ -101,7 +118,7 @@ struct ApprovalBannerView: View {
                 // Stage E: only an `.agentHook`-sourced request has a
                 // cross-actions menu -- `.mcpTool` renders exactly as
                 // before it (no menu at all).
-                if let menuToolName = agentHookToolNameForMenu {
+                if let menuToolName = agentHookToolName {
                     crossActionsMenu(toolName: menuToolName)
                 }
             }
@@ -114,7 +131,7 @@ struct ApprovalBannerView: View {
     }
 
     /// Compact cross-actions menu, shown only for an `.agentHook`-sourced
-    /// request (see `agentHookToolNameForMenu`): two actions that go
+    /// request (see `agentHookToolName`): two actions that go
     /// beyond this single request's own Deny/Always Allow/Allow --
     /// "Allow All Pending" drains every pending request store-wide, and
     /// "Always Allow ... in All Panes" records CROSS Always-Allow memory
