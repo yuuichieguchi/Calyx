@@ -103,6 +103,11 @@
 //  CommandTrackingSettingsToggleWiringTests, same division of labor as
 //  before the split -- see that file's own header).
 //
+//  STAGE E (approval-inbox-for-CLI-agents): a 5th Agents-pane switch,
+//  agentHookApproval, was added after commandTracking -- its own wiring
+//  stays independently pinned by AgentHookApprovalSettingsToggleWiringTests,
+//  same division of labor as commandTracking's.
+//
 //  Coverage:
 //  - (A) each Sessions-pane switch (persistentSessions/historyPersistence)
 //    and each Agents-pane switch this file covers (agentResume/
@@ -110,7 +115,7 @@
 //    SettingsWindowController.shared as its `.target` and its own
 //    expected handler selector as `.action`
 //  - (A) exactly 2 switches exist in the Sessions pane's own view
-//    subtree, and exactly 4 in the Agents pane's, both in SettingsRow's
+//    subtree, and exactly 5 in the Agents pane's, both in SettingsRow's
 //    declared top-to-bottom order (openSessionBrowserButton is a button,
 //    not a switch, so excluded)
 //  - (B) sessionToggleInitialState(for:) reads true/false exactly from
@@ -211,31 +216,35 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
         }
     }
 
-    // The 4 switches that moved off the Sessions pane onto Agents.
-    // commandTracking (the last of the 4) is intentionally NOT included
-    // in the wiring zip below -- it's already independently covered by
-    // CommandTrackingSettingsToggleWiringTests.test_commandTrackingSwitch_existsWithTargetAndActionWired
-    // (identifier-based lookup, position-independent), same division of
-    // labor this file used for the Sessions pane before the split.
-    func test_agentsToggleSwitches_exactlyFour_inRowOrder() throws {
+    // The 5 switches that live on the Agents pane. commandTracking and
+    // agentHookApproval (the last 2 of the 5) are intentionally NOT
+    // included in the wiring zip below -- they're already independently
+    // covered by CommandTrackingSettingsToggleWiringTests
+    // .test_commandTrackingSwitch_existsWithTargetAndActionWired and
+    // AgentHookApprovalSettingsToggleWiringTests
+    // .test_agentHookApprovalSwitch_existsWithTargetAndActionWired
+    // (both identifier-based lookups, position-independent), same
+    // division of labor this file used for the Sessions pane before the
+    // split. Renamed from ...exactlyFour... (Stage E added the 5th).
+    func test_agentsToggleSwitches_exactlyFive_inRowOrder() throws {
         let switches = collectSwitches(in: try agentsPaneView())
 
         XCTAssertEqual(
-            switches.count, 4,
-            "The Agents pane must show exactly 4 switches (agentResume/agentResumeAutoExecute/" +
-            "cockpitAutoApprove/commandTracking). Found \(switches.count)."
+            switches.count, 5,
+            "The Agents pane must show exactly 5 switches (agentResume/agentResumeAutoExecute/" +
+            "cockpitAutoApprove/commandTracking/agentHookApproval). Found \(switches.count)."
         )
     }
 
     func test_agentsToggleSwitches_haveTargetAndActionWired() throws {
         let switches = collectSwitches(in: try agentsPaneView())
-        try XCTSkipIf(switches.count != 4, "covered, and already failing, by the count pin above")
+        try XCTSkipIf(switches.count != 5, "covered, and already failing, by the count pin above")
 
         // SettingsRow's own declared order for the Agents pane, filtered
         // to the switch-backed rows (SettingsPaneTests.expectedRows pins
         // this exact ordering). Only the first 3 are asserted here --
-        // commandTracking's wiring is covered by
-        // CommandTrackingSettingsToggleWiringTests instead (see comment
+        // commandTracking's and agentHookApproval's wiring are each
+        // covered by their own dedicated files instead (see comment
         // above).
         let expected: [(name: String, selectorName: String)] = [
             ("agentResume", "agentResumeDidChange:"),

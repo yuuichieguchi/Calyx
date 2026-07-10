@@ -85,6 +85,7 @@ enum AccessibilityID {
         static let lspAutoInstallSwitch = "calyx.settings.lsp.lspAutoInstallSwitch"
         static let lspRequireConfirmationSwitch = "calyx.settings.lsp.lspRequireConfirmationSwitch"
         static let cockpitAutoApproveSwitch = "calyx.settings.sessions.cockpitAutoApproveSwitch"
+        static let agentHookApprovalSwitch = "calyx.settings.sessions.agentHookApprovalSwitch"
     }
     enum SessionBrowser {
         static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }
@@ -112,13 +113,20 @@ enum AccessibilityID {
     /// Calyx/Features/ApprovalInbox/). Same `calyx.approvalBanner.*`
     /// shape as RecoveryBar (a container + its action buttons), plus a
     /// `payload` identifier so an XCUITest suite can assert the rendered
-    /// (control-character-escaped) command text.
+    /// (control-character-escaped) command text. Stage E adds a compact
+    /// cross-actions menu (`crossActionsMenu`), shown only for an
+    /// `.agentHook`-sourced request, with two items
+    /// (`allowAllPendingItem`/`alwaysAllowAllPanesItem`) -- see
+    /// ApprovalBannerView.
     enum ApprovalBanner {
         static let container = "calyx.approvalBanner.container"
         static let allowButton = "calyx.approvalBanner.allowButton"
         static let denyButton = "calyx.approvalBanner.denyButton"
         static let alwaysAllowButton = "calyx.approvalBanner.alwaysAllowButton"
         static let payload = "calyx.approvalBanner.payload"
+        static let crossActionsMenu = "calyx.approvalBanner.crossActionsMenu"
+        static let allowAllPendingItem = "calyx.approvalBanner.allowAllPendingItem"
+        static let alwaysAllowAllPanesItem = "calyx.approvalBanner.alwaysAllowAllPanesItem"
     }
     enum Diff {
         static let container = "calyx.diff"

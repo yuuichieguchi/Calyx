@@ -118,6 +118,11 @@ class SettingsWindowController: NSWindowController {
             )
         case .commandTracking:
             return SectionHeading(title: "Command Tracking", subtitle: "Changes apply to new terminals only.")
+        case .agentHookApproval:
+            return SectionHeading(
+                title: "Agent Hook Approval",
+                subtitle: "Routes CLI agents' (Claude Code, Codex) tool-permission prompts to the Calyx approval banner. Off = agents prompt in their own pane, as before."
+            )
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .themeColorWell, .themeColorHex, .lspRequireConfirmation,
@@ -180,6 +185,8 @@ class SettingsWindowController: NSWindowController {
             return cockpitAutoApproveRow()
         case .commandTracking:
             return commandTrackingRow()
+        case .agentHookApproval:
+            return agentHookApprovalRow()
         case .openSessionBrowserButton:
             return sessionBrowserButtonRow()
         case .openConfigFileFooter:
@@ -273,6 +280,7 @@ class SettingsWindowController: NSWindowController {
         case .agentResumeAutoExecute: return SessionSettings.agentResumeAutoExecute
         case .cockpitAutoApprove: return CockpitSettings.autoApproveEnabled
         case .commandTracking: return CommandTrackingSettings.trackingEnabled
+        case .agentHookApproval: return CockpitSettings.agentHookApprovalEnabled
         default: return false
         }
     }
@@ -329,6 +337,15 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.target = self
         toggleSwitch.action = #selector(commandTrackingDidChange(_:))
         return controlRow(label: "Track shell commands", control: toggleSwitch)
+    }
+
+    private func agentHookApprovalRow() -> NSView {
+        let toggleSwitch = NSSwitch()
+        toggleSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.agentHookApprovalSwitch)
+        toggleSwitch.state = Self.sessionToggleInitialState(for: .agentHookApproval) ? .on : .off
+        toggleSwitch.target = self
+        toggleSwitch.action = #selector(agentHookApprovalDidChange(_:))
+        return controlRow(label: "Show agent tool prompts in the approval banner", control: toggleSwitch)
     }
 
     private func sessionBrowserButtonRow() -> NSView {
@@ -503,6 +520,10 @@ class SettingsWindowController: NSWindowController {
         } else {
             CalyxShellIntegrationEnvironment.remove(rootDirectory: root)
         }
+    }
+
+    @objc private func agentHookApprovalDidChange(_ sender: NSSwitch) {
+        CockpitSettings.agentHookApprovalEnabled = (sender.state == .on)
     }
 
     @objc private func openSessionBrowser(_ sender: Any?) {

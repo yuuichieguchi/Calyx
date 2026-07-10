@@ -13,6 +13,13 @@
 // `model.current` inside `body`) so this view's content is never itself
 // optional -- MainContentView already unwraps `model.current` once to
 // decide whether to show this view at all.
+//
+// Stage E: an `.agentHook`-sourced request (a CLI agent's PreToolUse
+// hook call, see `ApprovalRequest.Source`) renders the same Deny/Always
+// Allow/Allow row as an `.mcpTool`-sourced one, PLUS a compact
+// cross-actions menu (see `crossActionsMenu(toolName:)`) with two
+// broader actions. An `.mcpTool`-sourced request renders exactly as
+// before -- no menu.
 
 import SwiftUI
 
@@ -38,6 +45,18 @@ struct ApprovalBannerView: View {
     private var targetLabel: String {
         guard let targetSurfaceID = request.targetSurfaceID else { return "this window" }
         return String(targetSurfaceID.uuidString.prefix(8))
+    }
+
+    /// Stage E: the CLI's own tool name alone (e.g. "Bash"), NOT
+    /// `displayToolName`'s "Kind · toolName" combination -- used only by
+    /// the cross-actions menu's "Always Allow <toolName> in All Panes"
+    /// label below. `nil` for an `.mcpTool`-sourced request, which never
+    /// shows that menu at all. Routed through `ControlCharacterDisplay.render`
+    /// same as `toolName` above -- it comes from the same untrusted
+    /// tool-call provenance.
+    private var agentHookToolNameForMenu: String? {
+        guard case .agentHook(let toolName, _, _) = request.source else { return nil }
+        return ControlCharacterDisplay.render(toolName)
     }
 
     private var headerText: String {
@@ -78,6 +97,13 @@ struct ApprovalBannerView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .accessibilityIdentifier(AccessibilityID.ApprovalBanner.allowButton)
+
+                // Stage E: only an `.agentHook`-sourced request has a
+                // cross-actions menu -- `.mcpTool` renders exactly as
+                // before it (no menu at all).
+                if let menuToolName = agentHookToolNameForMenu {
+                    crossActionsMenu(toolName: menuToolName)
+                }
             }
         }
         .padding(.horizontal, 16)
@@ -85,6 +111,34 @@ struct ApprovalBannerView: View {
         .modifier(RecoveryBarBackgroundModifier(reduceTransparency: reduceTransparency))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.ApprovalBanner.container)
+    }
+
+    /// Compact cross-actions menu, shown only for an `.agentHook`-sourced
+    /// request (see `agentHookToolNameForMenu`): two actions that go
+    /// beyond this single request's own Deny/Always Allow/Allow --
+    /// "Allow All Pending" drains every pending request store-wide, and
+    /// "Always Allow ... in All Panes" records CROSS Always-Allow memory
+    /// for this tool. Kept content-hugging (`.fixedSize()`), same
+    /// rationale as `payloadView`'s own header comment, so the menu's
+    /// compact ellipsis label never stretches the banner's action row.
+    private func crossActionsMenu(toolName: String) -> some View {
+        Menu {
+            Button("Allow All Pending (\(model.totalPendingCount))") {
+                model.allowAllPending()
+            }
+            .accessibilityIdentifier(AccessibilityID.ApprovalBanner.allowAllPendingItem)
+
+            Button("Always Allow \(toolName) in All Panes") {
+                model.alwaysAllowAcrossPanes(id: request.id)
+            }
+            .accessibilityIdentifier(AccessibilityID.ApprovalBanner.alwaysAllowAllPanesItem)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .controlSize(.small)
+        .fixedSize()
+        .accessibilityIdentifier(AccessibilityID.ApprovalBanner.crossActionsMenu)
     }
 
     /// Content-hugging payload: a one-line command must never reserve

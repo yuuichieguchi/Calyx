@@ -19,6 +19,12 @@
 //    nothing to the inbox
 //  - Global auto-approve short-circuits to 200 with an allow body,
 //    without submitting
+//  - Stage E: an AgentHookApprovalMemory hit (pane OR cross scope)
+//    short-circuits to 200 with an allow body, without submitting --
+//    checked after the global auto-approve short-circuit and before
+//    submit; a miss still submits and long-polls as before. server.stop()
+//    also clears the injected agentHookApprovalMemory, same as it
+//    already drains approvalInbox
 //  - Otherwise: submits an ApprovalRequest(source: .agentHook(...)) and
 //    long-polls approvalInbox.awaitDecision, mapping .allowed/.denied/
 //    .expired to the AgentHookPermissionResponse body for the resolved
@@ -251,6 +257,106 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
                        "(claude-code) kind, without ever consulting the inbox")
         XCTAssertTrue(approvalInbox.pending.isEmpty,
                       "global cockpit auto-approve being on must never submit a request to the inbox")
+    }
+
+    // MARK: - Stage E: AgentHookApprovalMemory consultation
+
+    /// A pane-scoped Always-Allow memory hit (same surfaceID, kind,
+    /// toolName as a prior "Always Allow" click) must short-circuit
+    /// exactly like the global auto-approve toggle above -- 200, an
+    /// ALLOW body for the resolved kind, and nothing submitted.
+    func test_route_paneMemoryHit_returnsAllowBody_withoutSubmitting() async throws {
+        CockpitSettings.agentHookApprovalEnabled = true
+        let approvalInbox = ApprovalInboxStore()
+        server.approvalInbox = approvalInbox
+        let memory = AgentHookApprovalMemory()
+        server.agentHookApprovalMemory = memory
+        let surfaceID = UUID()
+        memory.rememberPane(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash")
+
+        let request = approvalRequestRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString, body: validToolCallBody()
+        )
+
+        let response = await server.route(request: request)
+
+        XCTAssertEqual(response.statusCode, 200)
+        let decision = try permissionDecision(fromResponseBody: response.body)
+        XCTAssertEqual(decision, "allow",
+                       "a pane-scoped Always-Allow memory hit must return an ALLOW body immediately")
+        XCTAssertTrue(approvalInbox.pending.isEmpty,
+                      "a memory hit must never submit a request to the inbox")
+    }
+
+    /// A cross-scoped Always-Allow memory hit (same kind+toolName,
+    /// regardless of surface) must short-circuit the same way, even for
+    /// a surfaceID that memory has never seen before.
+    func test_route_crossMemoryHit_returnsAllowBody_withoutSubmitting() async throws {
+        CockpitSettings.agentHookApprovalEnabled = true
+        let approvalInbox = ApprovalInboxStore()
+        server.approvalInbox = approvalInbox
+        let memory = AgentHookApprovalMemory()
+        server.agentHookApprovalMemory = memory
+        memory.rememberCross(kind: AgentEntry.claudeCodeKind, toolName: "Bash")
+
+        let request = approvalRequestRequest(
+            token: testToken, surfaceIDHeader: UUID().uuidString, body: validToolCallBody()
+        )
+
+        let response = await server.route(request: request)
+
+        XCTAssertEqual(response.statusCode, 200)
+        let decision = try permissionDecision(fromResponseBody: response.body)
+        XCTAssertEqual(decision, "allow",
+                       "a cross-scoped Always-Allow memory hit must return an ALLOW body immediately, " +
+                       "regardless of which surface the request targets")
+        XCTAssertTrue(approvalInbox.pending.isEmpty,
+                      "a memory hit must never submit a request to the inbox")
+    }
+
+    /// A memory MISS (recorded only for an unrelated tool) must never
+    /// accidentally short-circuit -- the request must still submit and
+    /// long-poll exactly like the existing pending flow.
+    func test_route_memoryMiss_stillSubmitsAndLongPolls() async throws {
+        CockpitSettings.agentHookApprovalEnabled = true
+        let approvalInbox = ApprovalInboxStore()
+        server.approvalInbox = approvalInbox
+        let memory = AgentHookApprovalMemory()
+        server.agentHookApprovalMemory = memory
+        memory.rememberCross(kind: AgentEntry.claudeCodeKind, toolName: "Write")
+
+        let request = approvalRequestRequest(
+            token: testToken, surfaceIDHeader: UUID().uuidString, body: validToolCallBody()
+        )
+        let task = Task { @MainActor in
+            await self.server.route(request: request)
+        }
+        await yieldToScheduler()
+
+        XCTAssertEqual(approvalInbox.pending.count, 1,
+                       "a memory miss (recorded for a different tool) must still submit to the inbox and " +
+                       "long-poll for a decision, same as the existing pending flow")
+
+        let requestID = try XCTUnwrap(approvalInbox.pending.first?.id)
+        approvalInbox.decide(id: requestID, .allowed)
+        _ = await task.value
+    }
+
+    /// Mirrors `test_serverStop_expiresPendingHookApproval_returnsFailSafeBody`'s
+    /// own rationale for `approvalInbox.expireAll()`: a stopped server
+    /// must never leave a stale Always-Allow memory behind either.
+    func test_serverStop_clearsAgentHookApprovalMemory() {
+        let memory = AgentHookApprovalMemory()
+        server.agentHookApprovalMemory = memory
+        let surfaceID = UUID()
+        memory.rememberPane(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash")
+        XCTAssertTrue(memory.isAutoAllowed(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                     "precondition: the pane memory was recorded before stop()")
+
+        server.stop()
+
+        XCTAssertFalse(memory.isAutoAllowed(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                       "server.stop() must clear the agent-hook approval memory, same as it drains approvalInbox")
     }
 
     // MARK: - Submission + decision mapping

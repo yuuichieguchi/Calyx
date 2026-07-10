@@ -125,6 +125,16 @@ final class CalyxMCPServer {
     /// waiting on a decision nobody can make anymore.
     var approvalInbox: ApprovalInboxStore = .shared
 
+    /// Session-scoped "Always Allow" memory `routeApprovalRequest`
+    /// consults (after the global-auto-approve short-circuit, before
+    /// submitting to `approvalInbox`): a pane- or cross-scoped hit
+    /// short-circuits to 200 with an allow body, same as global
+    /// auto-approve, without ever reaching the inbox. Defaults to the
+    /// shared singleton; tests inject an isolated instance, same
+    /// rationale as `approvalInbox` above. `stop()` clears it via
+    /// `clearAll()`, mirroring that method's own `approvalInbox.expireAll()`.
+    var agentHookApprovalMemory: AgentHookApprovalMemory = .shared
+
     /// The timeout `POST /approval-request`'s long-poll (`routeApprovalRequest`)
     /// gives `approvalInbox.awaitDecision` before resolving `.expired`.
     /// Defaults to `ApprovalHookTiming.serverTimeoutMs` (see that enum's
@@ -406,7 +416,9 @@ final class CalyxMCPServer {
     /// `CockpitSettings.agentHookApprovalEnabled` being off does the
     /// same -> global auto-approve (`!ApprovalPolicy.requiresApproval()`)
     /// short-circuits to 200 with an ALLOW body, also without ever
-    /// submitting -> otherwise submits an `ApprovalRequest(source:
+    /// submitting -> a Stage E `agentHookApprovalMemory.isAutoAllowed`
+    /// hit (pane OR cross scope) short-circuits the same way, also
+    /// without submitting -> otherwise submits an `ApprovalRequest(source:
     /// .agentHook(...))`, posts one user notification, and long-polls
     /// `approvalInbox.awaitDecision`.
     ///
@@ -476,6 +488,12 @@ final class CalyxMCPServer {
         }
 
         guard ApprovalPolicy.requiresApproval() else {
+            return HTTPParser.response(
+                statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
+            )
+        }
+
+        if agentHookApprovalMemory.isAutoAllowed(surfaceID: surfaceID, kind: kind, toolName: call.toolName) {
             return HTTPParser.response(
                 statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
             )
@@ -1000,6 +1018,11 @@ final class CalyxMCPServer {
         // decision nobody can make anymore -- see
         // `CalyxMCPServerCockpitToolsTests.test_serverStop_expiresPendingApprovals`.
         approvalInbox.expireAll()
+        // Clears every Always-Allow memory recorded this session so a
+        // restarted server never silently auto-allows a request the
+        // human never actually decided to trust across a stop/start
+        // boundary -- see AgentHookApprovalMemory's own header comment.
+        agentHookApprovalMemory.clearAll()
         Task { await store.cleanup() }
 
         // LSP bridge teardown. `stop()` is synchronous to match the

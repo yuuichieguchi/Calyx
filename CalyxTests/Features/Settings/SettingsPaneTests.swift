@@ -35,6 +35,15 @@
 //  had become a dumping ground with mismatched section typography (only
 //  "Command Tracking" carried a full SectionHeading -- user-flagged).
 //
+//  STAGE E (approval-inbox-for-CLI-agents, two-scope Always-Allow
+//  session memory): a new `agentHookApproval` row lands on the Agents
+//  pane, right after `commandTracking` in SettingsRow's declared order --
+//  it toggles CockpitSettings.agentHookApprovalEnabled, gating
+//  CalyxMCPServer's POST /approval-request endpoint (see that setting's
+//  own doc comment). expectedRows below is extended the same way
+//  cockpitAutoApprove/commandTracking each were before it (see this
+//  repo's own history on this file).
+//
 //  ICON COVERAGE (round-2 Red phase, user-reported defect): the Settings
 //  toolbar's tabStyle (.toolbar, SettingsWindowController.setupContent())
 //  renders a degenerate fat header with sunk text when a tab item has no
@@ -90,6 +99,7 @@ final class SettingsPaneTests: XCTestCase {
         ("agentResumeAutoExecute", .agents),
         ("cockpitAutoApprove", .agents),
         ("commandTracking", .agents),
+        ("agentHookApproval", .agents),
         ("openSessionBrowserButton", .sessions),
         ("openConfigFileFooter", .appearance),
     ]
