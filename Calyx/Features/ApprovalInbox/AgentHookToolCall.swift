@@ -22,7 +22,11 @@ struct AgentHookToolCall: Sendable {
     static let maxSummaryLength = 500
 
     /// `tool_name`s whose `summary` is the string at `tool_input.file_path`.
-    private static let filePathToolNames: Set<String> = ["Write", "Edit", "Read", "NotebookEdit"]
+    /// `NotebookEdit` is deliberately NOT in this set -- Claude Code's
+    /// actual PreToolUse schema for it is `tool_input.notebook_path`, a
+    /// distinct key of its own (see `derivedSummary`'s own `NotebookEdit`
+    /// case).
+    private static let filePathToolNames: Set<String> = ["Write", "Edit", "Read"]
 
     /// Decodes a CLI agent's PreToolUse hook stdin JSON. `tool_name` is
     /// mandatory (a non-empty string) -- a missing/empty/non-string
@@ -35,10 +39,12 @@ struct AgentHookToolCall: Sendable {
     /// `Character` (backs off to the last whole character that still
     /// fits, rather than cutting mid-character). `summary` is a
     /// tool-specific human-readable string (the command for `Bash`, the
-    /// file path for `Write`/`Edit`/`Read`/`NotebookEdit`, the URL for
-    /// `WebFetch`) capped at `maxSummaryLength` characters -- any other
-    /// `tool_name`, or a recognized one missing its expected key, falls
-    /// back to the same compact JSON of `tool_input` used for `payload`.
+    /// file path for `Write`/`Edit`/`Read`, the notebook path for
+    /// `NotebookEdit` -- its own distinct `tool_input.notebook_path` key,
+    /// never `file_path` -- the URL for `WebFetch`) capped at
+    /// `maxSummaryLength` characters -- any other `tool_name`, or a
+    /// recognized one missing its expected key, falls back to the same
+    /// compact JSON of `tool_input` used for `payload`.
     static func decode(from data: Data) -> AgentHookToolCall? {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let toolName = object["tool_name"] as? String, !toolName.isEmpty else {
@@ -69,6 +75,8 @@ struct AgentHookToolCall: Sendable {
             return (toolInput["command"] as? String) ?? compactJSON
         case _ where filePathToolNames.contains(toolName):
             return (toolInput["file_path"] as? String) ?? compactJSON
+        case "NotebookEdit":
+            return (toolInput["notebook_path"] as? String) ?? compactJSON
         case "WebFetch":
             return (toolInput["url"] as? String) ?? compactJSON
         default:

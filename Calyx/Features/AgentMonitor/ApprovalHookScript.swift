@@ -134,16 +134,10 @@ enum ApprovalHookScript {
 
     /// Installs the script into `toDirectory`, creating the directory if
     /// needed, and marks it executable (0755). Returns the script's
-    /// absolute path. Mirrors `AgentHookScript.install(toDirectory:)`
-    /// exactly.
+    /// absolute path. Shares its actual write-then-chmod logic with
+    /// `AgentHookScript.install(toDirectory:)` via
+    /// `AgentHookScript.installScript(body:fileName:toDirectory:)`.
     static func install(toDirectory directory: String) throws -> String {
-        let fm = FileManager.default
-        if !fm.fileExists(atPath: directory) {
-            try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
-        }
-        let scriptPath = (directory as NSString).appendingPathComponent(fileName)
-        try scriptBody.write(toFile: scriptPath, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
-        return scriptPath
+        try AgentHookScript.installScript(body: scriptBody, fileName: fileName, toDirectory: directory)
     }
 }

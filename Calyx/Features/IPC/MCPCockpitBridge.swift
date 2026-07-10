@@ -558,7 +558,11 @@ final class MCPCockpitBridge {
             payload: payload, createdAt: Date()
         )
         approvals.submit(request)
-        let decision = await approvals.awaitDecision(id: request.id, timeoutMs: approvalTimeoutMs)
+        // `awaitDecisionHonoringCancellation` already demotes an
+        // `.allowed` result to `.expired` when this call's own Task was
+        // concurrently cancelled -- see that method's own doc comment on
+        // `ApprovalInboxStore` for the caller obligation it centralizes.
+        let decision = await approvals.awaitDecisionHonoringCancellation(id: request.id, timeoutMs: approvalTimeoutMs)
 
         switch decision {
         case .denied:
@@ -566,9 +570,6 @@ final class MCPCockpitBridge {
         case .expired:
             return .respond(["status": "approval_timeout"])
         case .allowed:
-            guard !Task.isCancelled else {
-                return .respond(["status": "approval_timeout"])
-            }
             return .proceed
         }
     }

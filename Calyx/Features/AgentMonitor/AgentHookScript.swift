@@ -88,12 +88,22 @@ enum AgentHookScript {
     /// needed, and marks it executable (0755). Returns the script's
     /// absolute path.
     static func install(toDirectory directory: String) throws -> String {
+        try installScript(body: scriptBody, fileName: fileName, toDirectory: directory)
+    }
+
+    /// Shared installer body: writes `body` to `fileName` inside
+    /// `directory` (creating it if needed) and marks it executable
+    /// (0755), returning the script's absolute path. Used by both
+    /// `AgentHookScript.install(toDirectory:)` above and
+    /// `ApprovalHookScript.install(toDirectory:)`, so the actual
+    /// write-then-chmod logic exists in exactly one place.
+    static func installScript(body: String, fileName: String, toDirectory directory: String) throws -> String {
         let fm = FileManager.default
         if !fm.fileExists(atPath: directory) {
             try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
         }
         let scriptPath = (directory as NSString).appendingPathComponent(fileName)
-        try scriptBody.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+        try body.write(toFile: scriptPath, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
         return scriptPath
     }

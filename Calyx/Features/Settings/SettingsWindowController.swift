@@ -114,7 +114,8 @@ class SettingsWindowController: NSWindowController {
         case .cockpitAutoApprove:
             return SectionHeading(
                 title: "Command Approval",
-                subtitle: "Applies to agent-initiated pane commands (run, send keys, palette). Off = ask every time."
+                subtitle: "Applies to agent-initiated pane commands (run, send keys, palette) and to CLI agents' "
+                    + "(Claude Code, Codex) tool-call approval requests. Off = ask every time."
             )
         case .commandTracking:
             return SectionHeading(title: "Command Tracking", subtitle: "Changes apply to new terminals only.")

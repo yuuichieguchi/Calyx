@@ -77,33 +77,36 @@ final class ApprovalBannerModel {
     /// from `current` -- `current` can advance between a render and a
     /// click (another decide()/expire() landing first), so re-reading it
     /// here could resolve a DIFFERENT request than the one the human
-    /// looked at and clicked Allow/Deny on. A no-op if `id` is no longer
-    /// pending (`store.decide` itself already no-ops safely for that
-    /// case too, but the explicit guard here also protects
-    /// `alwaysAllow(id:)`'s side effects below from firing on a stale
-    /// click).
+    /// looked at and clicked Allow/Deny on. A stale `id` (no longer
+    /// pending) is a safe no-op -- `store.decide` itself already no-ops
+    /// for that case, so no separate guard is needed here (unlike
+    /// `alwaysAllow(id:)` below, which guards its own extra side effects).
     func allow(id: UUID) {
-        guard store.pending.contains(where: { $0.id == id }) else { return }
         store.decide(id: id, .allowed)
     }
 
     func deny(id: UUID) {
-        guard store.pending.contains(where: { $0.id == id }) else { return }
         store.decide(id: id, .denied)
     }
 
     /// Branches on the clicked request's own `source` (Stage E).
     ///
-    /// For an `.mcpTool`-sourced request (unchanged): turns on auto-approve
-    /// for every FUTURE gated action, resolves the clicked `id` allowed
-    /// first (the request the human actually looked at), then drains
-    /// every OTHER request already queued and visible to THIS window --
-    /// otherwise the user would have to separately dismiss each banner
-    /// already on screen right after turning auto-approve on. Deliberately
-    /// scoped to this window: a pending request owned by a DIFFERENT
-    /// window is left alone here (auto-approve only gates that request's
-    /// future re-submits; that other window drains its own backlog the
-    /// same way on its own next interaction).
+    /// For an `.mcpTool`-sourced request: turns on auto-approve for every
+    /// FUTURE gated action, resolves the clicked `id` allowed first (the
+    /// request the human actually looked at), then drains every OTHER
+    /// `.mcpTool`-sourced request already queued and visible to THIS
+    /// window -- otherwise the user would have to separately dismiss each
+    /// banner already on screen right after turning auto-approve on.
+    /// Deliberately scoped to this window: a pending request owned by a
+    /// DIFFERENT window is left alone here (auto-approve only gates that
+    /// request's future re-submits; that other window drains its own
+    /// backlog the same way on its own next interaction). Also
+    /// deliberately scoped by SOURCE (R2 fix-pin): a queued
+    /// `.agentHook`-sourced request -- even one targeting the SAME
+    /// surface -- is never swept into this drain, since flipping global
+    /// auto-approve says nothing about that request's own, separate
+    /// Always-Allow memory; only that request's own always-allow action
+    /// (the `.agentHook` branch below) may ever decide it.
     ///
     /// For an `.agentHook`-sourced request (Stage E, new): NEVER touches
     /// `CockpitSettings.autoApproveEnabled` at all. Instead records PANE
@@ -133,7 +136,11 @@ final class ApprovalBannerModel {
         case .mcpTool:
             CockpitSettings.autoApproveEnabled = true
             var idsToAllow = [id]
-            idsToAllow.append(contentsOf: store.pending.filter { $0.id != id && isVisible($0) }.map(\.id))
+            idsToAllow.append(contentsOf: store.pending.filter { candidate in
+                guard candidate.id != id, isVisible(candidate) else { return false }
+                guard case .mcpTool = candidate.source else { return false }
+                return true
+            }.map(\.id))
             store.decide(ids: idsToAllow, .allowed)
 
         case .agentHook(let toolName, let kind, _):

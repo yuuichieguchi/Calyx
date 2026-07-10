@@ -3,12 +3,12 @@
 //
 // Single source of truth for the timing constants that must nest
 // strictly inside one another across the whole approval-inbox-for-
-// CLI-agents hook chain (see .claude/IDEAS.md, "アイディア 3"):
-// Calyx's own long-poll timeout must resolve before the hook script's
-// own curl `-m` deadline gives up on it, which itself must fire before
-// the CLI agent's own hook-entry timeout kills the whole hook process
-// outright. Getting this nesting wrong in either direction produces a
-// user-visible failure at the wrong layer:
+// CLI-agents hook chain: Calyx's own long-poll timeout must resolve
+// before the hook script's own curl `-m` deadline gives up on it,
+// which itself must fire before the CLI agent's own hook-entry
+// timeout kills the whole hook process outright. Getting this nesting
+// wrong in either direction produces a user-visible failure at the
+// wrong layer:
 //
 // - If curl's timeout were <= the server's, curl would give up while
 //   Calyx is still legitimately waiting on a human decision, and the
@@ -43,9 +43,13 @@ enum ApprovalHookTiming {
     /// Claude Code's and Codex's own default PreToolUse hook timeout, in
     /// seconds -- the outermost deadline in the chain, and the value
     /// every other constant here is derived backward from. Configurable
-    /// per-hook entry in both CLIs, but Calyx's own injected hook
-    /// entries do not override it, so this is the value that actually
-    /// applies in practice.
+    /// per-hook entry in both CLIs; Calyx's own injected approval-hook
+    /// entry (`ClaudeHooksConfigManager.approvalCommandEntry` /
+    /// `CodexHooksConfigManager`'s equivalent) DOES write an explicit
+    /// `timeout` value for it, rather than leaving it as an unspecified
+    /// CLI default -- but that written value is itself
+    /// `hookEntryTimeoutSeconds`, i.e. this same 600, so the nesting
+    /// invariant below still holds regardless.
     static let holdSeconds = 600
 
     /// `CalyxMCPServer.approvalRequestTimeoutMs`'s default: the

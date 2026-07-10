@@ -65,6 +65,11 @@ final class CalyxMCPServer {
         return fmt
     }()
 
+    /// The `/approval-request` route's path, shared by `route(request:)`'s
+    /// own switch case and `dispatchRoute`'s guard so the one path string
+    /// that gates the connection-drop watch exists in exactly one place.
+    private static let approvalRequestPath = "/approval-request"
+
     // MARK: - Init
 
     init() {}
@@ -134,6 +139,24 @@ final class CalyxMCPServer {
     /// rationale as `approvalInbox` above. `stop()` clears it via
     /// `clearAll()`, mirroring that method's own `approvalInbox.expireAll()`.
     var agentHookApprovalMemory: AgentHookApprovalMemory = .shared
+
+    /// Whether a resolved surface UUID corresponds to a still-live pane
+    /// anywhere in the app -- consulted by `routeApprovalRequest`
+    /// immediately before it would otherwise submit to `approvalInbox`
+    /// (R4): a stale/forged/torn-down surface short-circuits to 200 with
+    /// an EMPTY body, submitting nothing and posting no notification,
+    /// rather than queuing a request whose banner no window could ever
+    /// show (see `ApprovalBannerModel.isVisible` -- nothing owns a
+    /// surface that doesn't exist) while the hook script long-polls for
+    /// a decision nobody can ever make. Defaults to
+    /// `LiveCockpitAppAccess.paneExists(_:)` -- the same canonical
+    /// "does this surface exist" check `MCPCockpitBridge`'s `pane_run`/
+    /// `pane_send_keys` already gate on before ever bothering a human
+    /// (see `CockpitAppAccessing`'s own doc comment for why `paneExists`,
+    /// not a second, separately-maintained membership check, is the one
+    /// source of truth for pane identity). Test-overridable, same
+    /// rationale as `approvalInbox`/`agentHookApprovalMemory` above.
+    var approvalSurfaceExists: (UUID) -> Bool = { LiveCockpitAppAccess().paneExists($0) }
 
     /// The timeout `POST /approval-request`'s long-poll (`routeApprovalRequest`)
     /// gives `approvalInbox.awaitDecision` before resolving `.expired`.
@@ -229,7 +252,7 @@ final class CalyxMCPServer {
             return await routeAgentEvent(request: request)
         case ("POST", "/command-event"):
             return await routeCommandEvent(request: request)
-        case ("POST", "/approval-request"):
+        case ("POST", Self.approvalRequestPath):
             return await routeApprovalRequest(request: request)
         default:
             return HTTPParser.response(statusCode: 404, body: nil)
@@ -418,9 +441,14 @@ final class CalyxMCPServer {
     /// short-circuits to 200 with an ALLOW body, also without ever
     /// submitting -> a Stage E `agentHookApprovalMemory.isAutoAllowed`
     /// hit (pane OR cross scope) short-circuits the same way, also
-    /// without submitting -> otherwise submits an `ApprovalRequest(source:
-    /// .agentHook(...))`, posts one user notification, and long-polls
-    /// `approvalInbox.awaitDecision`.
+    /// without submitting -> R4: an `approvalSurfaceExists` miss (a
+    /// stale/forged/torn-down surface) short-circuits the same inert way
+    /// as the unrecognized-kind case above, also without submitting ->
+    /// otherwise submits an `ApprovalRequest(source: .agentHook(...))`,
+    /// posts one user notification (its `body` run through
+    /// `SecretRedactor.redact` first -- see that call site's own comment
+    /// for why only the notification, never the banner, is redacted),
+    /// and long-polls `approvalInbox.awaitDecisionHonoringCancellation`.
     ///
     /// Three invariants a future change here must preserve:
     ///
@@ -436,25 +464,30 @@ final class CalyxMCPServer {
     ///     `.expired`, which `AgentHookPermissionResponse` renders as
     ///     "ask" for claude-code (defer to Claude Code's own prompt) or
     ///     an empty body for codex (no "ask" analog there) -- NEVER
-    ///     "allow". An `.allowed` decision that raced a concurrent
-    ///     cancellation of this call's own Task is re-mapped to
-    ///     `.expired` below, mirroring `MCPCockpitBridge.gate`'s own
-    ///     re-check (see that method's comment): `awaitDecision`'s
-    ///     documented caller obligation is that `.allowed` does not
-    ///     guarantee this Task survived to receive it.
+    ///     "allow". `awaitDecisionHonoringCancellation` is what re-maps an
+    ///     `.allowed` decision that raced a concurrent cancellation of
+    ///     this call's own Task to `.expired` -- see that method's own
+    ///     doc comment on `ApprovalInboxStore` (the same re-check
+    ///     `MCPCockpitBridge.gate` also goes through, centralized there
+    ///     rather than duplicated in both places).
     ///
-    /// (c) A hook killed client-side (curl's own `-m` deadline, or the
-    ///     CLI's hook-entry timeout, firing before Calyx answers) simply
-    ///     stops reading this response -- its connection dropping is
-    ///     detected by `finishRequest`'s connection-drop wiring (scoped
-    ///     to this endpoint only), which cancels the Task running this
-    ///     call and expires the pending request through the same
-    ///     mechanism as a timeout, clearing its banner. A decision that
-    ///     still resolves `.allowed` for such an already-abandoned call
-    ///     is harmless: no hook process is left to read this response,
-    ///     and nothing executes server-side as a result of it --
-    ///     execution happens inside the CLI agent's own process, driven
-    ///     entirely by whatever it read from its own hook's stdout.
+    /// (c) A hook killed client-side (curl's own `-m` deadline, the CLI's
+    ///     hook-entry timeout, or the whole hook process being killed
+    ///     outright, e.g. by SIGKILL) drops this connection out from
+    ///     under the still-suspended long-poll. `dispatchRoute`'s sentinel
+    ///     receive (scoped to this endpoint only -- see that method's own
+    ///     doc comment for the real detection mechanism, and why a
+    ///     `stateUpdateHandler`-based approach does NOT work here) is what
+    ///     notices the drop and cancels the `Task` running this call,
+    ///     which propagates into `approvalInbox.awaitDecision`'s
+    ///     cancellation handler and expires the pending request through
+    ///     the same mechanism as a timeout, clearing its banner. A
+    ///     decision that still resolves `.allowed` for such an
+    ///     already-abandoned call is harmless: no hook process is left to
+    ///     read this response, and nothing executes server-side as a
+    ///     result of it -- execution happens inside the CLI agent's own
+    ///     process, driven entirely by whatever it read from its own
+    ///     hook's stdout.
     private func routeApprovalRequest(request: HTTPRequest) async -> HTTPResponse {
         guard let authToken = bearerToken(from: request.headers), authToken == token else {
             return HTTPParser.response(statusCode: 401, body: nil)
@@ -499,6 +532,15 @@ final class CalyxMCPServer {
             )
         }
 
+        // R4: a valid-FORMAT surface UUID no live surface registry
+        // actually knows about (pane already closed, or a stale/forged
+        // header) -- inert pass-through, same as the unrecognized-kind
+        // guard above, rather than queuing a request whose banner no
+        // window could ever show.
+        guard approvalSurfaceExists(surfaceID) else {
+            return HTTPParser.response(statusCode: 200, body: nil)
+        }
+
         let requestID = UUID()
         approvalInbox.submit(ApprovalRequest(
             id: requestID,
@@ -507,18 +549,28 @@ final class CalyxMCPServer {
             payload: call.payload,
             createdAt: Date()
         ))
-        // NotificationSanitizer runs inside sendNotification itself --
-        // no need to sanitize title/body here.
+        // R3 fix-pin: the notification body is redacted through
+        // SecretRedactor -- the same redaction CommandLogStore already
+        // runs text through before persistence (see that type's own
+        // header comment) -- because a notification can leak into places
+        // (Notification Center history, a screen someone else can see)
+        // the human never explicitly chose to expose a raw secret to.
+        // The BANNER, in contrast, deliberately keeps `call.summary`
+        // verbatim (via `ApprovalRequest.displayPayload` /
+        // `.agentHook`'s own `summary`) -- the human approving this
+        // exact tool call must see exactly what they're being asked to
+        // approve, unredacted; `ControlCharacterDisplay` there guards a
+        // different concern (terminal-control-character spoofing), not
+        // secret leakage. NotificationSanitizer still runs inside
+        // sendNotification itself -- no need to sanitize title/body for
+        // that separate concern here.
         NotificationManager.shared.sendNotification(
             title: "\(AgentEntry.displayName(forKind: kind)) wants to run \(call.toolName)",
-            body: "\(call.toolName): \(call.summary)",
+            body: SecretRedactor.redact("\(call.toolName): \(call.summary)"),
             tabID: surfaceID
         )
 
-        var decision = await approvalInbox.awaitDecision(id: requestID, timeoutMs: approvalRequestTimeoutMs)
-        if decision == .allowed && Task.isCancelled {
-            decision = .expired
-        }
+        let decision = await approvalInbox.awaitDecisionHonoringCancellation(id: requestID, timeoutMs: approvalRequestTimeoutMs)
         return HTTPParser.response(statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: decision))
     }
 
@@ -1334,41 +1386,64 @@ final class CalyxMCPServer {
     /// completely unchanged — none of them block on a human, so none of
     /// them need this.
     ///
-    /// Installing `connection.stateUpdateHandler` here (rather than
-    /// unconditionally in `handleConnection`) is deliberate: no other
-    /// code in this class ever sets it for an accepted connection (only
-    /// the *listener* probe in `startListenerAndWaitForReady` uses its
-    /// own, unrelated `stateUpdateHandler`), so this is a clean install,
-    /// not a replacement of an existing handler. The handler ignores
-    /// every state once `accumulator.didRespond` is true — gating on the
-    /// same flag `sendHTTPResponse` already uses as its single source of
-    /// truth — so the ordinary post-response `connection.cancel()` (from
-    /// `sendHTTPResponse` itself) can never be mistaken for a pre-response
-    /// drop: `didRespond` is set synchronously, before `connection.send`
-    /// is even called, strictly before any `.cancelled` state resulting
-    /// from that same send's completion could ever reach this handler.
+    /// THE REAL MECHANISM (empirically verified, replacing an earlier
+    /// `connection.stateUpdateHandler`-based attempt that never actually
+    /// fired): with no `receive()` outstanding on a connection,
+    /// `NWConnection` does NOT report a peer's graceful FIN via
+    /// `stateUpdateHandler` at all — a SIGKILLed curl process on loopback
+    /// also produces a plain FIN, not a distinguishable error state. The
+    /// only way this framework ever surfaces either is a `receive()`
+    /// completing with `isComplete == true` or a non-nil `error`, which
+    /// can only happen while a `receive()` call is actually outstanding.
+    /// So this keeps a SENTINEL `connection.receive` call outstanding for
+    /// the whole lifetime of `routeTask`'s suspension: once it completes
+    /// with `isComplete`/`error` — and only while `accumulator.didRespond`
+    /// is still `false` — it cancels `routeTask`. A sentinel completing
+    /// AFTER `didRespond` (e.g. because `sendHTTPResponse`'s own
+    /// `connection.cancel()` also completes this same outstanding
+    /// receive) is a deliberate no-op, gated on the same `didRespond`
+    /// flag `sendHTTPResponse` itself uses as its single source of truth.
+    /// Any bytes the sentinel actually reads are discarded and the
+    /// sentinel simply re-arms itself — this connection never supports
+    /// pipelining (`Connection: close`), so there is nothing meaningful
+    /// to parse out of a non-terminal read here, but the watch must stay
+    /// outstanding afterward or a later genuine drop would go right back
+    /// to being undetectable.
     private func dispatchRoute(
         connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator
     ) async -> HTTPResponse {
-        guard request.path == "/approval-request" else {
+        guard request.path == Self.approvalRequestPath else {
             return await route(request: request)
         }
 
         let routeTask = Task { @MainActor in
             await self.route(request: request)
         }
-        connection.stateUpdateHandler = { state in
-            switch state {
-            case .failed, .cancelled:
-                Task { @MainActor in
-                    guard !accumulator.didRespond else { return }
-                    routeTask.cancel()
+
+        armApprovalRequestConnectionDropSentinel(connection: connection, routeTask: routeTask, accumulator: accumulator)
+
+        return await routeTask.value
+    }
+
+    /// The sentinel receive `dispatchRoute` arms for `/approval-request`
+    /// — see that method's own doc comment for the full rationale. Kept
+    /// as its own recursive method (mirroring `receiveUntilComplete`'s
+    /// shape) rather than inline in `dispatchRoute`, so the re-arm-on-
+    /// non-terminal-data step reads as a plain recursive call instead of
+    /// a nested closure capturing itself.
+    private func armApprovalRequestConnectionDropSentinel(
+        connection: NWConnection, routeTask: Task<HTTPResponse, Never>, accumulator: ReceiveAccumulator
+    ) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: HTTPParser.maxHeaderSize + HTTPParser.maxBodySize) { [weak self] _, _, isComplete, error in
+            Task { @MainActor in
+                guard let self, !accumulator.didRespond else { return }
+                guard isComplete || error != nil else {
+                    self.armApprovalRequestConnectionDropSentinel(connection: connection, routeTask: routeTask, accumulator: accumulator)
+                    return
                 }
-            default:
-                break
+                routeTask.cancel()
             }
         }
-        return await routeTask.value
     }
 
     /// Sends `httpResponse` and cancels the connection once it's fully

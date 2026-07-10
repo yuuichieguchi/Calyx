@@ -30,10 +30,10 @@ struct ApprovalBannerView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     /// Routed through `ControlCharacterDisplay.render` same as
-    /// `request.payload` below -- `displayToolName` comes from the same
-    /// untrusted tool-call provenance as `payload`, so it must not be
-    /// able to smuggle a hidden/spoofing payload into the header just
-    /// because it's a different field on `ApprovalRequest`.
+    /// `request.displayPayload` below -- `displayToolName` comes from the
+    /// same untrusted tool-call provenance as `displayPayload`, so it
+    /// must not be able to smuggle a hidden/spoofing payload into the
+    /// header just because it's a different field on `ApprovalRequest`.
     private var toolName: String {
         ControlCharacterDisplay.render(request.displayToolName)
     }
@@ -165,7 +165,7 @@ struct ApprovalBannerView: View {
     }
 
     private var payloadText: some View {
-        Text(ControlCharacterDisplay.render(request.payload))
+        Text(ControlCharacterDisplay.render(request.displayPayload))
             .font(.system(.callout, design: .monospaced))
             .frame(maxWidth: .infinity, alignment: .leading)
             .textSelection(.enabled)

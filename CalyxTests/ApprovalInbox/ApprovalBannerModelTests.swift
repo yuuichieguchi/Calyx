@@ -23,8 +23,11 @@
 //  - alwaysAllow(id:) turns on CockpitSettings.autoApproveEnabled,
 //    decides the clicked id .allowed, AND drains every other request
 //    already visible to this window in the same action -- for an
-//    `.mcpTool`-sourced request (unchanged, Stage E). For an
-//    `.agentHook`-sourced request (Stage E, NEW), alwaysAllow(id:)
+//    `.mcpTool`-sourced request (unchanged, Stage E), but NEVER a queued
+//    `.agentHook`-sourced request on that same drain, even targeting the
+//    same surface (source-scoped, see
+//    test_alwaysAllow_mcpToolSource_doesNotDrainQueuedAgentHookRequest_onSameSurface).
+//    For an `.agentHook`-sourced request (Stage E, NEW), alwaysAllow(id:)
 //    instead records PANE Always-Allow memory (surfaceID, kind,
 //    toolName) via the injected `memory`, batch-allows only pending
 //    requests sharing that EXACT tuple, and never touches
@@ -311,6 +314,55 @@ final class ApprovalBannerModelTests: XCTestCase {
 
         XCTAssertEqual(store.pending.map(\.id), [foreignRequest.id],
                        "alwaysAllow(id:) must leave a request targeting a surface this window doesn't own pending")
+    }
+
+    /// R2 fix-pin: the `.mcpTool` branch of `alwaysAllow(id:)` drains
+    /// every OTHER pending request visible to this window with NO source
+    /// filter -- so a queued `.agentHook` request targeting the SAME
+    /// surface must NOT be swept up in an mcpTool click's drain. Only
+    /// that agentHook request's own (separate) always-allow action may
+    /// ever decide it -- see the `.agentHook` branch below, which records
+    /// its own pane/cross memory instead of touching the global setting.
+    func test_alwaysAllow_mcpToolSource_doesNotDrainQueuedAgentHookRequest_onSameSurface() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.alwaysAllowMcpToolDoesNotDrainAgentHook"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled, "precondition: the isolated suite starts with auto-approve off")
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let surfaceID = UUID()
+        let mcpToolRequest = makeRequest(
+            targetSurfaceID: surfaceID, payload: "pane_run", createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let agentHookRequest = makeAgentHookRequest(
+            targetSurfaceID: surfaceID, toolName: "Bash", createdAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        store.submit(mcpToolRequest)
+        store.submit(agentHookRequest)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true }, memory: memory)
+
+        let waiterMcp = Task { @MainActor in await store.awaitDecision(id: mcpToolRequest.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.alwaysAllow(id: mcpToolRequest.id)
+
+        XCTAssertTrue(CockpitSettings.autoApproveEnabled,
+                      "the mcpTool branch must still flip global auto-approve, unchanged")
+        XCTAssertEqual(store.pending.map(\.id), [agentHookRequest.id],
+                       "alwaysAllow(id:) on an .mcpTool request must decide only that request, leaving a " +
+                       "queued .agentHook request on the SAME surface pending -- it has its own, separate " +
+                       "always-allow action")
+        XCTAssertFalse(memory.isAutoAllowed(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash"),
+                       "the mcpTool branch must never record agent-hook Always-Allow memory as a side effect")
+
+        let resultMcp = await waiterMcp.value
+        XCTAssertEqual(resultMcp, .allowed)
+
+        // Drain the still-pending agentHook request so this test doesn't
+        // leak a suspended awaitDecision waiter.
+        store.decide(id: agentHookRequest.id, .allowed)
     }
 
     // MARK: - pendingCountForWindow
