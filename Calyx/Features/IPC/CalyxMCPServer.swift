@@ -125,6 +125,17 @@ final class CalyxMCPServer {
     /// waiting on a decision nobody can make anymore.
     var approvalInbox: ApprovalInboxStore = .shared
 
+    /// The timeout `POST /approval-request`'s long-poll (`routeApprovalRequest`)
+    /// gives `approvalInbox.awaitDecision` before resolving `.expired`.
+    /// Defaults to `ApprovalHookTiming.serverTimeoutMs` (see that enum's
+    /// header comment for the full nesting rationale against the hook
+    /// script's own curl timeout and the CLI's hook-entry timeout);
+    /// test-overridable so tests can drive the timeout path in well
+    /// under a second rather than actually waiting out the real
+    /// production value, same rationale as `MCPCockpitBridge`'s own
+    /// `approvalTimeoutMs`.
+    var approvalRequestTimeoutMs: Int = ApprovalHookTiming.serverTimeoutMs
+
     /// Lazily constructed, cached `MCPCockpitBridge` that Cockpit tool
     /// calls dispatch through -- same `lazy` caveat as
     /// `lazyCommandLogBridge`: only built on first actual Cockpit-tool
@@ -208,6 +219,8 @@ final class CalyxMCPServer {
             return await routeAgentEvent(request: request)
         case ("POST", "/command-event"):
             return await routeCommandEvent(request: request)
+        case ("POST", "/approval-request"):
+            return await routeApprovalRequest(request: request)
         default:
             return HTTPParser.response(statusCode: 404, body: nil)
         }
@@ -290,6 +303,22 @@ final class CalyxMCPServer {
         return sessionSurfaceMap.surfaceID(for: raw)
     }
 
+    /// Resolves `X-Calyx-Agent-Kind`, trimming whitespace and falling
+    /// back to `AgentEntry.claudeCodeKind` when the header is absent OR
+    /// present-but-blank (e.g. a proxy/plugin bug that sends
+    /// `X-Calyx-Agent-Kind: ` with no value), rather than letting an
+    /// empty-string kind reach the registry, the sidebar, or the
+    /// approval inbox. Shared by `routeAgentEvent` and
+    /// `routeApprovalRequest` so the same header is resolved identically
+    /// on both routes.
+    private func agentKind(from headers: [String: String]) -> String {
+        if let trimmed = header(named: "X-Calyx-Agent-Kind", in: headers)?
+            .trimmingCharacters(in: .whitespaces), !trimmed.isEmpty {
+            return trimmed
+        }
+        return AgentEntry.claudeCodeKind
+    }
+
     private func routeAgentEvent(request: HTTPRequest) async -> HTTPResponse {
         guard let authToken = bearerToken(from: request.headers), authToken == token else {
             return HTTPParser.response(statusCode: 401, body: nil)
@@ -303,17 +332,7 @@ final class CalyxMCPServer {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
 
-        // Trim whitespace and fall back to claude-code when the header is
-        // absent OR present-but-blank (e.g. a proxy/plugin bug that sends
-        // `X-Calyx-Agent-Kind: ` with no value), rather than letting an
-        // empty-string kind reach the registry and the sidebar.
-        let kind: String
-        if let trimmed = header(named: "X-Calyx-Agent-Kind", in: request.headers)?
-            .trimmingCharacters(in: .whitespaces), !trimmed.isEmpty {
-            kind = trimmed
-        } else {
-            kind = AgentEntry.claudeCodeKind
-        }
+        let kind = agentKind(from: request.headers)
         agentRegistry.handleHookEvent(event, surfaceID: surfaceID, kind: kind)
         // P4: record the agent's self-reported session ID (when
         // present) into the calyx-session daemon's per-session meta so
@@ -373,6 +392,116 @@ final class CalyxMCPServer {
 
         commandLogStore.ingest(event, surfaceID: surfaceID)
         return HTTPParser.response(statusCode: 204, body: nil)
+    }
+
+    /// Handles `POST /approval-request`, the long-poll endpoint the
+    /// `calyx-approval-hook` script blocks on from a CLI agent's
+    /// PreToolUse hook while a human decides whether to allow its next
+    /// tool call. Contract, in order: bearer auth (401) -> body present
+    /// (400) -> body.count <= 262_144, checked BEFORE decode (413,
+    /// mirrors `routeCommandEvent`) -> `AgentHookToolCall.decode` (400)
+    /// -> `resolveSurfaceID` (400) -> an unrecognized `X-Calyx-Agent-Kind`
+    /// (anything other than claude-code/codex) short-circuits to 200
+    /// with an EMPTY body, never submitting anything ->
+    /// `CockpitSettings.agentHookApprovalEnabled` being off does the
+    /// same -> global auto-approve (`!ApprovalPolicy.requiresApproval()`)
+    /// short-circuits to 200 with an ALLOW body, also without ever
+    /// submitting -> otherwise submits an `ApprovalRequest(source:
+    /// .agentHook(...))`, posts one user notification, and long-polls
+    /// `approvalInbox.awaitDecision`.
+    ///
+    /// Three invariants a future change here must preserve:
+    ///
+    /// (a) THE RESPONSE BODY IS THE HOOK'S STDOUT, BYTE FOR BYTE --
+    ///     Claude Code / Codex parse it directly as their own
+    ///     PreToolUse hook JSON contract (see
+    ///     `AgentHookPermissionResponse`'s header comment). Nothing here
+    ///     may wrap, prepend, or otherwise reshape it.
+    ///
+    /// (b) Fail-safe mapping: every path that resolves without a genuine
+    ///     human decision (timed-out long-poll, `server.stop()`'s drain,
+    ///     or this call's own Task being cancelled mid-poll) maps to
+    ///     `.expired`, which `AgentHookPermissionResponse` renders as
+    ///     "ask" for claude-code (defer to Claude Code's own prompt) or
+    ///     an empty body for codex (no "ask" analog there) -- NEVER
+    ///     "allow". An `.allowed` decision that raced a concurrent
+    ///     cancellation of this call's own Task is re-mapped to
+    ///     `.expired` below, mirroring `MCPCockpitBridge.gate`'s own
+    ///     re-check (see that method's comment): `awaitDecision`'s
+    ///     documented caller obligation is that `.allowed` does not
+    ///     guarantee this Task survived to receive it.
+    ///
+    /// (c) A hook killed client-side (curl's own `-m` deadline, or the
+    ///     CLI's hook-entry timeout, firing before Calyx answers) simply
+    ///     stops reading this response -- its connection dropping is
+    ///     detected by `finishRequest`'s connection-drop wiring (scoped
+    ///     to this endpoint only), which cancels the Task running this
+    ///     call and expires the pending request through the same
+    ///     mechanism as a timeout, clearing its banner. A decision that
+    ///     still resolves `.allowed` for such an already-abandoned call
+    ///     is harmless: no hook process is left to read this response,
+    ///     and nothing executes server-side as a result of it --
+    ///     execution happens inside the CLI agent's own process, driven
+    ///     entirely by whatever it read from its own hook's stdout.
+    private func routeApprovalRequest(request: HTTPRequest) async -> HTTPResponse {
+        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+            return HTTPParser.response(statusCode: 401, body: nil)
+        }
+
+        guard let body = request.body else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+        guard body.count <= 262_144 else {
+            return HTTPParser.response(statusCode: 413, body: nil)
+        }
+
+        guard let call = AgentHookToolCall.decode(from: body) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        guard let surfaceID = resolveSurfaceID(from: request.headers) else {
+            return HTTPParser.response(statusCode: 400, body: nil)
+        }
+
+        let kind = agentKind(from: request.headers)
+        guard kind == AgentEntry.claudeCodeKind || kind == AgentEntry.codexKind else {
+            // An agent CLI Calyx doesn't have a hook-response contract
+            // for at all (see `AgentHookPermissionResponse`'s own
+            // fail-safe contract) -- never submit to the inbox for one.
+            return HTTPParser.response(statusCode: 200, body: nil)
+        }
+
+        guard CockpitSettings.agentHookApprovalEnabled else {
+            return HTTPParser.response(statusCode: 200, body: nil)
+        }
+
+        guard ApprovalPolicy.requiresApproval() else {
+            return HTTPParser.response(
+                statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
+            )
+        }
+
+        let requestID = UUID()
+        approvalInbox.submit(ApprovalRequest(
+            id: requestID,
+            source: .agentHook(toolName: call.toolName, kind: kind, summary: call.summary),
+            targetSurfaceID: surfaceID,
+            payload: call.payload,
+            createdAt: Date()
+        ))
+        // NotificationSanitizer runs inside sendNotification itself --
+        // no need to sanitize title/body here.
+        NotificationManager.shared.sendNotification(
+            title: "\(AgentEntry.displayName(forKind: kind)) wants to run \(call.toolName)",
+            body: "\(call.toolName): \(call.summary)",
+            tabID: surfaceID
+        )
+
+        var decision = await approvalInbox.awaitDecision(id: requestID, timeoutMs: approvalRequestTimeoutMs)
+        if decision == .allowed && Task.isCancelled {
+            decision = .expired
+        }
+        return HTTPParser.response(statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: decision))
     }
 
     /// Case-insensitive `Authorization: Bearer <token>` extraction, shared
@@ -1153,7 +1282,7 @@ final class CalyxMCPServer {
     private func finishRequest(connection: NWConnection, buffer: Data, accumulator: ReceiveAccumulator) async {
         do {
             let httpRequest = try HTTPParser.parse(buffer)
-            let httpResponse = await self.route(request: httpRequest)
+            let httpResponse = await self.dispatchRoute(connection: connection, request: httpRequest, accumulator: accumulator)
             self.sendHTTPResponse(connection: connection, httpResponse: httpResponse, accumulator: accumulator)
         } catch let error as HTTPParseError {
             let statusCode: Int
@@ -1166,6 +1295,57 @@ final class CalyxMCPServer {
         } catch {
             self.sendHTTPResponse(connection: connection, httpResponse: HTTPParser.response(statusCode: 500, body: nil), accumulator: accumulator)
         }
+    }
+
+    /// Runs `route(request:)`, additionally wiring a connection-drop
+    /// watch scoped to `/approval-request` ONLY: that endpoint alone can
+    /// suspend for up to `approvalRequestTimeoutMs` (~9.5 minutes)
+    /// awaiting a human decision, so it alone needs to notice the peer
+    /// disappearing mid-poll (the hook process getting killed by curl's
+    /// own `-m` deadline or the CLI's hook-entry timeout) and cancel its
+    /// own `route(request:)` Task — cancellation propagates into
+    /// `approvalInbox.awaitDecision`'s cancellation handler, expiring
+    /// the pending request and clearing its banner (see
+    /// `routeApprovalRequest`'s own doc comment, point (c)). Every other
+    /// route still runs via the plain `await route(request:)` path below
+    /// completely unchanged — none of them block on a human, so none of
+    /// them need this.
+    ///
+    /// Installing `connection.stateUpdateHandler` here (rather than
+    /// unconditionally in `handleConnection`) is deliberate: no other
+    /// code in this class ever sets it for an accepted connection (only
+    /// the *listener* probe in `startListenerAndWaitForReady` uses its
+    /// own, unrelated `stateUpdateHandler`), so this is a clean install,
+    /// not a replacement of an existing handler. The handler ignores
+    /// every state once `accumulator.didRespond` is true — gating on the
+    /// same flag `sendHTTPResponse` already uses as its single source of
+    /// truth — so the ordinary post-response `connection.cancel()` (from
+    /// `sendHTTPResponse` itself) can never be mistaken for a pre-response
+    /// drop: `didRespond` is set synchronously, before `connection.send`
+    /// is even called, strictly before any `.cancelled` state resulting
+    /// from that same send's completion could ever reach this handler.
+    private func dispatchRoute(
+        connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator
+    ) async -> HTTPResponse {
+        guard request.path == "/approval-request" else {
+            return await route(request: request)
+        }
+
+        let routeTask = Task { @MainActor in
+            await self.route(request: request)
+        }
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor in
+                    guard !accumulator.didRespond else { return }
+                    routeTask.cancel()
+                }
+            default:
+                break
+            }
+        }
+        return await routeTask.value
     }
 
     /// Sends `httpResponse` and cancels the connection once it's fully

@@ -70,4 +70,37 @@ final class CockpitSettingsTests: XCTestCase {
 
         CockpitSettings._testTeardownSuite(named: otherSuiteName)
     }
+
+    // MARK: - agentHookApprovalEnabled (Stage B: agent-hook approval toggle)
+    //
+    // Same shape and rationale as autoApproveEnabled above -- a second,
+    // independent UserDefaults-backed switch gating whether
+    // CalyxMCPServer's new POST /approval-request endpoint ever submits
+    // a CLI agent's PreToolUse call to the approval inbox at all.
+    // Defaults OFF, same "approval is opt-in" posture as
+    // autoApproveEnabled defaulting off means "approval is required".
+
+    func test_agentHookApprovalEnabled_defaultFalse_andRoundTrips() {
+        XCTAssertFalse(CockpitSettings.agentHookApprovalEnabled,
+                       "agentHookApprovalEnabled must default to false when the key has never been written")
+
+        CockpitSettings.agentHookApprovalEnabled = true
+        XCTAssertTrue(CockpitSettings.agentHookApprovalEnabled,
+                     "Setting agentHookApprovalEnabled to true must be readable back as true")
+
+        CockpitSettings.agentHookApprovalEnabled = false
+        XCTAssertFalse(CockpitSettings.agentHookApprovalEnabled,
+                      "Setting agentHookApprovalEnabled to false must be readable back as false")
+
+        XCTAssertEqual(CockpitSettings.agentHookApprovalEnabledKey, "calyx.cockpit.agentHookApprovalEnabled",
+                       "the UserDefaults key must match the spec'd literal exactly")
+
+        // Verify the write actually reached the isolated test suite --
+        // otherwise the assertions above would be indistinguishable from a
+        // getter that simply ignores any set.
+        CockpitSettings.agentHookApprovalEnabled = true
+        let rawSuite = UserDefaults(suiteName: suiteName)!
+        XCTAssertTrue(rawSuite.bool(forKey: CockpitSettings.agentHookApprovalEnabledKey),
+                      "Setting agentHookApprovalEnabled must actually persist the value into the isolated test suite")
+    }
 }
