@@ -13,8 +13,11 @@ set -euo pipefail
 # pane-side script always reads that exact, no-override-possible path),
 # so the demo's own "Enable AI Agent IPC" would clobber the production
 # instance's endpoint file. Also requires the `claude` CLI on PATH --
-# the scenario pastes `claude` into three panes and expects it to
-# actually start a real agent.
+# the scenario pastes `claude --model sonnet` into three panes and
+# expects it to actually start a real agent. (`--model sonnet` is pinned
+# rather than left to the operator's own ambient default, which
+# field-flipped between takes and wrecked this scenario's pacing -- see
+# DemoRecordingScenario.swift's own PRE-ROLL comment.)
 #
 # pkill/killall are prohibited in this repo: if a Calyx process is
 # running, this asks the human to quit it rather than killing it out
@@ -55,8 +58,9 @@ fi
 
 if ! command -v claude > /dev/null; then
     echo "ERROR: the 'claude' CLI was not found on PATH."
-    echo "Install Claude Code first -- the demo scenario pastes 'claude'"
-    echo "into three panes and expects it to actually start."
+    echo "Install Claude Code first -- the demo scenario pastes"
+    echo "'claude --model sonnet' into three panes and expects it to"
+    echo "actually start."
     exit 1
 fi
 
@@ -208,9 +212,10 @@ echo
 echo "=== Calyx Demo Recording ==="
 echo "This launches an isolated Calyx.app instance (its own defaults"
 echo "domain and session dir -- not your real Calyx state) at a fixed"
-echo "1440x900 window, builds a 2x2 pane split, starts real 'claude'"
-echo "agents in three panes, and drives a short scripted product demo"
-echo "end to end, including a real approval-banner interaction."
+echo "1440x900 window, builds a 2x2 pane split, starts real"
+echo "'claude --model sonnet' agents in three panes, and drives a short"
+echo "scripted product demo end to end, including a real"
+echo "approval-banner interaction."
 echo
 echo "When you see \"DEMO: PRE-ROLL COMPLETE\" in the log below (or the"
 echo "4 panes visibly settle with their agents idle), start your screen"

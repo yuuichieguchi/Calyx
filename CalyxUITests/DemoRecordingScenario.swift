@@ -67,9 +67,9 @@
 //
 // STORYBOARD (~90s):
 //   PRE-ROLL  -- enable AI Agent IPC, build the 2x2 split, start
-//                `claude` in panes 1-3 (plus a trust-dialog Return),
-//                `cd`+`clear` in pane 4, print the "start recording"
-//                marker, hold 15s.
+//                `claude --model sonnet` in panes 1-3 (plus a
+//                trust-dialog Return), `cd`+`clear` in pane 4, print the
+//                "start recording" marker, hold 15s.
 //   BEAT 1    -- send one prompt to each of panes 1-3.
 //   BEAT 2    -- first approval banner: wait, hold, click Allow.
 //   BEAT 3    -- second approval banner: wait, hold, click the
@@ -203,12 +203,21 @@ final class DemoRecordingScenario: CalyxUITestCase {
         menuAction("File", item: "Split Down")
         _ = waitForSplitterCount(timeout: 10) { $0 > dividersAfterFirstDown }
 
+        // `--model sonnet` (not a bare `claude`): a bare invocation
+        // inherits the OPERATOR's own ambient default model, which
+        // field-flipped between takes (Sonnet 5 in one take, a
+        // long-thinking Opus/"Fable 5"-class model in the next, after
+        // the operator changed their own default) and wrecked this
+        // scenario's pacing -- every sleep/keeper-loop bound in this
+        // file is tuned against a fast-responding model. Pinning the
+        // model here makes response latency reproducible regardless of
+        // whatever the operator's own default happens to be that day.
         clickQuadrant(1)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude")
+        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
         clickQuadrant(2)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude")
+        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
         clickQuadrant(3)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude")
+        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
         // Single combined wait for all three Claude Code startups rather
         // than one per pane -- they were kicked off back-to-back above
         // and start up concurrently.
