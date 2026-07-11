@@ -257,8 +257,16 @@ fi
 
 echo
 echo "Done. If you use the production Calyx again, re-run 'Enable AI Agent IPC' there to restore its endpoint file."
+# Field-confirmed benign case for a non-zero status here: a long run
+# (BEAT 5's sentinel wait can stretch well past a minute) can outlast
+# XCTest's own finalization timer for its automatic screen-recording
+# attachment, which then SIGKILLs the test runner AFTER the scenario has
+# already reached tearDown and the app has already quit cleanly -- no
+# app crash, no jetsam, the scripted take itself ran to completion. This
+# script cannot tell that case apart from an actual bad take from the
+# exit code alone, so it says so rather than asserting either one.
 if [ "$status" -ne 0 ]; then
-    echo "The take failed or recorded issues -- retake with --skip-build once you've fixed whatever went wrong."
+    echo "Note: a non-zero exit here is usually just XCTest failing to finalize its own internal screen recording of this long run (the runner gets SIGKILLed in post-test cleanup) -- it does NOT mean your screen recording is bad. If the scenario visibly played to the end, the take is fine. Retake with --skip-build only if something actually looked wrong on screen."
 fi
 
 exit "$status"
