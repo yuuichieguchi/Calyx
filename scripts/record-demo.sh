@@ -77,6 +77,17 @@ Calyx's scripted product-demo recording. Safe to delete -- this script
 recreates it fresh on every run.
 EOF
 
+# Claude Code auto-loads the cwd's CLAUDE.md on startup -- this pins the
+# fixture agents' response language and length for the recording without
+# any on-camera instruction, so the demo reads as English/concise
+# regardless of the operator's own Claude Code language preference.
+cat > "$WORKSPACE/CLAUDE.md" << 'EOF'
+# Demo workspace rules
+
+- Respond only in English in this repository, regardless of any other language preference.
+- Keep responses short: a few sentences or a compact list. This session is being screen-recorded.
+EOF
+
 cat > "$WORKSPACE/src/parser.py" << 'EOF'
 """Tiny config-line parser used by the demo fixture."""
 
@@ -169,7 +180,7 @@ chmod +x "$WORKSPACE/scripts/test.sh"
     # (GPG/SSH) turned on. -c core.hooksPath=/dev/null: same reasoning,
     # insulating these commits from any global hooks that might reject
     # or alter them.
-    git add README.md
+    git add README.md CLAUDE.md
     git -c commit.gpgsign=false -c core.hooksPath=/dev/null commit -q -m "Initial commit: demo workspace scaffold"
 
     git add src/parser.py src/cache.py
