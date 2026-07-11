@@ -258,6 +258,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if !restoreSession() {
             if pendingURLs.isEmpty {
                 createNewWindow()
+                // Demo-recording scenario only (CalyxUITests
+                // /DemoRecordingScenario.swift): every UI test launches
+                // with a fresh session dir (see comment above), so
+                // launch always takes THIS branch, not restoreSession()'s
+                // -- no equivalent hook is needed there.
+                applyDemoWindowFrameIfNeeded()
             }
         }
         // Bug 3c gap-close: a snapshot preserved by a PREVIOUS run's
@@ -472,6 +478,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let wc = CalyxWindowController(windowSession: windowSession, initialHost: initialHost)
         windowControllers.append(wc)
         wc.showWindow(nil)
+    }
+
+    /// `--demo-window-frame=<W>x<H>` (DemoWindowFrameArgument.parse):
+    /// forces the just-created main window to a fixed, screen-recording-
+    /// friendly size and position, so the scripted demo scenario
+    /// (CalyxUITests/DemoRecordingScenario.swift) always frames
+    /// identically regardless of this machine's actual screen size or
+    /// `CalyxWindowController`'s own 800x600-then-`center()` default.
+    /// Gated on `--uitesting` (mirrors every other `--uitesting`-only
+    /// behavior in this file) even though a production launch never
+    /// receives `--demo-window-frame` in the first place -- an explicit
+    /// gate here keeps the intent readable at the call site, per this
+    /// argument's own spec (only ever consulted alongside `--uitesting`).
+    private func applyDemoWindowFrameIfNeeded() {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard arguments.contains("--uitesting"),
+              let size = DemoWindowFrameArgument.parse(arguments),
+              let window = windowControllers.last?.window else {
+            return
+        }
+        // Same NSScreen.main?.visibleFrame fallback shape as
+        // restoreWindow(_:)'s own screen-clamping above, for consistency.
+        let screenFrame = NSScreen.main?.visibleFrame ?? CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let origin = CGPoint(x: screenFrame.midX - size.width / 2, y: screenFrame.midY - size.height / 2)
+        window.setFrame(CGRect(origin: origin, size: size), display: true)
     }
 
     #if DEBUG
