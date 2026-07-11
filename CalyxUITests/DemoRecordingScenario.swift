@@ -238,12 +238,20 @@ final class DemoRecordingScenario: CalyxUITestCase {
 
         // MARK: - BEAT 1: one prompt per pane (1-3)
 
+        // "Respond only in English. " prefix on every prompt below (and
+        // on BEAT 5's pane-1 prompt): field-verified that the fixture
+        // CLAUDE.md alone (scripts/record-demo.sh) is NOT sufficient --
+        // a real run still had 2 of 3 panes answer in Japanese, so it
+        // loses to whatever biases that user's own Claude Code toward
+        // Japanese. An in-turn instruction is the strongest lever
+        // available here; the fixture CLAUDE.md stays in place as
+        // reinforcement, not as the sole mechanism.
         clickQuadrant(1)
-        panePasteAndReturn("Run ./scripts/test.sh and fix any failure")
+        panePasteAndReturn("Respond only in English. Run ./scripts/test.sh and fix any failure")
         clickQuadrant(2)
-        panePasteAndReturn("Summarize the git log of this repo")
+        panePasteAndReturn("Respond only in English. Summarize the git log of this repo")
         clickQuadrant(3)
-        panePasteAndReturn("List TODO comments in src/")
+        panePasteAndReturn("Respond only in English. List TODO comments in src/")
 
         // MARK: - BEAT 2: first approval banner -> Allow
 
@@ -295,7 +303,11 @@ final class DemoRecordingScenario: CalyxUITestCase {
         clickQuadrant(4)
         panePasteAndReturn("./scripts/test.sh")
         clickQuadrant(1)
-        panePasteAndReturn("Wait for the test run in the other pane and summarize the result")
+        // Same "Respond only in English. " prefix and rationale as BEAT
+        // 1 above -- pane 1's turn here is the longest on-camera
+        // response in the whole recording, so it's the least tolerant
+        // of flipping language mid-take.
+        panePasteAndReturn("Respond only in English. Wait for the test run in the other pane and summarize the result")
         Thread.sleep(forTimeInterval: 20)
 
         // MARK: - BEAT 6: calm final hold
