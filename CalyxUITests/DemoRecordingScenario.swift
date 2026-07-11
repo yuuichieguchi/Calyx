@@ -337,7 +337,7 @@ final class DemoRecordingScenario: CalyxUITestCase {
         // "wait and summarize" turn depends on MCP calls (e.g.
         // terminal_await_command) that would otherwise stall forever on
         // an unanswered approval. 16 iterations x 2s = ~32s: the fixture
-        // test.sh (scripts/record-demo.sh) now runs ~18s itself, and
+        // test.sh (scripts/record-demo.sh) now runs ~15s itself, and
         // this keeper must still outlast that PLUS the agent's own
         // await round-trip and its final summary render, not just the
         // raw test duration.
