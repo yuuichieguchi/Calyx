@@ -20,6 +20,17 @@
 // cross-actions menu (see `crossActionsMenu(toolName:)`) with two
 // broader actions. An `.mcpTool`-sourced request renders exactly as
 // before -- no menu.
+//
+// Queue navigation: while `model.positionInfo.count > 1`, a Previous/
+// Next chevron pair + "N / M" position label (see
+// `queueNavigator(positionInfo:)`) renders at the action cluster's
+// leading edge, adjacent to the decision buttons -- the browse-then-
+// decide loop keeps the mouse in one place; the sequential loop never
+// needs the arrows at all thanks to advance-on-decide (see
+// ApprovalBannerModel.advanceCursor(pastDisplayed:excluding:)'s own doc
+// comment). Drives `ApprovalBannerModel`'s own `selectedRequestID`
+// cursor -- a single queued request renders no navigator at all, since
+// there is nothing to step to.
 
 import SwiftUI
 
@@ -77,10 +88,7 @@ struct ApprovalBannerView: View {
     }
 
     private var headerText: String {
-        let pendingCount = model.pendingCountForWindow
-        let base = "\(toolName) → \(targetLabel)"
-        guard pendingCount > 1 else { return base }
-        return base + " (\(pendingCount) pending)"
+        "\(toolName) → \(targetLabel)"
     }
 
     var body: some View {
@@ -96,6 +104,30 @@ struct ApprovalBannerView: View {
             Spacer(minLength: 16)
 
             HStack {
+                // Queue navigation: leading edge of this action cluster,
+                // immediately adjacent to Deny/Always Allow/Allow -- the
+                // browse-then-decide loop (glance at each queued
+                // command, then click Previous/Next to compare before
+                // deciding) keeps the mouse in one place instead of
+                // ping-ponging across the banner's full width to a
+                // header-area control. The purely sequential loop (just
+                // clicking Allow/Deny down the queue) never needs the
+                // arrows at all, since advance-on-decide already moves
+                // the cursor forward on every decision (see
+                // ApprovalBannerModel.advanceCursor(pastDisplayed:
+                // excluding:)'s own doc comment). Only shown while more
+                // than one request is queued for this window (a single
+                // request has nothing to navigate to) -- see
+                // ApprovalBannerModel.positionInfo's own doc comment.
+                // Single source for the gate: `positionInfo.count`
+                // (derived from the same `visibleRequests` model.
+                // pendingCountForWindow itself counts), rather than also
+                // reading `model.pendingCountForWindow` here.
+                if let positionInfo = model.positionInfo, positionInfo.count > 1 {
+                    queueNavigator(positionInfo: positionInfo)
+                        .padding(.trailing, 8)
+                }
+
                 Button("Deny") {
                     model.deny(id: request.id)
                 }
@@ -128,6 +160,52 @@ struct ApprovalBannerView: View {
         .modifier(RecoveryBarBackgroundModifier(reduceTransparency: reduceTransparency))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.ApprovalBanner.container)
+    }
+
+    /// Previous/Next chevron pair + "N / M" position label, rendered at
+    /// the leading edge of the trailing action `HStack` (see this file's
+    /// own header comment for why it sits there, adjacent to Deny/
+    /// Always Allow/Allow, rather than up in the header area), shown
+    /// only while more than one request is queued for this window (see
+    /// the call site's own `positionInfo.count > 1` gate) -- mirrors
+    /// `BrowserToolbarView`'s own chevron.left/chevron.right precedent
+    /// (Calyx/Views/Browser/BrowserContainerView.swift).
+    /// `.buttonStyle(.borderless)` + `.controlSize(.small)` +
+    /// `.fixedSize()` keep this content-hugging, same rationale as
+    /// `crossActionsMenu`'s own header comment, so it never stretches
+    /// the banner's action row. Disabled states are derived directly
+    /// from the passed `positionInfo` (`index <= 1` / `index >= count`)
+    /// rather than a separate `model.canSelectPrevious`/`canSelectNext`
+    /// read -- one source (the same `positionInfo` already used for the
+    /// label) for both the label and the chevrons' enabled state, rather
+    /// than two independently-computed answers that could in principle
+    /// disagree. `canSelectPrevious`/`canSelectNext` stay public on the
+    /// model regardless -- `selectNext()`/`selectPrevious()` still guard
+    /// on them internally, and CalyxTests/ApprovalInbox/
+    /// ApprovalBannerModelTests.swift asserts them directly.
+    private func queueNavigator(positionInfo: (index: Int, count: Int)) -> some View {
+        HStack(spacing: 8) {
+            Button(action: { model.selectPrevious() }) {
+                Image(systemName: "chevron.left")
+            }
+            .disabled(positionInfo.index <= 1)
+            .accessibilityIdentifier(AccessibilityID.ApprovalBanner.previousButton)
+
+            Text("\(positionInfo.index) / \(positionInfo.count)")
+                .font(.callout)
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier(AccessibilityID.ApprovalBanner.positionLabel)
+
+            Button(action: { model.selectNext() }) {
+                Image(systemName: "chevron.right")
+            }
+            .disabled(positionInfo.index >= positionInfo.count)
+            .accessibilityIdentifier(AccessibilityID.ApprovalBanner.nextButton)
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .fixedSize()
     }
 
     /// Compact cross-actions menu, shown only for an `.agentHook`-sourced

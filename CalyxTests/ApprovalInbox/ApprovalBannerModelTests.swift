@@ -43,7 +43,10 @@
 //    (kind, toolName), regardless of window/pane, leaving a
 //    different-tool request pending and never touching any setting
 //  - pendingCountForWindow counts only requests this window owns
-//    (mirrors current's ownership filter, for a "+N more" affordance)
+//    (mirrors current's ownership filter; the view's queue navigator
+//    now gates on positionInfo.count instead, see that property's own
+//    doc comment, but pendingCountForWindow remains its own
+//    model-level contract, asserted directly below)
 //
 //  Stage E init change: ApprovalBannerModel's initializer gains a new
 //  `memory: AgentHookApprovalMemory` parameter, defaulted to `.shared`
@@ -575,6 +578,424 @@ final class ApprovalBannerModelTests: XCTestCase {
                        "a same-tool request on a pane this window doesn't own must still be drained")
     }
 
+    // MARK: - Queue navigation (prev/next cursor)
+    //
+    // A stored, private `selectedRequestID: UUID?` cursor lets a window
+    // step through every request VISIBLE to it (same ownsSurface/
+    // isKeyWindow filter `current`/`pendingCountForWindow` already use),
+    // instead of only ever showing the oldest one. `current` returns the
+    // selected request while it's still pending+visible, else falls back
+    // to the oldest visible request (mirrors today's behavior when
+    // nothing has been explicitly selected yet, or the selection has
+    // been resolved out from under it). `positionInfo` is this window's
+    // 1-based (index, count) of `current` within that same visible
+    // queue, nil exactly when `current` is nil. Deciding the DISPLAYED
+    // request (the id `current` actually returned at the time of the
+    // call) via allow(id:)/deny(id:)/alwaysAllow(id:)/
+    // alwaysAllowAcrossPanes(id:) advances the cursor to its successor
+    // in that pre-removal visible queue (predecessor if it was last,
+    // nil if it was the only one visible) -- so the banner keeps
+    // stepping forward through the backlog instead of always snapping
+    // back to the oldest. allowAllPending() clears the cursor outright
+    // (nothing is left pending to point at). A stale id -- one that is
+    // NOT the currently-displayed request, e.g. already resolved by some
+    // other path -- must never move the cursor; and a brand-new arrival
+    // submitted after a selection has been made must never move that
+    // existing selection either.
+
+    func test_selectNext_advancesCurrentAndPositionInfo() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let first = makeRequest(targetSurfaceID: surfaceID, payload: "first", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeRequest(targetSurfaceID: surfaceID, payload: "second", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        let third = makeRequest(targetSurfaceID: surfaceID, payload: "third", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        store.submit(first)
+        store.submit(second)
+        store.submit(third)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true })
+
+        XCTAssertEqual(model.current?.id, first.id, "precondition: current starts at the oldest pending request")
+        XCTAssertEqual(model.positionInfo?.index, 1, "positionInfo's index is 1-based")
+        XCTAssertEqual(model.positionInfo?.count, 3, "positionInfo's count is the size of this window's visible queue")
+
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, second.id, "selectNext() must advance current to the next request in the visible queue")
+        XCTAssertEqual(model.positionInfo?.index, 2)
+        XCTAssertEqual(model.positionInfo?.count, 3)
+
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, third.id, "a second selectNext() must advance current to the newest request")
+        XCTAssertEqual(model.positionInfo?.index, 3)
+        XCTAssertEqual(model.positionInfo?.count, 3)
+    }
+
+    func test_navigation_clampsAtQueueEnds() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let first = makeRequest(targetSurfaceID: surfaceID, payload: "first", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeRequest(targetSurfaceID: surfaceID, payload: "second", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        store.submit(first)
+        store.submit(second)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true })
+
+        XCTAssertFalse(model.canSelectPrevious, "at the oldest (first) request, there is nothing before it to select")
+        model.selectPrevious()
+        XCTAssertEqual(model.current?.id, first.id, "selectPrevious() at the start of the queue must be a no-op")
+
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, second.id, "precondition: navigated to the newest request")
+        XCTAssertFalse(model.canSelectNext, "at the newest (last) request, there is nothing after it to select")
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, second.id, "selectNext() at the end of the queue must be a no-op")
+    }
+
+    func test_navigation_skipsForeignSurfaceRequests() {
+        let store = ApprovalInboxStore()
+        let ownedSurfaceID = UUID()
+        let foreignSurfaceID = UUID()
+        let t1 = makeRequest(targetSurfaceID: ownedSurfaceID, payload: "t1", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let t2 = makeRequest(targetSurfaceID: foreignSurfaceID, payload: "t2", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        let t3 = makeRequest(targetSurfaceID: ownedSurfaceID, payload: "t3", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        store.submit(t1)
+        store.submit(t2)
+        store.submit(t3)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == ownedSurfaceID }, isKeyWindow: { true })
+
+        XCTAssertEqual(model.positionInfo?.count, 2,
+                       "positionInfo's count must reflect only requests this window owns, excluding the foreign-surface request")
+
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, t3.id,
+                       "selectNext() must skip over the foreign-surface request entirely and land on the next OWNED request")
+    }
+
+    func test_current_fallsBackToOldestVisible_whenSelectionResolvedExternally() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let first = makeRequest(targetSurfaceID: surfaceID, payload: "first", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeRequest(targetSurfaceID: surfaceID, payload: "second", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        let third = makeRequest(targetSurfaceID: surfaceID, payload: "third", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        store.submit(first)
+        store.submit(second)
+        store.submit(third)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true })
+
+        model.selectNext()
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, third.id, "precondition: navigated to the newest request")
+
+        store.decide(id: third.id, .allowed)
+
+        XCTAssertEqual(model.current?.id, first.id,
+                       "once the selected request is resolved externally (bypassing the model), current must fall back to the oldest still-visible request")
+        XCTAssertEqual(model.positionInfo?.index, 1)
+        XCTAssertEqual(model.positionInfo?.count, 2)
+    }
+
+    func test_allow_onDisplayedRequest_advancesToSuccessor() async throws {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let first = makeRequest(targetSurfaceID: surfaceID, payload: "first", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeRequest(targetSurfaceID: surfaceID, payload: "second", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        let third = makeRequest(targetSurfaceID: surfaceID, payload: "third", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        store.submit(first)
+        store.submit(second)
+        store.submit(third)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true })
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, second.id, "precondition: current is the displayed (middle) request")
+
+        let waiter = Task { @MainActor in
+            await store.awaitDecision(id: second.id, timeoutMs: 5_000)
+        }
+        await yieldToScheduler()
+
+        model.allow(id: second.id)
+
+        XCTAssertEqual(model.current?.id, third.id,
+                       "allow(id:) on the currently-displayed request must advance the cursor to its successor in the visible queue")
+        XCTAssertEqual(model.positionInfo?.index, 2)
+        XCTAssertEqual(model.positionInfo?.count, 2)
+
+        let result = await waiter.value
+        XCTAssertEqual(result, .allowed)
+    }
+
+    func test_deny_onLastDisplayedRequest_fallsBackToPredecessor() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let first = makeRequest(targetSurfaceID: surfaceID, payload: "first", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeRequest(targetSurfaceID: surfaceID, payload: "second", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        let third = makeRequest(targetSurfaceID: surfaceID, payload: "third", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        store.submit(first)
+        store.submit(second)
+        store.submit(third)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true })
+        model.selectNext()
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, third.id, "precondition: navigated to the last (newest) displayed request")
+
+        model.deny(id: third.id)
+
+        XCTAssertEqual(model.current?.id, second.id,
+                       "deny(id:) on the last displayed request must fall back to its predecessor in the visible queue, since there is no successor")
+        XCTAssertEqual(model.positionInfo?.index, 2)
+        XCTAssertEqual(model.positionInfo?.count, 2)
+    }
+
+    /// Mirrors the pre-existing stale-id contract above (F5), but for the
+    /// NEW cursor: once the SELECTED request has been resolved out from
+    /// under the model by some other path, `current` has already fallen
+    /// back to the oldest visible request -- a subsequent `allow(id:)`
+    /// call using the (now stale) selected id must not move the cursor
+    /// again, and must leave every still-pending request untouched.
+    func test_allow_withStaleID_doesNotMoveCursor() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let first = makeRequest(targetSurfaceID: surfaceID, payload: "first", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeRequest(targetSurfaceID: surfaceID, payload: "second", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        let third = makeRequest(targetSurfaceID: surfaceID, payload: "third", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        store.submit(first)
+        store.submit(second)
+        store.submit(third)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true })
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, second.id, "precondition: current is the displayed (middle) request")
+
+        // Some other path resolves the selected request while the model
+        // still holds it as `selectedRequestID`.
+        store.decide(id: second.id, .allowed)
+        XCTAssertEqual(model.current?.id, first.id,
+                       "precondition: current has already fallen back to the oldest visible request")
+
+        model.allow(id: second.id)
+
+        XCTAssertEqual(model.current?.id, first.id,
+                       "a stale allow(id:) for a request that is no longer the displayed one must not move the cursor")
+        XCTAssertEqual(store.pending.map(\.id), [first.id, third.id],
+                       "the stale allow(id:) call must not touch any request that is still pending")
+    }
+
+    /// Same successor-advance contract as `allow(id:)`/`deny(id:)` above,
+    /// exercised through the `.agentHook` branch of `alwaysAllow(id:)`
+    /// instead. The two requests deliberately use DIFFERENT `toolName`s
+    /// so the pane-scoped memory drain (see `alwaysAllow(id:)`'s own doc
+    /// comment) takes only the clicked one, keeping this test isolated to
+    /// the cursor-advance behavior rather than the drain's own matching
+    /// rules (already covered elsewhere).
+    func test_alwaysAllow_agentHook_onDisplayedRequest_advancesToSuccessor() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.navigationAlwaysAllowAgentHook"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let surfaceID = UUID()
+        let first = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "Bash", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "Write", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        store.submit(first)
+        store.submit(second)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true }, memory: memory)
+        XCTAssertEqual(model.current?.id, first.id, "precondition: current defaults to the oldest (first) request")
+
+        let waiter = Task { @MainActor in
+            await store.awaitDecision(id: first.id, timeoutMs: 5_000)
+        }
+        await yieldToScheduler()
+
+        model.alwaysAllow(id: first.id)
+
+        XCTAssertEqual(store.pending.map(\.id), [second.id],
+                       "precondition: the different-toolName request must be left pending by the pane-scoped drain")
+        XCTAssertEqual(model.current?.id, second.id,
+                       "alwaysAllow(id:) on the displayed request must advance the cursor to its successor, same as allow(id:)/deny(id:)")
+
+        let result = await waiter.value
+        XCTAssertEqual(result, .allowed)
+    }
+
+    /// RED reproducer: `advanceCursor(pastDisplayed:)` picks the
+    /// immediate visible neighbor (index + 1, computed from the
+    /// PRE-removal `visibleRequests`) as the new cursor before the drain
+    /// actually runs -- but the `.agentHook` branch's pane-scoped drain
+    /// (same surface + kind + toolName) can sweep that very neighbor away
+    /// in the SAME call. Here, clicking Always-Allow on B (tool "bravo")
+    /// drains both B and C (C shares B's toolName), so the neighbor
+    /// `advanceCursor` picked (C) never survives. Once C is gone,
+    /// `current`'s `selectedRequestID` lookup misses and falls all the
+    /// way back to the OLDEST visible request (A) -- the banner snaps
+    /// backward -- instead of stepping to the nearest FORWARD survivor,
+    /// D, which is what the forward-triage contract actually promises.
+    func test_alwaysAllow_agentHook_drainSweepsSuccessor_cursorLandsOnForwardSurvivor() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.drainSweepsSuccessor"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let surfaceID = UUID()
+        let a = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "alpha", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let b = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "bravo", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        let c = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "bravo", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        let d = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "delta", createdAt: Date(timeIntervalSince1970: 1_700_000_300))
+        store.submit(a)
+        store.submit(b)
+        store.submit(c)
+        store.submit(d)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true }, memory: memory)
+
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, b.id, "precondition: current is the displayed (2nd) request, B")
+
+        let waiterB = Task { @MainActor in await store.awaitDecision(id: b.id, timeoutMs: 5_000) }
+        let waiterC = Task { @MainActor in await store.awaitDecision(id: c.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.alwaysAllow(id: b.id)
+
+        XCTAssertEqual(Set(store.pending.map(\.id)), Set([a.id, d.id]),
+                       "precondition: the pane-scoped drain must decide both B and C (same surface+kind+tool " +
+                       "'bravo'), leaving only A and D pending")
+
+        XCTAssertEqual(model.current?.id, d.id,
+                       "alwaysAllow(id:) must advance the cursor to the nearest FORWARD survivor (D) once its " +
+                       "immediate successor (C) is itself swept up by the very same drain -- not fall back to " +
+                       "the oldest visible request (A)")
+        XCTAssertEqual(model.positionInfo?.index, 2, "D is now the 2nd (newest) of the 2 remaining visible requests")
+        XCTAssertEqual(model.positionInfo?.count, 2)
+
+        let resultB = await waiterB.value
+        let resultC = await waiterC.value
+        XCTAssertEqual(resultB, .allowed)
+        XCTAssertEqual(resultC, .allowed)
+    }
+
+    /// Same underlying bug as the RED reproducer above, but here the
+    /// drain sweeps the cursor's clicked request (C) AND its immediate
+    /// successor (D) both, leaving NO forward survivor at all. The
+    /// correct fallback in that case is the nearest BACKWARD survivor
+    /// (B), not simply the oldest visible request (A) -- those two only
+    /// coincide when the cursor itself was already at the oldest
+    /// surviving position, which is NOT the case here. Distinct tool
+    /// names (alpha/bravo/charlie/charlie) keep B out of the drain's own
+    /// match (only same-toolName "charlie" requests, C and D, are
+    /// swept), so B survives purely as the nearest predecessor, never as
+    /// a side effect of the drain's own filtering. This is a second RED
+    /// reproducer, not merely a pinning test: today's code also lands on
+    /// A here (stale cursor -> oldest fallback), which is the wrong
+    /// answer once a correct nearest-survivor fallback is implemented.
+    func test_alwaysAllow_agentHook_drainSweepsAllForward_cursorFallsBackToNearestPredecessor() async throws {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.drainSweepsAllForward"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+
+        let store = ApprovalInboxStore()
+        let memory = AgentHookApprovalMemory()
+        let surfaceID = UUID()
+        let a = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "alpha", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let b = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "bravo", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        let c = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "charlie", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        let d = makeAgentHookRequest(targetSurfaceID: surfaceID, toolName: "charlie", createdAt: Date(timeIntervalSince1970: 1_700_000_300))
+        store.submit(a)
+        store.submit(b)
+        store.submit(c)
+        store.submit(d)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true }, memory: memory)
+
+        model.selectNext()
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, c.id, "precondition: current is the displayed (3rd) request, C")
+
+        let waiterC = Task { @MainActor in await store.awaitDecision(id: c.id, timeoutMs: 5_000) }
+        let waiterD = Task { @MainActor in await store.awaitDecision(id: d.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.alwaysAllow(id: c.id)
+
+        XCTAssertEqual(Set(store.pending.map(\.id)), Set([a.id, b.id]),
+                       "precondition: the pane-scoped drain must decide both C and D (same surface+kind+tool " +
+                       "'charlie'), leaving only A and B pending")
+
+        XCTAssertEqual(model.current?.id, b.id,
+                       "alwaysAllow(id:) must fall back to the nearest BACKWARD survivor (B) once BOTH the " +
+                       "clicked request (C) and its immediate successor (D) are swept by the drain, leaving no " +
+                       "forward survivor at all -- not fall back to the oldest visible request (A), which is " +
+                       "not the correct predecessor")
+        XCTAssertEqual(model.positionInfo?.index, 2, "B is now the 2nd (newest) of the 2 remaining visible requests")
+        XCTAssertEqual(model.positionInfo?.count, 2)
+
+        let resultC = await waiterC.value
+        let resultD = await waiterD.value
+        XCTAssertEqual(resultC, .allowed)
+        XCTAssertEqual(resultD, .allowed)
+    }
+
+    func test_newArrival_neverMovesSelection() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let first = makeRequest(targetSurfaceID: surfaceID, payload: "first", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeRequest(targetSurfaceID: surfaceID, payload: "second", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        store.submit(first)
+        store.submit(second)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true })
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, second.id, "precondition: current is the newest (second) request")
+
+        let newer = makeRequest(targetSurfaceID: surfaceID, payload: "newer", createdAt: Date(timeIntervalSince1970: 1_700_000_200))
+        store.submit(newer)
+
+        XCTAssertEqual(model.current?.id, second.id,
+                       "a new arrival submitted with a NEWER createdAt (appended after the selection) must never move an existing selection")
+        XCTAssertEqual(model.positionInfo?.index, 2)
+        XCTAssertEqual(model.positionInfo?.count, 3)
+
+        let older = makeRequest(targetSurfaceID: surfaceID, payload: "older", createdAt: Date(timeIntervalSince1970: 1_699_999_900))
+        store.submit(older)
+
+        XCTAssertEqual(model.current?.id, second.id,
+                       "a new arrival submitted with an OLDER createdAt (inserted at the head of the queue) must also never move an existing selection")
+        XCTAssertEqual(model.positionInfo?.index, 3)
+        XCTAssertEqual(model.positionInfo?.count, 4)
+    }
+
+    func test_allowAllPending_clearsSelectionAndBanner() async throws {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let first = makeRequest(targetSurfaceID: surfaceID, payload: "first", createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeRequest(targetSurfaceID: surfaceID, payload: "second", createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        store.submit(first)
+        store.submit(second)
+
+        let model = ApprovalBannerModel(store: store, ownsSurface: { $0 == surfaceID }, isKeyWindow: { true })
+        model.selectNext()
+        XCTAssertEqual(model.current?.id, second.id, "precondition: current is the newest (second) request")
+
+        let waiterFirst = Task { @MainActor in await store.awaitDecision(id: first.id, timeoutMs: 5_000) }
+        let waiterSecond = Task { @MainActor in await store.awaitDecision(id: second.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.allowAllPending()
+
+        XCTAssertNil(model.current, "allowAllPending() must clear the cursor along with every pending request, leaving the banner empty")
+        XCTAssertNil(model.positionInfo, "positionInfo must be nil once nothing is left visible")
+
+        let resultFirst = await waiterFirst.value
+        let resultSecond = await waiterSecond.value
+        XCTAssertEqual(resultFirst, .allowed)
+        XCTAssertEqual(resultSecond, .allowed)
+    }
+
     // MARK: - AccessibilityID coverage for the new cross-actions menu (Stage E, spec-level only)
     //
     // SwiftUI Menu rendering itself is not unit-testable (no production
@@ -589,6 +1010,11 @@ final class ApprovalBannerModelTests: XCTestCase {
             AccessibilityID.ApprovalBanner.crossActionsMenu,
             AccessibilityID.ApprovalBanner.allowAllPendingItem,
             AccessibilityID.ApprovalBanner.alwaysAllowAllPanesItem,
+            // Queue navigation (prev/next cursor): the banner's new
+            // Previous/Next buttons and their "N / M" position label.
+            AccessibilityID.ApprovalBanner.previousButton,
+            AccessibilityID.ApprovalBanner.nextButton,
+            AccessibilityID.ApprovalBanner.positionLabel,
         ]
 
         for identifier in newIdentifiers {
@@ -604,8 +1030,8 @@ final class ApprovalBannerModelTests: XCTestCase {
             AccessibilityID.ApprovalBanner.payload,
         ]
         XCTAssertEqual(Set(newIdentifiers).intersection(preExistingIdentifiers), [],
-                       "the 3 new identifiers must be distinct from every pre-existing ApprovalBanner identifier")
+                       "the 6 new identifiers must be distinct from every pre-existing ApprovalBanner identifier")
         XCTAssertEqual(Set(newIdentifiers).count, newIdentifiers.count,
-                       "the 3 new identifiers must also be distinct from each other")
+                       "the 6 new identifiers must also be distinct from each other")
     }
 }

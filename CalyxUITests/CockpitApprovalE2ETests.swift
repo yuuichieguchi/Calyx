@@ -86,6 +86,9 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     private static let approvalBannerAllowButtonID = "calyx.approvalBanner.allowButton"
     private static let approvalBannerDenyButtonID = "calyx.approvalBanner.denyButton"
     private static let approvalBannerPayloadID = "calyx.approvalBanner.payload"
+    private static let approvalBannerNextButtonID = "calyx.approvalBanner.nextButton"
+    private static let approvalBannerPreviousButtonID = "calyx.approvalBanner.previousButton"
+    private static let approvalBannerPositionLabelID = "calyx.approvalBanner.positionLabel"
 
     // MARK: - Test
 
@@ -185,6 +188,102 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
             let found = commands.contains { ($0["command"] as? String)?.contains("COCKPIT_MARKER_DENY") == true }
             XCTAssertFalse(found, "a denied pane_run must never reach the real shell -- COCKPIT_MARKER_DENY must never be tracked")
         }
+
+        // MARK: 4b. queue navigation -- two requests queued (the queue is
+        // empty at this point, MARK 4's Deny having drained it), banner
+        // shows a position label + Next/Previous chevrons, a Next/
+        // Previous/Next round-trip exercises BOTH chevrons end-to-end
+        // (Previous was otherwise only unit-covered), and Allow resolves
+        // the NAVIGATED-TO (displayed) request out of order.
+
+        let navAOutFile = "/tmp/calyx-e2e-cockpit-run-nav-a-\(ProcessInfo.processInfo.processIdentifier).json"
+        toolCallBackgrounded(
+            name: "pane_run",
+            argumentsJSON: "{\"surface_id\": \"\(surfaceID)\", \"command\": \"echo COCKPIT_MARKER_NAV_A\", \"await\": false}",
+            outFile: navAOutFile, counter: &counter
+        )
+
+        let navPayloadText = app.staticTexts[Self.approvalBannerPayloadID]
+        XCTAssertTrue(waitFor(navPayloadText, timeout: 15), "the approval banner never appeared for the first queued (NAV_A) request")
+        XCTAssertTrue(elementText(navPayloadText).contains("NAV_A"),
+                     "the banner must display the first queued command -- got: \(elementText(navPayloadText))")
+
+        let navBOutFile = "/tmp/calyx-e2e-cockpit-run-nav-b-\(ProcessInfo.processInfo.processIdentifier).json"
+        toolCallBackgrounded(
+            name: "pane_run",
+            argumentsJSON: "{\"surface_id\": \"\(surfaceID)\", \"command\": \"echo COCKPIT_MARKER_NAV_B\", \"await\": false}",
+            outFile: navBOutFile, counter: &counter
+        )
+
+        let positionLabel = app.staticTexts[Self.approvalBannerPositionLabelID]
+        XCTAssertTrue(waitFor(positionLabel, timeout: 15), "the position label never appeared once a second request queued behind NAV_A")
+        XCTAssertTrue(elementText(positionLabel).contains("1 / 2"),
+                     "with two requests queued, the still-displayed first request must read \"1 / 2\" -- got: \(elementText(positionLabel))")
+
+        app.buttons[Self.approvalBannerNextButtonID].click()
+
+        // Bounded poll, same 5x1s pattern as MARK 4's denied-marker
+        // absence check above: clicking Next must advance the banner to
+        // the second (NAV_B) queued request.
+        var advancedToNavB = false
+        for _ in 0..<5 {
+            if elementText(navPayloadText).contains("NAV_B") && elementText(positionLabel).contains("2 / 2") {
+                advancedToNavB = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        XCTAssertTrue(advancedToNavB, "clicking Next must advance the banner to the second (NAV_B) queued request, reading \"2 / 2\"")
+
+        app.buttons[Self.approvalBannerPreviousButtonID].click()
+
+        // Bounded poll, same 5x1s pattern: clicking Previous must step
+        // the banner back to the first (NAV_A) queued request.
+        var steppedBackToNavA = false
+        for _ in 0..<5 {
+            if elementText(navPayloadText).contains("NAV_A") && elementText(positionLabel).contains("1 / 2") {
+                steppedBackToNavA = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        XCTAssertTrue(steppedBackToNavA, "clicking Previous must step the banner back to the first (NAV_A) queued request, reading \"1 / 2\"")
+
+        app.buttons[Self.approvalBannerNextButtonID].click()
+
+        // Bounded poll, same 5x1s pattern: clicking Next again must
+        // return the banner to the second (NAV_B) queued request,
+        // completing the round-trip.
+        var returnedToNavB = false
+        for _ in 0..<5 {
+            if elementText(navPayloadText).contains("NAV_B") && elementText(positionLabel).contains("2 / 2") {
+                returnedToNavB = true
+                break
+            }
+            Thread.sleep(forTimeInterval: 1)
+        }
+        XCTAssertTrue(returnedToNavB, "clicking Next again must return the banner to the second (NAV_B) queued request, reading \"2 / 2\"")
+
+        app.buttons[Self.approvalBannerAllowButtonID].click()
+
+        let navBResultText = waitForFileContent(atPath: navBOutFile)
+        XCTAssertNotEqual(navBResultText, "(no output)", "the backgrounded pane_run (NAV_B) curl produced no output")
+        let navBResult = try parseJSONObject(navBResultText, context: "pane_run NAV_B result")
+        XCTAssertEqual(navBResult["status"] as? String, "sent",
+                       "Allow on the navigated-to (displayed) request must resolve NAV_B, even though it was queued second -- got: \(navBResultText)")
+
+        XCTAssertTrue(elementText(navPayloadText).contains("NAV_A"),
+                     "once NAV_B is resolved, the banner must fall back to displaying the still-pending NAV_A request")
+        XCTAssertFalse(app.staticTexts[Self.approvalBannerPositionLabelID].exists,
+                      "with only one request left pending, single-request rendering must show no position label")
+
+        app.buttons[Self.approvalBannerDenyButtonID].click()
+
+        let navAResultText = waitForFileContent(atPath: navAOutFile)
+        XCTAssertNotEqual(navAResultText, "(no output)", "the backgrounded pane_run (NAV_A) curl produced no output")
+        let navAResult = try parseJSONObject(navAResultText, context: "pane_run NAV_A result")
+        XCTAssertEqual(navAResult["status"] as? String, "denied",
+                       "Deny must resolve the last remaining queued request (NAV_A), draining the queue so MARK 5 starts clean -- got: \(navAResultText)")
 
         // MARK: 5. pane_split -- one more pane in the same tab
 
