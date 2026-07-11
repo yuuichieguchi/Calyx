@@ -311,8 +311,24 @@ final class DemoRecordingScenario: CalyxUITestCase {
         // Same "Respond only in English. " prefix and rationale as BEAT
         // 1 above -- pane 1's turn here is the longest on-camera
         // response in the whole recording, so it's the least tolerant
-        // of flipping language mid-take.
-        panePasteAndReturn("Respond only in English. Wait for the test run in the other pane and summarize the result")
+        // of flipping language mid-take. The rest of the prompt is
+        // deliberately explicit, not the vague "wait for the test run
+        // and summarize" wording tried before: field-confirmed that
+        // left the agent unsure WHICH pane and WHICH tool, so it
+        // flailed on pane_list + repeated terminal_list_commands (the
+        // LIST tool) instead of ever calling terminal_await_command
+        // (the BLOCK-until-done tool this beat is actually demoing).
+        // Naming "find the (non-agent) pane" / "wait for that command to
+        // finish" / "how many tests passed" maps onto the intended
+        // pane_list -> terminal_await_command -> summarize tool flow in
+        // natural English, and disambiguates the target pane (pane 4,
+        // the only one NOT running an agent) without hardcoding a pane
+        // ID the agent has no other way to know.
+        panePasteAndReturn(
+            "Respond only in English. Using the calyx-ipc tools, find the pane that is running a " +
+            "shell command (not one of the agent panes), wait for that command to finish, then tell " +
+            "me how many tests passed."
+        )
 
         // Hold for pane 4 to actually run the tests and pane 1 to
         // summarize the result -- but a KEEPER loop, not a single fixed
@@ -320,11 +336,12 @@ final class DemoRecordingScenario: CalyxUITestCase {
         // approvePendingIfAny()'s own doc comment), and pane 1's own
         // "wait and summarize" turn depends on MCP calls (e.g.
         // terminal_await_command) that would otherwise stall forever on
-        // an unanswered approval. 12 iterations x 2s = ~24s (a bit
-        // longer than the previous fixed 20s hold, to absorb the extra
-        // approval round-trips) -- comfortably covers pane 4's own ~8s
-        // test.sh run.
-        for _ in 0..<12 {
+        // an unanswered approval. 16 iterations x 2s = ~32s: the fixture
+        // test.sh (scripts/record-demo.sh) now runs ~18s itself, and
+        // this keeper must still outlast that PLUS the agent's own
+        // await round-trip and its final summary render, not just the
+        // raw test duration.
+        for _ in 0..<16 {
             Thread.sleep(forTimeInterval: 2)
             approvePendingIfAny()
         }

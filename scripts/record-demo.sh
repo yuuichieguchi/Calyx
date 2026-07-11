@@ -156,11 +156,13 @@ cat > "$WORKSPACE/scripts/test.sh" << 'EOF'
 set -euo pipefail
 
 echo "Running test suite..."
-sleep 2
+sleep 3
 echo "  collecting tests... 24 found"
-sleep 3
+sleep 4
 echo "  running unit tests..."
-sleep 3
+sleep 4
+echo "  running integration tests..."
+sleep 4
 echo "All 24 tests passed."
 exit 0
 EOF
