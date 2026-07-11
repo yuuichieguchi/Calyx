@@ -4,6 +4,10 @@ A macOS 26+ native terminal application built on [libghostty](https://github.com
 
 **Documentation**: [help.getcalyx.app](https://help.getcalyx.app)
 
+**Demo** (36s) -- three Claude Code agents in parallel, one approval banner, cross-pane command log:
+
+https://github.com/user-attachments/assets/a04e1161-e296-4791-9b7c-3ef84d990089
+
 ![Calyx Terminal](assets/screenshot.png)
 
 ## Features
