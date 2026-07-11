@@ -265,6 +265,10 @@ schemes:
       # manual PlistBuddy patch of the generated .xctestrun afterward.
       environmentVariables:
         CALYX_SESSION_BIN: $(CALYX_SESSION_BIN)
+        # Same propagation rationale as CALYX_SESSION_BIN above:
+        # scripts/record-demo.sh's own `CALYX_DEMO_RECORDING=1` shell
+        # prefix does not otherwise reach the test runner process.
+        CALYX_DEMO_RECORDING: $(CALYX_DEMO_RECORDING)
 
 fileGroups:
   - Calyx-Bridging-Header.h
