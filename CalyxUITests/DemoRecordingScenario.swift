@@ -67,9 +67,9 @@
 //
 // STORYBOARD (~90s):
 //   PRE-ROLL  -- enable AI Agent IPC, build the 2x2 split, start
-//                `claude` in panes 1-3 (plus a trust-dialog Return),
-//                `cd`+`clear` in pane 4, print the "start recording"
-//                marker, hold 15s.
+//                `claude --model sonnet` in panes 1-3 (plus a
+//                trust-dialog Return), `cd`+`clear` in pane 4, print the
+//                "start recording" marker, hold 15s.
 //   BEAT 1    -- send one prompt to each of panes 1-3.
 //   BEAT 2    -- first approval banner: wait, hold, click Allow.
 //   BEAT 3    -- second approval banner: wait, hold, click the
@@ -203,12 +203,21 @@ final class DemoRecordingScenario: CalyxUITestCase {
         menuAction("File", item: "Split Down")
         _ = waitForSplitterCount(timeout: 10) { $0 > dividersAfterFirstDown }
 
+        // `--model sonnet` (not a bare `claude`): a bare invocation
+        // inherits the OPERATOR's own ambient default model, which
+        // field-flipped between takes (Sonnet 5 in one take, a
+        // long-thinking Opus/"Fable 5"-class model in the next, after
+        // the operator changed their own default) and wrecked this
+        // scenario's pacing -- every sleep/keeper-loop bound in this
+        // file is tuned against a fast-responding model. Pinning the
+        // model here makes response latency reproducible regardless of
+        // whatever the operator's own default happens to be that day.
         clickQuadrant(1)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude")
+        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
         clickQuadrant(2)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude")
+        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
         clickQuadrant(3)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude")
+        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
         // Single combined wait for all three Claude Code startups rather
         // than one per pane -- they were kicked off back-to-back above
         // and start up concurrently.
@@ -323,28 +332,51 @@ final class DemoRecordingScenario: CalyxUITestCase {
         // pane_list -> terminal_await_command -> summarize tool flow in
         // natural English, and disambiguates the target pane (pane 4,
         // the only one NOT running an agent) without hardcoding a pane
-        // ID the agent has no other way to know.
+        // ID the agent has no other way to know. The final sentence
+        // ("touch /tmp/calyx-demo-done") is a completion SENTINEL: the
+        // terminal grid is Metal-rendered, not accessibility text, so
+        // there is nothing to anchor "the summary actually rendered" on
+        // any other way -- and a fixed wall-clock window field-failed
+        // against a long-thinking model (one observed run took 1m26s to
+        // answer), killing the app mid-task. The keeper loop below polls
+        // for this file instead of racing the clock.
         panePasteAndReturn(
             "Respond only in English. Using the calyx-ipc tools, find the pane that is running a " +
             "shell command (not one of the agent panes), wait for that command to finish, then tell " +
-            "me how many tests passed."
+            "me how many tests passed. When you have answered, run exactly: touch /tmp/calyx-demo-done"
         )
 
         // Hold for pane 4 to actually run the tests and pane 1 to
-        // summarize the result -- but a KEEPER loop, not a single fixed
-        // sleep: every new tool call still banners after BEAT 3 (see
+        // summarize the result -- a KEEPER loop that ends on the agent's
+        // OWN completion sentinel (/tmp/calyx-demo-done, touched by its
+        // final prompt sentence above), not on wall-clock: every new
+        // tool call still banners after BEAT 3 (see
         // approvePendingIfAny()'s own doc comment), and pane 1's own
         // "wait and summarize" turn depends on MCP calls (e.g.
         // terminal_await_command) that would otherwise stall forever on
-        // an unanswered approval. 16 iterations x 2s = ~32s: the fixture
-        // test.sh (scripts/record-demo.sh) now runs ~15s itself, and
-        // this keeper must still outlast that PLUS the agent's own
-        // await round-trip and its final summary render, not just the
-        // raw test duration.
-        for _ in 0..<16 {
+        // an unanswered approval, on top of highly variable agent
+        // think-time. Up to 90 iterations x 2s = ~180s is only a SAFETY
+        // BOUND for a model that never touches the sentinel at all (e.g.
+        // it misunderstood the prompt) -- the loop breaks the moment the
+        // sentinel appears, however long that actually takes. This
+        // driver only READS the sentinel via FileManager.fileExists --
+        // the same "sandboxed CalyxUITests runner reading a plain /tmp
+        // path" shape PaneCLIExec's own helpers already rely on for
+        // their outfile polling. It never writes or deletes this file
+        // itself (the sandboxed runner cannot reliably do either), so
+        // cleanup is owned by scripts/record-demo.sh instead (see that
+        // script's own `rm -f` ahead of each run).
+        for _ in 0..<90 {
             Thread.sleep(forTimeInterval: 2)
             approvePendingIfAny()
+            if FileManager.default.fileExists(atPath: "/tmp/calyx-demo-done") {
+                break
+            }
         }
+        // Post-sentinel hold: gives the viewer a few seconds to actually
+        // read the on-screen summary before the pre-BEAT-6 sweep/BEAT 6
+        // move on.
+        Thread.sleep(forTimeInterval: 6)
 
         // Bounded pre-BEAT-6 sweep: same rationale as
         // approvePendingIfAny()'s own doc comment -- up to 5 iterations,
