@@ -212,12 +212,36 @@ final class DemoRecordingScenario: CalyxUITestCase {
         // file is tuned against a fast-responding model. Pinning the
         // model here makes response latency reproducible regardless of
         // whatever the operator's own default happens to be that day.
+        //
+        // `--append-system-prompt "Always respond in English. Never use
+        // any other language."`: the in-prompt "Respond only in
+        // English." prefix (BEAT 1/BEAT 5 below) and the fixture
+        // CLAUDE.md (scripts/record-demo.sh) are both CONVERSATION-level
+        // instructions, and field-confirmed to still lose to the
+        // operator's own ambient locale bias roughly half the time on
+        // pane 1's longest response. `--append-system-prompt` is the
+        // strongest lever the CLI exposes for this (verified via
+        // `claude --help`) -- a SYSTEM-prompt-level instruction applied
+        // for the whole interactive session, not just one turn -- so it
+        // holds where the conversation-level levers didn't. Kept as an
+        // ADDITION, not a replacement: the "Respond only in English."
+        // prefix and the CLAUDE.md rule both stay in place as defense in
+        // depth.
         clickQuadrant(1)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
+        panePasteAndReturn(
+            "cd /tmp/calyx-demo-workspace && claude --model sonnet " +
+            "--append-system-prompt \"Always respond in English. Never use any other language.\""
+        )
         clickQuadrant(2)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
+        panePasteAndReturn(
+            "cd /tmp/calyx-demo-workspace && claude --model sonnet " +
+            "--append-system-prompt \"Always respond in English. Never use any other language.\""
+        )
         clickQuadrant(3)
-        panePasteAndReturn("cd /tmp/calyx-demo-workspace && claude --model sonnet")
+        panePasteAndReturn(
+            "cd /tmp/calyx-demo-workspace && claude --model sonnet " +
+            "--append-system-prompt \"Always respond in English. Never use any other language.\""
+        )
         // Single combined wait for all three Claude Code startups rather
         // than one per pane -- they were kicked off back-to-back above
         // and start up concurrently.

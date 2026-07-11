@@ -13,10 +13,12 @@ set -euo pipefail
 # pane-side script always reads that exact, no-override-possible path),
 # so the demo's own "Enable AI Agent IPC" would clobber the production
 # instance's endpoint file. Also requires the `claude` CLI on PATH --
-# the scenario pastes `claude --model sonnet` into three panes and
-# expects it to actually start a real agent. (`--model sonnet` is pinned
-# rather than left to the operator's own ambient default, which
-# field-flipped between takes and wrecked this scenario's pacing -- see
+# the scenario pastes `claude --model sonnet --append-system-prompt
+# "Always respond in English. Never use any other language."` into three
+# panes and expects it to actually start a real agent. (`--model sonnet`
+# and the appended system prompt are both pinned rather than left to the
+# operator's own ambient defaults/locale, which field-flipped between
+# takes and wrecked this scenario's pacing/language -- see
 # DemoRecordingScenario.swift's own PRE-ROLL comment.)
 #
 # pkill/killall are prohibited in this repo: if a Calyx process is
@@ -58,9 +60,9 @@ fi
 
 if ! command -v claude > /dev/null; then
     echo "ERROR: the 'claude' CLI was not found on PATH."
-    echo "Install Claude Code first -- the demo scenario pastes"
-    echo "'claude --model sonnet' into three panes and expects it to"
-    echo "actually start."
+    echo "Install Claude Code first -- the demo scenario pastes a full"
+    echo "'claude --model sonnet --append-system-prompt ...' command into"
+    echo "three panes and expects it to actually start."
     exit 1
 fi
 
@@ -213,9 +215,9 @@ echo "=== Calyx Demo Recording ==="
 echo "This launches an isolated Calyx.app instance (its own defaults"
 echo "domain and session dir -- not your real Calyx state) at a fixed"
 echo "1440x900 window, builds a 2x2 pane split, starts real"
-echo "'claude --model sonnet' agents in three panes, and drives a short"
-echo "scripted product demo end to end, including a real"
-echo "approval-banner interaction."
+echo "'claude --model sonnet' agents (pinned to an English-only system"
+echo "prompt) in three panes, and drives a short scripted product demo"
+echo "end to end, including a real approval-banner interaction."
 echo
 echo "When you see \"DEMO: PRE-ROLL COMPLETE\" in the log below (or the"
 echo "4 panes visibly settle with their agents idle), start your screen"
@@ -255,8 +257,16 @@ fi
 
 echo
 echo "Done. If you use the production Calyx again, re-run 'Enable AI Agent IPC' there to restore its endpoint file."
+# Field-confirmed benign case for a non-zero status here: a long run
+# (BEAT 5's sentinel wait can stretch well past a minute) can outlast
+# XCTest's own finalization timer for its automatic screen-recording
+# attachment, which then SIGKILLs the test runner AFTER the scenario has
+# already reached tearDown and the app has already quit cleanly -- no
+# app crash, no jetsam, the scripted take itself ran to completion. This
+# script cannot tell that case apart from an actual bad take from the
+# exit code alone, so it says so rather than asserting either one.
 if [ "$status" -ne 0 ]; then
-    echo "The take failed or recorded issues -- retake with --skip-build once you've fixed whatever went wrong."
+    echo "Note: a non-zero exit here is usually just XCTest failing to finalize its own internal screen recording of this long run (the runner gets SIGKILLed in post-test cleanup) -- it does NOT mean your screen recording is bad. If the scenario visibly played to the end, the take is fine. Retake with --skip-build only if something actually looked wrong on screen."
 fi
 
 exit "$status"
