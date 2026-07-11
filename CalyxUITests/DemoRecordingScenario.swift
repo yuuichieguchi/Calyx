@@ -296,6 +296,11 @@ final class DemoRecordingScenario: CalyxUITestCase {
         if awaitOrContinue(firstAgentRow, timeout: 10) {
             firstAgentRow.click()
         }
+        // See approvePendingIfAny()'s own doc comment: after BEAT 3,
+        // every new agent tool call still banners, so a request may
+        // already be pending by the time the agent row's own click
+        // above lands.
+        approvePendingIfAny()
         Thread.sleep(forTimeInterval: 2)
 
         // MARK: - BEAT 5: run the test script, ask pane 1 to summarize it
@@ -308,7 +313,31 @@ final class DemoRecordingScenario: CalyxUITestCase {
         // response in the whole recording, so it's the least tolerant
         // of flipping language mid-take.
         panePasteAndReturn("Respond only in English. Wait for the test run in the other pane and summarize the result")
-        Thread.sleep(forTimeInterval: 20)
+
+        // Hold for pane 4 to actually run the tests and pane 1 to
+        // summarize the result -- but a KEEPER loop, not a single fixed
+        // sleep: every new tool call still banners after BEAT 3 (see
+        // approvePendingIfAny()'s own doc comment), and pane 1's own
+        // "wait and summarize" turn depends on MCP calls (e.g.
+        // terminal_await_command) that would otherwise stall forever on
+        // an unanswered approval. 12 iterations x 2s = ~24s (a bit
+        // longer than the previous fixed 20s hold, to absorb the extra
+        // approval round-trips) -- comfortably covers pane 4's own ~8s
+        // test.sh run.
+        for _ in 0..<12 {
+            Thread.sleep(forTimeInterval: 2)
+            approvePendingIfAny()
+        }
+
+        // Bounded pre-BEAT-6 sweep: same rationale as
+        // approvePendingIfAny()'s own doc comment -- up to 5 iterations,
+        // breaking early the moment nothing is pending, so the closing
+        // calm shot doesn't show a dangling banner.
+        for _ in 0..<5 {
+            if !banner.exists { break }
+            approvePendingIfAny()
+            Thread.sleep(forTimeInterval: 1)
+        }
 
         // MARK: - BEAT 6: calm final hold
 
@@ -430,5 +459,34 @@ final class DemoRecordingScenario: CalyxUITestCase {
         if awaitOrContinue(itemByID, timeout: 2) {
             itemByID.click()
         }
+    }
+
+    /// Best-effort, non-asserting "keeper": if a banner is currently up
+    /// AND its Allow button exists, clicks it -- a silent no-op
+    /// otherwise. Uses a plain `.exists` check, NOT `awaitOrContinue`/any
+    /// wait, since this is called repeatedly in a loop (BEAT 5, the
+    /// pre-BEAT-6 sweep) where waiting on every iteration would
+    /// needlessly stall the recording for a banner that may never
+    /// reappear.
+    ///
+    /// Needed field-confirmed: once agentHookApprovalEnabled is on,
+    /// EVERY agent tool call banners (CalyxMCPServer's
+    /// routeApprovalRequest has no per-tool filter), and BEAT 3's "Allow
+    /// All Pending" deliberately leaves no standing memory -- it only
+    /// drains whatever was ALREADY pending at that moment. So after BEAT
+    /// 3, every NEW tool call still banners. Left unattended, an agent
+    /// stalls waiting on an unanswered request (BEAT 5's own pane-1
+    /// "wait and summarize" prompt depends on this), and the closing
+    /// shot can show a dangling banner. On camera, these quick clicks
+    /// read as the human supervising the agents, not as noise.
+    private func approvePendingIfAny() {
+        let banner = app.descendants(matching: .any)
+            .matching(identifier: "calyx.approvalBanner.container")
+            .firstMatch
+        guard banner.exists else { return }
+
+        let allowButton = app.buttons["calyx.approvalBanner.allowButton"]
+        guard allowButton.exists else { return }
+        allowButton.click()
     }
 }
