@@ -117,7 +117,10 @@ enum AccessibilityID {
     /// cross-actions menu (`crossActionsMenu`), shown only for an
     /// `.agentHook`-sourced request, with two items
     /// (`allowAllPendingItem`/`alwaysAllowAllPanesItem`) -- see
-    /// ApprovalBannerView.
+    /// ApprovalBannerView. Queue navigation adds `previousButton`/
+    /// `nextButton`/`positionLabel`, shown only while more than one
+    /// request is queued for this window (see
+    /// ApprovalBannerModel.positionInfo).
     enum ApprovalBanner {
         static let container = "calyx.approvalBanner.container"
         static let allowButton = "calyx.approvalBanner.allowButton"
@@ -127,6 +130,9 @@ enum AccessibilityID {
         static let crossActionsMenu = "calyx.approvalBanner.crossActionsMenu"
         static let allowAllPendingItem = "calyx.approvalBanner.allowAllPendingItem"
         static let alwaysAllowAllPanesItem = "calyx.approvalBanner.alwaysAllowAllPanesItem"
+        static let previousButton = "calyx.approvalBanner.previousButton"
+        static let nextButton = "calyx.approvalBanner.nextButton"
+        static let positionLabel = "calyx.approvalBanner.positionLabel"
     }
     enum Diff {
         static let container = "calyx.diff"
