@@ -69,6 +69,16 @@ WORKSPACE=/tmp/calyx-demo-workspace
 rm -rf "$WORKSPACE"
 mkdir -p "$WORKSPACE/src" "$WORKSPACE/scripts"
 
+# BEAT 5's own completion sentinel (CalyxUITests/DemoRecordingScenario.swift)
+# lives at this fixed, top-level /tmp path -- NOT under $WORKSPACE, so the
+# rm -rf above never touches it. A stale sentinel left over from a
+# previous take would make BEAT 5's keeper loop see it as already-done
+# and end that beat instantly, so it must be cleared before every run.
+# This runs unconditionally here (both the normal and --skip-build paths
+# always execute this fixture-setup section before xcodebuild), so a
+# --skip-build retake still gets a clean sentinel.
+rm -f /tmp/calyx-demo-done
+
 cat > "$WORKSPACE/README.md" << 'EOF'
 # Calyx Demo Workspace
 
