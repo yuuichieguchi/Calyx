@@ -362,24 +362,36 @@ struct HermesConfigManager: Sendable {
         // Iterate by repeatedly searching for a fresh valid block, since each
         // removal invalidates previously-computed ranges.
         while let range = findValidManagedBlocks(in: working).first {
-            var lower = range.lowerBound
-            var upper = range.upperBound
-
-            // Eat one trailing newline if present.
-            if upper < working.endIndex, working[upper] == "\n" {
-                upper = working.index(after: upper)
-            }
-            // Eat one leading newline if present (so the deleted block doesn't
-            // leave behind a blank-line gap).
-            if lower > working.startIndex {
-                let prev = working.index(before: lower)
-                if working[prev] == "\n" {
-                    lower = prev
-                }
-            }
+            let (lower, upper) = eatOneAdjacentNewline(in: working, range: range)
             working.removeSubrange(lower..<upper)
         }
         return working
+    }
+
+    /// Removes the block spanned by `range` plus exactly ONE of its adjacent
+    /// newlines (preferring the trailing one), so the line before the block
+    /// and the line after it end up separated by exactly one newline instead
+    /// of zero (lines merging) or two (a stray blank line).
+    private static func eatOneAdjacentNewline(
+        in content: String,
+        range: Range<String.Index>
+    ) -> (Range<String.Index>.Bound, Range<String.Index>.Bound) {
+        var lower = range.lowerBound
+        var upper = range.upperBound
+
+        if upper < content.endIndex, content[upper] == "\n" {
+            // Eat the trailing newline — the separator between the block and
+            // whatever follows is preserved by the newline before the block.
+            upper = content.index(after: upper)
+        } else if lower > content.startIndex {
+            // No trailing newline to eat (block is at EOF): fall back to
+            // eating the leading one instead, so we still remove exactly one.
+            let prev = content.index(before: lower)
+            if content[prev] == "\n" {
+                lower = prev
+            }
+        }
+        return (lower, upper)
     }
 
     /// Self-heal helper used during enableIPC: removes ANY BEGIN line through
@@ -391,33 +403,16 @@ struct HermesConfigManager: Sendable {
             let searchAfterBegin = beginRange.upperBound..<working.endIndex
             let upperBound = firstMatch(of: endLineRegex, in: working, range: searchAfterBegin)?.upperBound
                 ?? working.endIndex
-            var lower = beginRange.lowerBound
-            var upper = upperBound
-            if upper < working.endIndex, working[upper] == "\n" {
-                upper = working.index(after: upper)
-            }
-            if lower > working.startIndex {
-                let prev = working.index(before: lower)
-                if working[prev] == "\n" {
-                    lower = prev
-                }
-            }
+            let (lower, upper) = eatOneAdjacentNewline(
+                in: working,
+                range: beginRange.lowerBound..<upperBound
+            )
             working.removeSubrange(lower..<upper)
         }
         // Self-heal also removes orphan END lines that have no matching BEGIN,
         // so a broken state does not leak into the freshly-written file.
         while let endRange = firstMatch(of: endLineRegex, in: working) {
-            var lower = endRange.lowerBound
-            var upper = endRange.upperBound
-            if upper < working.endIndex, working[upper] == "\n" {
-                upper = working.index(after: upper)
-            }
-            if lower > working.startIndex {
-                let prev = working.index(before: lower)
-                if working[prev] == "\n" {
-                    lower = prev
-                }
-            }
+            let (lower, upper) = eatOneAdjacentNewline(in: working, range: endRange)
             working.removeSubrange(lower..<upper)
         }
         return working

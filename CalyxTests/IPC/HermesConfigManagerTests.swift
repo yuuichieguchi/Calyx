@@ -263,6 +263,40 @@ final class HermesConfigManagerTests: XCTestCase {
                        "Old token should be gone")
     }
 
+    /// Regression test: mcp_servers: followed by a sibling top-level key
+    /// (e.g. `toolsets:`) is the exact shape that corrupted a real user's
+    /// config. Re-enabling calls the self-heal path (`stripAllManagedRegions`)
+    /// to remove the previously-inserted block before writing a fresh one;
+    /// that removal must not eat the newline separating the block from the
+    /// following top-level key, or the two lines merge into invalid YAML.
+    func test_enableIPC_idempotentInsert_preservesFollowingTopLevelKey() throws {
+        // Given: mcp_servers: with a child, followed by a sibling top-level key.
+        let existing = """
+        mcp_servers:
+          stripe:
+            url: "https://mcp.stripe.com"
+        toolsets:
+          - hermes-cli
+          - web
+        """
+        try writeConfig(existing)
+
+        // When: enableIPC is called twice (second call exercises the
+        // self-heal removal of the first call's block).
+        try HermesConfigManager.enableIPC(port: 41830, token: "first-tok", configPath: configPath)
+        try HermesConfigManager.enableIPC(port: 55555, token: "second-tok", configPath: configPath)
+
+        // Then: the following top-level key must remain on its own line,
+        // not merged onto the end of a preceding value.
+        let content = readConfig()
+        XCTAssertTrue(content.contains("\ntoolsets:\n"),
+                      "toolsets: must remain on its own line, not merged with adjacent content")
+        XCTAssertTrue(content.contains("  - hermes-cli"),
+                      "Content after the managed block should be preserved intact")
+        XCTAssertTrue(content.contains("  - web"),
+                      "Content after the managed block should be preserved intact")
+    }
+
     // MARK: - enableIPC: Unsupported YAML structure
 
     func test_enableIPC_throwsOnInlineMcpServersMap() throws {
@@ -563,6 +597,40 @@ final class HermesConfigManagerTests: XCTestCase {
                        "END marker (managed) should be removed")
         XCTAssertFalse(content.contains("calyx-ipc:"),
                        "calyx-ipc child should be removed")
+    }
+
+    /// Regression test: mcp_servers: followed by a sibling top-level key
+    /// (e.g. `toolsets:`) is the exact shape that corrupted a real user's
+    /// config. Removing the managed block must leave exactly one newline
+    /// between the preserved content before the block and the top-level
+    /// key after it — not zero (lines merge into invalid YAML) or two (a
+    /// stray blank line).
+    func test_disableIPC_preservesFollowingTopLevelKey() throws {
+        // Given: Case B setup where mcp_servers: is followed by another
+        // top-level key with no blank line in between.
+        let existing = """
+        mcp_servers:
+          stripe:
+            url: "https://mcp.stripe.com"
+        toolsets:
+          - web
+        """
+        try writeConfig(existing)
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+        XCTAssertTrue(readConfig().contains("calyx-ipc:"),
+                      "Test setup: enable should have inserted the managed sub-block")
+
+        // When
+        try HermesConfigManager.disableIPC(configPath: configPath)
+
+        // Then
+        let content = readConfig()
+        XCTAssertFalse(content.contains("stripe.com\"toolsets:"),
+                       "Removing the managed block must not merge the surrounding lines")
+        XCTAssertTrue(content.contains("url: \"https://mcp.stripe.com\"\ntoolsets:"),
+                      "Exactly one newline should separate preserved content from the following key")
+        XCTAssertTrue(content.contains("  - web"),
+                      "Content after the managed block should be preserved intact")
     }
 
     func test_disableIPC_removesEmptyMcpServersWhenOnlyChild() throws {
