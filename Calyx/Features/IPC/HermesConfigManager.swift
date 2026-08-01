@@ -362,7 +362,7 @@ struct HermesConfigManager: Sendable {
         // Iterate by repeatedly searching for a fresh valid block, since each
         // removal invalidates previously-computed ranges.
         while let range = findValidManagedBlocks(in: working).first {
-            let (lower, upper) = eatOneAdjacentNewline(in: working, range: range)
+            let (lower, upper) = removeAdjacentNewline(in: working, range: range)
             working.removeSubrange(lower..<upper)
         }
         return working
@@ -372,7 +372,7 @@ struct HermesConfigManager: Sendable {
     /// newlines (preferring the trailing one), so the line before the block
     /// and the line after it end up separated by exactly one newline instead
     /// of zero (lines merging) or two (a stray blank line).
-    private static func eatOneAdjacentNewline(
+    private static func removeAdjacentNewline(
         in content: String,
         range: Range<String.Index>
     ) -> (Range<String.Index>.Bound, Range<String.Index>.Bound) {
@@ -380,12 +380,12 @@ struct HermesConfigManager: Sendable {
         var upper = range.upperBound
 
         if upper < content.endIndex, content[upper] == "\n" {
-            // Eat the trailing newline — the separator between the block and
-            // whatever follows is preserved by the newline before the block.
+            // Remove the trailing newline — the separator between the block
+            // and whatever follows is preserved by the newline before the block.
             upper = content.index(after: upper)
         } else if lower > content.startIndex {
-            // No trailing newline to eat (block is at EOF): fall back to
-            // eating the leading one instead, so we still remove exactly one.
+            // No trailing newline to remove (block is at EOF): fall back to
+            // removing the leading one instead, so we still remove exactly one.
             let prev = content.index(before: lower)
             if content[prev] == "\n" {
                 lower = prev
@@ -403,7 +403,7 @@ struct HermesConfigManager: Sendable {
             let searchAfterBegin = beginRange.upperBound..<working.endIndex
             let upperBound = firstMatch(of: endLineRegex, in: working, range: searchAfterBegin)?.upperBound
                 ?? working.endIndex
-            let (lower, upper) = eatOneAdjacentNewline(
+            let (lower, upper) = removeAdjacentNewline(
                 in: working,
                 range: beginRange.lowerBound..<upperBound
             )
@@ -412,7 +412,7 @@ struct HermesConfigManager: Sendable {
         // Self-heal also removes orphan END lines that have no matching BEGIN,
         // so a broken state does not leak into the freshly-written file.
         while let endRange = firstMatch(of: endLineRegex, in: working) {
-            let (lower, upper) = eatOneAdjacentNewline(in: working, range: endRange)
+            let (lower, upper) = removeAdjacentNewline(in: working, range: endRange)
             working.removeSubrange(lower..<upper)
         }
         return working

@@ -267,7 +267,7 @@ final class HermesConfigManagerTests: XCTestCase {
     /// (e.g. `toolsets:`) is the exact shape that corrupted a real user's
     /// config. Re-enabling calls the self-heal path (`stripAllManagedRegions`)
     /// to remove the previously-inserted block before writing a fresh one;
-    /// that removal must not eat the newline separating the block from the
+    /// that removal must not remove the newline separating the block from the
     /// following top-level key, or the two lines merge into invalid YAML.
     func test_enableIPC_idempotentInsert_preservesFollowingTopLevelKey() throws {
         // Given: mcp_servers: with a child, followed by a sibling top-level key.
