@@ -25,7 +25,7 @@ brew install --cask calyx
 1. Download `Calyx.zip` from the [latest release](https://github.com/yuuichieguchi/Calyx/releases/latest).
 2. Unzip it and move `Calyx.app` to `/Applications`.
 
-Calyx requires macOS 26 Tahoe or later. Direct downloads update through Sparkle; Homebrew installations update with `brew upgrade`.
+Calyx requires macOS 26 Tahoe or later on Apple Silicon (arm64 only). Direct downloads update through Sparkle; Homebrew installations update with `brew upgrade`.
 
 ## Why Calyx
 
