@@ -118,6 +118,32 @@ targets:
             fi
           done
         name: Bundle Remote Session Binaries
+      - script: |
+          set -e
+          # Stamps the short git hash of the checkout this build came
+          # from into the BUILT Info.plist as CalyxCommit, which the
+          # About window's "Commit" row reads (and links to
+          # github.com/yuuichieguchi/Calyx/commits/<hash>).
+          #
+          # Stamped here rather than declared under `info.properties`
+          # below because a build setting is resolved at PROJECT GENERATION
+          # time (xcodegen), not at build time — it would pin whatever
+          # commit was checked out when project.yml was last generated.
+          #
+          # Delete-then-Add, both tolerant of failure: an incremental
+          # build does not reprocess Info.plist, so the key from the
+          # previous build is still there and a bare Add would fail.
+          PLIST="${BUILT_PRODUCTS_DIR}/${INFOPLIST_PATH}"
+          COMMIT=$(git -C "${PROJECT_DIR}" rev-parse --short HEAD 2>/dev/null || true)
+          if [ -n "$COMMIT" ] && [ -f "$PLIST" ]; then
+            /usr/libexec/PlistBuddy -c "Delete :CalyxCommit" "$PLIST" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :CalyxCommit string $COMMIT" "$PLIST"
+          else
+            # No git (e.g. a source tarball) — AboutView's own `commit`
+            # row is `if let`-gated, so it simply does not render.
+            echo "warning: could not resolve a git commit for CalyxCommit; About will omit its Commit row."
+          fi
+        name: Stamp Git Commit
     info:
       path: Calyx/Info.plist
       properties:

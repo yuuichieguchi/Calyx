@@ -58,9 +58,12 @@
 //  `selectAll:`) as `SurfaceView`'s own identically-named `@IBAction`s
 //  below -- selector-name identity, not a shared declaring type, is what
 //  lets `-[NSApplication targetForAction:]` resolve those menu items to
-//  `SurfaceView`'s implementations at all. Confirmed on-device: with the
-//  About panel (a non-`CalyxWindow` `NSPanel`, `canBecomeMain == false`)
-//  key, `NSApp.mainWindow` stays whatever `CalyxWindow` was last main, so
+//  `SurfaceView`'s implementations at all. Confirmed on-device: with a
+//  non-`CalyxWindow` `NSPanel` reporting `canBecomeMain == false` key
+//  (the standard About panel at the time; About is a plain `NSWindow`
+//  today, `AboutWindowController.swift`, but the mechanism belongs to
+//  `NSPanel`, not to About),
+//  `NSApp.mainWindow` stays whatever `CalyxWindow` was last main, so
 //  Cmd+V there silently sends the clipboard into that BACKGROUND window's
 //  shell -- no visible feedback, unlike issue #45's Cmd+W (a closed tab is
 //  obvious; injected shell input is not). `pasteAsPlainText(_:)` has no

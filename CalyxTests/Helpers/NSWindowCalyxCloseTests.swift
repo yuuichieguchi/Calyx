@@ -7,7 +7,7 @@
 //
 //  Exercises `NSWindow.calyxPerformClose(_:)`'s DEFAULT behavior — i.e.
 //  the base `NSWindow` extension, not `CalyxWindow`'s override — on a
-//  PLAIN, bare `NSWindow` (About panel/Settings/Session Browser stand-in;
+//  PLAIN, bare `NSWindow` (About/Settings/Session Browser stand-in;
 //  none of those subclass `CalyxWindow`, so they all fall through to
 //  this exact default implementation). Deliberately does NOT construct a
 //  `CalyxWindowController` at all: these windows' delegate is this

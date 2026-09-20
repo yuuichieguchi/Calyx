@@ -2649,7 +2649,34 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         windowMenu.addItem(.separator())
         windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
 
+        // Help menu — deliberately LAST, and assigned to `NSApp.helpMenu`
+        // so AppKit treats it as THE help menu (the same thing Ghostty's
+        // MainMenu.xib does with `systemMenu="help"`): that is what makes
+        // macOS insert its own "Search" field at the top of the menu.
+        let helpMenuItem = NSMenuItem()
+        mainMenu.addItem(helpMenuItem)
+        let helpMenu = NSMenu(title: "Help")
+        helpMenuItem.submenu = helpMenu
+        // Cmd+? — the system-standard help shortcut, matching Ghostty's
+        // own "Ghostty Help" item.
+        //
+        // `target = self`, unlike almost every other item in this menu
+        // bar: a Help menu item is the one place where leaving the
+        // target nil is actively dangerous, because AppKit's own
+        // `NSApplication.showHelp(_:)` sits in the responder chain ahead
+        // of the delegate (see `openCalyxHelp(_:)`'s doc comment). The
+        // explicit target pins resolution to this class regardless of
+        // what any future selector rename does.
+        let helpItem = NSMenuItem(title: "Calyx Help", action: #selector(openCalyxHelp(_:)), keyEquivalent: "?")
+        helpItem.target = self
+        helpMenu.addItem(helpItem)
+
         NSApp.mainMenu = mainMenu
+        // `helpMenu` must be reachable from `NSApp.mainMenu` before it is
+        // assigned here -- otherwise AppKit can't resolve it as a menu
+        // inside the menu bar, and the assignment is silently ignored
+        // (no Search field gets inserted).
+        NSApp.helpMenu = helpMenu
     }
 
     // MARK: - Session Persistence
@@ -4271,12 +4298,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         debugLog("Debug select complete")
     }
 
+    /// Calyx's own About window (`AboutWindowController`) -- it replaced
+    /// `NSApp.orderFrontStandardAboutPanel`, which had nowhere to put
+    /// the Build/Commit rows or the Docs/GitHub buttons. Only the
+    /// implementation changed; the name stayed `showAboutPanel` so the
+    /// menu item's selector, and every reference to it, still resolves.
     @objc private func showAboutPanel() {
-        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? ""
-        NSApp.orderFrontStandardAboutPanel(options: [
-            .version: "",
-            .applicationVersion: version
-        ])
+        AboutWindowController.shared.show()
+    }
+
+    /// Help menu's "Calyx Help" item -- opens the hosted documentation
+    /// in the user's browser, the same thing About's own "Docs" button
+    /// does (both point at `AboutView.docsURL`).
+    ///
+    /// MUST NOT be named `showHelp(_:)`: `NSApplication` itself
+    /// implements that selector (it opens the app's Help Book, or puts
+    /// up a "Help isn't available for Calyx." alert when there is none),
+    /// and `-[NSApplication targetForAction:]` reaches NSApp BEFORE its
+    /// delegate -- so a nil-target `showHelp:` menu item never reaches
+    /// this class at all. Field-verified: the alert is exactly what the
+    /// first cut of this menu item produced. Ghostty avoids the same
+    /// collision only because its MainMenu.xib wires the item's target
+    /// to its AppDelegate explicitly; the item below does both (unique
+    /// selector AND explicit target).
+    @objc private func openCalyxHelp(_ sender: Any?) {
+        guard let url = AboutView.docsURL else { return }
+        NSWorkspace.shared.open(url)
     }
 
     @objc private func openPreferences(_ sender: Any?) {

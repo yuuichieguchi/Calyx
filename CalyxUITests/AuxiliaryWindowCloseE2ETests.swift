@@ -14,10 +14,9 @@
 // `NSApp.keyWindow`/`NSApp.mainWindow` are WindowServer-assigned, not
 // settable from inside the app process under test -- an XCTest host
 // cannot manufacture a real "key but not main" window (`NSWindow
-// +CalyxClose.swift`'s header documents About's own panel as reporting
-// `canBecomeMain == false`, which is the production-code premise this
-// file exists to exercise end-to-end, NOT a fact this file itself
-// re-derives -- XCUITest exposes no API to read an element's key/main
+// +CalyxClose.swift`'s header documents both key/main shapes a panel can
+// take, which is the production-code premise this file exists to
+// exercise end-to-end, NOT a fact this file itself re-derives -- XCUITest exposes no API to read an element's key/main
 // state directly, so what follows verifies the resulting BEHAVIOR
 // through a real menu click + a real keystroke, not the AX-level
 // key/main mechanics themselves) without an actual end-to-end run
@@ -54,11 +53,12 @@
 // established style, e.g. `LastWindowCloseDoesNotQuitE2ETests`): for
 // each of About / Settings / Session Browser, opened via its own real
 // menu item (the ordinary way any of these becomes the frontmost,
-// user-focused panel -- About is a real `NSPanel`; Settings and Session
-// Browser are plain `NSWindow`s that DO become main the moment they
-// become key, but still not the terminal's `CalyxWindowController` --
-// see `NSWindow+CalyxClose.swift`'s header for why both cases used to
-// fail differently pre-fix), a real Cmd+W keystroke must close ONLY
+// user-focused panel -- all three are today plain `NSWindow`s that DO
+// become main the moment they become key, but still never the terminal's
+// `CalyxWindowController`; About was AppKit's standard `NSPanel` when
+// this file was written, and `NSWindow+CalyxClose.swift`'s header keeps
+// the writeup of how those two shapes used to fail DIFFERENTLY pre-fix),
+// a real Cmd+W keystroke must close ONLY
 // that panel and must leave the terminal window's own tab count
 // completely unchanged. This file verifies that user-visible CONTRACT;
 // it does not (and, per the note above, cannot) directly inspect which
@@ -68,10 +68,11 @@
 // level. The terminal window is fixed at exactly 2 tabs
 // (`fixTabCountAtTwo()`) BEFORE any panel opens, specifically so a
 // post-Cmd+W tab count of 2 proves the count is UNCHANGED, not merely
-// "still more than zero" -- pre-fix, About's own symptom was silently
-// closing the terminal's ACTIVE tab out from under the user (2 -> 1),
-// which a weaker "at least one tab remains" assertion would not have
-// caught.
+// "still more than zero" -- pre-fix, the `NSPanel`-shaped symptom (then
+// About's, and still reachable by any `canBecomeMain == false` panel)
+// was silently closing the terminal's ACTIVE tab out from under the user
+// (2 -> 1), which a weaker "at least one tab remains" assertion would
+// not have caught.
 //
 // THIS FILE DELIBERATELY DOES NOT COVER:
 //   - The ClipboardConfirmation sheet's own Cmd+W handling (beeps and
@@ -96,47 +97,28 @@
 // (SIGTERM bypasses AppKit's close path entirely) -- same discipline
 // as `LastWindowCloseDoesNotQuitE2ETests`'s own header note.
 //
-// About panel locator -- FIELD-VERIFIED, not assumed (a first real run
-// was deliberately instrumented with a throwaway `logAllTopLevelElements`
-// diagnostic -- enumerating `app.children(matching: .any)` with each
-// element's `elementType`/title/identifier -- before committing to any
-// predicate; not preserved in this file since it was a one-off
-// diagnostic, not lasting coverage, but its finding is inlined below):
-// About's own AXTitle was never a viable locator to begin with --
-// `orderFrontStandardAboutPanel`'s panel is a private AppKit class this
-// codebase does not control, and it turns out to report an EMPTY title
-// (confirmed in that diagnostic run: `title=""`). It is not usable as
-// an EXCLUSION key either --
-// the assumption that the terminal's own title would read back empty
-// once `titleVisibility = .hidden` is applied to it (`CalyxWindow
-// .setupWindow()`) was checked in that same run and is WRONG: it reads
-// back as the shell's current directory ("~"), a live, non-empty,
-// AppKit-managed value, not "Calyx" and not "". More importantly,
-// About is NOT even an `XCUIElementTypeWindow` in the first place --
-// `app.windows.count` stayed at 1 for the panel's entire 5s post-open
-// poll window while a screenshot taken at that exact moment showed the
-// panel fully rendered on screen. `app.children(matching: .any)`
-// enumerated over that same moment showed About as the app's ONE
-// `app.dialogs` element instead (`XCUIElementTypeDialog`, private
-// runtime identifier "_NS:154" -- itself not a stable identifier to
-// key a lookup on, so not used as one below). This matches, and is
-// presumably WHY, this exact test target already has an established
-// `app.dialogs.firstMatch` idiom for exactly this situation (`BrowserUITests`,
-// `BrowserScriptingUITests`, `CommandLogE2ETests`, `CockpitApprovalE2ETests`,
-// `LastWindowCloseDoesNotQuitE2ETests`, `MenuShortcutsUITests`) -- those
-// are all NSAlert-backed prompts, About is AppKit's own standard panel,
-// and both land in the same `.dialog` bucket. `app.dialogs.firstMatch`
-// is safe to treat as a stable identity here (unlike a positional
-// `app.windows.firstMatch` would have been): the terminal window is
-// never itself classified as a dialog, so once About closes,
-// `app.dialogs` has nothing left to match -- no other element could
-// make `firstMatch` re-resolve to something that still (wrongly)
-// "exists". Settings and Session Browser, by contrast, DO have
-// field-verified, unambiguous WINDOW titles precedented elsewhere in
-// this test target ("Appearance" -- `SettingsWindowE2ETests`;
-// "Sessions" -- `SessionBrowserAttachKillE2ETests`), so those two tests
-// locate their panel directly by title instead, and never needed this
-// investigation.
+// About window locator -- About is now Calyx's OWN window
+// (`AboutWindowController`, a SwiftUI `AboutView` in a plain `NSWindow`),
+// NOT `NSApp.orderFrontStandardAboutPanel`'s panel any more, so it is a
+// normal `XCUIElementTypeWindow` located by its title, exactly like the
+// Settings and Session Browser tests below ("Appearance" --
+// `SettingsWindowE2ETests`; "Sessions" --
+// `SessionBrowserAttachKillE2ETests`). `AboutWindowController` sets
+// `window.title = "About Calyx"` even though `titleVisibility` is
+// `.hidden`, precisely so this AX title exists to key on -- a hidden
+// title bar does NOT blank out the AX title (independently confirmed for
+// the terminal window, whose `titleVisibility = .hidden` still reads back
+// as the shell's current directory).
+//
+// HISTORICAL, kept because it is the reason the assertions below check
+// WINDOW counts and not `app.dialogs`: while About was the standard
+// AppKit panel, it was field-verified NOT to be an
+// `XCUIElementTypeWindow` at all (`app.windows.count` stayed at 1 for the
+// panel's entire 5s post-open poll while a screenshot showed it fully
+// rendered) and reported an EMPTY AXTitle, so it could only be located as
+// the app's one `app.dialogs` element. Both facts died with the panel:
+// today opening About takes `app.windows.count` from 1 to 2 and leaves
+// `app.dialogs` empty.
 
 import XCTest
 
@@ -196,35 +178,41 @@ final class AuxiliaryWindowCloseE2ETests: CalyxUITestCase {
     // MARK: - Tests
 
     /// THE reported bug's core negative condition (see this file's
-    /// header): with the About panel key -- a real `NSPanel` that
-    /// reports `canBecomeMain == false`, so `NSApp.mainWindow` stays
-    /// pinned to the terminal window behind it -- Cmd+W must close ONLY
-    /// About. Pre-fix, `-[NSApplication targetForAction:]`'s main-window
-    /// fallback found the terminal's own `CalyxWindowController
-    /// .closeTab(_:)` instead, silently closing its active tab while
-    /// About sat untouched in front.
+    /// header): with About key, Cmd+W must close ONLY About and leave
+    /// the terminal's tabs alone. Pre-fix, `-[NSApplication
+    /// targetForAction:]`'s main-window fallback found the terminal's own
+    /// `CalyxWindowController.closeTab(_:)` instead, silently closing its
+    /// active tab while About sat untouched in front.
+    ///
+    /// About is now a plain `NSWindow` (`AboutWindowController`), so it
+    /// is the Settings case of the two failure modes
+    /// `NSWindow+CalyxClose.swift`'s header documents -- `canBecomeMain
+    /// == true`, so pre-fix Cmd+W here would have been inert rather than
+    /// destructive. The fix (`calyxPerformClose(_:)` resolving against
+    /// the KEY window's own chain) covers both identically, and this
+    /// test's post-conditions -- About gone, tab count untouched -- are
+    /// the same either way.
     func test_cmdW_withAboutKey_closesAbout_andLeavesTerminalTabsIntact() {
         ensureMenuBarReady()
         fixTabCountAtTwo()
 
         XCTAssertEqual(app.windows.count, 1, "Precondition: only the terminal window should be open before About.")
-        XCTAssertEqual(app.dialogs.count, 0, "Precondition: no dialog/panel should be open before About.")
 
         app.activate()
         Thread.sleep(forTimeInterval: 0.5)
         menuAction("Calyx", item: "About Calyx")
 
-        // About is field-verified to surface as `app.dialogs`, NOT
-        // `app.windows` -- see this file's header, "About panel
-        // locator", for the diagnostic run that established this.
-        let aboutDialog = app.dialogs.firstMatch
-        XCTAssertTrue(waitFor(aboutDialog, timeout: 5), "About panel (an app.dialogs element) did not appear after \"About Calyx\".")
+        // About is Calyx's own `NSWindow`, located by the AX title
+        // `AboutWindowController` sets -- see this file's header,
+        // "About window locator".
+        let aboutWindow = app.windows["About Calyx"]
+        XCTAssertTrue(waitFor(aboutWindow, timeout: 5), "About window did not appear after \"About Calyx\".")
         logWindowsSnapshot("after opening About")
         saveScreenshot(name: "auxiliary-close-about-open")
-        XCTAssertEqual(app.windows.count, 1, "Opening About must not change the WINDOW count (it is not a window).")
+        XCTAssertEqual(app.windows.count, 2, "Opening About must add exactly one window (terminal + About).")
 
-        // About was just ordered front by NSApp.orderFrontStandardAboutPanel
-        // -- send Cmd+W while it, not the terminal, is on top / key.
+        // About was just made key by AboutWindowController.show() --
+        // send Cmd+W while it, not the terminal, is on top / key.
         app.typeKey("w", modifierFlags: .command)
 
         // THE NEGATIVE CONDITION, part 1: About must actually disappear
@@ -232,9 +220,9 @@ final class AuxiliaryWindowCloseE2ETests: CalyxUITestCase {
         // not silently swallowed) -- checked BEFORE the tab count below,
         // since a misrouted close is async and checking tabs first
         // could pass vacuously ahead of a delayed wrong close landing.
-        waitForNonExistence(aboutDialog, timeout: 5)
+        waitForNonExistence(aboutWindow, timeout: 5)
         logWindowsSnapshot("after Cmd+W")
-        XCTAssertEqual(app.dialogs.count, 0, "About did not close after Cmd+W while it was key.")
+        XCTAssertFalse(aboutWindow.exists, "About did not close after Cmd+W while it was key.")
 
         // THE NEGATIVE CONDITION, part 2: the terminal's own tabs, fixed
         // at 2 by fixTabCountAtTwo() above, must be completely untouched.
@@ -248,9 +236,8 @@ final class AuxiliaryWindowCloseE2ETests: CalyxUITestCase {
         XCTAssertTrue(app.windows.firstMatch.exists, "The terminal window should still be alive.")
     }
 
-    /// Settings (`SettingsWindowController`) is a plain `NSWindow`
-    /// (unlike About's `NSPanel`): `canBecomeMain == true`, so making it
-    /// key ALSO makes it main. Pre-fix, `targetForAction:`'s main-window
+    /// Settings (`SettingsWindowController`) is a plain `NSWindow`:
+    /// `canBecomeMain == true`, so making it key ALSO makes it main. Pre-fix, `targetForAction:`'s main-window
     /// fallback then walked Settings' OWN chain a second time, found no
     /// `closeTab:` receiver there either, and AppKit auto-disabled the
     /// menu item outright -- Cmd+W did nothing at all (no misroute, but

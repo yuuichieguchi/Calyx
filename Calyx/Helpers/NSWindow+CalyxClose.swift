@@ -17,23 +17,30 @@
 // `CalyxWindowController` anywhere in it), so AppKit falls through to
 // step (2) — but what step (2) finds next, and therefore the
 // user-visible symptom, differs by panel:
-//   - About's real `NSPanel` (`AppDelegate.showAboutPanel()`, via
-//     `NSApp.orderFrontStandardAboutPanel`) reports `canBecomeMain ==
-//     false`, so `NSApp.mainWindow` stays pinned to whichever
-//     `CalyxWindow` was main before About opened. Step (2) then hits
-//     THAT terminal window's `CalyxWindowController` instead — closing
-//     the wrong window's active tab while About, the window the user
-//     is actually looking at, does nothing.
-//   - Settings (`SettingsWindowController.swift`) and Session Browser
-//     (`SessionBrowserWindowController.swift`) are each a plain
-//     `NSWindow`, not an `NSPanel` — `canBecomeMain` defaults to
-//     `true`, so the panel becomes main itself the moment it becomes
-//     key. Step (2) then walks that SAME panel's chain a second time
-//     and still finds no `CalyxWindowController`, so the nil-target
-//     action resolves to nothing anywhere and AppKit auto-disables the
-//     menu item instead — no misrouted close, but no response either.
-// Either way the menu item is broken — destructively misrouted for
-// About, silently inert for Settings/Session Browser.
+//   - An `NSPanel` that reports `canBecomeMain == false` (at the time
+//     this was written, About: `AppDelegate.showAboutPanel()` then went
+//     through `NSApp.orderFrontStandardAboutPanel`) leaves
+//     `NSApp.mainWindow` pinned to whichever `CalyxWindow` was main
+//     before the panel opened. Step (2) then hits THAT terminal
+//     window's `CalyxWindowController` instead — closing the wrong
+//     window's active tab while the panel the user is actually looking
+//     at does nothing.
+//   - A plain `NSWindow`, not an `NSPanel` — About
+//     (`AboutWindowController.swift`, which replaced the standard panel
+//     with Calyx's own SwiftUI About window), Settings
+//     (`SettingsWindowController.swift`) and Session Browser
+//     (`SessionBrowserWindowController.swift`) — has `canBecomeMain`
+//     defaulting to `true`, so the panel becomes main itself the moment
+//     it becomes key. Step (2) then walks that SAME panel's chain a
+//     second time and still finds no `CalyxWindowController`, so the
+//     nil-target action resolves to nothing anywhere and AppKit
+//     auto-disables the menu item instead — no misrouted close, but no
+//     response either.
+// Both shapes are documented, not just the one this app ships today:
+// the `canBecomeMain == false` case is still live for any future
+// `NSPanel` (and `SurfaceView.swift`'s own Edit-action gate cites it).
+// Either way the menu item is broken — destructively misrouted in the
+// first shape, silently inert in the second.
 //
 // Fix: give `NSWindow` ITSELF a method with a stable selector,
 // `calyxPerformClose(_:)`. Since every window (a plain `NSWindow`/
@@ -66,8 +73,8 @@ import AppKit
 @MainActor
 extension NSWindow {
     /// Default `calyxPerformClose(_:)` for any window that doesn't
-    /// override it (About panel, Settings, Session Browser — every
-    /// plain `NSWindow`/`NSPanel` in this app). A sheet must only ever
+    /// override it (About, Settings, Session Browser — every plain
+    /// `NSWindow`/`NSPanel` in this app). A sheet must only ever
     /// close via its own presenting controller's explicit button/
     /// `endSheet` call: `ClipboardConfirmationController`'s sheet holds
     /// an in-flight libghostty clipboard request that only its own code

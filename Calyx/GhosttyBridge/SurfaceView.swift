@@ -1302,13 +1302,18 @@ extension SurfaceView {
     //   `#selector(NSText.selectAll(_:))`, target `nil` -- selector-NAME
     //   identity (`copy:`/`paste:`/`selectAll:`), not any shared declaring
     //   type or protocol, is what lets `targetForAction:` resolve those
-    //   menu items to these `@IBAction`s at all. CONFIRMED ON-DEVICE: with
-    //   the About panel (a non-`CalyxWindow` `NSPanel`, `canBecomeMain ==
-    //   false`) key, `NSApp.mainWindow` stays whatever `CalyxWindow` was
-    //   last main, so Cmd+V there silently sends the clipboard into that
-    //   BACKGROUND window's shell -- unlike issue #45's Cmd+W (a closed
-    //   tab is visibly gone), there is no on-screen feedback at all, so a
-    //   user has no way to notice it happened. `copy(_:)`/`selectAll(_:)`
+    //   menu items to these `@IBAction`s at all. CONFIRMED ON-DEVICE:
+    //   with a non-`CalyxWindow` `NSPanel` that reports `canBecomeMain ==
+    //   false` key (the standard About panel, back when
+    //   `AppDelegate.showAboutPanel()` still used
+    //   `orderFrontStandardAboutPanel` -- About is a plain `NSWindow`
+    //   today, `AboutWindowController.swift`, but the mechanism is a
+    //   property of `NSPanel`, not of About), `NSApp.mainWindow` stays
+    //   whatever `CalyxWindow` was last main, so Cmd+V there silently
+    //   sends the clipboard into that BACKGROUND window's shell -- unlike
+    //   issue #45's Cmd+W (a closed tab is visibly gone), there is no
+    //   on-screen feedback at all, so a user has no way to notice it
+    //   happened. `copy(_:)`/`selectAll(_:)`
     //   are gated alongside it for the same defect category even though
     //   the harm is smaller: a non-key window's selection/clipboard state
     //   must not be mutable from a keystroke aimed at a DIFFERENT window.
