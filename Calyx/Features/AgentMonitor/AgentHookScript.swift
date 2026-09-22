@@ -121,7 +121,13 @@ enum AgentHookScript {
         exit 0
     fi
 
-    endpoint_file="$HOME/Library/Application Support/Calyx/agent-endpoint.json"
+    # CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController alongside
+    # CALYX_SURFACE_ID, scoped to wherever this Calyx process actually
+    # wrote agent-endpoint.json (a --calyx-path-root scratch directory
+    # under test, the real Application Support directory otherwise). The
+    # literal fallback covers a pane launched before that injection
+    # existed, or a shell that stripped the variable.
+    endpoint_file="${CALYX_ENDPOINT_FILE:-\(AgentEndpointFile.shellFallbackPath)}"
     if [ ! -f "$endpoint_file" ]; then
         exit 0
     fi
@@ -157,15 +163,20 @@ enum AgentHookScript {
     /// (0755), returning the script's absolute path. Used by both
     /// `AgentHookScript.install(toDirectory:)` above and
     /// `ApprovalHookScript.install(toDirectory:)`, so the actual
-    /// write-then-chmod logic exists in exactly one place.
+    /// write logic exists in exactly one place. Routes through
+    /// `ConfigFileUtils.withExclusiveConfig`, which resolves the
+    /// script's path, takes its exclusive lock, and writes atomically
+    /// at 0755 -- the mode an agent CLI executes -- applied to the temp
+    /// file before the rename inside the lock, so no other process can
+    /// observe or race an intermediate permission state.
     static func installScript(body: String, fileName: String, toDirectory directory: String) throws -> String {
         let fm = FileManager.default
         if !fm.fileExists(atPath: directory) {
             try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
         }
         let scriptPath = (directory as NSString).appendingPathComponent(fileName)
-        try body.write(toFile: scriptPath, atomically: true, encoding: .utf8)
-        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptPath)
+        let data = Data(body.utf8)
+        try ConfigFileUtils.withExclusiveConfig(path: scriptPath, mode: 0o755, restoreModeOnNoWrite: true) { _ in data }
         return scriptPath
     }
 }

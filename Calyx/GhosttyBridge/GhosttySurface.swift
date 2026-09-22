@@ -84,13 +84,24 @@ final class GhosttySurfaceController: Identifiable {
 
         // Inject CALYX_SURFACE_ID so the calyx-agent-hook script (installed
         // by ClaudeHooksConfigManager) can report this pane's Claude Code
-        // lifecycle events back to the Agents sidebar. `ghostty_surface_new`
-        // copies env_vars into its own arena during the call
-        // (apprt/embedded.zig's dupeZ), so the C strings built below only
-        // need to stay alive for the duration of that call — the nested
-        // `withCString`/`withUnsafeMutableBufferPointer` closures provide
-        // exactly that. Any env_vars already on `baseConfig` are preserved,
-        // with CALYX_SURFACE_ID prepended.
+        // lifecycle events back to the Agents sidebar, and
+        // CALYX_ENDPOINT_FILE so every generated hook/plugin/shell-
+        // integration script (AgentHookScript, ApprovalHookScript,
+        // OpenCodePluginManager, PiExtensionManager,
+        // ShellIntegrationInstaller) reads the exact agent-endpoint.json
+        // this process wrote, rather than a `$HOME`-derived literal --
+        // this pane's shell starts via `login -flp <system-username>`,
+        // which resets `$HOME` to the real system user regardless of
+        // CalyxPathRoot.testRoot, so a scoped launch (unit-test host,
+        // `--calyx-path-root=`) would otherwise disagree with every
+        // script it spawns about where that file lives.
+        // `ghostty_surface_new` copies env_vars into its own arena during
+        // the call (apprt/embedded.zig's dupeZ), so the C strings built
+        // below only need to stay alive for the duration of that call —
+        // the nested `withCString`/`withUnsafeMutableBufferPointer`
+        // closures provide exactly that. Any env_vars already on
+        // `baseConfig` are preserved, with CALYX_SURFACE_ID and
+        // CALYX_ENDPOINT_FILE prepended.
         var existingEnvKeys: [String] = []
         var existingEnvValues: [String] = []
         if baseConfig.env_var_count > 0, let vars = baseConfig.env_vars {
@@ -102,8 +113,8 @@ final class GhosttySurfaceController: Identifiable {
                 existingEnvValues.append(value)
             }
         }
-        let envKeys = ["CALYX_SURFACE_ID"] + existingEnvKeys
-        let envValues = [id.uuidString] + existingEnvValues
+        let envKeys = ["CALYX_SURFACE_ID", "CALYX_ENDPOINT_FILE"] + existingEnvKeys
+        let envValues = [id.uuidString, AgentEndpointFile.path] + existingEnvValues
 
         let newSurface: ghostty_surface_t? = envKeys.withCStrings { keyPointers in
             envValues.withCStrings { valuePointers in

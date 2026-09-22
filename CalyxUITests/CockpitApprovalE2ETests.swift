@@ -9,34 +9,39 @@
 // is integration coverage for already-implemented behavior, not a RED
 // stub: it is expected to PASS when correctly written.
 //
-// ISOLATION CAVEAT (accepted, not a bug -- identical reasoning to
+// ISOLATION: launched with `--calyx-path-root=<scoped temp dir>` plus
+// `-calyx.ipc.enabled YES` -- identical mechanism to
 // CommandLogE2ETests.swift's own header, restated here since this
-// suite depends on the exact same fixed path): this suite does NOT
-// override `HOME` on the app-under-test's launch environment.
-// `PaneCLIExec`'s own header establishes (field-verified) that a
-// pane's shell does NOT inherit Calyx.app's own HOME override at all --
-// ghostty execs every surface via `login -flp <system-username> ...`,
-// which resets `$HOME` against the REAL system user regardless of what
-// the app process's own environment says. This suite's pane-side
-// scripts read `~/Library/Application Support/Calyx/agent-endpoint.json`
-// (the SAME fixed, no-override-possible path CommandLogE2ETests'
-// query script reads), so overriding HOME on the app process would
-// only make the APP write that file to an isolated path while every
-// pane-side script keeps reading the REAL system path -- a strictly
-// WORSE mismatch. `CALYX_UITEST_SESSION_DIR` / `CALYX_UITEST_DEFAULTS_SUITE`
-// (the base class's own isolation) still cover window/tab-session
-// state and every UserDefaults-backed setting -- including
-// CockpitSettings.autoApproveEnabled, which is why this suite can rely
-// on a truly fresh "auto-approve OFF" default per run (see
-// CockpitSettings.swift / SettingsStore.swift: `_testStore` is nil in
-// this out-of-process app-under-test, so resolution falls to
+// suite depends on the exact same scoped path. `CalyxPathRoot.testRoot`
+// scopes every Calyx-owned and agent-owned config path beneath the temp
+// dir, and `AppDelegate.resyncAgentHooksIfInstalled` runs real
+// launch-time activation against it. This suite's pane-side scripts
+// read `CALYX_ENDPOINT_FILE` (injected by `GhosttySurfaceController`
+// into every pane's own environment, scoped to wherever this launch
+// actually wrote `agent-endpoint.json`) ahead of the literal, unscoped
+// `~/Library/Application Support/Calyx/agent-endpoint.json` fallback --
+// see `AgentEndpointFile.swift`/`GhosttySurface.swift`'s own doc
+// comments for why a pane's shell (started via `login -flp
+// <system-username> ...`, which resets `$HOME` to the real system user
+// regardless of `CalyxPathRoot.testRoot`) could not otherwise resolve
+// the scoped path at all. `CALYX_UITEST_SESSION_DIR` /
+// `CALYX_UITEST_DEFAULTS_SUITE` (the base class's own isolation) still
+// cover window/tab-session state and every UserDefaults-backed
+// setting -- including CockpitSettings.autoApproveEnabled, which is why
+// this suite can rely on a truly fresh "auto-approve OFF" default per
+// run (see CockpitSettings.swift / SettingsStore.swift: `_testStore` is
+// nil in this out-of-process app-under-test, so resolution falls to
 // `uiTestSuite`, keyed by `CALYX_UITEST_DEFAULTS_SUITE`, never
 // `.standard`).
 //
-// ENVIRONMENTAL PRECONDITION (outside this test's control, same as
-// CommandLogE2ETests.swift's own): `IPCConfigManager.enableIPC`'s
+// ENVIRONMENTAL PRECONDITION, now satisfied by `setUp()` rather than
+// left to the host machine (identical mechanism to
+// CommandLogE2ETests.swift's own header): `IPCConfigManager.enableIPC`'s
 // `anySucceeded` gate requires at least one of `~/.claude`, `~/.codex`,
-// `~/.config/opencode` to exist on the machine running this suite.
+// `~/.config/opencode` (resolved beneath the scoped root here) to
+// exist -- `setUp()` creates `<scopedPathRoot>/.claude` before
+// `app.launch()` so this suite's activation always succeeds regardless
+// of what CLIs happen to be installed on the machine running it.
 //
 // QUERY MECHANISM (PaneCLIExec pattern, mirrors CommandLogE2ETests.swift's
 // own header on why: the CalyxUITests runner is itself App-Sandboxed and
@@ -79,8 +84,8 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     /// target drives the app-under-test as a separate OS process via
     /// `XCUIApplication`, with no `@testable import Calyx` linkage, so
     /// that enum isn't visible here. Every other E2E suite in this
-    /// directory (e.g. `CommandLogE2ETests.enableAIAgentIPCViaCommandPalette`'s
-    /// own `"calyx.commandPalette.searchField"`) already hardcodes the
+    /// directory (e.g. `SettingsSessionsToggleE2ETests`'s own
+    /// `persistentSessionsSwitchIdentifier`) already hardcodes the
     /// same identifiers as string literals for the same reason; named
     /// here (rather than inlined at each call site) purely because this
     /// suite references them from more than one place.
@@ -95,12 +100,53 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     private static let approvalBannerDismissButtonID = "calyx.approvalBanner.dismissButton"
     private static let approvalBannerTooltipID = "calyx.approvalBanner.tooltip"
 
+    // MARK: - Scoped launch
+
+    /// `--calyx-path-root=<this>` (see this file's header): a fresh
+    /// per-test temp directory, created lazily on first access so it
+    /// exists before `additionalLaunchArguments` is read by
+    /// `CalyxUITestCase.setUp()`, ahead of `app.launch()`.
+    private lazy var scopedPathRoot: String = {
+        let root = NSTemporaryDirectory() + "CalyxUITests-pathroot-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        // Satisfies IPCConfigManager.enableIPC's anySucceeded gate (see
+        // this file's header) without depending on what CLIs happen to
+        // be installed on the machine running this suite.
+        try? FileManager.default.createDirectory(atPath: root + "/.claude", withIntermediateDirectories: true)
+        return root
+    }()
+
+    override var additionalLaunchArguments: [String] {
+        ["--calyx-path-root=\(scopedPathRoot)", "-calyx.ipc.enabled", "YES"]
+    }
+
+    override func tearDown() {
+        super.tearDown()
+        try? FileManager.default.removeItem(atPath: scopedPathRoot)
+    }
+
+    /// Polls for the scoped `agent-endpoint.json` (written by
+    /// `AgentEndpointFile.write` once launch-time activation's real
+    /// `CalyxMCPServer.start()` succeeds), mirroring
+    /// `CommandLogE2ETests.waitForIPCActivation` exactly (kept as a
+    /// near-duplicate, matching this suite's own established convention
+    /// for small per-file helpers -- see this file's header).
+    private func waitForIPCActivation(timeout: TimeInterval = 20) {
+        let endpointPath = scopedPathRoot + "/Calyx/agent-endpoint.json"
+        let deadline = Date().addingTimeInterval(timeout)
+        while !FileManager.default.fileExists(atPath: endpointPath), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: endpointPath),
+                     "launch-time AI Agent IPC activation never wrote agent-endpoint.json under the scoped root")
+    }
+
     // MARK: - Test
 
     func test_cockpitTools_endToEnd() throws {
         var counter = 0
 
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         // MARK: 1. Resolve this pane's own surface_id
 
@@ -398,7 +444,7 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     /// instead.
     func test_approvalBanner_isPositionedAtVisibleFrameTopRightCorner() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
         XCTAssertFalse(surfaceID.isEmpty, "$CALYX_SURFACE_ID must be set for every ghostty-spawned pane")
@@ -492,7 +538,7 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     /// through from the designated host's own active tab title).
     func test_paletteExecute_headerShowsDesignatedHostTabTitle_notThisWindow() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         // A real, UNGATED MCP round trip first (mirrors
         // `test_cockpitTools_endToEnd`'s own opening `pane_list` call):
@@ -551,7 +597,7 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     /// clicking again collapses it away.
     func test_payloadTap_togglesExpandedPayload() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
         XCTAssertFalse(surfaceID.isEmpty, "$CALYX_SURFACE_ID must be set for every ghostty-spawned pane")
@@ -620,7 +666,7 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     /// own visibleFrame comparison.
     func test_dismissButton_returnsStatusDismissed_removesBanner() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
         XCTAssertFalse(surfaceID.isEmpty, "$CALYX_SURFACE_ID must be set for every ghostty-spawned pane")
@@ -717,7 +763,7 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     /// afterward must dismiss the tooltip.
     func test_hoverPayload_showsTooltip_panelNeverMoves() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
         XCTAssertFalse(surfaceID.isEmpty, "$CALYX_SURFACE_ID must be set for every ghostty-spawned pane")
@@ -808,7 +854,7 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     /// request, reading "2 / 2"; both are then denied.
     func test_twoWindows_onePendingRequestEach_singleAppWidePanel_pagesBetweenBoth() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let firstSurfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
         XCTAssertFalse(firstSurfaceID.isEmpty, "$CALYX_SURFACE_ID must be set for the first window's own pane")
@@ -921,28 +967,6 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
         let denyItem = app.menuItems.matching(NSPredicate(format: "title == %@", "Deny")).firstMatch
         XCTAssertTrue(waitFor(denyItem, timeout: 10), "the Options menu never listed a \"Deny\" item")
         denyItem.click()
-    }
-
-    /// Opens the Command Palette, executes "Enable AI Agent IPC", and
-    /// dismisses the resulting `NSAlert.runModal()` confirmation --
-    /// identical to `CommandLogE2ETests`'s own helper of the same name
-    /// (kept as a near-duplicate rather than shared, matching this
-    /// suite's other files' own precedent).
-    private func enableAIAgentIPCViaCommandPalette() {
-        openCommandPaletteViaMenu()
-
-        let searchField = app.descendants(matching: .any)
-            .matching(identifier: "calyx.commandPalette.searchField")
-            .firstMatch
-        XCTAssertTrue(waitFor(searchField), "Command palette did not appear")
-
-        searchField.typeText("Enable AI Agent IPC")
-        searchField.typeKey(.enter, modifierFlags: [])
-
-        let alert = app.dialogs.firstMatch
-        XCTAssertTrue(alert.waitForExistence(timeout: 10),
-                     "the IPC enable/error alert (CalyxWindowController.showIPCAlert) did not appear")
-        alert.buttons["OK"].click()
     }
 
     private func parseJSONObject(_ text: String, context: String) throws -> [String: Any] {
@@ -1065,8 +1089,9 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
     }
 
     /// Builds a python3 script that POSTs a single `tools/call` to the
-    /// real MCP server (endpoint read from the real, fixed
-    /// `agent-endpoint.json` path -- see this file's header) and prints
+    /// real MCP server (endpoint read from `CALYX_ENDPOINT_FILE`,
+    /// falling back to the unscoped `agent-endpoint.json` path -- see
+    /// this file's header) and prints
     /// the tool's own (already-decoded) JSON result text on one line, or
     /// `{"error": ...}` on any failure -- mirrors
     /// `CommandLogE2ETests.queryScript`'s `call_tool` helper exactly,
@@ -1087,7 +1112,7 @@ final class CockpitApprovalE2ETests: CalyxUITestCase {
         import subprocess
 
         def main():
-            endpoint_path = os.path.expanduser(
+            endpoint_path = os.environ.get("CALYX_ENDPOINT_FILE") or os.path.expanduser(
                 "~/Library/Application Support/Calyx/agent-endpoint.json"
             )
             with open(endpoint_path) as f:

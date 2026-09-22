@@ -34,7 +34,7 @@ private final class FakeIPCServerControl: IPCServerControlling {
     var startError: Error?
     var portAfterStart: Int?
 
-    func start(token: String) throws {
+    func start(token: String) async throws {
         startCallCount += 1
         startedWithToken = token
         if let startError {
@@ -43,6 +43,12 @@ private final class FakeIPCServerControl: IPCServerControlling {
         if let portAfterStart {
             port = portAfterStart
         }
+        // Mirrors production: the server resolves its own token during
+        // start() (LiveIPCServerControl.start(token:) may reuse an
+        // on-disk token instead of the freshly generated one), so the
+        // coordinator reads it back from `server.token` after start()
+        // returns rather than trusting the token it passed in.
+        self.token = token
         isRunning = true
     }
 
@@ -65,6 +71,11 @@ private final class FakeIPCAgentConfigInstaller: IPCAgentConfigInstalling, @unch
     var enableResult = configResult()
     var disableResult = configResult()
 
+    /// Invoked at the start of disableIPC(), before it does anything else,
+    /// so a test can record this call's position relative to other fakes'
+    /// calls without depending on this installer's own result.
+    var onDisableIPC: (() -> Void)?
+
     func enableIPC(port: Int, token: String) -> IPCConfigResult {
         enableCallCount += 1
         receivedPort = port
@@ -73,6 +84,7 @@ private final class FakeIPCAgentConfigInstaller: IPCAgentConfigInstalling, @unch
     }
 
     func disableIPC() -> IPCConfigResult {
+        onDisableIPC?()
         disableCallCount += 1
         return disableResult
     }
@@ -86,12 +98,18 @@ private final class FakeIPCAgentHooksInstaller: IPCAgentHooksInstalling, @unchec
     var installResult = hooksResult()
     var removeResult = hooksResult()
 
+    /// Invoked at the start of remove(), before it does anything else, so
+    /// a test can record this call's position relative to other fakes'
+    /// calls without depending on this installer's own result.
+    var onRemove: (() -> Void)?
+
     func install() -> AgentHooksResult {
         installCallCount += 1
         return installResult
     }
 
     func remove() -> AgentHooksResult {
+        onRemove?()
         removeCallCount += 1
         return removeResult
     }
@@ -121,6 +139,12 @@ private final class FakeIPCTokenGenerator: IPCTokenGenerating, @unchecked Sendab
 private final class FakeIPCIssueReporter: IPCIntegrationIssueReporting {
     private(set) var reportedConfigIssues: [[String]] = []
     private(set) var reportedHooksIssues: [[String]] = []
+    private(set) var reportedServerIssues: [[String]] = []
+
+    /// Invoked at the start of reportServerIssues(), before it does
+    /// anything else, so a test can record this call's position relative
+    /// to the other fakes' calls.
+    var onReportServerIssues: (() -> Void)?
 
     func reportConfigIssues(_ issues: [String]) {
         reportedConfigIssues.append(issues)
@@ -128,6 +152,11 @@ private final class FakeIPCIssueReporter: IPCIntegrationIssueReporting {
 
     func reportHooksIssues(_ issues: [String]) {
         reportedHooksIssues.append(issues)
+    }
+
+    func reportServerIssues(_ issues: [String]) {
+        onReportServerIssues?()
+        reportedServerIssues.append(issues)
     }
 }
 
@@ -141,7 +170,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
 
     // MARK: - enable(): pi-only and agentless machines
 
-    func test_enable_piOnlyMachine_installsHooksNeverStopsServerAndReportsWired() {
+    func test_enable_piOnlyMachine_installsHooksNeverStopsServerAndReportsWired() async {
         // Given: every IPCConfigResult axis is skipped (no agent has an MCP
         // client config file), but pi's hooks axis succeeded.
         let server = FakeIPCServerControl()
@@ -156,7 +185,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        let outcome = coordinator.enable()
+        let outcome = await coordinator.enable()
 
         XCTAssertEqual(hooksInstaller.installCallCount, 1,
                        "pi has no IPCConfigResult axis at all; the hooks installer is its only integration path and must run")
@@ -170,7 +199,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
                       "pi wiring only shows up through hooks.anySucceeded; a pi-only machine must still report as wired")
     }
 
-    func test_enable_nothingInstalledAtAll_stillInstallsHooksNeverStopsServerAndReportsNotWired() {
+    func test_enable_nothingInstalledAtAll_stillInstallsHooksNeverStopsServerAndReportsNotWired() async {
         // Given: every config axis skipped AND every hooks axis skipped, i.e.
         // a machine with no supported agent CLI at all.
         let server = FakeIPCServerControl()
@@ -184,7 +213,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        let outcome = coordinator.enable()
+        let outcome = await coordinator.enable()
 
         XCTAssertEqual(hooksInstaller.installCallCount, 1,
                        "Hooks install must still run even when no agent CLI config file could be written")
@@ -198,7 +227,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         XCTAssertFalse(report.anyAgentWired, "Nothing succeeded on either axis, so anyAgentWired must be false")
     }
 
-    func test_enable_everyConfigAxisFailed_stillInstallsHooksAndNeverStopsServer() {
+    func test_enable_everyConfigAxisFailed_stillInstallsHooksAndNeverStopsServer() async {
         // Given: every config axis failed outright (not skipped). No branch
         // may sit between the config write and the hooks install.
         let server = FakeIPCServerControl()
@@ -217,7 +246,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        _ = coordinator.enable()
+        _ = await coordinator.enable()
 
         XCTAssertEqual(hooksInstaller.installCallCount, 1,
                        "A config write failure on every axis must not skip the independent hooks install step")
@@ -227,7 +256,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
 
     // MARK: - enable(): endpoint resolution
 
-    func test_enable_serverAlreadyRunning_reusesEndpointWithoutRestartOrNewToken() {
+    func test_enable_serverAlreadyRunning_reusesEndpointWithoutRestartOrNewToken() async {
         // Given: the server is already running with a live token. Restarting
         // it would tear down connected agents (CalyxMCPServer.start stops
         // any running server first).
@@ -244,7 +273,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        let outcome = coordinator.enable()
+        let outcome = await coordinator.enable()
 
         XCTAssertEqual(server.startCallCount, 0,
                        "Restarting an already-running server tears down live agent connections; start must never run")
@@ -270,7 +299,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         XCTAssertEqual(report.port, 41835, "The reported port must be the running server's own port")
     }
 
-    func test_enable_freshStart_startsServerAndWritesNewPortAndToken() {
+    func test_enable_freshStart_startsServerAndWritesNewPortAndToken() async {
         // Given: the server is not running. The port used to configure agents
         // must come from server.port AFTER start() returns, not before.
         let server = FakeIPCServerControl()
@@ -285,7 +314,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        let outcome = coordinator.enable()
+        let outcome = await coordinator.enable()
 
         XCTAssertEqual(server.startCallCount, 1, "A server that is not running must be started exactly once")
         XCTAssertEqual(configInstaller.receivedPort, 41830,
@@ -303,7 +332,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
 
     // MARK: - enable(): failure short-circuits
 
-    func test_enable_tokenGenerationThrows_touchesNothingElse() {
+    func test_enable_tokenGenerationThrows_touchesNothingElse() async {
         let server = FakeIPCServerControl()
         let configInstaller = FakeIPCAgentConfigInstaller()
         let hooksInstaller = FakeIPCAgentHooksInstaller()
@@ -315,7 +344,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        let outcome = coordinator.enable()
+        let outcome = await coordinator.enable()
 
         guard case .tokenGenerationFailed = outcome else {
             XCTFail("Expected .tokenGenerationFailed when the token generator throws")
@@ -328,9 +357,12 @@ final class IPCActivationCoordinatorTests: XCTestCase {
                        "A token-generation failure must not report any config issues; there is nothing to report yet")
         XCTAssertEqual(issueReporter.reportedHooksIssues, [],
                        "A token-generation failure must not report any hooks issues; there is nothing to report yet")
+        XCTAssertEqual(issueReporter.reportedServerIssues, [["Failed to generate secure token."]],
+                       "A token-generation failure must reach the server-issue domain with the same text the enable " +
+                       "alert would show, so the sidebar and Settings never disagree")
     }
 
-    func test_enable_serverStartThrows_touchesNothingElse() {
+    func test_enable_serverStartThrows_touchesNothingElse() async {
         let server = FakeIPCServerControl()
         server.startError = NSError(domain: "test.ipc.start", code: 1)
         let configInstaller = FakeIPCAgentConfigInstaller()
@@ -342,7 +374,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        let outcome = coordinator.enable()
+        let outcome = await coordinator.enable()
 
         guard case .serverStartFailed = outcome else {
             XCTFail("Expected .serverStartFailed when server.start throws")
@@ -351,11 +383,17 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         XCTAssertEqual(configInstaller.enableCallCount, 0, "No config should be written when the server never actually started")
         XCTAssertEqual(hooksInstaller.installCallCount, 0, "No hooks should be installed when the server never actually started")
         XCTAssertEqual(server.stopCallCount, 0, "A server that failed to start was never running; there is nothing to stop")
+        XCTAssertEqual(issueReporter.reportedServerIssues.count, 1, "A server-start failure must report exactly one server-issue entry")
+        XCTAssertEqual(
+            issueReporter.reportedServerIssues.first,
+            [server.startError!.localizedDescription],
+            "The reported reason must match the same text the enable alert shows for .serverStartFailed, not a second copy"
+        )
     }
 
     // MARK: - enable(): issue reporting
 
-    func test_enable_configAndHooksFailOnDifferentAxes_reportsEachDomainSeparately() {
+    func test_enable_configAndHooksFailOnDifferentAxes_reportsEachDomainSeparately() async {
         // Given: one config axis fails and a different hooks axis fails.
         let server = FakeIPCServerControl()
         server.portAfterStart = 41830
@@ -372,7 +410,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        _ = coordinator.enable()
+        _ = await coordinator.enable()
 
         XCTAssertEqual(
             issueReporter.reportedConfigIssues,
@@ -386,7 +424,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         )
     }
 
-    func test_enable_everythingSucceeded_reportsEmptyIssuesList() {
+    func test_enable_everythingSucceeded_reportsEmptyIssuesList() async {
         let server = FakeIPCServerControl()
         server.portAfterStart = 41830
         let configInstaller = FakeIPCAgentConfigInstaller()
@@ -400,7 +438,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        _ = coordinator.enable()
+        _ = await coordinator.enable()
 
         XCTAssertEqual(issueReporter.reportedConfigIssues, [[]],
                        "A clean enable must report the config domain exactly once with an empty issues list, " +
@@ -408,11 +446,14 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         XCTAssertEqual(issueReporter.reportedHooksIssues, [[]],
                        "A clean enable must report the hooks domain exactly once with an empty issues list, " +
                        "clearing any banner left over from an earlier failed attempt")
+        XCTAssertEqual(issueReporter.reportedServerIssues, [[]],
+                       "A clean enable must clear the server-issue domain too, in case an earlier attempt left a " +
+                       "start-failure banner standing")
     }
 
     // MARK: - disable()
 
-    func test_disable_stopsServerRemovesConfigAndHooksAndClearsIssues() {
+    func test_disable_stopsServerRemovesConfigAndHooksAndClearsIssues() async {
         let server = FakeIPCServerControl()
         server.isRunning = true
         server.port = 41830
@@ -428,7 +469,7 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        let report = coordinator.disable()
+        let report = await coordinator.disable()
 
         XCTAssertEqual(server.stopCallCount, 1, "disable() must stop the MCP server exactly once, its only stop call site")
         XCTAssertEqual(configInstaller.disableCallCount, 1, "disable() must remove the agent config entries exactly once")
@@ -439,6 +480,9 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         XCTAssertEqual(issueReporter.reportedHooksIssues, [[]],
                        "disable() must clear the hooks domain's banner exactly once; removal failures surface only " +
                        "in the returned alert, not as a standing banner")
+        XCTAssertEqual(issueReporter.reportedServerIssues, [[]],
+                       "disable() must clear the server-issue domain too, so the sidebar drops a stale start-failure " +
+                       "banner once the setting is off")
 
         if case .success = report.config.claudeCode {
             // pass: report carries the fake config installer's actual result
@@ -452,7 +496,44 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         }
     }
 
-    func test_disableThenEnable_takesFreshStartBranch() {
+    func test_disable_clearsServerIssuesBanner_beforeConfigAndHooksRemoval() async {
+        // The switch reads OFF the instant disable() is called (Settings
+        // flips it synchronously before awaiting disable()), so the
+        // server-issues banner must be cleared before the off-main-actor
+        // config/hooks removal I/O runs, not after: a standing "server
+        // failed to start" banner must not outlive the switch turning OFF
+        // for the duration of that I/O.
+        let server = FakeIPCServerControl()
+        server.isRunning = true
+        server.port = 41830
+        server.token = "5f3c9a1e"
+        let configInstaller = FakeIPCAgentConfigInstaller()
+        let hooksInstaller = FakeIPCAgentHooksInstaller()
+        let tokenGenerator = FakeIPCTokenGenerator()
+        let issueReporter = FakeIPCIssueReporter()
+        let coordinator = IPCActivationCoordinator(
+            server: server, configInstaller: configInstaller, hooksInstaller: hooksInstaller,
+            tokenGenerator: tokenGenerator, issueReporter: issueReporter
+        )
+
+        final class OrderRecorder: @unchecked Sendable {
+            private(set) var events: [String] = []
+            func record(_ event: String) { events.append(event) }
+        }
+        let recorder = OrderRecorder()
+        issueReporter.onReportServerIssues = { recorder.record("reportServerIssues") }
+        configInstaller.onDisableIPC = { recorder.record("disableIPC") }
+        hooksInstaller.onRemove = { recorder.record("remove") }
+
+        _ = await coordinator.disable()
+
+        XCTAssertEqual(
+            recorder.events, ["reportServerIssues", "disableIPC", "remove"],
+            "reportServerIssues([]) must run before the config/hooks removal I/O, not after"
+        )
+    }
+
+    func test_disableThenEnable_takesFreshStartBranch() async {
         // Given: a live server, disabled and then immediately re-enabled.
         // FakeIPCServerControl.stop() clears isRunning/port exactly like
         // the real CalyxMCPServer.stop() does, so the following enable()
@@ -472,8 +553,8 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             tokenGenerator: tokenGenerator, issueReporter: issueReporter
         )
 
-        _ = coordinator.disable()
-        let outcome = coordinator.enable()
+        _ = await coordinator.disable()
+        let outcome = await coordinator.enable()
 
         XCTAssertEqual(tokenGenerator.makeTokenCallCount, 1,
                        "disable() must leave the fake server not-running, so the very next enable() must generate a fresh token")

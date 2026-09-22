@@ -45,6 +45,10 @@
 //  - the no-arg real-process wrapper, evaluated against THIS test
 //    process's own real environment (must be true here, since this
 //    process IS a unit-test host)
+//  - all 4 combinations of {--uitesting present, hasScopedPathRoot} for
+//    mayPerformAgentIPCActivation(arguments:hasScopedPathRoot:), the
+//    predicate gating real IPC activation on the launch path and both
+//    Settings > Agents handlers
 //
 
 import XCTest
@@ -88,6 +92,46 @@ final class LaunchEnvironmentPolicyTests: XCTestCase {
         XCTAssertTrue(
             LaunchEnvironmentPolicy.isUnitTestHost(),
             "this very test process is a unit-test host: XCTest is loaded and the CalyxTests scheme never passes --uitesting"
+        )
+    }
+
+    // MARK: - mayPerformAgentIPCActivation(arguments:hasScopedPathRoot:) -- all 4 combinations
+
+    func test_noUITesting_noPathRoot_mayActivate() {
+        XCTAssertTrue(
+            LaunchEnvironmentPolicy.mayPerformAgentIPCActivation(arguments: ["/path/to/Calyx"], hasScopedPathRoot: false),
+            "a normal launch (no --uitesting) may always activate, scoped path root or not"
+        )
+    }
+
+    func test_noUITesting_withPathRoot_mayActivate() {
+        XCTAssertTrue(
+            LaunchEnvironmentPolicy.mayPerformAgentIPCActivation(
+                arguments: ["/path/to/Calyx"],
+                hasScopedPathRoot: true
+            ),
+            "a normal launch may always activate, scoped path root or not"
+        )
+    }
+
+    func test_uiTesting_withPathRoot_mayActivate() {
+        XCTAssertTrue(
+            LaunchEnvironmentPolicy.mayPerformAgentIPCActivation(
+                arguments: ["/path/to/Calyx", "--uitesting", "--calyx-path-root=/tmp/scoped"],
+                hasScopedPathRoot: true
+            ),
+            "--uitesting WITH a scoped path root confines every write to that root, so activation is safe"
+        )
+    }
+
+    func test_uiTesting_noPathRoot_mayNotActivate() {
+        XCTAssertFalse(
+            LaunchEnvironmentPolicy.mayPerformAgentIPCActivation(
+                arguments: ["/path/to/Calyx", "--uitesting"],
+                hasScopedPathRoot: false
+            ),
+            "--uitesting with no scoped path root is a UI-test launch that forgot --calyx-path-root=, " +
+            "so activation would touch the developer's real environment and must be refused"
         )
     }
 }

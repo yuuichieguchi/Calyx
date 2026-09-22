@@ -147,7 +147,7 @@ final class CalyxMCPServerWiringBugSpecTests: XCTestCase {
     /// race-to-install-bridge leak described in the audit.
     func test_doubleStart_newStartLSPRunsAfterPriorTeardownDrains() async throws {
         // ---- Phase 1: start(A) and let it commit bridge_A. ----
-        try server.start(token: "alpha-token", preferredPort: basePort)
+        try await server.start(token: "alpha-token", preferredPort: basePort)
         XCTAssertTrue(server.isRunning,
                       "precondition: first start() must mark the server running")
 
@@ -178,13 +178,21 @@ final class CalyxMCPServerWiringBugSpecTests: XCTestCase {
         //               lspStartTask; the returned teardown_1
         //               captures preStartupBridge = bridge_A and
         //               will suspend in shutdownAll(). ----
-        try server.start(token: "beta-token", preferredPort: basePort)
+        try await server.start(token: "beta-token", preferredPort: basePort)
         XCTAssertTrue(server.isRunning,
                       "second start() must keep the server running")
-        XCTAssertEqual(
-            server.inflightTeardownCount, 1,
-            "stop() inside start(B) must have scheduled teardown_1 — it should still be in flight at this synchronous boundary"
-        )
+        // No assertion on inflightTeardownCount here: start() is itself
+        // async (the canonical-port scan awaits a real listener bind),
+        // so teardown_1 -- scheduled synchronously inside stop() before
+        // that first await -- gets a real chance to run to completion
+        // on @MainActor during start(B)'s own suspension, and reliably
+        // does (pendingStartup already drained by Phase 1, bridge_A's
+        // shutdownAll finishes quickly). "Still in flight at this
+        // synchronous boundary" described the pre-async-conversion
+        // blocking start(), a boundary this code no longer has. The
+        // actual regression guard is Phase 4's assertion below, which
+        // reads the probe captured *during* startup_B rather than
+        // inferring anything from teardown_1's drain state afterward.
 
         // Capture startup_B so we can await its full body. With the
         // chain fix `startup_B` first awaits priorTeardown.value, so

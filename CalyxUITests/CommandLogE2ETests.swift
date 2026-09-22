@@ -11,49 +11,38 @@
 //  (terminal_list_commands/terminal_read_output), exactly the path an
 //  MCP-connected coding agent uses.
 //
-//  ISOLATION CAVEAT (accepted, not a bug): this suite does NOT override
-//  `HOME` on the app-under-test's launch environment, unlike
-//  `SessionPersistenceE2ETests`. That suite CAN override HOME because
-//  every pane command it issues explicitly re-derives the daemon's
-//  socket path via `--runtime-dir`/`--state-dir` flags
-//  (`PaneCLIExec.calyxSessionRootFlags`) -- there is no equivalent
-//  escape hatch here: `calyx.zsh`/the fish integration both read
-//  `"$HOME/Library/Application Support/Calyx/agent-endpoint.json"` as a
-//  hardcoded path baked into the installed script, with no CLI-flag
-//  override. `PaneCLIExec`'s own header already establishes (field-
-//  verified) that a pane's shell does NOT inherit Calyx.app's own HOME
-//  override at all -- ghostty execs every surface via `login -flp
-//  <system-username> ...`, which resets `$HOME` against the REAL
-//  system user regardless of what the app process's own environment
-//  says. Overriding HOME on the app process here would therefore make
-//  the APP write agent-endpoint.json/the integration scripts to an
-//  isolated path while the PANE's hook script keeps reading the REAL
-//  system path -- a strictly WORSE, silently-broken mismatch, not an
-//  isolation win. So this suite deliberately runs against the real
-//  `~/Library/Application Support/Calyx/` tree. This is acceptable
-//  ONLY because everything written there is exactly what a real
-//  "Enable AI Agent IPC" + normal launch already writes in production
-//  (idempotent, fixed content -- ShellIntegrationInstaller.install,
-//  AgentHookScript.install, AgentEndpointFile.write all overwrite
-//  deterministically, no test-specific content, no destructive
-//  removal of anything pre-existing): `CALYX_UITEST_SESSION_DIR` /
-//  `CALYX_UITEST_DEFAULTS_SUITE` (the base class's own isolation) still
-//  cover window/tab-session state and every UserDefaults-backed
-//  setting, which is the isolation surface this suite's own assertions
-//  actually depend on.
+//  ISOLATION: launched with `--calyx-path-root=<scoped temp dir>` plus
+//  `-calyx.ipc.enabled YES`, so `CalyxPathRoot.testRoot` scopes every
+//  Calyx-owned and agent-owned config path -- `AppSupportDirectory`,
+//  `AgentToolPaths`, and therefore `AgentEndpointFile` -- beneath the
+//  temp dir instead of the developer's real home, and
+//  `AppDelegate.resyncAgentHooksIfInstalled` (gated on
+//  `LaunchEnvironmentPolicy.mayPerformAgentIPCActivation()`, which
+//  requires `CalyxPathRoot.testRoot != nil` under `--uitesting`) runs
+//  real launch-time activation against that scoped root. This closed a real
+//  path-resolution hole: a pane's shell starts via `login -flp
+//  <system-username>`, which resets `$HOME` to the real system user
+//  regardless of `CalyxPathRoot.testRoot`, so `calyx.zsh`/the fish
+//  integration previously could only read the hardcoded, unscoped
+//  `"$HOME/Library/Application Support/Calyx/agent-endpoint.json"`.
+//  `GhosttySurfaceController` now injects `CALYX_ENDPOINT_FILE` into
+//  every pane's own environment (`AgentEndpointFile.path`, already
+//  reflecting the scoped root), which every generated script reads
+//  ahead of that literal fallback -- see `AgentEndpointFile.swift` and
+//  `GhosttySurface.swift`'s own doc comments. `setUp()` below
+//  pre-creates `<scopedRoot>/.claude`, satisfying
+//  `IPCConfigManager.enableIPC`'s `anySucceeded` gate (see below)
+//  without depending on the developer's own machine.
 //
-//  ENVIRONMENTAL PRECONDITION (outside this test's control, same as any
-//  real "Enable AI Agent IPC" use): `IPCConfigManager.enableIPC`'s
+//  ENVIRONMENTAL PRECONDITION, now satisfied by `setUp()` rather than
+//  left to the host machine: `IPCConfigManager.enableIPC`'s
 //  `anySucceeded` gate requires at least one of `~/.claude`, `~/.codex`,
-//  `~/.config/opencode` to exist on the machine running this suite --
-//  otherwise `CalyxWindowController.enableIPC` stops the MCP server
-//  right after starting it and shows an "IPC Error" alert instead of
-//  "IPC Enabled" (both use the same "OK" button this test dismisses
-//  either way, but only the success path leaves the server running for
-//  the rest of this test to talk to). Not worked around here -- there
-//  is no test-level seam for it, and a real developer machine running
-//  Claude Code (as this whole task was) already satisfies it via
-//  `~/.claude`.
+//  `~/.config/opencode` (resolved beneath the scoped root here) to
+//  exist -- otherwise launch-time activation stops the MCP server right
+//  after starting it and leaves `AgentRegistry.hooksIssues` set instead
+//  of a running server. `setUp()` creates `<scopedRoot>/.claude` before
+//  `app.launch()` so this suite's activation always succeeds regardless
+//  of what CLIs happen to be installed on the machine running it.
 //
 //  QUERY MECHANISM (PaneCLIExec pattern, mirrors
 //  `SessionPersistenceE2ETests`'s own header on why: the `CalyxUITests`
@@ -76,24 +65,69 @@ import XCTest
 
 final class CommandLogE2ETests: CalyxUITestCase {
 
+    // MARK: - Scoped launch
+
+    /// `--calyx-path-root=<this>` (see this file's header): a fresh
+    /// per-test temp directory, created lazily on first access so it
+    /// exists before `additionalLaunchArguments` is read by
+    /// `CalyxUITestCase.setUp()`, ahead of `app.launch()`.
+    private lazy var scopedPathRoot: String = {
+        let root = NSTemporaryDirectory() + "CalyxUITests-pathroot-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        // Satisfies IPCConfigManager.enableIPC's anySucceeded gate (see
+        // this file's header) without depending on what CLIs happen to
+        // be installed on the machine running this suite.
+        try? FileManager.default.createDirectory(atPath: root + "/.claude", withIntermediateDirectories: true)
+        return root
+    }()
+
+    override var additionalLaunchArguments: [String] {
+        ["--calyx-path-root=\(scopedPathRoot)", "-calyx.ipc.enabled", "YES"]
+    }
+
+    override func tearDown() {
+        super.tearDown()
+        try? FileManager.default.removeItem(atPath: scopedPathRoot)
+    }
+
+    /// Polls for the scoped `agent-endpoint.json` (written by
+    /// `AgentEndpointFile.write` once launch-time activation's real
+    /// `CalyxMCPServer.start()` succeeds) so this test never pastes a
+    /// pane command before the shell-integration scripts it depends on
+    /// are actually installed at `<scopedPathRoot>/Calyx`.
+    private func waitForIPCActivation(timeout: TimeInterval = 20) {
+        let endpointPath = scopedPathRoot + "/Calyx/agent-endpoint.json"
+        let deadline = Date().addingTimeInterval(timeout)
+        while !FileManager.default.fileExists(atPath: endpointPath), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: endpointPath),
+                     "launch-time AI Agent IPC activation never wrote agent-endpoint.json under the scoped root")
+    }
+
     // MARK: - Test
 
     func test_trackedCommands_areQueryableViaTerminalMCPTools() throws {
         var counter = 0
 
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
-        // Two tracked commands, fire-and-forget (panePasteAndReturn, NOT
-        // paneExec): paneExec appends `> outFile 2>&1` to the pasted
-        // line, which (per shell redirection-attaches-to-the-last-
-        // simple-command rules) would land on `false` alone for the
-        // first command below, polluting the ACTUAL command text
-        // preexec captures with a redirection suffix that serves no
-        // purpose here -- this suite only needs the SERVER-side tracked
-        // record, never the pane's own stdout, so there is nothing to
-        // read back from either command.
-        panePasteAndReturn("echo CALYX_CMDLOG_MARKER_A1; false")
-        panePasteAndReturn("echo done")
+        // Two tracked commands, typed directly into the frontmost pane
+        // (NOT panePasteAndReturn/paneExec): both of those helpers write
+        // the command to a script file and type `sh <scriptPath>` into
+        // the pane instead, so the interactive shell's preexec hook only
+        // ever sees that `sh` invocation as `$1` -- never the command
+        // text inside the script -- which would leave the SERVER-side
+        // tracked `command` field unable to match either marker below.
+        // Typing the literal command text directly makes preexec capture
+        // exactly what this test needs to find via terminal_list_commands.
+        // This suite only needs the SERVER-side tracked record, never the
+        // pane's own stdout, so there is nothing to read back from either
+        // command.
+        Thread.sleep(forTimeInterval: 1)
+        app.typeText("echo CALYX_CMDLOG_MARKER_A1; false\n")
+        Thread.sleep(forTimeInterval: 1)
+        app.typeText("echo done\n")
 
         let encodedScript = Data(Self.queryScript.utf8).base64EncodedString()
         let queryCommand = "printf '%s' '\(encodedScript)' | base64 -d > /tmp/calyx-e2e-cmdlog-query.py && " +
@@ -162,31 +196,7 @@ final class CommandLogE2ETests: CalyxUITestCase {
 
     // MARK: - Helpers
 
-    /// Opens the Command Palette, executes "Enable AI Agent IPC" (the
-    /// real `CalyxWindowController.enableIPC()` -- starts a real
-    /// `CalyxMCPServer`, writes a real `agent-endpoint.json`, installs
-    /// the real shell/agent-hook scripts), and dismisses the resulting
-    /// `NSAlert.runModal()` confirmation. `CockpitApprovalE2ETests` keeps
-    /// an identical copy of this same helper (see that file's own doc
-    /// comment).
-    private func enableAIAgentIPCViaCommandPalette() {
-        openCommandPaletteViaMenu()
-
-        let searchField = app.descendants(matching: .any)
-            .matching(identifier: "calyx.commandPalette.searchField")
-            .firstMatch
-        XCTAssertTrue(waitFor(searchField), "Command palette did not appear")
-
-        searchField.typeText("Enable AI Agent IPC")
-        searchField.typeKey(.enter, modifierFlags: [])
-
-        let alert = app.dialogs.firstMatch
-        XCTAssertTrue(alert.waitForExistence(timeout: 10),
-                     "the IPC enable/error alert (CalyxWindowController.showIPCAlert) did not appear")
-        alert.buttons["OK"].click()
-    }
-
-    /// Pane-side python3 script: reads the real agent-endpoint.json,
+    /// Pane-side python3 script: reads the scoped agent-endpoint.json,
     /// polls terminal_list_commands (via a real POST to /mcp) until a
     /// command containing the marker text shows up, then reads that
     /// command's output via terminal_read_output. Prints one compact
@@ -203,7 +213,7 @@ final class CommandLogE2ETests: CalyxUITestCase {
     import time
 
     def main():
-        endpoint_path = os.path.expanduser(
+        endpoint_path = os.environ.get("CALYX_ENDPOINT_FILE") or os.path.expanduser(
             "~/Library/Application Support/Calyx/agent-endpoint.json"
         )
         with open(endpoint_path) as f:

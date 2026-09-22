@@ -642,7 +642,7 @@ final class CalyxMCPServerLSPIntegrationTests: XCTestCase {
     // 13. `stop()` tears down the injected LSP bridge: every cached
     //     session is shut down, and `server.lspBridge` is cleared so
     //     no stale reference survives the toggle. Guards against the
-    //     leak where Disable AI Agent IPC left child language-server
+    //     leak where disabling IPC left child language-server
     //     processes and FSEvents streams alive.
     func test_stop_tearsDownLSPBridge() async throws {
         // Arrange — inject a bridge wired to a fake driver and warm up a

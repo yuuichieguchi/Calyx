@@ -186,10 +186,16 @@ final class PiExtensionManagerTests: XCTestCase {
     }
 
     func test_piConfigDirectory_isPisAgentRootRatherThanTheDotPiRoot() {
-        XCTAssertEqual(AgentToolPaths.piConfigDirectory, NSHomeDirectory() + "/.pi/agent",
+        XCTAssertTrue(AgentToolPaths.piConfigDirectory.hasSuffix("/.pi/agent"),
                        "The path reaches down to agent because ~/.pi alone is not evidence of an " +
                        "installed pi, and the extensions/ directory install() writes into lives " +
                        "directly under the agent root")
+    }
+
+    func test_piConfigDirectory_productionRoot_resolvesAgainstRealHome() {
+        XCTAssertEqual(AgentToolPaths.piConfigDirectory(testRoot: nil), NSHomeDirectory() + "/.pi/agent",
+                       "With no CalyxPathRoot.testRoot override, piConfigDirectory must resolve to exactly " +
+                       "the same string production has always used")
     }
 
     // MARK: - scriptBody invariants
@@ -279,6 +285,17 @@ final class PiExtensionManagerTests: XCTestCase {
         XCTAssertFalse(PiExtensionManager.scriptBody.contains("Bun."),
                        "Bun's globals do not exist in pi's Node runtime, so a Bun API would throw on the " +
                        "first event and take every ping with it")
+    }
+
+    func test_scriptBody_readsEndpointPathFromCalyxEndpointFileWithLiteralFallback() {
+        let needle = ("process.env.CALYX_ENDPOINT_FILE ?? \(AgentEndpointFile.javascriptFallbackPathExpression)")
+            .replacingOccurrences(of: " ", with: "")
+        assertScriptContains(
+            needle,
+            "Extension must read CALYX_ENDPOINT_FILE (injected by GhosttySurfaceController, scoped to " +
+            "wherever Calyx actually wrote agent-endpoint.json), falling back to the literal " +
+            "process.env.HOME-relative path for a pane launched before that injection existed"
+        )
     }
 
     func test_scriptBody_usesBothTheAgentEventAndApprovalRequestEndpoints() {

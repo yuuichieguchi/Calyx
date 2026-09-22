@@ -11,6 +11,8 @@
 
 import Foundation
 
+// MARK: - OpenCodePluginManager
+
 enum OpenCodePluginManager: Sendable {
 
     // MARK: - Constants
@@ -109,8 +111,12 @@ enum OpenCodePluginManager: Sendable {
       let cachedEndpointMtimeMs = null;
 
       async function loadEndpoint() {
+        // CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController
+        // alongside CALYX_SURFACE_ID, scoped to wherever this Calyx
+        // process actually wrote agent-endpoint.json. The literal
+        // fallback covers a pane launched before that injection existed.
         const endpointPath =
-          `${process.env.HOME}/Library/Application Support/Calyx/agent-endpoint.json`;
+          process.env.CALYX_ENDPOINT_FILE ?? \(AgentEndpointFile.javascriptFallbackPathExpression);
         const stats = await stat(endpointPath);
         if (cachedEndpoint && stats.mtimeMs === cachedEndpointMtimeMs) {
           return cachedEndpoint;
@@ -227,7 +233,9 @@ enum OpenCodePluginManager: Sendable {
     /// OpenCode config root can legitimately symlink `plugins/` or the
     /// plugin file itself elsewhere) is followed to its real file
     /// (`ConfigFileUtils.resolveConfigPath`) and overwritten in place,
-    /// leaving the symlink itself intact.
+    /// leaving the symlink itself intact. `AgentHooksCoordinator.installOpenCode`
+    /// already gates this call on the OpenCode config root existing, so
+    /// this function does not repeat that check.
     static func install(pluginsDirectory: String? = nil) throws -> String {
         let scriptPath = pluginPath(pluginsDirectory: pluginsDirectory)
         let pluginsDir = (scriptPath as NSString).deletingLastPathComponent
@@ -237,24 +245,22 @@ enum OpenCodePluginManager: Sendable {
             try fm.createDirectory(atPath: pluginsDir, withIntermediateDirectories: true)
         }
 
-        let resolvedScriptPath = try ConfigFileUtils.resolveConfigPath(scriptPath)
-        try scriptBody.write(toFile: resolvedScriptPath, atomically: true, encoding: .utf8)
+        let data = Data(scriptBody.utf8)
+        // 0600: Calyx owns this file outright.
+        try ConfigFileUtils.withExclusiveConfig(path: scriptPath, mode: 0o600, restoreModeOnNoWrite: true) { _ in data }
         return scriptPath
     }
 
     /// Deletes the plugin file. A no-op when nothing is installed; throws
     /// if the file exists but couldn't be removed (e.g. a permissions
     /// error), rather than silently leaving it in place. Symmetric with
-    /// `install`: resolves a symlinked destination path
-    /// (`ConfigFileUtils.resolveConfigPath`) and removes the real target
-    /// file, leaving the symlink itself intact (now dangling) — removing
-    /// the raw `path` instead would delete the symlink and leave the
-    /// real installed file behind un-removed.
+    /// `install`: resolves a symlinked destination path and removes the
+    /// real target file, leaving the symlink itself intact (now
+    /// dangling) — removing the raw `path` instead would delete the
+    /// symlink and leave the real installed file behind un-removed.
     static func remove(pluginsDirectory: String? = nil) throws {
         let path = pluginPath(pluginsDirectory: pluginsDirectory)
-        let resolvedPath = try ConfigFileUtils.resolveConfigPath(path)
-        guard FileManager.default.fileExists(atPath: resolvedPath) else { return }
-        try FileManager.default.removeItem(atPath: resolvedPath)
+        try ConfigFileUtils.withExclusiveConfig(path: path) { _ in nil }
     }
 
     static func isInstalled(pluginsDirectory: String? = nil) -> Bool {

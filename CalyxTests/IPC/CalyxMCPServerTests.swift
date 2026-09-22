@@ -546,7 +546,7 @@ final class CalyxMCPServerTests: XCTestCase {
     // ==================== Lifecycle Tests ====================
 
     // 18. start/stop lifecycle
-    func test_startStop_lifecycle() throws {
+    func test_startStop_lifecycle() async throws {
         // Arrange
         let srv = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
         srv.agentRegistry = AgentRegistry()
@@ -558,7 +558,7 @@ final class CalyxMCPServerTests: XCTestCase {
                        "Port should be 0 before start()")
 
         // Act — start
-        try srv.start(token: "lifecycle-token")
+        try await srv.start(token: "lifecycle-token")
 
         // Assert — running
         XCTAssertTrue(srv.isRunning,
@@ -579,14 +579,14 @@ final class CalyxMCPServerTests: XCTestCase {
     // 18b. start()/stop() drive AgentRegistry.isServerRunning — AgentStatusView
     // observes AgentRegistry (not CalyxMCPServer, which isn't @Observable)
     // directly, so this is what actually makes the sidebar redraw.
-    func test_start_marksAgentRegistryServerRunning_stop_resetsIt() throws {
+    func test_start_marksAgentRegistryServerRunning_stop_resetsIt() async throws {
         let srv = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
         let registry = AgentRegistry()
         srv.agentRegistry = registry
         XCTAssertFalse(registry.isServerRunning,
                        "Precondition: a fresh registry reports the server as not running")
 
-        try srv.start(token: "registry-lifecycle-token")
+        try await srv.start(token: "registry-lifecycle-token")
 
         XCTAssertTrue(registry.isServerRunning,
                       "start() must mark the injected AgentRegistry as running")
@@ -599,11 +599,11 @@ final class CalyxMCPServerTests: XCTestCase {
 
     // 18c. stop() clears every AgentRegistry entry, so disabling IPC (or a
     // start()-triggered restart) doesn't leave stale sidebar rows on screen.
-    func test_stop_clearsAgentRegistryEntries() throws {
+    func test_stop_clearsAgentRegistryEntries() async throws {
         let srv = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
         let registry = AgentRegistry()
         srv.agentRegistry = registry
-        try srv.start(token: "registry-clear-token")
+        try await srv.start(token: "registry-clear-token")
         registry.handleHookEvent(
             AgentEvent(hookEventName: "SessionStart", sessionID: "s1", cwd: "/tmp/repo", message: nil),
             surfaceID: UUID()
@@ -619,11 +619,11 @@ final class CalyxMCPServerTests: XCTestCase {
     // start() and removed from it on stop() — this is what
     // agentEndpointDirectory exists to redirect away from the real
     // ~/Library/Application Support/Calyx path in every test in this suite.
-    func test_start_writesAgentEndpointFile_stop_removesIt() throws {
+    func test_start_writesAgentEndpointFile_stop_removesIt() async throws {
         let srv = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
         srv.agentRegistry = AgentRegistry()
 
-        try srv.start(token: "endpoint-file-token")
+        try await srv.start(token: "endpoint-file-token")
 
         let filePath = agentEndpointDir + "/agent-endpoint.json"
         XCTAssertTrue(FileManager.default.fileExists(atPath: filePath),
@@ -643,7 +643,7 @@ final class CalyxMCPServerTests: XCTestCase {
     // occupies the configured directory's path) must degrade the Agents
     // sidebar, not the whole IPC server — its MCP tools have nothing to do
     // with this file.
-    func test_start_survivesAgentEndpointFileWriteFailure() throws {
+    func test_start_survivesAgentEndpointFileWriteFailure() async throws {
         // A regular file (not a directory) at this path does NOT make
         // AgentEndpointFile.write's `createDirectory` call fail:
         // `fileExists(atPath:)` returns true for a plain file too, so
@@ -661,7 +661,7 @@ final class CalyxMCPServerTests: XCTestCase {
         srv.agentRegistry = AgentRegistry()
         defer { try? FileManager.default.removeItem(atPath: blockedPath) }
 
-        try srv.start(token: "survives-endpoint-failure-token")
+        try await srv.start(token: "survives-endpoint-failure-token")
 
         XCTAssertTrue(srv.isRunning,
                       "start() must succeed even when agent-endpoint.json can't be written")
@@ -670,12 +670,12 @@ final class CalyxMCPServerTests: XCTestCase {
     }
 
     // 19. Rapid start/stop toggle — no crash, correct final state
-    func test_enableDisable_rapidToggle() throws {
+    func test_enableDisable_rapidToggle() async throws {
         let srv = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
         srv.agentRegistry = AgentRegistry()
 
         for i in 0..<10 {
-            try srv.start(token: "token-\(i)")
+            try await srv.start(token: "token-\(i)")
             XCTAssertTrue(srv.isRunning,
                           "Server should be running after start() iteration \(i)")
             srv.stop()
@@ -700,14 +700,14 @@ final class CalyxMCPServerTests: XCTestCase {
     // and one never started, must not let the never-started one's
     // stop() delete the running one's endpoint file out from under
     // calyx-agent-hook.
-    func test_stop_onNeverStartedServer_doesNotDeleteAnotherServersEndpointFile() throws {
+    func test_stop_onNeverStartedServer_doesNotDeleteAnotherServersEndpointFile() async throws {
         // Server A: actually starts, so it really writes
         // agent-endpoint.json into the shared directory.
         let serverA = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
         serverA.agentRegistry = AgentRegistry()
         serverA.approvalInbox = ApprovalInboxStore()
         serverA.agentHookApprovalMemory = AgentHookApprovalMemory()
-        try serverA.start(token: "server-a-token")
+        try await serverA.start(token: "server-a-token")
         defer { serverA.stop() }
 
         let filePath = agentEndpointDir + "/agent-endpoint.json"
@@ -841,7 +841,7 @@ final class CalyxMCPServerTests: XCTestCase {
         let token = "port-zero-token"
 
         do {
-            try srv.start(token: token, preferredPort: 0)
+            try await srv.start(token: token, preferredPort: 0)
         } catch {
             XCTFail(
                 """
@@ -897,7 +897,7 @@ final class CalyxMCPServerTests: XCTestCase {
     // The canonical scan's first iteration binds it and `finishStart`
     // records `tryPort == preferredPort` — this is the common,
     // already-working path the port-0 fix must not disturb.
-    func test_start_freeHighPort_recordsRequestedPort() throws {
+    func test_start_freeHighPort_recordsRequestedPort() async throws {
         guard let freePort = findFreeHighPort() else {
             throw XCTSkip("Could not find a free loopback port to use as preferredPort on this host")
         }
@@ -905,7 +905,7 @@ final class CalyxMCPServerTests: XCTestCase {
         let srv = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
         srv.agentRegistry = AgentRegistry()
 
-        try srv.start(token: "free-high-port-token", preferredPort: freePort)
+        try await srv.start(token: "free-high-port-token", preferredPort: freePort)
 
         XCTAssertEqual(
             srv.port, freePort,
@@ -938,7 +938,7 @@ final class CalyxMCPServerTests: XCTestCase {
         srv.agentRegistry = AgentRegistry()
         let token = "split-segment-token"
 
-        try srv.start(token: token, preferredPort: 0)
+        try await srv.start(token: token, preferredPort: 0)
         let port = srv.port
         XCTAssertGreaterThan(port, 0, "Precondition: server must be bound to a real, reachable port")
 
@@ -977,7 +977,7 @@ final class CalyxMCPServerTests: XCTestCase {
         srv.agentRegistry = AgentRegistry()
         let token = "overflow-token"
 
-        try srv.start(token: token, preferredPort: 0)
+        try await srv.start(token: token, preferredPort: 0)
         let port = srv.port
 
         let statusCode = try await Task.detached {
@@ -1005,7 +1005,7 @@ final class CalyxMCPServerTests: XCTestCase {
         srv.agentRegistry = AgentRegistry()
         let token = "oversized-body-token"
 
-        try srv.start(token: token, preferredPort: 0)
+        try await srv.start(token: token, preferredPort: 0)
         let port = srv.port
 
         let statusCode = try await Task.detached {
@@ -1037,7 +1037,7 @@ final class CalyxMCPServerTests: XCTestCase {
         srv._testRouteDelay = .milliseconds(400)
         let token = "slow-route-token"
 
-        try srv.start(token: token, preferredPort: 0)
+        try await srv.start(token: token, preferredPort: 0)
         let port = srv.port
 
         let (statusCode, body) = await sendRealInitializeRequest(port: port, token: token)
@@ -1068,7 +1068,7 @@ final class CalyxMCPServerTests: XCTestCase {
         srv.connectionReceiveDeadline = .milliseconds(300)
         let token = "headers-only-token"
 
-        try srv.start(token: token, preferredPort: 0)
+        try await srv.start(token: token, preferredPort: 0)
         let port = srv.port
 
         let statusCode = try await Task.detached {
@@ -1109,7 +1109,7 @@ final class CalyxMCPServerTests: XCTestCase {
         srv.connectionReceiveDeadline = .milliseconds(300)
         let token = "headers-only-double-send-token"
 
-        try srv.start(token: token, preferredPort: 0)
+        try await srv.start(token: token, preferredPort: 0)
         let port = srv.port
 
         let fullResponse = try await Task.detached {
@@ -1178,7 +1178,7 @@ final class CalyxMCPServerTests: XCTestCase {
         srv.agentRegistry = AgentRegistry()
         let token = "many-chunks-token"
 
-        try srv.start(token: token, preferredPort: 0)
+        try await srv.start(token: token, preferredPort: 0)
         let port = srv.port
 
         let bodyDict: [String: Any] = [
@@ -1223,10 +1223,10 @@ final class CalyxMCPServerTests: XCTestCase {
     // `nl.port?.rawValue`, not merely the pre-bind BSD-socket probe
     // value — exercised directly now that this method is `internal`
     // for testability.
-    func test_bindKernelAssignedListener_recordsListenersActualResolvedPort() throws {
+    func test_bindKernelAssignedListener_recordsListenersActualResolvedPort() async throws {
         let srv = CalyxMCPServer(agentEndpointDirectory: agentEndpointDir)
 
-        guard let (listener, port) = srv.bindKernelAssignedListener() else {
+        guard let (listener, port) = await srv.bindKernelAssignedListener() else {
             XCTFail("bindKernelAssignedListener should succeed on a host with free ephemeral loopback ports available")
             return
         }

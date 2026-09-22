@@ -73,12 +73,26 @@ struct AgentStatusView: View {
             // companion -- see that function's own doc comment.
             let isServerRunning = AgentRegistry.shared.isServerRunning
             let hasExternal = AgentRegistry.shared.hasExternalEntries
+            // Resolved once here and reused in both branches below: a
+            // server-start failure must render its own banner whether
+            // or not herdr rows keep the sidebar in the rows branch --
+            // see AgentSidebarGate.showsServerIssuesBanner's own doc
+            // comment.
+            let serverIssues = AgentRegistry.shared.serverIssues
+            let showsServerIssuesBanner = AgentSidebarGate.showsServerIssuesBanner(isServerRunning: isServerRunning, serverIssues: serverIssues)
             if !AgentSidebarGate.decide(isServerRunning: isServerRunning, hasExternal: hasExternal) {
-                disabledPlaceholder
+                if showsServerIssuesBanner {
+                    agentServerIssuesBanner(serverIssues)
+                } else {
+                    disabledPlaceholder
+                }
             } else {
                 let entries = AgentRegistry.shared.sortedEntries
                 let integrationIssues = AgentRegistry.shared.integrationIssues
                 VStack(spacing: 0) {
+                    if showsServerIssuesBanner {
+                        agentServerIssuesBanner(serverIssues)
+                    }
                     if !integrationIssues.isEmpty {
                         hooksIssuesBanner(integrationIssues)
                     }
@@ -165,7 +179,7 @@ struct AgentStatusView: View {
                                         rowsHeight = height
                                     }
 
-                                    if AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: isServerRunning, hasExternal: hasExternal) && rowsHeight > 0 {
+                                    if AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: isServerRunning, hasExternal: hasExternal, serverIssues: serverIssues) && rowsHeight > 0 {
                                         monitoringDisabledPlaceholder(
                                             minHeight: max(0, (viewport.size.height - rowsHeight).rounded(.down) - 1)
                                         )
@@ -204,8 +218,35 @@ struct AgentStatusView: View {
     /// `MainContentView`'s single root glass sheet showing through the
     /// sidebar.
     private func hooksIssuesBanner(_ issues: [String]) -> some View {
+        issuesBanner(
+            title: "Some agent integrations failed to install",
+            issues: issues,
+            accessibilityID: AccessibilityID.Sidebar.agentHooksIssuesBanner
+        )
+    }
+
+    /// Shown instead of `disabledPlaceholder` when `AgentRegistry
+    /// .serverIssues` is standing -- the setting is still ON, but the
+    /// last enable attempt's server-start step itself failed (token
+    /// generation or `CalyxMCPServer.start`), so telling the user to
+    /// "Enable AI Agent IPC" would contradict the Settings switch, which
+    /// already reads ON. See `AgentSidebarGate.showsServerIssuesBanner`.
+    private func agentServerIssuesBanner(_ issues: [String]) -> some View {
+        issuesBanner(
+            title: "AI Agent IPC server failed to start",
+            issues: issues,
+            accessibilityID: AccessibilityID.Sidebar.agentServerIssuesBanner
+        )
+    }
+
+    /// Shared look for `hooksIssuesBanner` and `agentServerIssuesBanner`:
+    /// plain, quiet text -- no icon, no background -- matching
+    /// `disabledPlaceholder` / `emptyPlaceholder` rather than a designed
+    /// warning box, so nothing opaque paints over `MainContentView`'s
+    /// single root glass sheet showing through the sidebar.
+    private func issuesBanner(title: String, issues: [String], accessibilityID: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Some agent integrations failed to install")
+            Text(title)
                 .font(.system(size: 11.5, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary)
             ForEach(issues, id: \.self) { issue in
@@ -218,7 +259,7 @@ struct AgentStatusView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .accessibilityIdentifier(AccessibilityID.Sidebar.agentHooksIssuesBanner)
+        .accessibilityIdentifier(accessibilityID)
     }
 
     // MARK: - Placeholders
@@ -230,7 +271,7 @@ struct AgentStatusView: View {
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Text("Open Command Palette → Enable AI Agent IPC")
+            Text("Open Settings → Agents → Enable AI Agent IPC")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
@@ -286,7 +327,7 @@ struct AgentStatusView: View {
                 .font(.system(size: 12, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-            Text("Open Command Palette → Enable AI Agent IPC")
+            Text("Open Settings → Agents → Enable AI Agent IPC")
                 .font(.system(size: 11))
                 .foregroundStyle(.tertiary)
                 .multilineTextAlignment(.center)
@@ -342,8 +383,29 @@ enum AgentSidebarGate {
     /// own monitoring IS running, herdr or not), and `hasExternal ==
     /// false` with the server off never reaches the rows branch to begin
     /// with (see `decide`).
-    static func showsMonitoringDisabledBanner(isServerRunning: Bool, hasExternal: Bool) -> Bool {
-        !isServerRunning && hasExternal
+    /// `serverIssues` suppresses this banner: a standing server-start
+    /// failure already renders `agentServerIssuesBanner`, which states
+    /// why Calyx's own agents are absent, so stacking the generic
+    /// "disabled, open Settings" notice on top of it would both
+    /// duplicate the explanation and contradict a Settings switch that
+    /// still reads ON (a start failure is not the same state as the
+    /// setting being off).
+    static func showsMonitoringDisabledBanner(isServerRunning: Bool, hasExternal: Bool, serverIssues: [String]) -> Bool {
+        !isServerRunning && hasExternal && serverIssues.isEmpty
+    }
+
+    /// Whether the sidebar should render `agentServerIssuesBanner`: a
+    /// server-start failure (`AgentRegistry.serverIssues`) is standing
+    /// while Calyx's own server is not running. Independent of `decide`
+    /// and of `hasExternal`: a herdr row's presence must not hide a real
+    /// server-start failure any more than its absence does. Applies in
+    /// BOTH of `content`'s branches:
+    /// the placeholder branch (no rows at all) and the rows branch (rows
+    /// shown from herdr), so the caller renders this banner above
+    /// `disabledPlaceholder`/rows in the former case and above
+    /// `hooksIssuesBanner` in the latter.
+    static func showsServerIssuesBanner(isServerRunning: Bool, serverIssues: [String]) -> Bool {
+        !isServerRunning && !serverIssues.isEmpty
     }
 }
 

@@ -520,13 +520,23 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// so enabling IPC for one CLI can never spread to a second CLI the
     /// user installed afterward but never opted in for.
     ///
-    /// Skipped entirely for a `--uitesting` launch: `CalyxUITestCase`
-    /// runs the app-under-test with that flag and no XCTest loaded, so
-    /// `LaunchEnvironmentPolicy.isUnitTestHost()`'s gate at the top of
-    /// `applicationDidFinishLaunching` never catches it, and it does not
-    /// redirect HOME -- without this second guard, every E2E run would
-    /// read-modify-write the developer's own real `~/.claude/settings.json`
-    /// / `~/.codex/config.toml` / OpenCode plugin file.
+    /// Skipped for a `--uitesting` launch that has no
+    /// `CalyxPathRoot.testRoot` (i.e. did not receive
+    /// `--calyx-path-root=`), per
+    /// `LaunchEnvironmentPolicy.mayPerformAgentIPCActivation()`:
+    /// `CalyxUITestCase` runs the app-under-test with `--uitesting` and
+    /// no XCTest loaded, so `LaunchEnvironmentPolicy.isUnitTestHost()`'s
+    /// gate at the top of `applicationDidFinishLaunching` never catches
+    /// it -- every Calyx-owned and agent-owned config path now resolves
+    /// through `CalyxPathRoot.testRoot` (see that type's own doc
+    /// comment), so a launch that DOES pass `--calyx-path-root=` writes
+    /// only inside its own scoped root and this guard does not apply to
+    /// it; a launch that does not pass it would still read-modify-write
+    /// the developer's own real `~/.claude/settings.json` /
+    /// `~/.codex/config.toml` / OpenCode plugin file, so the guard still
+    /// applies there. The same predicate also gates both Settings > Agents
+    /// IPC handlers, so a `--uitesting` launch missing
+    /// `--calyx-path-root=` can never activate from either entry point.
     ///
     /// The actual per-tool checks, config parsing, and any resulting
     /// writes all run off `@MainActor` (`resyncAgentHooksOffMainThread()`
@@ -542,11 +552,35 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// to present one against. Never touches `configIssues`: this path
     /// only ever re-syncs hooks, so a config-write failure a manual
     /// enable already surfaced stays visible across it.
+    ///
+    /// Two-branch launch-time decision: on a real launch with
+    /// IPCSettings.enabled, activates AI Agent IPC (starts the server,
+    /// writes agent CLI configs, installs hooks via install() -- the
+    /// setting being on already records explicit consent, so
+    /// resyncInstalled()'s existing-entry inference is not needed here);
+    /// otherwise falls back to the resync-only migration path below,
+    /// which existing users who have not opted into the setting yet
+    /// (every user right after upgrading) still need.
     private func resyncAgentHooksIfInstalled() {
-        guard !ProcessInfo.processInfo.arguments.contains("--uitesting") else { return }
-        Task {
-            let hooksResult = await resyncAgentHooksOffMainThread()
-            AgentRegistry.shared.setHooksIssues(hooksResult.issueMessages)
+        guard LaunchEnvironmentPolicy.mayPerformAgentIPCActivation() else { return }
+
+        if IPCSettings.enabled {
+            // IPCActivationCoordinator.enable() already serializes itself
+            // through IPCActivationChain.shared, which also records the
+            // outcome and posts .calyxIPCStateDidChange itself before its
+            // in-flight flag drops -- wrapping this call in a second
+            // chain.run() would deadlock (the inner run() would await the
+            // very outer Task it is nested inside), and re-recording or
+            // re-posting here would be redundant with what the chain
+            // already does.
+            Task {
+                _ = await IPCActivationCoordinator().enable()
+            }
+        } else {
+            Task {
+                let hooksResult = await resyncAgentHooksOffMainThread()
+                AgentRegistry.shared.setHooksIssues(hooksResult.issueMessages)
+            }
         }
     }
 

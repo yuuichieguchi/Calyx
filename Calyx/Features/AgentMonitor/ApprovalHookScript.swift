@@ -139,7 +139,13 @@ enum ApprovalHookScript {
         exit 0
     fi
 
-    endpoint_file="$HOME/Library/Application Support/Calyx/agent-endpoint.json"
+    # CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController alongside
+    # CALYX_SURFACE_ID, scoped to wherever this Calyx process actually
+    # wrote agent-endpoint.json (a --calyx-path-root scratch directory
+    # under test, the real Application Support directory otherwise). The
+    # literal fallback covers a pane launched before that injection
+    # existed, or a shell that stripped the variable.
+    endpoint_file="${CALYX_ENDPOINT_FILE:-\(AgentEndpointFile.shellFallbackPath)}"
     if [ ! -f "$endpoint_file" ]; then
         exit 0
     fi

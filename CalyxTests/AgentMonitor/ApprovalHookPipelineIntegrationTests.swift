@@ -104,7 +104,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         // AgentHookPipelineIntegrationTests.setUp: this suite only needs
         // *some* running server on the port the script itself reads back
         // out of agent-endpoint.json at call time.
-        try server.start(token: testToken, preferredPort: Int.random(in: 49_152...65_000))
+        try await server.start(token: testToken, preferredPort: Int.random(in: 49_152...65_000))
 
         scriptPath = try ApprovalHookScript.install(toDirectory: appSupportDir + "/bin")
     }

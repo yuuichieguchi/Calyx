@@ -280,7 +280,7 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc]"))
     }
 
-    func test_disableIPC_unreadableFile() throws {
+    func test_disableIPC_unreadableFile_throws() throws {
         // Given: file exists but is unreadable (permission 0o000)
         writeConfig("[mcp_servers.calyx-ipc]\nurl = \"http://localhost:41830/mcp\"\n")
         try FileManager.default.setAttributes(
@@ -288,8 +288,12 @@ final class CodexConfigManagerTests: XCTestCase {
             ofItemAtPath: configPath
         )
 
-        // When/Then: no error thrown (no-op because file can't be read)
-        XCTAssertNoThrow(try CodexConfigManager.disableIPC(configPath: configPath))
+        // When/Then: an unreadable config must throw rather than silently
+        // no-op. `withExclusiveConfig` reads inside the lock without
+        // `try?`, and a read that fails because the user can't read their
+        // own file must surface as a failure -- silently skipping it would
+        // leave the user unable to tell why nothing connected.
+        XCTAssertThrowsError(try CodexConfigManager.disableIPC(configPath: configPath))
 
         // Cleanup: restore permissions so tearDown can remove the file
         try FileManager.default.setAttributes(
@@ -414,9 +418,13 @@ final class CodexConfigManagerTests: XCTestCase {
     }
 
     func test_disableIPC_symlinkFollowedToRealFile_removesSuccessfullyAndKeepsLinkIntact() throws {
-        // Given: configPath is a symlink to a real file that already has the section
+        // Given: configPath is a symlink to a real file that already has
+        // the section, plus an unrelated user-owned table so the file
+        // legitimately survives disableIPC (this test is about symlink
+        // resolution, not about the "whole file becomes Calyx's own
+        // region" cascade, which deletes the file).
         let realFile = tempDir + "/real_config.toml"
-        writeConfig("[mcp_servers.calyx-ipc]\nurl = \"http://localhost:41830/mcp\"\n")
+        writeConfig("[other]\nkey = 1\n[mcp_servers.calyx-ipc]\nurl = \"http://localhost:41830/mcp\"\n")
         try FileManager.default.moveItem(atPath: configPath, toPath: realFile)
         try FileManager.default.createSymbolicLink(atPath: configPath, withDestinationPath: realFile)
 
@@ -444,11 +452,11 @@ final class CodexConfigManagerTests: XCTestCase {
         // When
         try CodexConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
 
-        // Then: handled correctly, content normalized to \n
+        // Then: the user's own CRLF content survives untouched -- only
+        // Calyx's own appended region is new bytes.
         let content = readConfig()
-        XCTAssertFalse(content.contains("\r\n"), "CRLF should be normalized to LF")
-        XCTAssertTrue(content.contains("[general]"))
-        XCTAssertTrue(content.contains("model = \"gpt-4\""))
+        XCTAssertTrue(content.contains("[general]\r\nmodel = \"gpt-4\"\r\ntemperature = 0.7\r\n"),
+                      "The user's own CRLF-terminated lines must not be rewritten")
         XCTAssertTrue(content.contains("[mcp_servers.calyx-ipc]"))
         XCTAssertTrue(content.contains("http://127.0.0.1:41830/mcp"))
     }

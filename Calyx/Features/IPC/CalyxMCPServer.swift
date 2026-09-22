@@ -890,7 +890,7 @@ final class CalyxMCPServer {
 
     // MARK: - Lifecycle
 
-    func start(token: String, preferredPort: Int = 41830) throws {
+    func start(token: String, preferredPort: Int = IPCEndpointReuse.defaultPort) async throws {
         // Capture the teardown Task scheduled by the prior `stop()` so
         // the new LSP startup can wait for it before installing a fresh
         // bridge. Without this chain the new `lspStartTask` and the
@@ -936,7 +936,7 @@ final class CalyxMCPServer {
         // never accepts connections.
         for portOffset in 0..<10 {
             let tryPort = preferredPort + portOffset
-            guard let (nl, resolvedPort) = bindListener(onPort: tryPort) else {
+            guard let (nl, resolvedPort) = await bindListener(onPort: tryPort) else {
                 lastError = NSError(
                     domain: "CalyxMCPServer",
                     code: 3,
@@ -961,7 +961,7 @@ final class CalyxMCPServer {
         // back out of the listener so `self.port` (and downstream the
         // URL published by `ClaudeConfigManager.enableIPC`) stays
         // consistent with the bind.
-        if let (nl, resolvedPort) = bindKernelAssignedListener() {
+        if let (nl, resolvedPort) = await bindKernelAssignedListener() {
             finishStart(listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown)
             return
         }
@@ -994,12 +994,15 @@ final class CalyxMCPServer {
     /// record port `0` as if it were a successful bind.
     ///
     /// Note: the listener's queue is intentionally a dedicated background
-    /// queue rather than `.main`. `start()` runs on the main thread and
-    /// must block-wait on the state semaphore; running the listener
-    /// callbacks on `.main` would deadlock. Once the listener is ready
-    /// we reassign `newConnectionHandler` so connections route back into
-    /// `@MainActor` via `Task { @MainActor in ... }`.
-    private func bindListener(onPort tryPort: Int) -> (NWListener, Int)? {
+    /// queue rather than `.main`. `startListenerAndWaitForReady` suspends
+    /// on a `CheckedContinuation` instead of blocking a thread, so
+    /// `@MainActor` stays free to run other work while a bind is in
+    /// flight; the listener's own callbacks still run on their dedicated
+    /// queue so the state handler never has to hop onto `@MainActor`
+    /// itself. Once the listener is ready we reassign
+    /// `newConnectionHandler` so connections route back into `@MainActor`
+    /// via `Task { @MainActor in ... }`.
+    private func bindListener(onPort tryPort: Int) async -> (NWListener, Int)? {
         let params = NWParameters.tcp
         let nwPort = NWEndpoint.Port(integerLiteral: UInt16(tryPort))
         params.requiredLocalEndpoint = NWEndpoint.hostPort(
@@ -1007,7 +1010,7 @@ final class CalyxMCPServer {
             port: nwPort
         )
         guard let nl = try? NWListener(using: params) else { return nil }
-        guard let ready = startListenerAndWaitForReady(nl) else { return nil }
+        guard let ready = await startListenerAndWaitForReady(nl) else { return nil }
         guard let resolvedPort = ready.port?.rawValue, resolvedPort != 0 else {
             ready.cancel()
             return nil
@@ -1043,7 +1046,7 @@ final class CalyxMCPServer {
     /// `internal` (not `private`) so `CalyxMCPServerTests` can exercise
     /// it directly via `@testable import` without needing to exhaust
     /// the whole canonical scan range first just to reach this path.
-    func bindKernelAssignedListener() -> (NWListener, Int)? {
+    func bindKernelAssignedListener() async -> (NWListener, Int)? {
         // Strategy: use the BSD socket API to ask the kernel for a free
         // ephemeral port on 127.0.0.1, then probe that exact port via
         // `requiredLocalEndpoint` with the resolved port number — see
@@ -1068,7 +1071,7 @@ final class CalyxMCPServer {
                 port: nwPort
             )
             guard let nl = try? NWListener(using: params) else { continue }
-            guard let ready = startListenerAndWaitForReady(nl) else { continue }
+            guard let ready = await startListenerAndWaitForReady(nl) else { continue }
 
             // Symmetric with `bindListener(onPort:)`: read the port the
             // listener itself actually resolved to, rather than
@@ -1136,63 +1139,68 @@ final class CalyxMCPServer {
         return resolvedPort != 0 ? resolvedPort : nil
     }
 
+    /// 1s is generous: a successful loopback bind reaches `.ready` in
+    /// sub-millisecond on a healthy host; bind failures are reported
+    /// essentially synchronously from the kernel. We cap so a wedged
+    /// listener never blocks `start()` indefinitely.
+    private static let listenerReadyTimeout: TimeInterval = 1.0
+
     /// Shared helper: start `nl` on a dedicated background queue and
-    /// block until it reaches `.ready` (success) or `.failed` /
+    /// suspend until it reaches `.ready` (success) or `.failed` /
     /// `.cancelled` / timeout (failure). Returns the listener on
     /// success, `nil` on failure.
-    private func startListenerAndWaitForReady(_ nl: NWListener) -> NWListener? {
-        // Reference-typed box so the `stateUpdateHandler` closure
-        // (running on the listener queue) and the main-thread reader
-        // after `sema.wait` share a single storage cell without
-        // triggering Swift 6's "concurrently-executing var capture"
-        // diagnostic. The semaphore signal/wait provides the
-        // happens-before edge that makes the unsynchronised
-        // assignment safe.
-        final class OutcomeBox: @unchecked Sendable {
-            var didSucceed: Bool = false
-        }
-        let box = OutcomeBox()
-        let sema = DispatchSemaphore(value: 0)
+    ///
+    /// `stateUpdateHandler` can fire `.ready` and later still fire
+    /// `.failed`/`.cancelled` on this SAME listener (a later `.cancel()`
+    /// on the failure path in `bindListener(onPort:)` drives `.cancelled`
+    /// into this same closure) — a `CheckedContinuation` resumed twice
+    /// traps, so every arm below (the state handler's three cases and the
+    /// timeout) routes through one `IPCListenerReadyGuard`, constructed
+    /// before `nl.start(queue:)` so no resume can race its construction.
+    /// The state handler and the timeout's `asyncAfter` both run on the
+    /// same serial `listenerQueue`, so the guard needs no lock beyond its
+    /// own plain `Bool`.
+    private func startListenerAndWaitForReady(_ nl: NWListener) async -> NWListener? {
         let listenerQueue = DispatchQueue(
             label: "CalyxMCPServer.listenerProbe"
         )
-        nl.stateUpdateHandler = { state in
-            switch state {
-            case .ready:
-                box.didSucceed = true
-                sema.signal()
-            case .failed(let err):
-                NSLog("[CalyxMCPServer] probe listener failed: \(err)")
-                box.didSucceed = false
-                sema.signal()
-            case .cancelled:
-                box.didSucceed = false
-                sema.signal()
-            default:
-                break
+        let guardian = IPCListenerReadyGuard()
+
+        let didSucceed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            nl.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    guardian.resumeOnce { continuation.resume(returning: true) }
+                case .failed(let err):
+                    NSLog("[CalyxMCPServer] probe listener failed: \(err)")
+                    guardian.resumeOnce { continuation.resume(returning: false) }
+                case .cancelled:
+                    guardian.resumeOnce { continuation.resume(returning: false) }
+                default:
+                    break
+                }
+            }
+            // NWListener fails its `start()` with EINVAL when no
+            // `newConnectionHandler` is set before `start()` is invoked.
+            // Install a no-op placeholder here purely to satisfy the
+            // start-time invariant; `finishStart` reassigns the real
+            // production handler after the probe completes successfully.
+            // Without this placeholder every bind in the canonical
+            // 41830-41839 scan fails with `POSIXErrorCode(rawValue: 22)`
+            // and `start()` ends up in the kernel-assigned fallback path
+            // unconditionally — which used to throw outright before the
+            // fallback existed, breaking previously-passing tests.
+            nl.newConnectionHandler = { connection in
+                connection.cancel()
+            }
+            nl.start(queue: listenerQueue)
+
+            listenerQueue.asyncAfter(deadline: .now() + Self.listenerReadyTimeout) {
+                guardian.resumeOnce { continuation.resume(returning: false) }
             }
         }
-        // NWListener fails its `start()` with EINVAL when no
-        // `newConnectionHandler` is set before `start()` is invoked.
-        // Install a no-op placeholder here purely to satisfy the
-        // start-time invariant; `finishStart` reassigns the real
-        // production handler after the probe completes successfully.
-        // Without this placeholder every bind in the canonical
-        // 41830-41839 scan fails with `POSIXErrorCode(rawValue: 22)`
-        // and `start()` ends up in the kernel-assigned fallback path
-        // unconditionally — which used to throw outright before the
-        // fallback existed, breaking previously-passing tests.
-        nl.newConnectionHandler = { connection in
-            connection.cancel()
-        }
-        nl.start(queue: listenerQueue)
 
-        // 1s is generous: a successful loopback bind reaches `.ready` in
-        // sub-millisecond on a healthy host; bind failures are reported
-        // essentially synchronously from the kernel. We cap so a wedged
-        // listener never blocks `start()` indefinitely.
-        let result = sema.wait(timeout: .now() + 1.0)
-        if result == .timedOut || !box.didSucceed {
+        if !didSucceed {
             nl.cancel()
             return nil
         }

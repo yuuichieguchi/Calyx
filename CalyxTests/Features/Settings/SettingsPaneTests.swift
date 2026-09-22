@@ -88,6 +88,7 @@ final class SettingsPaneTests: XCTestCase {
         ("lspRequireConfirmation", .lsp),
         ("persistentSessions", .sessions),
         ("historyPersistence", .sessions),
+        ("agentIPC", .agents),
         ("agentResume", .agents),
         ("agentResumeAutoExecute", .agents),
         ("cockpitAutoApprove", .agents),

@@ -758,21 +758,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         commandRegistry.register(PaletteCommand(id: "git.refresh", title: "Refresh Git Changes", category: "Git") { [weak self] in
             self?.refreshGitSidebar(trigger: .manualRefresh)
         })
-        commandRegistry.register(PaletteCommand(id: "ipc.enable", title: "Enable AI Agent IPC", category: "IPC", isAvailable: {
-            !CalyxMCPServer.shared.isRunning
-        }) { [weak self] in
-            self?.enableIPC()
-        })
-        commandRegistry.register(PaletteCommand(id: "ipc.reconfigure", title: "Reconfigure AI Agent IPC", category: "IPC", isAvailable: {
-            CalyxMCPServer.shared.isRunning
-        }) { [weak self] in
-            self?.enableIPC()
-        })
-        commandRegistry.register(PaletteCommand(id: "ipc.disable", title: "Disable AI Agent IPC", category: "IPC", isAvailable: {
-            CalyxMCPServer.shared.isRunning
-        }) { [weak self] in
-            self?.disableIPC()
-        })
         commandRegistry.register(PaletteCommand(id: "cli.install", title: "Install CLI to PATH", category: "System") {
             let appPath = Bundle.main.bundlePath
             let cliSource = "\(appPath)/Contents/Resources/bin/calyx"
@@ -5791,20 +5776,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             }
         }
         return seeds
-    }
-
-    // MARK: - IPC
-
-    private func enableIPC() {
-        let outcome = IPCActivationCoordinator().enable()
-        let alert = IPCActivationPresenter.enableAlert(for: outcome)
-        showIPCAlert(title: alert.title, message: alert.message)
-    }
-
-    private func disableIPC() {
-        let report = IPCActivationCoordinator().disable()
-        let alert = IPCActivationPresenter.disableAlert(for: report)
-        showIPCAlert(title: alert.title, message: alert.message)
     }
 
     // MARK: - AI Agent Tab Detection

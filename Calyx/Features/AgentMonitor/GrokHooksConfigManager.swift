@@ -60,7 +60,9 @@ struct GrokHooksConfigManager: Sendable {
 
     /// Writes the Calyx-owned hook file at `configPath`, creating its
     /// parent directory when absent, replacing any previous contents
-    /// wholesale.
+    /// wholesale. `AgentHooksCoordinator.installGrok` already gates this
+    /// call on the Grok config root existing, so this function does not
+    /// repeat that check.
     ///
     /// Every handler is invoked with an explicit `grok` argument:
     /// `"<scriptPath>" grok` for the state pings, `"<approvalScriptPath>"
@@ -85,6 +87,7 @@ struct GrokHooksConfigManager: Sendable {
     ) throws {
         let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
         let hooksDirectory = (path as NSString).deletingLastPathComponent
+
         if !FileManager.default.fileExists(atPath: hooksDirectory) {
             try FileManager.default.createDirectory(
                 atPath: hooksDirectory, withIntermediateDirectories: true
@@ -113,7 +116,8 @@ struct GrokHooksConfigManager: Sendable {
         ) else {
             throw GrokHooksConfigError.writeFailed("JSON encoding failed")
         }
-        try ConfigFileUtils.atomicWrite(data: data, to: path)
+        // 0600: Calyx owns this file outright.
+        try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600, restoreModeOnNoWrite: true) { _ in data }
     }
 
     /// Deletes the Calyx-owned hook file. A no-op when it does not
@@ -121,9 +125,8 @@ struct GrokHooksConfigManager: Sendable {
     /// a dotfiles-managed hooks directory keeps its link rather than
     /// losing it while the installed file survives.
     static func removeHooks(configPath: String? = nil) throws {
-        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
-        guard FileManager.default.fileExists(atPath: path) else { return }
-        try FileManager.default.removeItem(atPath: path)
+        let path = configPath ?? defaultConfigPath
+        try ConfigFileUtils.withExclusiveConfig(path: path) { _ in nil }
     }
 
     /// Whether the Calyx-owned hook file exists and names

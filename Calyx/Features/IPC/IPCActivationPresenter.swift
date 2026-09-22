@@ -71,7 +71,7 @@ enum IPCActivationPresenter {
             let message = [
                 runningLine, configLines, hooksLines,
                 "Restart agent instances to connect.",
-                "Fix the errors above and run Reconfigure AI Agent IPC.",
+                "Fix the errors above and click Refresh in Settings > Agents.",
             ].joined(separator: "\n")
             return AlertContent(title: title, message: message)
 
@@ -86,7 +86,7 @@ enum IPCActivationPresenter {
                 "No agent CLI could be configured.",
                 configLines, hooksLines,
                 serverKeepsServingLine,
-                "Fix the errors above and run Reconfigure AI Agent IPC.",
+                "Fix the errors above and click Refresh in Settings > Agents.",
             ].joined(separator: "\n")
             return AlertContent(title: "Agent Setup Failed", message: message)
 
@@ -101,7 +101,7 @@ enum IPCActivationPresenter {
                 "No supported agent CLI was found to configure.",
                 configLines, hooksLines,
                 serverKeepsServingLine,
-                "Install a supported agent and run Reconfigure AI Agent IPC.",
+                "Install a supported agent and click Refresh in Settings > Agents.",
             ].joined(separator: "\n")
             return AlertContent(title: "No Agents Configured", message: message)
         }

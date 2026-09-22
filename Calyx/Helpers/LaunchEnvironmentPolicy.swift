@@ -13,6 +13,18 @@
 // run the app-under-test in a separate process with no XCTest loaded
 // (CalyxUITests launches it with "--uitesting" instead), so that process
 // always evaluates false here and keeps running the full launch.
+//
+// Also decides whether this process may perform a REAL IPC activation
+// (start CalyxMCPServer, write an agent CLI config file, install agent
+// hooks) -- a distinct question from isUnitTestHost() above, since a
+// `--uitesting` launch is not caught by isUnitTestHost() at all (it has
+// no XCTest loaded). Without this predicate, a `--uitesting` launch that
+// omitted `--calyx-path-root=` would activate against the developer's
+// real `~/.claude.json`, `~/.codex/config.toml`, `~/.grok/config.toml`
+// and OpenCode config, and bind a real loopback port -- every entry
+// point that can trigger activation (the launch path and both Settings
+// handlers) must consult this same predicate rather than each carrying
+// its own copy of the condition.
 
 import Foundation
 
@@ -30,6 +42,29 @@ enum LaunchEnvironmentPolicy {
         isUnitTestHost(
             xcTestPresent: TestEnvironment.isTestHost,
             arguments: ProcessInfo.processInfo.arguments
+        )
+    }
+
+    /// True iff this process may perform a real IPC activation. False
+    /// only for a `--uitesting` launch that has no scoped path root: that
+    /// combination is a UI-test launch that forgot `--calyx-path-root=`,
+    /// so every Calyx-owned and agent-owned config path would still
+    /// resolve to the developer's real home directory
+    /// (`CalyxPathRoot.testRoot`'s own doc comment). Every other
+    /// combination -- not `--uitesting` at all, or `--uitesting` WITH a
+    /// scoped path root -- is safe to activate: a scoped path root
+    /// confines every write this activation performs to that root.
+    static func mayPerformAgentIPCActivation(arguments: [String], hasScopedPathRoot: Bool) -> Bool {
+        !(arguments.contains("--uitesting") && !hasScopedPathRoot)
+    }
+
+    /// Real-process convenience: evaluates the above against this
+    /// process's own ProcessInfo.processInfo.arguments and
+    /// CalyxPathRoot.testRoot.
+    static func mayPerformAgentIPCActivation() -> Bool {
+        mayPerformAgentIPCActivation(
+            arguments: ProcessInfo.processInfo.arguments,
+            hasScopedPathRoot: CalyxPathRoot.testRoot != nil
         )
     }
 }

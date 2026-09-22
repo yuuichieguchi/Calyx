@@ -17,13 +17,6 @@ struct ClaudeConfigManager: Sendable {
     static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
 
-        var config = try ConfigFileUtils.readConfigWithBackup(path: path)
-
-        // Ensure mcpServers key exists
-        var mcpServers = config[mcpServersKey] as? [String: Any] ?? [:]
-
-        // Add/update calyx-ipc entry.
-        //
         // Claude Code expands `${VAR}` header values from its own process
         // environment. Inside a persistent calyx-session pane,
         // CALYX_SURFACE_ID does not identify the pane (absent with a
@@ -47,47 +40,30 @@ struct ClaudeConfigManager: Sendable {
                 "X-Calyx-Session-ID": "${CALYX_SESSION_ID:-}"
             ]
         ]
-        mcpServers[calyxIPCKey] = calyxEntry
-        config[mcpServersKey] = mcpServers
+        // .sortedKeys: JSONSerialization on a Swift Dictionary otherwise
+        // emits keys in an order seeded per process launch, so without it
+        // this entry's own bytes would differ across launches even when
+        // its content doesn't -- defeating withExclusiveConfig's
+        // input-equals-output no-write check on every restart.
+        let entryData = try JSONSerialization.data(withJSONObject: calyxEntry, options: [.sortedKeys])
 
-        // Serialize
-        let outputData = try JSONSerialization.data(
-            withJSONObject: config,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-
-        // Atomic write with file locking
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
+        // 0600: this entry carries the bearer token, so ~/.claude.json's
+        // mode is enforced rather than left as-is.
+        try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
+            try JSONConfigDocumentEditor.setValue(entryData, at: [mcpServersKey, calyxIPCKey], in: current)
+        }
     }
 
     static func disableIPC(configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
 
-        var config = try ConfigFileUtils.readConfigWithBackup(path: path)
-
-        // Remove calyx-ipc from mcpServers
-        guard var mcpServers = config[mcpServersKey] as? [String: Any] else {
-            // No mcpServers key → nothing to remove
-            return
+        // mode: nil -- disable writes no secret, only removes one, so it
+        // must preserve whatever mode the user's file already has rather
+        // than forcing 0600 (that mode belongs to enableIPC, which
+        // writes the token).
+        try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+            try JSONConfigDocumentEditor.removeValue(at: [mcpServersKey, calyxIPCKey], in: current)
         }
-
-        mcpServers.removeValue(forKey: calyxIPCKey)
-
-        // If mcpServers is now empty, remove the key entirely
-        if mcpServers.isEmpty {
-            config.removeValue(forKey: mcpServersKey)
-        } else {
-            config[mcpServersKey] = mcpServers
-        }
-
-        // Serialize
-        let outputData = try JSONSerialization.data(
-            withJSONObject: config,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-
-        // Atomic write with file locking
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     /// Returns `false` (rather than throwing) when `configPath`'s symlink
@@ -98,24 +74,14 @@ struct ClaudeConfigManager: Sendable {
         guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
             return false
         }
-        let fm = FileManager.default
-
-        guard fm.fileExists(atPath: path) else { return false }
-
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let parsed = try? JSONSerialization.jsonObject(with: data),
-              let config = parsed as? [String: Any],
-              let mcpServers = config[mcpServersKey] as? [String: Any] else {
-            return false
-        }
-
-        return mcpServers[calyxIPCKey] != nil
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return false }
+        return JSONConfigDocumentEditor.containsValue(at: [mcpServersKey, calyxIPCKey], in: data)
     }
 
     // MARK: - Private
 
     private static var defaultConfigPath: String {
-        NSHomeDirectory() + "/.claude.json"
+        AgentToolPaths.claudeConfigPath
     }
 
 }

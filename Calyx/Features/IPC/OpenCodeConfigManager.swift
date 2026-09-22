@@ -43,21 +43,47 @@ struct OpenCodeConfigManager: Sendable {
     /// Relative filename (including leading slash) for `AGENTS.md` under the OpenCode config dir.
     private static let agentsMDFilename = "/AGENTS.md"
 
-    /// Common prefix shared by all BEGIN CALYX IPC markers (historical and current).
-    /// Kept as a derived constant so `beginDelimiter` stays in sync with it.
-    private static let beginAnchor = "<!-- BEGIN CALYX IPC"
-
     /// BEGIN delimiter for the Calyx IPC managed block in AGENTS.md.
     /// Must match the literal the tests search for.
-    private static let beginDelimiter = beginAnchor + " (managed by Calyx, do not edit) -->"
-
-    /// Regex that matches a full BEGIN line (`<!-- BEGIN CALYX IPC ... -->`), requiring
-    /// the `-->` closing on the same line. This prevents `stripManagedBlocks` from
-    /// anchoring on user prose that merely mentions `<!-- BEGIN CALYX IPC` mid-line.
-    private static let beginLinePattern = #"<!--\s*BEGIN CALYX IPC[^\n]*?-->"#
+    private static let beginDelimiter = "<!-- BEGIN CALYX IPC (managed by Calyx, do not edit) -->"
 
     /// END delimiter for the Calyx IPC managed block in AGENTS.md.
     private static let endDelimiter = "<!-- END CALYX IPC -->"
+
+    /// Shared line-anchored editor for the AGENTS.md managed block: finds
+    /// a well-formed BEGIN...END span by exact (whitespace-tolerant) line
+    /// match, so user prose that merely mentions the marker text mid-line
+    /// is never mistaken for a block boundary. AGENTS.md's body is fixed
+    /// Markdown prose Calyx itself writes, with no structural shape (a
+    /// YAML child key, a TOML sub-table) that can distinguish a user's own
+    /// content from Calyx's once it ends up inside the span -- so unlike
+    /// HermesConfigManager's and CodexHooksConfigManager's own marker
+    /// editors, `foreignBodyBytes` is left `nil`: a well-formed BEGIN...END
+    /// span is always Calyx's owned region in full, removed entirely
+    /// regardless of whether its wording matches the body this Calyx
+    /// version currently writes (older releases worded it differently).
+    /// `isOwnBodyLine` only bounds the orphan-BEGIN (no matching END) self-
+    /// heal scan, never a well-formed span.
+    private static let agentsMDEditor = MarkerConfigDocumentEditor(
+        beginLine: beginDelimiter,
+        endLine: endDelimiter,
+        isOwnBodyLine: { doc, index in isOwnAgentsMDOrphanBodyLine(doc, index) }
+    )
+
+    /// Bounds `agentsMDEditor`'s orphan-BEGIN self-heal scan above: whether
+    /// `doc.lines[index]` still looks like part of Calyx's own generated
+    /// block body. Judged by stable identifiers -- a blank line, or a line
+    /// containing one of the Calyx IPC MCP tool names -- rather than exact
+    /// wording, since `managedBlockBody`'s prose can change across Calyx
+    /// releases while these tool names do not.
+    private static func isOwnAgentsMDOrphanBodyLine(_ doc: LineDoc, _ index: Int) -> Bool {
+        let line = String(decoding: doc.lineBytes(doc.lines[index]), as: UTF8.self)
+        if line.isEmpty { return true }
+        let ownIdentifiers = [
+            "Calyx IPC", "register_peer", "receive_messages", "send_message", "list_peers", "broadcast",
+        ]
+        return ownIdentifiers.contains { line.contains($0) }
+    }
 
     /// Managed-block body injected into AGENTS.md. This is MCPProtocol.instructions
     /// minus the browser-automation paragraph, formatted as Markdown.
@@ -129,16 +155,8 @@ struct OpenCodeConfigManager: Sendable {
         guard let jsonPath = try? ConfigFileUtils.resolveConfigPath(dir + Self.openCodeJSONFilename) else {
             return false
         }
-
-        guard FileManager.default.fileExists(atPath: jsonPath),
-              let data = try? Data(contentsOf: URL(fileURLWithPath: jsonPath)),
-              let parsed = try? JSONSerialization.jsonObject(with: data),
-              let config = parsed as? [String: Any],
-              let mcp = config[mcpKey] as? [String: Any] else {
-            return false
-        }
-
-        return mcp[calyxIPCKey] != nil
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: jsonPath)) else { return false }
+        return JSONConfigDocumentEditor.containsValue(at: [mcpKey, calyxIPCKey], in: data)
     }
 
     // MARK: - Private: Preflight
@@ -157,30 +175,6 @@ struct OpenCodeConfigManager: Sendable {
     // MARK: - Private: opencode.json
 
     private static func upsertOpenCodeJSON(port: Int, token: String, path: String) throws {
-        // Note: unlike ClaudeConfigManager, no .bak backup is created here.
-        // We match CodexConfigManager's pattern — the atomic-write + .tmp flow
-        // is considered sufficient for tool-config files of this size.
-        let fm = FileManager.default
-        var config: [String: Any]
-
-        if fm.fileExists(atPath: path) {
-            let data = try Data(contentsOf: URL(fileURLWithPath: path))
-
-            // Treat an empty file as an empty object (allows a pre-created empty file).
-            if data.isEmpty {
-                config = [:]
-            } else {
-                guard let parsed = try? JSONSerialization.jsonObject(with: data),
-                      let dict = parsed as? [String: Any] else {
-                    // Invalid JSON: throw WITHOUT overwriting the file.
-                    throw OpenCodeConfigError.invalidJSON
-                }
-                config = dict
-            }
-        } else {
-            config = [:]
-        }
-
         // Build the calyx-ipc entry fresh — no merge, guarantees stale header keys
         // are not retained across upserts.
         let calyxEntry: [String: Any] = [
@@ -193,168 +187,59 @@ struct OpenCodeConfigManager: Sendable {
                 "X-Calyx-Agent-Kind": AgentEntry.openCodeKind,
             ]
         ]
+        // .sortedKeys: see ClaudeConfigManager.enableIPC's identical
+        // comment -- without it this entry's bytes are not stable across
+        // process launches, defeating withExclusiveConfig's no-write check.
+        let entryData = try JSONSerialization.data(withJSONObject: calyxEntry, options: [.sortedKeys])
 
-        var mcp = config[mcpKey] as? [String: Any] ?? [:]
-        mcp[calyxIPCKey] = calyxEntry
-        config[mcpKey] = mcp
-
-        let outputData = try JSONSerialization.data(
-            withJSONObject: config,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
+        do {
+            // 0600: this entry carries the bearer token.
+            try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
+                // A 0-byte file (a pre-created empty file) is treated the same
+                // as an absent one: `JSONConfigDocumentEditor` already starts
+                // a fresh `{}` for both `nil` and empty input.
+                try JSONConfigDocumentEditor.setValue(entryData, at: [mcpKey, calyxIPCKey], in: current)
+            }
+        } catch ConfigFileError.invalidJSON {
+            // Preserve this manager's own public error type for a
+            // malformed root document: this call site's contract predates
+            // the shared editor and is unrelated to it.
+            throw OpenCodeConfigError.invalidJSON
+        }
     }
 
     private static func removeFromOpenCodeJSON(path: String) throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: path) else { return }
-
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-
-        // Empty file → nothing to do.
-        guard !data.isEmpty else { return }
-
-        guard let parsed = try? JSONSerialization.jsonObject(with: data),
-              var config = parsed as? [String: Any] else {
+        do {
+            // mode: nil -- disable writes no secret, only removes the
+            // entry that carried one, so it must preserve whatever mode
+            // the user's file already has rather than forcing 0600 (that
+            // mode belongs to upsertOpenCodeJSON, which writes the
+            // token).
+            try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+                // A 0-byte file has nothing to remove and is left exactly as it
+                // was: `JSONConfigDocumentEditor.removeValue` passes empty
+                // input straight through unchanged.
+                try JSONConfigDocumentEditor.removeValue(at: [mcpKey, calyxIPCKey], in: current)
+            }
+        } catch ConfigFileError.invalidJSON {
             throw OpenCodeConfigError.invalidJSON
         }
-
-        guard var mcp = config[mcpKey] as? [String: Any] else {
-            // No mcp key → nothing to remove.
-            return
-        }
-
-        mcp.removeValue(forKey: calyxIPCKey)
-
-        // If mcp is now empty, drop the key entirely (parity with ClaudeConfigManager).
-        if mcp.isEmpty {
-            config.removeValue(forKey: mcpKey)
-        } else {
-            config[mcpKey] = mcp
-        }
-
-        let outputData = try JSONSerialization.data(
-            withJSONObject: config,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     // MARK: - Private: AGENTS.md
 
     private static func upsertAgentsMD(path: String) throws {
-        let fm = FileManager.default
-
-        let existing: String
-        if fm.fileExists(atPath: path) {
-            existing = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        } else {
-            existing = ""
+        // mode: nil (leave the mode as-is): AGENTS.md is a user-owned
+        // prompt file with no secret in it.
+        try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+            try agentsMDEditor.setBlock(body: managedBlockBody, in: current)
         }
-
-        // Strip any previous managed block(s), then append a fresh one.
-        // This guarantees idempotency: exactly one managed block afterwards,
-        // regardless of how many stale ones were present.
-        let cleaned = stripManagedBlocks(from: existing)
-
-        let freshBlock = beginDelimiter + "\n" + managedBlockBody + "\n" + endDelimiter + "\n"
-
-        var output = cleaned
-        if !output.isEmpty {
-            // Ensure a blank line separates user content from the managed block.
-            if !output.hasSuffix("\n") {
-                output += "\n"
-            }
-            if !output.hasSuffix("\n\n") {
-                output += "\n"
-            }
-        }
-        output += freshBlock
-
-        guard let data = output.data(using: .utf8) else {
-            throw OpenCodeConfigError.writeFailed("UTF-8 encoding failed")
-        }
-
-        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     private static func removeFromAgentsMD(path: String) throws {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: path) else { return }
-
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else {
-            // Unreadable → treat as no-op (consistent with CodexConfigManager).
-            return
+        try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+            try agentsMDEditor.removeBlock(in: current)
         }
-
-        let cleaned = stripManagedBlocks(from: content)
-
-        // Only write if content actually changed, to avoid gratuitous timestamp churn.
-        guard cleaned != content else { return }
-
-        guard let data = cleaned.data(using: .utf8) else {
-            throw OpenCodeConfigError.writeFailed("UTF-8 encoding failed")
-        }
-
-        try ConfigFileUtils.atomicWrite(data: data, to: path)
-    }
-
-    /// Removes all `BEGIN CALYX IPC` ... `END CALYX IPC` managed blocks from a string.
-    ///
-    /// Matches by searching for a full BEGIN line (via `beginLinePattern`), then the
-    /// next occurrence of `endDelimiter` following it. The regex requires the `-->`
-    /// comment terminator on the same line as `BEGIN CALYX IPC`, so user prose that
-    /// merely mentions `<!-- BEGIN CALYX IPC` mid-line is NOT treated as a block
-    /// start. The search is still robust to legacy BEGIN markers that have additional
-    /// trailing label text before the `-->`, e.g.
-    /// `<!-- BEGIN CALYX IPC (managed by Calyx, do not edit) -->`.
-    ///
-    /// Preserves all content outside the removed blocks exactly, including user
-    /// content both before and after the block.
-    private static func stripManagedBlocks(from content: String) -> String {
-        let endAnchor = endDelimiter
-
-        var result = content
-
-        // Match a complete BEGIN line (regex, not plain prefix), so a bare
-        // mid-line mention of `<!-- BEGIN CALYX IPC` in user prose cannot
-        // anchor a false-positive managed-block span.
-        while let beginRange = result.range(
-            of: Self.beginLinePattern,
-            options: .regularExpression
-        ) {
-            // Find end delimiter AFTER the BEGIN marker.
-            guard let endRange = result.range(of: endAnchor, range: beginRange.upperBound..<result.endIndex) else {
-                // Unterminated managed block — bail out to avoid removing user content.
-                break
-            }
-
-            // Extend removal forward past a trailing newline (if any) so we don't
-            // leave an orphan blank line where the block used to be.
-            var removeUpperBound = endRange.upperBound
-            if removeUpperBound < result.endIndex,
-               result[removeUpperBound] == "\n" {
-                removeUpperBound = result.index(after: removeUpperBound)
-            }
-
-            // Extend removal backward over a leading blank-line separator if one
-            // exists immediately before the BEGIN marker — keeps removal symmetric
-            // with the insertion (which adds a blank line before the block).
-            var removeLowerBound = beginRange.lowerBound
-            if removeLowerBound > result.startIndex {
-                let prevIndex = result.index(before: removeLowerBound)
-                if result[prevIndex] == "\n" {
-                    // Only eat ONE newline so user content separators stay intact.
-                    removeLowerBound = prevIndex
-                }
-            }
-
-            result.removeSubrange(removeLowerBound..<removeUpperBound)
-        }
-
-        return result
     }
 
     // MARK: - Private: Defaults

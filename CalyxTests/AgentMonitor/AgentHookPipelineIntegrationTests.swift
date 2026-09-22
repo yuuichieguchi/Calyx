@@ -74,7 +74,7 @@ final class AgentHookPipelineIntegrationTests: XCTestCase {
         // own canonical-scan-then-kernel-assigned-fallback still applies
         // on top of this if the randomly chosen port also happens to be
         // taken.
-        try server.start(token: testToken, preferredPort: Int.random(in: 49_152...65_000))
+        try await server.start(token: testToken, preferredPort: Int.random(in: 49_152...65_000))
 
         scriptPath = try AgentHookScript.install(toDirectory: appSupportDir + "/bin")
     }

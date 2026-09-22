@@ -15,6 +15,13 @@ class SettingsWindowController: NSWindowController {
     private let presetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let colorWell = NSColorWell()
     private let hexField = NSTextField()
+    /// The AI Agent IPC row's three controls -- stored so
+    /// updateAgentIPCRow() can update them after construction. This pane
+    /// is built once in init(), so a control not held here could never be
+    /// updated again afterward.
+    private let agentIPCSwitch = NSSwitch()
+    private let agentIPCRefreshButton = NSButton(title: "Refresh", target: nil, action: nil)
+    private let agentIPCStatusLabel = NSTextField(wrappingLabelWithString: "")
 
     private let tabViewController = SettingsTabViewController()
 
@@ -45,6 +52,20 @@ class SettingsWindowController: NSWindowController {
         super.init(window: window)
 
         setupContent()
+
+        // Settings is AppKit, so @Observable does not drive it. Chain
+        // in-flight transitions (including the launch-time auto-enable,
+        // which can run before this window has ever been shown) post
+        // this so an already-open (or later-opened) Settings window's
+        // row always reflects the live state.
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(agentIPCStateDidChange),
+            name: .calyxIPCStateDidChange, object: nil
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
     }
 
     @available(*, unavailable)
@@ -127,7 +148,7 @@ class SettingsWindowController: NSWindowController {
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .glassOpacityCells, .themeColorWell, .themeColorHex, .lspRequireConfirmation,
-             .historyPersistence, .agentResumeAutoExecute,
+             .historyPersistence, .agentResumeAutoExecute, .agentIPC,
              .openSessionBrowserButton:
             return nil
         }
@@ -180,6 +201,8 @@ class SettingsWindowController: NSWindowController {
             return persistentSessionsRow()
         case .historyPersistence:
             return historyPersistenceRow()
+        case .agentIPC:
+            return agentIPCRow()
         case .agentResume:
             return agentResumeRow()
         case .agentResumeAutoExecute:
@@ -281,14 +304,17 @@ class SettingsWindowController: NSWindowController {
     /// from this function's original scope, it now covers toggle rows
     /// across multiple panes, each backed by its own store: SessionSettings
     /// for the session rows, CockpitSettings for cockpitAutoApprove and
-    /// agentHookApproval, CommandTrackingSettings for commandTracking, and
-    /// UserDefaults.standard directly for glassOpacityCells (it has no
-    /// dedicated settings type). Extracted as its own function (rather than
+    /// agentHookApproval, CommandTrackingSettings for commandTracking,
+    /// and UserDefaults.standard directly for
+    /// glassOpacityCells (it has no dedicated settings type). Extracted as its own function (rather than
     /// reading each backing store directly inline in each row builder)
     /// because SettingsWindowController.shared's one-shot, process-lifetime
     /// construction makes the seeding behavior unobservable through the
     /// real singleton in a test -- this has none of that lifetime, so a
     /// test can set the backing store directly and call it standalone.
+    /// `.agentIPC` is deliberately absent (falls through to `default`):
+    /// `updateAgentIPCRow()` is that row's only initialization path, via
+    /// `AgentIPCRowResolver`, not this function.
     static func sessionToggleInitialState(for row: SettingsRow) -> Bool {
         switch row {
         case .persistentSessions: return SessionSettings.persistentSessionsEnabled
@@ -319,6 +345,50 @@ class SettingsWindowController: NSWindowController {
         toggleSwitch.target = self
         toggleSwitch.action = #selector(historyPersistenceDidChange(_:))
         return controlRow(label: "Persist session history to disk", control: toggleSwitch)
+    }
+
+    /// Hand-built (not `controlRow`, which takes exactly one control):
+    /// label + switch + Refresh button on one line, status text on the
+    /// next. The switch mirrors `IPCSettings.enabled` (the setting, never
+    /// the live server); flipping it and pressing Refresh both run
+    /// through `IPCActivationChain.shared` so a rapid pair of toggles
+    /// lands in order. All visible state comes from
+    /// `AgentIPCRowResolver.resolve`, re-applied by `updateAgentIPCRow()`
+    /// on every `.calyxIPCStateDidChange` notification.
+    private func agentIPCRow() -> NSView {
+        agentIPCSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.agentIPCSwitch)
+        agentIPCSwitch.target = self
+        agentIPCSwitch.action = #selector(agentIPCSwitchDidChange(_:))
+
+        agentIPCRefreshButton.bezelStyle = .rounded
+        agentIPCRefreshButton.setAccessibilityIdentifier(AccessibilityID.Settings.agentIPCRefreshButton)
+        agentIPCRefreshButton.target = self
+        agentIPCRefreshButton.action = #selector(agentIPCRefreshButtonPressed(_:))
+
+        agentIPCStatusLabel.setAccessibilityIdentifier(AccessibilityID.Settings.agentIPCStatusLabel)
+        agentIPCStatusLabel.textColor = .secondaryLabelColor
+        agentIPCStatusLabel.font = .systemFont(ofSize: 11)
+        agentIPCStatusLabel.preferredMaxLayoutWidth = Self.paneWidth - 2 * Self.paneContentInset
+
+        let controlsRow = NSStackView()
+        controlsRow.orientation = .horizontal
+        controlsRow.spacing = 12
+        controlsRow.alignment = .centerY
+        let text = NSTextField(labelWithString: "AI Agent IPC")
+        text.setContentHuggingPriority(.required, for: .horizontal)
+        controlsRow.addArrangedSubview(text)
+        controlsRow.addArrangedSubview(agentIPCSwitch)
+        controlsRow.addArrangedSubview(agentIPCRefreshButton)
+
+        let column = NSStackView()
+        column.orientation = .vertical
+        column.alignment = .leading
+        column.spacing = 4
+        column.addArrangedSubview(controlsRow)
+        column.addArrangedSubview(agentIPCStatusLabel)
+
+        updateAgentIPCRow()
+        return column
     }
 
     private func agentResumeRow() -> NSView {
@@ -547,6 +617,84 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentHookApprovalDidChange(_ sender: NSSwitch) {
         CockpitSettings.agentHookApprovalEnabled = (sender.state == .on)
+    }
+
+    /// Writes the setting and refreshes the row unconditionally -- the
+    /// setting itself always reflects what the user asked for, even when
+    /// the activation below is skipped -- then runs enable/disable
+    /// through the shared chain so a rapid pair of toggles still lands
+    /// in order. `IPCActivationCoordinator.enable()`/`disable()` already
+    /// serialize themselves through `IPCActivationChain.shared`, which
+    /// also records the outcome and posts `.calyxIPCStateDidChange`
+    /// itself before its in-flight flag drops -- wrapping this call in a
+    /// second `chain.run()` would deadlock (the inner `run()` would
+    /// await the very outer `Task` it is nested inside), and
+    /// re-recording or re-posting here would be redundant with what the
+    /// chain already does.
+    ///
+    /// Guarded by `LaunchEnvironmentPolicy.mayPerformAgentIPCActivation()`:
+    /// without it, a `--uitesting` launch that forgot
+    /// `--calyx-path-root=` would activate against the developer's real
+    /// `~/.claude.json` / `~/.codex/config.toml` / `~/.grok/config.toml`
+    /// / OpenCode config the moment an E2E test flips this switch. See
+    /// that predicate's own doc comment.
+    @objc private func agentIPCSwitchDidChange(_ sender: NSSwitch) {
+        let enabled = sender.state == .on
+        IPCSettings.enabled = enabled
+        updateAgentIPCRow()
+        guard LaunchEnvironmentPolicy.mayPerformAgentIPCActivation() else { return }
+        Task {
+            if enabled {
+                _ = await IPCActivationCoordinator().enable()
+            } else {
+                _ = await IPCActivationCoordinator().disable()
+            }
+        }
+    }
+
+    /// Re-runs enable() through the shared chain -- never disable(), even
+    /// though the setting could in principle be off: `agentIPCRow()`
+    /// disables this button whenever `AgentIPCRowResolver` reports the
+    /// setting off (`refreshEnabled` requires `settingEnabled`), so this
+    /// only ever fires while the setting is already on. See
+    /// `agentIPCSwitchDidChange` above for why no extra recording or
+    /// posting happens here, and for why this is guarded the same way.
+    @objc private func agentIPCRefreshButtonPressed(_ sender: NSButton) {
+        guard LaunchEnvironmentPolicy.mayPerformAgentIPCActivation() else { return }
+        Task {
+            _ = await IPCActivationCoordinator().enable()
+        }
+    }
+
+    /// Re-applies `AgentIPCRowResolver.resolve` to the row's three
+    /// stored controls. Called after construction and on every
+    /// `.calyxIPCStateDidChange` notification -- including one posted
+    /// while the launch-time auto-activation is still running, before
+    /// this window has ever been shown, so opening Settings mid-launch
+    /// still shows the correct in-flight state.
+    private func updateAgentIPCRow() {
+        let inFlight: AgentIPCRowResolver.InFlight
+        switch IPCActivationChain.shared.runningOperation {
+        case .enabling:
+            inFlight = .enabling
+        case .disabling:
+            inFlight = .disabling
+        case nil:
+            inFlight = .none
+        }
+        let state = AgentIPCRowResolver.resolve(
+            settingEnabled: IPCSettings.enabled,
+            inFlight: inFlight,
+            lastReport: IPCActivationChain.shared.lastReport
+        )
+        agentIPCSwitch.state = state.switchOn ? .on : .off
+        agentIPCSwitch.isEnabled = state.switchEnabled
+        agentIPCRefreshButton.isEnabled = state.refreshEnabled
+        agentIPCStatusLabel.stringValue = state.statusText
+    }
+
+    @objc private func agentIPCStateDidChange(_ notification: Notification) {
+        updateAgentIPCRow()
     }
 
     @objc private func openSessionBrowser(_ sender: Any?) {

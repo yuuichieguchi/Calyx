@@ -59,7 +59,7 @@ final class IPCActivationPresenterTests: XCTestCase {
 
         let alert = IPCActivationPresenter.enableAlert(for: outcome)
 
-        XCTAssertTrue(alert.message.contains("Install a supported agent and run Reconfigure AI Agent IPC."),
+        XCTAssertTrue(alert.message.contains("Install a supported agent and click Refresh in Settings > Agents."),
                       "The fix for zero wired agents is installing one and re-running, not manual client configuration")
         XCTAssertTrue(
             alert.message.contains(
@@ -93,7 +93,7 @@ final class IPCActivationPresenterTests: XCTestCase {
                       "The failing axis must still be named, since fixing the error requires knowing which axis broke")
         XCTAssertFalse(alert.message.contains("No supported agent CLI was found to configure."),
                        "The not-installed lead line must never appear alongside a real per-axis error")
-        XCTAssertTrue(alert.message.contains("Fix the errors above and run Reconfigure AI Agent IPC."),
+        XCTAssertTrue(alert.message.contains("Fix the errors above and click Refresh in Settings > Agents."),
                       "The fix for a failed write is fixing the error, not installing an agent")
     }
 
@@ -198,7 +198,7 @@ final class IPCActivationPresenterTests: XCTestCase {
                        "in the title, not just report a clean refresh")
         XCTAssertTrue(alert.message.contains("Restart agent instances to connect."),
                       "The wired agent still needs a restart to pick up the config")
-        XCTAssertTrue(alert.message.contains("Fix the errors above and run Reconfigure AI Agent IPC."),
+        XCTAssertTrue(alert.message.contains("Fix the errors above and click Refresh in Settings > Agents."),
                       "The failed axis still needs its own fix-and-rerun instruction alongside the restart instruction")
     }
 

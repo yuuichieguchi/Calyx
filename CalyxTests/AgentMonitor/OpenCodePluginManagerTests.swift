@@ -48,6 +48,7 @@ final class OpenCodePluginManagerTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString).path
         try! FileManager.default.createDirectory(atPath: tempDir, withIntermediateDirectories: true)
         configRoot = tempDir + "/opencode"
+        try! FileManager.default.createDirectory(atPath: configRoot, withIntermediateDirectories: true)
     }
 
     override func tearDown() {
@@ -127,6 +128,17 @@ final class OpenCodePluginManagerTests: XCTestCase {
     func test_scriptBody_referencesAgentEndpointFile() {
         XCTAssertTrue(OpenCodePluginManager.scriptBody.contains("agent-endpoint.json"),
                      "Plugin must re-read agent-endpoint.json on every event")
+    }
+
+    func test_scriptBody_readsEndpointPathFromCalyxEndpointFileWithLiteralFallback() {
+        XCTAssertTrue(
+            OpenCodePluginManager.scriptBody.contains(
+                "process.env.CALYX_ENDPOINT_FILE ?? \(AgentEndpointFile.javascriptFallbackPathExpression)"
+            ),
+            "Plugin must read CALYX_ENDPOINT_FILE (injected by GhosttySurfaceController, scoped to " +
+            "wherever Calyx actually wrote agent-endpoint.json), falling back to the literal " +
+            "process.env.HOME-relative path for a pane launched before that injection existed"
+        )
     }
 
     func test_scriptBody_sendsAgentKindHeaderAsOpenCode() {

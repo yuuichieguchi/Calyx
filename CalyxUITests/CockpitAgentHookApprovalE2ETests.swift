@@ -29,14 +29,65 @@
 // linkage) -- is required for `routeApprovalRequest`'s own
 // `CockpitSettings.agentHookApprovalEnabled` guard to let ANY of these
 // requests reach the inbox at all.
+//
+// ISOLATION: `additionalLaunchArguments` also carries
+// `--calyx-path-root=<scoped temp dir>` plus `-calyx.ipc.enabled YES` --
+// identical mechanism to CommandLogE2ETests.swift's own header.
+// `CalyxPathRoot.testRoot` scopes every Calyx-owned and agent-owned
+// config path beneath the temp dir, and
+// `AppDelegate.resyncAgentHooksIfInstalled` runs real launch-time
+// activation against it. This suite's own embedded Python scripts read
+// `CALYX_ENDPOINT_FILE` (injected by `GhosttySurfaceController` into
+// every pane's own environment, scoped to wherever this launch actually
+// wrote `agent-endpoint.json`) ahead of the literal, unscoped
+// `~/Library/Application Support/Calyx/agent-endpoint.json` fallback --
+// see `AgentEndpointFile.swift`/`GhosttySurface.swift`'s own doc
+// comments for why a pane's shell (started via `login -flp
+// <system-username> ...`, which resets `$HOME` to the real system user
+// regardless of `CalyxPathRoot.testRoot`) could not otherwise resolve
+// the scoped path at all. `setUp()`'s own `scopedPathRoot` also
+// pre-creates `<scopedPathRoot>/.claude`, satisfying
+// `IPCConfigManager.enableIPC`'s `anySucceeded` gate.
 
 import XCTest
 import AppKit
 
 final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
 
+    /// `--calyx-path-root=<this>` (see this file's header): a fresh
+    /// per-test temp directory, created lazily on first access so it
+    /// exists before `additionalLaunchArguments` is read by
+    /// `CalyxUITestCase.setUp()`, ahead of `app.launch()`.
+    private lazy var scopedPathRoot: String = {
+        let root = NSTemporaryDirectory() + "CalyxUITests-pathroot-\(UUID().uuidString)"
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        // Satisfies IPCConfigManager.enableIPC's anySucceeded gate (see
+        // this file's header) without depending on what CLIs happen to
+        // be installed on the machine running this suite.
+        try? FileManager.default.createDirectory(atPath: root + "/.claude", withIntermediateDirectories: true)
+        return root
+    }()
+
     override var additionalLaunchArguments: [String] {
-        ["-calyx.cockpit.agentHookApprovalEnabled", "YES"]
+        ["-calyx.cockpit.agentHookApprovalEnabled", "YES", "--calyx-path-root=\(scopedPathRoot)", "-calyx.ipc.enabled", "YES"]
+    }
+
+    override func tearDown() {
+        super.tearDown()
+        try? FileManager.default.removeItem(atPath: scopedPathRoot)
+    }
+
+    /// Polls for the scoped `agent-endpoint.json`, mirroring
+    /// `CommandLogE2ETests.waitForIPCActivation` exactly (kept as a
+    /// near-duplicate -- see this file's header).
+    private func waitForIPCActivation(timeout: TimeInterval = 20) {
+        let endpointPath = scopedPathRoot + "/Calyx/agent-endpoint.json"
+        let deadline = Date().addingTimeInterval(timeout)
+        while !FileManager.default.fileExists(atPath: endpointPath), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: endpointPath),
+                     "launch-time AI Agent IPC activation never wrote agent-endpoint.json under the scoped root")
     }
 
     // MARK: - Accessibility identifiers (literal mirrors, see this file's own header)
@@ -62,7 +113,7 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
     /// response.
     func test_agentHookWithSuggestions_optionsMenuListsOfferAndNo_denyProducesDenyBehavior() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = try resolveFocusedSurfaceID(counter: &counter)
 
@@ -109,7 +160,7 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
     /// "Yes" button must produce a `behavior: "allow"` response.
     func test_agentHookWithoutSuggestions_optionsMenuListsAlwaysAllow_yesProducesAllowBehavior() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = try resolveFocusedSurfaceID(counter: &counter)
 
@@ -153,7 +204,7 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
     /// must echo `answers["Pick a color"] == "Blue"` into the response.
     func test_agentQuestion_chooseListedOption_answersEchoesChosenLabel() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = try resolveFocusedSurfaceID(counter: &counter)
 
@@ -203,7 +254,7 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
     /// must echo that exact text into `answers["Pick a color"]`.
     func test_agentQuestion_chooseOther_freeTextEchoesIntoAnswers() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = try resolveFocusedSurfaceID(counter: &counter)
 
@@ -262,7 +313,7 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
     /// yet.
     func test_agentHook_dismiss_producesEmptyResponseBody_removesBanner() throws {
         var counter = 0
-        enableAIAgentIPCViaCommandPalette()
+        waitForIPCActivation()
 
         let surfaceID = try resolveFocusedSurfaceID(counter: &counter)
 
@@ -299,25 +350,6 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
     }
 
     // MARK: - Helpers (file-private near-duplicates -- see this file's own header)
-
-    /// Opens the Command Palette, executes "Enable AI Agent IPC", and
-    /// dismisses the resulting `NSAlert.runModal()` confirmation.
-    private func enableAIAgentIPCViaCommandPalette() {
-        openCommandPaletteViaMenu()
-
-        let searchField = app.descendants(matching: .any)
-            .matching(identifier: "calyx.commandPalette.searchField")
-            .firstMatch
-        XCTAssertTrue(waitFor(searchField), "Command palette did not appear")
-
-        searchField.typeText("Enable AI Agent IPC")
-        searchField.typeKey(.enter, modifierFlags: [])
-
-        let alert = app.dialogs.firstMatch
-        XCTAssertTrue(alert.waitForExistence(timeout: 10),
-                     "the IPC enable/error alert (CalyxWindowController.showIPCAlert) did not appear")
-        alert.buttons["OK"].click()
-    }
 
     /// Same joined `.label`/`.value` reading `CockpitApprovalE2ETests.
     /// elementText`'s own doc comment establishes (field-verified: a
@@ -381,7 +413,7 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
         import subprocess
 
         def main():
-            endpoint_path = os.path.expanduser(
+            endpoint_path = os.environ.get("CALYX_ENDPOINT_FILE") or os.path.expanduser(
                 "~/Library/Application Support/Calyx/agent-endpoint.json"
             )
             with open(endpoint_path) as f:
@@ -450,7 +482,7 @@ final class CockpitAgentHookApprovalE2ETests: CalyxUITestCase {
         import subprocess
 
         def main():
-            endpoint_path = os.path.expanduser(
+            endpoint_path = os.environ.get("CALYX_ENDPOINT_FILE") or os.path.expanduser(
                 "~/Library/Application Support/Calyx/agent-endpoint.json"
             )
             with open(endpoint_path) as f:

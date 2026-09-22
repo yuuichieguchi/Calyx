@@ -179,8 +179,7 @@ struct IPCConfigManager: Sendable {
     // MARK: - Private: Hermes
 
     private static func enableHermes(port: Int, token: String) -> ConfigStatus {
-        let hermesDir = NSHomeDirectory() + "/.hermes/"
-        guard ConfigFileUtils.directoryExists(at: hermesDir) else {
+        guard ConfigFileUtils.directoryExists(at: AgentToolPaths.hermesConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         do {

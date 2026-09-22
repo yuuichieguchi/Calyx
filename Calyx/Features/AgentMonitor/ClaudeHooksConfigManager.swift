@@ -3,12 +3,10 @@
 //
 // Manages the "hooks" section of ~/.claude/settings.json for the
 // calyx-agent-hook lifecycle hook. Mirrors ClaudeConfigManager's API shape
-// and file-safety guarantees (symlink rejection, .bak backup, atomic
-// write): `removeHooks` gets them from the same shared
-// `ConfigFileUtils.readConfigWithBackup` as `ClaudeConfigManager`;
-// `installHooks` reads and backs up on its own instead, so a no-op
-// resync (content already matches) can return before either happens --
-// see that method's own no-op guard for why.
+// and file-safety guarantees (symlink rejection, atomic write): both
+// entry points go through `ConfigFileUtils.withExclusiveConfig` and edit
+// only Calyx's own array elements via `JSONConfigDocumentEditor`, leaving
+// co-located user hooks and unrelated top-level keys byte-identical.
 
 import Foundation
 
@@ -63,77 +61,39 @@ struct ClaudeHooksConfigManager: Sendable {
     /// than `PermissionRequest` gets exactly one entry.
     static func installHooks(scriptPath: String, approvalScriptPath: String, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
-        let resolvedPath = try ConfigFileUtils.resolveConfigPath(path)
 
-        // Read directly, rather than through ConfigFileUtils.readConfigWithBackup,
-        // so the no-op guard below (built from `originalData`) can run
-        // BEFORE any backup is written -- see that guard's own comment.
-        let originalData: Data?
-        var config: [String: Any]
-        if FileManager.default.fileExists(atPath: resolvedPath) {
-            let data = try Data(contentsOf: URL(fileURLWithPath: resolvedPath))
-            guard let parsed = try? JSONSerialization.jsonObject(with: data),
-                  let dict = parsed as? [String: Any] else {
-                throw ConfigFileError.invalidJSON
+        // mode: nil (leave the mode as-is): ~/.claude/settings.json is a
+        // user-owned file and this write carries no secret.
+        try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+            var bytes = current
+            for target in targetEvents {
+                guard eventShapeIsRecognized(target.name, in: bytes) else { continue }
+
+                let entries = commandEntries(
+                    scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, eventName: target.name
+                )
+                let newGroup = commandGroup(entries: entries, matcher: target.matcher)
+
+                // Already installed, unchanged: skip the remove+append
+                // round trip entirely, so a no-op reinstall leaves this
+                // event's position in "hooks" (and every byte of the
+                // file) untouched, matching every other unchanged event
+                // -- `withExclusiveConfig` only skips the write when the
+                // WHOLE document comes back byte-identical.
+                guard !ownGroupAlreadyInstalled(newGroup, eventName: target.name, in: bytes) else { continue }
+
+                bytes = try removingOwnEntriesFromEventGroups(target.name, in: bytes)
+                // .sortedKeys: see ClaudeConfigManager.enableIPC's identical
+                // comment -- without it this group's bytes are not stable
+                // across process launches, defeating withExclusiveConfig's
+                // no-write check.
+                let groupData = try JSONSerialization.data(withJSONObject: newGroup, options: [.sortedKeys])
+                bytes = try JSONConfigDocumentEditor.appendArrayElement(
+                    groupData, at: ["hooks", target.name], in: bytes
+                )
             }
-            originalData = data
-            config = dict
-        } else {
-            originalData = nil
-            config = [:]
+            return bytes
         }
-
-        var hooks = config["hooks"] as? [String: Any] ?? [:]
-
-        for target in targetEvents {
-            let entries = commandEntries(
-                scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, eventName: target.name
-            )
-            let newGroup = commandGroup(entries: entries, matcher: target.matcher)
-
-            guard let existingValue = hooks[target.name] else {
-                hooks[target.name] = [newGroup]
-                continue
-            }
-            guard let groups = existingValue as? [[String: Any]] else {
-                // The existing value for this event has a shape Calyx
-                // doesn't recognize (hand-edited, or a future hooks
-                // format) — skip installing Calyx's own entry for this
-                // event rather than silently discarding whatever the
-                // user has there. `hooks[target.name]` is left as-is.
-                continue
-            }
-
-            let deduped = removingOwnCommandEntries(from: groups)
-            hooks[target.name] = deduped + [newGroup]
-        }
-
-        config["hooks"] = hooks
-
-        let outputData = try JSONSerialization.data(
-            withJSONObject: config,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-
-        // This config is shared with the claude CLI, which writes its own
-        // permission grants into the same file. Skip the write -- and the
-        // .bak snapshot that would otherwise precede it -- when the
-        // generated bytes already match what's on disk: besides needless
-        // file churn, rewriting an externally-owned config on every
-        // launch-time resync widens the race window against the CLI's
-        // own writes, and re-snapshotting .bak on a no-op run would
-        // overwrite the user's original pre-Calyx backup with a
-        // Calyx-written one the moment nothing had actually changed.
-        if let originalData, originalData == outputData {
-            return
-        }
-
-        if let originalData {
-            let bakPath = resolvedPath + ".bak"
-            try originalData.write(to: URL(fileURLWithPath: bakPath))
-            chmod(bakPath, 0o600)
-        }
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     /// Removes only Calyx's own command entries (identified by the
@@ -147,31 +107,31 @@ struct ClaudeHooksConfigManager: Sendable {
     static func removeHooks(configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
 
-        var config = try ConfigFileUtils.readConfigWithBackup(path: path)
-
-        guard var hooks = config["hooks"] as? [String: Any] else { return }
-
-        for eventName in hooks.keys {
-            guard let groups = hooks[eventName] as? [[String: Any]] else { continue }
-            let filtered = removingOwnCommandEntries(from: groups)
-            if filtered.isEmpty {
-                hooks.removeValue(forKey: eventName)
-            } else {
-                hooks[eventName] = filtered
+        try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+            guard let current, !current.isEmpty else { return current }
+            // An actual JSON parse failure (corrupt file) throws, matching
+            // installHooks -- both entry points against the same corrupt
+            // file must agree, and a config the user can't get any signal
+            // about being unreadable is a config they can never fix. A
+            // well-formed document that merely lacks a "hooks" object (or
+            // has no dict root) is the ordinary "nothing installed here"
+            // case, not a parse failure, so it falls through to the no-op
+            // return below instead. `decodedValue` throws
+            // `ConfigFileError.invalidJSON` for the former case and
+            // returns `nil` for an absent "hooks" key, both handled here
+            // exactly as the prior whole-document `JSONSerialization`
+            // parse did.
+            guard let hooks = try JSONConfigDocumentEditor.decodedValue(at: [.key("hooks")], in: current) as? [String: Any] else {
+                return current
             }
-        }
 
-        if hooks.isEmpty {
-            config.removeValue(forKey: "hooks")
-        } else {
-            config["hooks"] = hooks
+            var bytes: Data? = current
+            for eventName in hooks.keys {
+                guard hooks[eventName] is [[String: Any]] else { continue }
+                bytes = try removingOwnEntriesFromEventGroups(eventName, in: bytes)
+            }
+            return bytes
         }
-
-        let outputData = try JSONSerialization.data(
-            withJSONObject: config,
-            options: [.prettyPrinted, .sortedKeys]
-        )
-        try ConfigFileUtils.atomicWrite(data: outputData, to: path)
     }
 
     /// Whether Calyx's own command entry is present for at least one of the
@@ -183,22 +143,12 @@ struct ClaudeHooksConfigManager: Sendable {
         guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
             return false
         }
-        let fm = FileManager.default
-
-        guard fm.fileExists(atPath: path) else { return false }
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let parsed = try? JSONSerialization.jsonObject(with: data),
-              let config = parsed as? [String: Any],
-              let hooks = config["hooks"] as? [String: Any] else {
-            return false
-        }
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else { return false }
 
         return targetEvents.contains { target in
-            let groups = (hooks[target.name] as? [[String: Any]]) ?? []
-            return groups.contains { group in
-                let entries = (group["hooks"] as? [[String: Any]]) ?? []
-                return entries.contains { isOwnCommandEntry($0) }
-            }
+            JSONConfigDocumentEditor.containsArrayElement(
+                at: [.key("hooks"), .key(target.name)], in: data, where: isOwnGroup
+            )
         }
     }
 
@@ -250,20 +200,89 @@ struct ClaudeHooksConfigManager: Sendable {
         return group
     }
 
-    /// Removes Calyx's own command entries from every group in `groups`,
-    /// dropping any group that becomes empty as a result (so reinstalling
-    /// or disabling doesn't leave empty `{"hooks": []}` groups behind).
-    /// Groups containing surviving (user-owned) entries are kept as-is.
-    private static func removingOwnCommandEntries(from groups: [[String: Any]]) -> [[String: Any]] {
-        groups.compactMap { group -> [String: Any]? in
-            guard let innerHooks = group["hooks"] as? [[String: Any]] else { return group }
-            let filtered = innerHooks.filter { !isOwnCommandEntry($0) }
-            guard filtered.count != innerHooks.count else { return group }
-            guard !filtered.isEmpty else { return nil }
-            var updated = group
-            updated["hooks"] = filtered
-            return updated
+    /// A matcher-group touches Calyx's own region when its nested
+    /// `"hooks"` array contains at least one of Calyx's own command
+    /// entries. Every group `commandGroup` builds is entirely its own,
+    /// but a hand-edited or pre-L1 config can also hold a group where a
+    /// Calyx entry sits alongside a user's own -- `removingOwnEntries
+    /// FromEventGroups` handles that mixed case by rebuilding the group
+    /// with only the survivors.
+    private static func isOwnGroup(_ value: Any) -> Bool {
+        guard let group = value as? [String: Any],
+              let entries = group["hooks"] as? [[String: Any]] else {
+            return false
         }
+        return entries.contains { isOwnCommandEntry($0) }
+    }
+
+    /// Removes Calyx's own command entries from every group of
+    /// `eventName`'s array in `bytes`, in place. Each group touching
+    /// Calyx's region is addressed all the way down to its own nested
+    /// `"hooks"` array (`.element(where: isOwnGroup)` locates the group,
+    /// `.key("hooks")` its nested entries), so a group that also holds a
+    /// user's own (foreign) entry keeps that entry with its original key
+    /// order and array position -- nothing is removed and re-appended. A
+    /// group whose nested `"hooks"` array becomes empty (nothing but
+    /// Calyx's own entries) is removed from `eventName`'s array as a
+    /// whole, cascading upward through the event key and the `"hooks"`
+    /// key exactly as `removeValue` does for a plain JSON key path.
+    private static func removingOwnEntriesFromEventGroups(_ eventName: String, in bytes: Data?) throws -> Data? {
+        try JSONConfigDocumentEditor.removeArrayElements(
+            at: [.key("hooks"), .key(eventName), .element(where: isOwnGroup), .key("hooks")],
+            in: bytes,
+            where: { ($0 as? [String: Any]).map(isOwnCommandEntry) ?? false }
+        )
+    }
+
+    /// Whether `eventName`'s array in `bytes` already contains exactly
+    /// `newGroup` as its sole Calyx-owned group -- the common no-op
+    /// resync case, where nothing needs to change for this event at all.
+    /// Anything else (no own group yet, more than one, an own group
+    /// mixed with a foreign one, or different content) answers `false`
+    /// and falls through to the ordinary remove-then-append path.
+    private static func ownGroupAlreadyInstalled(_ newGroup: [String: Any], eventName: String, in bytes: Data?) -> Bool {
+        guard let groups = (try? JSONConfigDocumentEditor.decodedValue(at: [.key("hooks"), .key(eventName)], in: bytes)) as? [[String: Any]],
+              groups.count == 1,
+              isOwnGroup(groups[0])
+        else {
+            return false
+        }
+        return jsonValuesEqual(groups[0], newGroup)
+    }
+
+    /// Structural equality over decoded JSON values (`[String: Any]`,
+    /// `[Any]`, and JSON scalars), used instead of comparing
+    /// `JSONSerialization`-encoded bytes: those bytes are not guaranteed
+    /// to come out in the same key order across two independent encoding
+    /// calls, but the *values* they'd encode are exactly what needs
+    /// comparing here.
+    private static func jsonValuesEqual(_ lhs: Any, _ rhs: Any) -> Bool {
+        switch (lhs, rhs) {
+        case let (l as [String: Any], r as [String: Any]):
+            guard l.count == r.count else { return false }
+            return l.allSatisfy { key, value in
+                guard let other = r[key] else { return false }
+                return jsonValuesEqual(value, other)
+            }
+        case let (l as [Any], r as [Any]):
+            guard l.count == r.count else { return false }
+            return zip(l, r).allSatisfy { jsonValuesEqual($0, $1) }
+        default:
+            return (lhs as? NSObject) == (rhs as? NSObject)
+        }
+    }
+
+    /// Whether `eventName`'s existing value in `bytes`'s `"hooks"` section
+    /// is one Calyx recognizes well enough to edit: absent (nothing to
+    /// remove, safe to install into), or an array of objects. Any other
+    /// existing shape (hand-edited, or a future hooks format) is left
+    /// completely alone -- read-only, since this only inspects `bytes`
+    /// to decide whether to call the editor at all.
+    private static func eventShapeIsRecognized(_ eventName: String, in bytes: Data?) -> Bool {
+        guard let bytes, !bytes.isEmpty else { return true }
+        guard JSONConfigDocumentEditor.containsValue(at: ["hooks", eventName], in: bytes) else { return true }
+        let existing = try? JSONConfigDocumentEditor.decodedValue(at: [.key("hooks"), .key(eventName)], in: bytes)
+        return existing is [[String: Any]]
     }
 
     /// A command entry is Calyx's own when its `command` path's last
@@ -287,6 +306,6 @@ struct ClaudeHooksConfigManager: Sendable {
     // MARK: - Private: Config Path
 
     private static var defaultConfigPath: String {
-        NSHomeDirectory() + "/.claude/settings.json"
+        AgentToolPaths.claudeSettingsPath
     }
 }

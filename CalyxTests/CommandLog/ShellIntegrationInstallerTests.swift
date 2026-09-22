@@ -83,6 +83,33 @@ final class ShellIntegrationInstallerTests: XCTestCase {
                        "reinstalling must overwrite with the same fixed body, not append or duplicate")
     }
 
+    /// Calyx owns these three files outright (they are never partially
+    /// user-authored, unlike a dotfile Calyx only injects an entry into),
+    /// so `ConfigFileUtils.withExclusiveConfig` is called with
+    /// `restoreModeOnNoWrite: true` -- a reinstall whose bytes end up
+    /// identical to what's already on disk must still repair a mode that
+    /// drifted behind Calyx's back (a plain `chmod`, or a backup/restore
+    /// tool that recreated the file), since a reinstall is the only
+    /// repair path available to the user for a drifted mode on a
+    /// Calyx-owned file.
+    func test_install_reinstallWithIdenticalContent_restoresDriftedMode() throws {
+        _ = try ShellIntegrationInstaller.install(toDirectory: installRoot)
+
+        let zshenvPath = ShellIntegrationInstaller.zshenvPath(in: installRoot)
+        XCTAssertEqual(chmod(zshenvPath.path, 0o600), 0, "precondition: simulate mode drift outside install()")
+
+        var statBefore = stat()
+        XCTAssertEqual(stat(zshenvPath.path, &statBefore), 0)
+        XCTAssertEqual(statBefore.st_mode & ~S_IFMT, 0o600, "precondition: mode must actually be drifted")
+
+        _ = try ShellIntegrationInstaller.install(toDirectory: installRoot)
+
+        var statAfter = stat()
+        XCTAssertEqual(stat(zshenvPath.path, &statAfter), 0)
+        XCTAssertEqual(statAfter.st_mode & ~S_IFMT, 0o644,
+                       "a reinstall with byte-identical content must still restore the drifted mode to 0644")
+    }
+
     func test_install_returnsTheRootDirectory() throws {
         let returned = try ShellIntegrationInstaller.install(toDirectory: installRoot)
         // Compares `.path` rather than the `URL` values directly:
@@ -236,6 +263,32 @@ final class ShellIntegrationInstallerTests: XCTestCase {
 
         let exitCode = try syntaxCheckExitCode(interpreter: fishPath, body: ShellIntegrationInstaller.fishIntegrationBody)
         XCTAssertEqual(exitCode, 0, "fishIntegrationBody must be syntactically valid fish (`fish -n`)")
+    }
+
+    func test_calyxZshBody_readsEndpointPathFromCalyxEndpointFileWithLiteralFallback() {
+        XCTAssertTrue(
+            ShellIntegrationInstaller.calyxZshBody.contains(
+                "local endpoint_file=\"${CALYX_ENDPOINT_FILE:-\(AgentEndpointFile.shellFallbackPath)}\""
+            ),
+            "calyxZshBody must read CALYX_ENDPOINT_FILE (injected by GhosttySurfaceController, scoped " +
+            "to wherever Calyx actually wrote agent-endpoint.json), falling back to the literal " +
+            "$HOME-relative path for a pane launched before that injection existed"
+        )
+    }
+
+    func test_fishIntegrationBody_readsEndpointPathFromCalyxEndpointFileWithLiteralFallback() {
+        let body = ShellIntegrationInstaller.fishIntegrationBody
+        XCTAssertTrue(body.contains("set -l endpoint_file \"$CALYX_ENDPOINT_FILE\""),
+                     "fishIntegrationBody must first try CALYX_ENDPOINT_FILE (injected by " +
+                     "GhosttySurfaceController); fish has no ${VAR:-default}, so it needs its own " +
+                     "explicit fallback step")
+        XCTAssertTrue(
+            body.contains(
+                "test -n \"$endpoint_file\"; or set endpoint_file \"\(AgentEndpointFile.shellFallbackPath)\""
+            ),
+            "fishIntegrationBody must fall back to the literal $HOME-relative path when " +
+            "CALYX_ENDPOINT_FILE is unset, mirroring the existing surface_id fallback shape"
+        )
     }
 
     /// `/usr/bin/which <name>`, matching SystemCommandRunner.locate's own

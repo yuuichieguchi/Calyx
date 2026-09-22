@@ -313,19 +313,23 @@ final class CalyxMCPServerLoopbackBugSpecTests: XCTestCase {
         // throws after the linear scan exhausts; post-fix it falls
         // back to a kernel-assigned port.
         let token = "fallback-test-token"
-        XCTAssertNoThrow(
-            try server.start(
+        do {
+            try await server.start(
                 token: token,
                 preferredPort: canonicalScanBase
-            ),
-            """
-            start() must fall back to a kernel-assigned ephemeral port \
-            (`NWEndpoint.Port(integerLiteral: 0)` / `.any`) when the \
-            canonical 10-port scan exhausts. Pre-fix the linear scan \
-            simply throws, hard-capping the server at 10 simultaneous \
-            instances and leaving no graceful recovery for a busy host.
-            """
-        )
+            )
+        } catch {
+            XCTFail(
+                """
+                start() must fall back to a kernel-assigned ephemeral port \
+                (`NWEndpoint.Port(integerLiteral: 0)` / `.any`) when the \
+                canonical 10-port scan exhausts. Pre-fix the linear scan \
+                simply throws, hard-capping the server at 10 simultaneous \
+                instances and leaving no graceful recovery for a busy host. \
+                Error: \(error)
+                """
+            )
+        }
 
         // Assert — after a successful start the server must report a
         // running state, a non-zero port, and that port must lie

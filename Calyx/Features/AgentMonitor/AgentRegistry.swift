@@ -52,6 +52,19 @@ final class AgentRegistry {
     /// hooks re-sync), cleared by `reset()`.
     private(set) var hooksIssues: [String] = []
 
+    /// The reason a server-start attempt failed (token generation or
+    /// `CalyxMCPServer.start` itself), the domain the sidebar's
+    /// `disabledPlaceholder` branch checks to show a failure banner
+    /// instead of the ordinary "disabled" text. Set wholesale by
+    /// `setServerIssues` (called by `IPCActivationCoordinator`).
+    /// Deliberately NOT cleared by `reset()`: `reset()` runs from
+    /// `CalyxMCPServer.stop()`, which is never called right after a
+    /// start failure, so clearing this domain there would erase the
+    /// banner while the failure it describes is still true. The only
+    /// way this domain clears is an explicit `setServerIssues([])` from
+    /// a subsequent successful `enable()` or a `disable()`.
+    private(set) var serverIssues: [String] = []
+
     /// `configIssues` and `hooksIssues` combined, config first, for the
     /// single warning banner `AgentStatusView` renders. Kept as two
     /// separate stored properties rather than one shared array so
@@ -692,6 +705,16 @@ final class AgentRegistry {
     /// `integrationIssues` is non-empty.
     func setHooksIssues(_ issues: [String]) {
         hooksIssues = issues
+    }
+
+    /// Replaces `serverIssues` wholesale. Called by
+    /// `IPCActivationCoordinator` with the same one-line reason
+    /// `IPCActivationPresenter` renders for `.tokenGenerationFailed` /
+    /// `.serverStartFailed`, or `[]` on a successful `enable()` or on
+    /// `disable()`. See `serverIssues`'s own doc comment for why
+    /// `reset()` never clears this domain.
+    func setServerIssues(_ issues: [String]) {
+        serverIssues = issues
     }
 
     // MARK: - Screen State Classification (Herdr Layer 2)

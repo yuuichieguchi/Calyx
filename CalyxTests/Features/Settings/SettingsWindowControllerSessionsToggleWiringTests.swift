@@ -213,43 +213,62 @@ final class SettingsWindowControllerSessionsToggleWiringTests: XCTestCase {
         }
     }
 
-    // The 5 switches that live on the Agents pane. commandTracking and
-    // agentHookApproval (the last 2 of the 5) are intentionally NOT
-    // included in the wiring zip below -- they're already independently
-    // covered by CommandTrackingSettingsToggleWiringTests
+    // The 6 switches that live on the Agents pane. agentIPC, commandTracking
+    // and agentHookApproval are intentionally NOT included in the wiring
+    // zip below -- they're already independently covered by
+    // test_agentIPCToggleSwitch_hasTargetAndActionWired below,
+    // CommandTrackingSettingsToggleWiringTests
     // .test_commandTrackingSwitch_existsWithTargetAndActionWired and
     // AgentHookApprovalSettingsToggleWiringTests
     // .test_agentHookApprovalSwitch_existsWithTargetAndActionWired
-    // (both identifier-based lookups, position-independent), same
+    // (all identifier-based lookups, position-independent), same
     // division of labor this file used for the Sessions pane before the
-    // split. Renamed from ...exactlyFour... (Stage E added the 5th).
-    func test_agentsToggleSwitches_exactlyFive_inRowOrder() throws {
+    // split. Renamed from ...exactlyFive... (agentIPC added a 6th).
+    func test_agentsToggleSwitches_exactlySix_inRowOrder() throws {
         let switches = collectSwitches(in: try agentsPaneView())
 
         XCTAssertEqual(
-            switches.count, 5,
-            "The Agents pane must show exactly 5 switches (agentResume/agentResumeAutoExecute/" +
+            switches.count, 6,
+            "The Agents pane must show exactly 6 switches (agentIPC/agentResume/agentResumeAutoExecute/" +
             "cockpitAutoApprove/commandTracking/agentHookApproval). Found \(switches.count)."
+        )
+    }
+
+    func test_agentIPCToggleSwitch_hasTargetAndActionWired() throws {
+        let switches = collectSwitches(in: try agentsPaneView())
+        try XCTSkipIf(switches.count != 6, "covered, and already failing, by the count pin above")
+
+        let agentIPCSwitch = switches[0]
+        XCTAssertTrue(
+            agentIPCSwitch.target === SettingsWindowController.shared,
+            "agentIPC's switch must have SettingsWindowController.shared as its .target, so toggling it " +
+            "actually invokes a handler"
+        )
+        XCTAssertEqual(
+            agentIPCSwitch.action, Selector(("agentIPCSwitchDidChange:")),
+            "agentIPC's switch .action must be #selector(agentIPCSwitchDidChange:)"
         )
     }
 
     func test_agentsToggleSwitches_haveTargetAndActionWired() throws {
         let switches = collectSwitches(in: try agentsPaneView())
-        try XCTSkipIf(switches.count != 5, "covered, and already failing, by the count pin above")
+        try XCTSkipIf(switches.count != 6, "covered, and already failing, by the count pin above")
 
         // SettingsRow's own declared order for the Agents pane, filtered
         // to the switch-backed rows (SettingsPaneTests.expectedRows pins
-        // this exact ordering). Only the first 3 are asserted here --
-        // commandTracking's and agentHookApproval's wiring are each
-        // covered by their own dedicated files instead (see comment
-        // above).
+        // this exact ordering). agentIPC (index 0) is skipped here --
+        // its own wiring is covered by
+        // test_agentIPCToggleSwitch_hasTargetAndActionWired above --
+        // and only the next 3 are asserted: commandTracking's and
+        // agentHookApproval's wiring are each covered by their own
+        // dedicated files instead (see comment above).
         let expected: [(name: String, selectorName: String)] = [
             ("agentResume", "agentResumeDidChange:"),
             ("agentResumeAutoExecute", "agentResumeAutoExecuteDidChange:"),
             ("cockpitAutoApprove", "cockpitAutoApproveDidChange:"),
         ]
 
-        for (toggleSwitch, (name, selectorName)) in zip(switches, expected) {
+        for (toggleSwitch, (name, selectorName)) in zip(switches.dropFirst(), expected) {
             XCTAssertTrue(
                 toggleSwitch.target === SettingsWindowController.shared,
                 "\(name)'s switch must have SettingsWindowController.shared as its .target, so toggling it " +

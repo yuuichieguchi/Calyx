@@ -25,15 +25,12 @@ import Foundation
 
 enum CodexHooksConfigError: Error, LocalizedError {
     case invalidScriptPath
-    case writeFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidScriptPath:
             return "The script path contains a single quote, which cannot be safely embedded " +
                 "in a TOML literal string"
-        case .writeFailed(let reason):
-            return "Failed to write Codex config file: \(reason)"
         }
     }
 }
@@ -57,6 +54,18 @@ struct CodexHooksConfigManager: Sendable {
     static let beginLine = "# BEGIN CALYX AGENT HOOKS (managed by Calyx, do not edit)"
     static let endLine = "# END CALYX AGENT HOOKS"
 
+    /// The BEGIN/END marker editor shared with every other marker-block
+    /// manager. Given `isCalyxGeneratedBlockLine` and `foreignTableBytes`,
+    /// it owns the well-formed append/replace of the freshly built managed
+    /// block, extracting any foreign TOML table found inside a removed
+    /// block's span and self-healing an orphan BEGIN entirely on its own.
+    private static let markerEditor = MarkerConfigDocumentEditor(
+        beginLine: beginLine,
+        endLine: endLine,
+        isOwnBodyLine: { doc, index in isCalyxGeneratedBlockLine(lineString(doc, index)) },
+        foreignBodyBytes: { doc, bodyLines in foreignTableBytes(in: doc, bodyLines: bodyLines) }
+    )
+
     // MARK: - Public API
 
     /// Replaces Calyx's managed block in `configPath` with a freshly built
@@ -74,40 +83,29 @@ struct CodexHooksConfigManager: Sendable {
             throw CodexHooksConfigError.invalidScriptPath
         }
 
-        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
-        let parentDir = (path as NSString).deletingLastPathComponent
+        let path = configPath ?? defaultConfigPath
+        let resolvedPath = try ConfigFileUtils.resolveConfigPath(path)
+        let parentDir = (resolvedPath as NSString).deletingLastPathComponent
 
         guard ConfigFileUtils.directoryExists(at: parentDir) else {
             throw CodexConfigError.directoryNotFound
         }
 
-        let content: String
-        if FileManager.default.fileExists(atPath: path) {
-            content = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        } else {
-            content = ""
+        let freshBody = managedBlockBody(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath)
+
+        // mode: nil (leave the mode as-is): this hooks block carries no
+        // secret. ~/.codex/config.toml is shared with CodexConfigManager's
+        // `[mcp_servers.calyx-ipc]` table, which does carry the bearer
+        // token and enforces 0600 on its own writes -- one file, two
+        // policies, deliberately: whichever manager's write actually
+        // contains the secret is the one that enforces the mode.
+        try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+            // Strips any existing managed block first (self-healing an
+            // orphan BEGIN and preserving any foreign TOML table found
+            // inside it, if present) so reinstalling never duplicates it.
+            let stripped = try markerEditor.removeBlock(in: current)
+            return try markerEditor.setBlock(body: freshBody, in: stripped)
         }
-        let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
-
-        // Strips any existing managed block first (self-healing an orphan
-        // BEGIN, if present) so reinstalling never duplicates it.
-        let (stripped, _) = removingManagedBlock(from: normalized)
-
-        let result = appendingSection(
-            managedBlock(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath),
-            to: stripped
-        )
-
-        // This config is shared with Codex itself. Avoid an atomic replace
-        // when the desired bytes are already present: besides needless file
-        // churn, rewriting an externally-owned config widens the race window
-        // with Codex persisting hook trust or a user's /hooks changes.
-        guard result != normalized else { return }
-
-        guard let data = result.data(using: .utf8) else {
-            throw CodexHooksConfigError.writeFailed("UTF-8 encoding failed")
-        }
-        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     /// Removes only Calyx's managed block from `configPath`, leaving the
@@ -115,40 +113,32 @@ struct CodexHooksConfigManager: Sendable {
     /// exists but has no managed block (including: doesn't rewrite the
     /// file in that case, so its modification time is left alone).
     /// Self-heals an orphan BEGIN marker (no matching END) rather than
-    /// throwing — see `removingManagedBlock`'s doc comment.
+    /// throwing, and preserves any foreign TOML table found inside a
+    /// removed block's span in place of it -- both entirely `markerEditor`'s
+    /// own responsibility (see its doc comments), given `isOwnBodyLine`
+    /// and `foreignBodyBytes` above.
     static func removeHooks(configPath: String? = nil) throws {
-        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
+        let path = configPath ?? defaultConfigPath
 
-        guard FileManager.default.fileExists(atPath: path) else { return }
-
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
-        let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
-
-        let (stripped, hadBlock) = removingManagedBlock(from: normalized)
-        guard hadBlock else { return }
-
-        guard let data = stripped.data(using: .utf8) else {
-            throw CodexHooksConfigError.writeFailed("UTF-8 encoding failed")
+        // mode: nil, same policy/reasoning as installHooks above: this
+        // block carries no token, so this call never touches the file's
+        // mode.
+        try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+            try markerEditor.removeBlock(in: current)
         }
-        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
-    /// Whether Calyx's managed block (its BEGIN marker) is present.
-    /// Returns `false` (rather than throwing) when `configPath`'s
-    /// symlink chain can't be resolved — this is a read-only status
-    /// check, and every other unreadable-file case here already resolves
-    /// to `false` the same way.
+    /// Whether Calyx's managed block (its BEGIN marker, well-formed or
+    /// orphan) is present. Returns `false` (rather than throwing) when
+    /// `configPath`'s symlink chain can't be resolved — this is a
+    /// read-only status check, and every other unreadable-file case here
+    /// already resolves to `false` the same way.
     static func areHooksInstalled(configPath: String? = nil) -> Bool {
-        guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
+        guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
             return false
         }
-
-        guard FileManager.default.fileExists(atPath: path),
-              let content = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return false
-        }
-        let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
-        return normalized.components(separatedBy: "\n").contains(beginLine)
+        return markerEditor.containsBlock(in: data)
     }
 
     // MARK: - Private: Managed Block Construction
@@ -188,86 +178,58 @@ struct CodexHooksConfigManager: Sendable {
         """
     }
 
-    private static func managedBlock(scriptPath: String, approvalScriptPath: String) -> String {
+    /// The managed block's body (everything between the BEGIN and END
+    /// lines, which `MarkerConfigDocumentEditor.setBlock` supplies itself).
+    private static func managedBlockBody(scriptPath: String, approvalScriptPath: String) -> String {
         let eventEntries = targetEvents.map { hookEntry(eventName: $0, scriptPath: scriptPath) }
-        return ([beginLine] + eventEntries + [approvalHookEntry(approvalScriptPath: approvalScriptPath)] + [endLine])
-            .joined(separator: "\n")
+        return (eventEntries + [approvalHookEntry(approvalScriptPath: approvalScriptPath)]).joined(separator: "\n")
     }
 
     // MARK: - Private: Managed Block Removal
 
-    /// Removes Calyx's managed block (BEGIN line through END line
-    /// inclusive, plus one immediately-preceding blank line if present) from
-    /// `content`. Any TOML table inside the comment span that is not positively
-    /// identified as one of Calyx's generated hook entries is moved outside it
-    /// rather than deleted. Returns the resulting content and whether a block
-    /// was found and removed.
-    ///
-    /// Self-heals an orphan BEGIN marker (no matching END — e.g. left by a
-    /// crash mid-write, or a file hand-edited after a prior install)
-    /// instead of throwing, following `HermesConfigManager.enableIPC`'s
-    /// precedent of stripping malformed managed-block remnants rather than
-    /// requiring manual file surgery: it removes the BEGIN line plus every
-    /// immediately-following line that still looks like part of Calyx's own
-    /// generated block body (`isCalyxGeneratedBlockLine`), stopping at the
-    /// first line that doesn't. Real user content past that point — even
-    /// directly abutting the orphan block with no blank-line separator — is
-    /// left untouched rather than guessed at.
-    private static func removingManagedBlock(from content: String) -> (result: String, hadBlock: Bool) {
-        var lines = content.components(separatedBy: "\n")
-
-        guard let beginIndex = lines.firstIndex(of: beginLine) else {
-            return (content, false)
-        }
-
-        let removeEnd: Int
-        if let endIndex = lines[(beginIndex + 1)...].firstIndex(of: endLine) {
-            removeEnd = endIndex
-        } else {
-            var lastRecognized = beginIndex
-            var scanIndex = beginIndex + 1
-            while scanIndex < lines.count, isCalyxGeneratedBlockLine(lines[scanIndex]) {
-                lastRecognized = scanIndex
-                scanIndex += 1
-            }
-            removeEnd = lastRecognized
-        }
-
-        let preservedForeignTables = foreignTableLines(in: lines[beginIndex...removeEnd])
-
-        var removeStart = beginIndex
-        if removeStart > 0, lines[removeStart - 1].isEmpty {
-            removeStart -= 1
-        }
-        lines.removeSubrange(removeStart...removeEnd)
-        let stripped = lines.joined(separator: "\n")
-        guard !preservedForeignTables.isEmpty else { return (stripped, true) }
-        return (appendingSection(preservedForeignTables.joined(separator: "\n"), to: stripped), true)
+    /// Decodes a single line's own content bytes (excluding its EOL) as a
+    /// `String`. Always safe against CRLF: `LineDoc` already separated the
+    /// terminator out, so the decoded string never contains a `\r\n` pair
+    /// whose grapheme-cluster collapse could defeat a `String`-level check.
+    private static func lineString(_ doc: LineDoc, _ index: Int) -> String {
+        String(decoding: doc.lineBytes(doc.lines[index]), as: UTF8.self)
     }
 
-    /// Extracts complete foreign TOML table chunks from a complete managed
-    /// span. A chunk is Calyx-owned only when an exact `[[hooks.<Event>]]` /
-    /// `[[hooks.<Event>.hooks]]` pair is present and the child chunk's command
-    /// references one of Calyx's installed hook scripts. Everything else is
-    /// external state, even when Codex happened to serialize it between our
-    /// BEGIN/END comments, and is retained verbatim in its original order.
-    private static func foreignTableLines(in lines: ArraySlice<String>) -> [String] {
-        let blockLines = Array(lines)
-        let contentEnd = blockLines.firstIndex(of: endLine) ?? blockLines.endIndex
-        let headerIndices = blockLines[..<contentEnd].indices.filter {
-            isTOMLTableHeader(blockLines[$0].trimmingCharacters(in: .whitespaces))
+    /// Extracts every complete foreign TOML table chunk from `bodyLines`
+    /// (the line-index range strictly between the BEGIN and END markers, or
+    /// between BEGIN and the last recognized orphan-body line). A chunk is
+    /// Calyx-owned only when an exact `[[hooks.<Event>]]` / `[[hooks.<Event>.hooks]]`
+    /// pair is present and the child chunk's command references one of
+    /// Calyx's installed hook scripts. Everything else is external state,
+    /// even when Codex happened to serialize it between our BEGIN/END
+    /// comments, and is returned byte-for-byte in its original order and
+    /// spacing, including whatever blank lines the user's own content had,
+    /// with each returned line's own original EOL attached: this must
+    /// never trim blank lines off content that isn't Calyx's own.
+    private static func foreignTableBytes(in doc: LineDoc, bodyLines: Range<Int>) -> [UInt8] {
+        let headerIndices = bodyLines.filter {
+            let trimmed = lineString(doc, $0).trimmingCharacters(in: .whitespaces)
+            return trimmed.hasPrefix("[") && trimmed.hasSuffix("]")
+        }
+        // A body with no table header anywhere gives this function no
+        // anchor to identify Calyx's own content by, so the whole body
+        // is foreign -- the same rule
+        // HermesConfigManager.foreignBodyBytes applies to a span with no
+        // recognizable calyx-ipc line.
+        guard let firstHeader = headerIndices.first else {
+            return rangeBytes(doc, bodyLines)
         }
 
         struct TableChunk {
             let header: String
-            let lines: [String]
+            let lineRange: Range<Int>
         }
 
         let chunks: [TableChunk] = headerIndices.enumerated().map { offset, start in
-            let end = offset + 1 < headerIndices.count ? headerIndices[offset + 1] : contentEnd
+            let end = offset + 1 < headerIndices.count ? headerIndices[offset + 1] : bodyLines.upperBound
             return TableChunk(
-                header: blockLines[start].trimmingCharacters(in: .whitespaces),
-                lines: Array(blockLines[start..<end])
+                header: lineString(doc, start).trimmingCharacters(in: .whitespaces),
+                lineRange: start..<end
             )
         }
 
@@ -275,18 +237,33 @@ struct CodexHooksConfigManager: Sendable {
         for index in chunks.indices.dropLast() {
             guard let event = calyxHookEvent(fromParentHeader: chunks[index].header),
                   chunks[index + 1].header == "[[hooks.\(event).hooks]]",
-                  chunkReferencesCalyxHookScript(chunks[index + 1].lines) else {
+                  chunkReferencesCalyxHookScript(doc, chunks[index + 1].lineRange) else {
                 continue
             }
             ownedChunkIndices.insert(index)
             ownedChunkIndices.insert(index + 1)
         }
 
-        var result = chunks.enumerated().flatMap { index, chunk in
-            ownedChunkIndices.contains(index) ? [] : chunk.lines
+        // Any line between the body's start and the first table header
+        // belongs to no chunk (`chunks` only starts at `firstHeader`) --
+        // there is no table header to identify it by either, so it is
+        // preserved verbatim in its original position, ahead of every
+        // chunk.
+        var result: [UInt8] = rangeBytes(doc, bodyLines.lowerBound..<firstHeader)
+        for (index, chunk) in chunks.enumerated() where !ownedChunkIndices.contains(index) {
+            result.append(contentsOf: rangeBytes(doc, chunk.lineRange))
         }
-        while result.first?.isEmpty == true { result.removeFirst() }
-        while result.last?.isEmpty == true { result.removeLast() }
+        return result
+    }
+
+    /// Concatenates `range`'s lines verbatim, each with its own original
+    /// EOL attached.
+    private static func rangeBytes(_ doc: LineDoc, _ range: Range<Int>) -> [UInt8] {
+        var result: [UInt8] = []
+        for lineIndex in range {
+            result.append(contentsOf: doc.bytes[doc.lines[lineIndex].contentRange])
+            result.append(contentsOf: doc.bytes[doc.lines[lineIndex].eolRange])
+        }
         return result
     }
 
@@ -294,35 +271,17 @@ struct CodexHooksConfigManager: Sendable {
         targetEvents.first { header == "[[hooks.\($0)]]" }
     }
 
-    private static func chunkReferencesCalyxHookScript(_ lines: [String]) -> Bool {
-        lines.contains { line in
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+    private static func chunkReferencesCalyxHookScript(_ doc: LineDoc, _ lineRange: Range<Int>) -> Bool {
+        lineRange.contains { lineIndex in
+            let trimmed = lineString(doc, lineIndex).trimmingCharacters(in: .whitespaces)
             return trimmed.hasPrefix("command")
                 && (trimmed.contains(AgentHookScript.fileName)
                     || trimmed.contains(ApprovalHookScript.fileName))
         }
     }
 
-    private static func isTOMLTableHeader(_ line: String) -> Bool {
-        line.hasPrefix("[") && line.hasSuffix("]")
-    }
-
-    /// Appends a TOML section after exactly the same minimum separator used
-    /// for the managed block. Keeping this in one helper ensures extracted
-    /// Codex state and freshly generated Calyx hooks are always valid sibling
-    /// tables, never accidentally joined onto the preceding value line.
-    private static func appendingSection(_ section: String, to content: String) -> String {
-        var result = content
-        if !result.isEmpty {
-            if !result.hasSuffix("\n") { result += "\n" }
-            if !result.hasSuffix("\n\n") { result += "\n" }
-        }
-        result += section + "\n"
-        return result
-    }
-
     /// Whether `line` looks like part of Calyx's own generated managed-block
-    /// body, for the orphan-BEGIN self-heal in `removingManagedBlock`: a
+    /// body, for `markerEditor`'s orphan-BEGIN self-heal: a
     /// blank line, a `#` comment, a `[[hooks.*]]` array-of-tables header, or
     /// a `type` / `command` (only when its value references
     /// `AgentHookScript.fileName` or `ApprovalHookScript.fileName`, i.e.

@@ -79,6 +79,17 @@ final class AgentHookScriptTests: XCTestCase {
                      "Script must read port/token from agent-endpoint.json on every invocation")
     }
 
+    func test_scriptBody_readsEndpointPathFromCalyxEndpointFileWithLiteralFallback() {
+        XCTAssertTrue(
+            AgentHookScript.scriptBody.contains(
+                "endpoint_file=\"${CALYX_ENDPOINT_FILE:-\(AgentEndpointFile.shellFallbackPath)}\""
+            ),
+            "Script must read CALYX_ENDPOINT_FILE (injected by GhosttySurfaceController, scoped to " +
+            "wherever Calyx actually wrote agent-endpoint.json), falling back to the literal " +
+            "$HOME-relative path for a pane launched before that injection existed"
+        )
+    }
+
     // MARK: - Phase 2: kind argv + X-Calyx-Agent-Kind header
 
     func test_scriptBody_defaultsKindArgvToClaudeCode() {

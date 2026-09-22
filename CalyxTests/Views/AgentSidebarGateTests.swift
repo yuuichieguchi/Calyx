@@ -61,7 +61,7 @@ final class AgentSidebarGateTests: XCTestCase {
             "neither input true -> placeholder"
         )
         XCTAssertFalse(
-            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: false, hasExternal: false),
+            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: false, hasExternal: false, serverIssues: []),
             "no rows are shown at all in this case, so the banner must not be shown either"
         )
     }
@@ -72,7 +72,7 @@ final class AgentSidebarGateTests: XCTestCase {
             "Calyx's own IPC server running -> rows"
         )
         XCTAssertFalse(
-            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: true, hasExternal: false),
+            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: true, hasExternal: false, serverIssues: []),
             "Calyx's own agent monitoring IS running, so there is nothing to warn about"
         )
     }
@@ -89,7 +89,7 @@ final class AgentSidebarGateTests: XCTestCase {
             "herdr rows alone -> rows"
         )
         XCTAssertTrue(
-            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: false, hasExternal: true),
+            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: false, hasExternal: true, serverIssues: []),
             "Calyx's own agent monitoring is OFF while rows are shown from herdr alone -- this must be flagged, " +
             "not silent"
         )
@@ -101,8 +101,44 @@ final class AgentSidebarGateTests: XCTestCase {
             "both sources -> rows"
         )
         XCTAssertFalse(
-            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: true, hasExternal: true),
+            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: true, hasExternal: true, serverIssues: []),
             "Calyx's own agent monitoring IS running (in addition to herdr), so there is nothing to warn about"
+        )
+    }
+
+    func test_herdrOnly_withServerIssues_suppressesMonitoringDisabledBanner() {
+        // A herdr row is present AND Calyx's own server failed to start:
+        // the server-issues banner (rendered from serverIssues) already
+        // explains why, so the generic "disabled, open Settings" notice
+        // must not also render -- that notice implies the setting is
+        // OFF, contradicting a switch that reads ON while a start
+        // attempt merely failed.
+        XCTAssertFalse(
+            AgentSidebarGate.showsMonitoringDisabledBanner(isServerRunning: false, hasExternal: true, serverIssues: ["Failed to start the local server."]),
+            "A standing server-start failure must suppress the disabled-monitoring notice, not stack with it"
+        )
+    }
+
+    // MARK: - showsServerIssuesBanner: applies whenever the server is down, rows or not
+
+    func test_showsServerIssuesBanner_serverNotRunning_withIssues_showsBanner() {
+        XCTAssertTrue(
+            AgentSidebarGate.showsServerIssuesBanner(isServerRunning: false, serverIssues: ["Failed to generate secure token."]),
+            "A server-start failure must surface as the server-issues banner whenever the server isn't running"
+        )
+    }
+
+    func test_showsServerIssuesBanner_serverNotRunning_noIssues_doesNotShow() {
+        XCTAssertFalse(
+            AgentSidebarGate.showsServerIssuesBanner(isServerRunning: false, serverIssues: []),
+            "No server issues means the ordinary disabled placeholder still applies"
+        )
+    }
+
+    func test_showsServerIssuesBanner_serverRunning_withIssues_doesNotApply() {
+        XCTAssertFalse(
+            AgentSidebarGate.showsServerIssuesBanner(isServerRunning: true, serverIssues: ["stale issue"]),
+            "The server-issues banner must not appear once the server is actually running"
         )
     }
 }

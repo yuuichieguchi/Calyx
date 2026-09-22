@@ -25,6 +25,7 @@ enum AccessibilityID {
         static func agentSubRow(id: String) -> String { "calyx.sidebar.agentSubRow.\(id)" }
         static let agentHooksIssuesBanner = "calyx.sidebar.agentHooksIssuesBanner"
         static let agentMonitoringDisabledBanner = "calyx.sidebar.agentMonitoringDisabledBanner"
+        static let agentServerIssuesBanner = "calyx.sidebar.agentServerIssuesBanner"
     }
     enum GroupContextMenu {
         static let close = "calyx.groupMenu.close"
@@ -83,11 +84,11 @@ enum AccessibilityID {
         /// `id` is the repository's work-tree root path.
         static func refPicker(_ id: String) -> String { "calyx.git.refPicker.\(id)" }
     }
-    /// Sessions pane of the Settings window
-    /// (Calyx/Features/Settings/SettingsWindowController.swift). Applied
-    /// to the four toggle NSSwitch controls so an XCUITest suite can
-    /// locate a specific switch by a stable identifier instead of an
-    /// ordinal position (`app.switches.firstMatch`), which silently
+    /// Settings window (Calyx/Features/Settings/SettingsWindowController.
+    /// swift). Applied to each pane's toggle NSSwitch controls, plus the
+    /// AI Agent IPC row's Refresh button and status label, so an XCUITest
+    /// suite can locate a specific control by a stable identifier instead
+    /// of an ordinal position (`app.switches.firstMatch`), which silently
     /// breaks the moment a row is reordered or another switch is added
     /// above it.
     enum Settings {
@@ -102,6 +103,9 @@ enum AccessibilityID {
         static let lspRequireConfirmationSwitch = "calyx.settings.lsp.lspRequireConfirmationSwitch"
         static let cockpitAutoApproveSwitch = "calyx.settings.sessions.cockpitAutoApproveSwitch"
         static let agentHookApprovalSwitch = "calyx.settings.sessions.agentHookApprovalSwitch"
+        static let agentIPCSwitch = "calyx.settings.agents.agentIPCSwitch"
+        static let agentIPCRefreshButton = "calyx.settings.agents.agentIPCRefreshButton"
+        static let agentIPCStatusLabel = "calyx.settings.agents.agentIPCStatusLabel"
     }
     enum SessionBrowser {
         static func row(_ id: String) -> String { "calyx.sessionBrowser.row.\(id)" }

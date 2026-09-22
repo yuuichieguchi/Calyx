@@ -51,7 +51,7 @@ final class AgentHookScriptSessionIDPipelineTests: XCTestCase {
         server.agentRegistry = registry
         // Isolated instance — never touch .shared, which other suites read.
         server.sessionSurfaceMap = SessionSurfaceMap()
-        try server.start(token: testToken, preferredPort: Int.random(in: 49_152...65_000))
+        try await server.start(token: testToken, preferredPort: Int.random(in: 49_152...65_000))
 
         scriptPath = try AgentHookScript.install(toDirectory: appSupportDir + "/bin")
     }

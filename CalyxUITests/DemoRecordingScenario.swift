@@ -8,10 +8,10 @@
 // by hand. Two-part never-abort-mid-recording contract: (1) every WAIT
 // goes through `awaitOrContinue` (logs and proceeds instead of failing
 // on a timeout); (2) `continueAfterFailure = true` (set in `setUp()`
-// below) so an unguarded inherited interaction -- `menuAction`'s and
-// `enableAIAgentIPCViaCommandPalette`'s own `.click()` calls, which do
-// NOT route through `awaitOrContinue` -- records a failure on a missing
-// element instead of throwing and aborting the take mid-recording.
+// below) so an unguarded inherited interaction -- `menuAction`'s own
+// `.click()` calls, which do NOT route through `awaitOrContinue` --
+// records a failure on a missing element instead of throwing and
+// aborting the take mid-recording.
 // Contains NO XCTAssert anywhere for the same reason: the human retakes
 // if something visibly went wrong, this driver never does.
 //
@@ -183,7 +183,7 @@ final class DemoRecordingScenario: CalyxUITestCase {
         awaitOrContinue(app.windows.firstMatch, timeout: 10)
         awaitOrContinue(app.menuBars.firstMatch, timeout: 10)
 
-        enableAIAgentIPCViaCommandPalette()
+        enableAIAgentIPCViaSettingsToggle()
 
         // 2x2 split: File > Split Right (creates the right column, B,
         // which becomes focused -- ghostty's own
@@ -481,27 +481,41 @@ final class DemoRecordingScenario: CalyxUITestCase {
         return observed
     }
 
-    /// Opens the Command Palette, runs "Enable AI Agent IPC", and
-    /// dismisses the resulting NSAlert.runModal() confirmation --
-    /// near-duplicate of CockpitApprovalE2ETests'/CommandLogE2ETests' own
-    /// helper of the same name (both already document this as a kept
-    /// near-duplicate rather than a shared call), adapted here to
-    /// `awaitOrContinue` instead of XCTAssert since this file asserts
-    /// nothing.
-    private func enableAIAgentIPCViaCommandPalette() {
-        openCommandPaletteViaMenu()
+    /// Opens Settings > Agents and clicks the AI Agent IPC switch on --
+    /// the deleted "Enable AI Agent IPC" command palette entry is gone
+    /// from production, and AI Agent IPC is now a Settings toggle
+    /// (`SettingsWindowController.agentIPCRow`, `AccessibilityID.Settings
+    /// .agentIPCSwitch`). This IS the on-camera enable beat: no
+    /// `--calyx-path-root`/`-calyx.ipc.enabled` launch argument scopes
+    /// this scenario (see this file's header on why -- it drives a real
+    /// `claude` CLI against the real `~/.claude/settings.json`), so this
+    /// click is the only thing that turns AI Agent IPC on for this
+    /// recording, exactly like a real first-time user's own click would.
+    /// Closes the Settings window afterward so the following beats land
+    /// on the main terminal window, mirroring
+    /// `LastWindowCloseDoesNotQuitE2ETests`'s own `XCUIIdentifierCloseWindow`
+    /// idiom, adapted here to `awaitOrContinue` instead of XCTAssert since
+    /// this file asserts nothing.
+    private func enableAIAgentIPCViaSettingsToggle() {
+        menuAction("Calyx", item: "Settings…")
 
-        let searchField = app.descendants(matching: .any)
-            .matching(identifier: "calyx.commandPalette.searchField")
+        let settingsWindow = app.windows.firstMatch
+        guard awaitOrContinue(settingsWindow, timeout: 10) else { return }
+
+        let agentsButton = settingsWindow.toolbars.buttons["Agents"]
+        guard awaitOrContinue(agentsButton, timeout: 5) else { return }
+        agentsButton.click()
+
+        let agentIPCSwitch = app.descendants(matching: .any)
+            .matching(identifier: "calyx.settings.agents.agentIPCSwitch")
             .firstMatch
-        guard awaitOrContinue(searchField, timeout: 10) else { return }
+        guard awaitOrContinue(agentIPCSwitch, timeout: 5) else { return }
+        agentIPCSwitch.click()
 
-        searchField.typeText("Enable AI Agent IPC")
-        searchField.typeKey(.enter, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 1.5)
 
-        let alert = app.dialogs.firstMatch
-        if awaitOrContinue(alert, timeout: 10) {
-            alert.buttons["OK"].click()
+        if awaitOrContinue(settingsWindow.buttons[XCUIIdentifierCloseWindow], timeout: 5) {
+            settingsWindow.buttons[XCUIIdentifierCloseWindow].click()
         }
     }
 

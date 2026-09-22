@@ -73,8 +73,12 @@ enum PiExtensionManager: Sendable {
         return;
       }
 
+      // CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController
+      // alongside CALYX_SURFACE_ID, scoped to wherever this Calyx process
+      // actually wrote agent-endpoint.json. The literal fallback covers a
+      // pane launched before that injection existed.
       const endpointPath =
-        `${process.env.HOME}/Library/Application Support/Calyx/agent-endpoint.json`;
+        process.env.CALYX_ENDPOINT_FILE ?? \(AgentEndpointFile.javascriptFallbackPathExpression);
       let cachedEndpoint = null;
       let cachedEndpointMtimeMs = null;
 
@@ -254,8 +258,9 @@ enum PiExtensionManager: Sendable {
             try fm.createDirectory(atPath: extensionsDir, withIntermediateDirectories: true)
         }
 
-        let resolvedScriptPath = try ConfigFileUtils.resolveConfigPath(scriptPath)
-        try scriptBody.write(toFile: resolvedScriptPath, atomically: true, encoding: .utf8)
+        let data = Data(scriptBody.utf8)
+        // 0600: Calyx owns this file outright.
+        try ConfigFileUtils.withExclusiveConfig(path: scriptPath, mode: 0o600, restoreModeOnNoWrite: true) { _ in data }
         return scriptPath
     }
 
@@ -263,15 +268,13 @@ enum PiExtensionManager: Sendable {
     /// throws if the file exists but could not be removed (e.g. a
     /// permissions error), rather than silently leaving it in place.
     /// Symmetric with `install`: resolves a symlinked destination path
-    /// (`ConfigFileUtils.resolveConfigPath`) and removes the real target
-    /// file, leaving the symlink itself intact (now dangling). Removing
-    /// the raw path instead would unlink the symlink and leave the real
-    /// installed extension behind, still loaded by pi.
+    /// and removes the real target file, leaving the symlink itself
+    /// intact (now dangling). Removing the raw path instead would unlink
+    /// the symlink and leave the real installed extension behind, still
+    /// loaded by pi.
     static func remove(extensionsDirectory: String? = nil) throws {
         let path = extensionPath(extensionsDirectory: extensionsDirectory)
-        let resolvedPath = try ConfigFileUtils.resolveConfigPath(path)
-        guard FileManager.default.fileExists(atPath: resolvedPath) else { return }
-        try FileManager.default.removeItem(atPath: resolvedPath)
+        try ConfigFileUtils.withExclusiveConfig(path: path) { _ in nil }
     }
 
     static func isInstalled(extensionsDirectory: String? = nil) -> Bool {

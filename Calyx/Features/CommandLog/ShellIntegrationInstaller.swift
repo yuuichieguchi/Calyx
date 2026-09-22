@@ -128,7 +128,11 @@ enum ShellIntegrationInstaller {
     'builtin' 'zmodload' 'zsh/datetime' 2>/dev/null || return 0
 
     _calyx_post() {
-        local endpoint_file="$HOME/Library/Application Support/Calyx/agent-endpoint.json"
+        # CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController
+        # alongside CALYX_SURFACE_ID, scoped to wherever this Calyx
+        # process actually wrote agent-endpoint.json. The literal
+        # fallback covers a pane launched before that injection existed.
+        local endpoint_file="${CALYX_ENDPOINT_FILE:-\(AgentEndpointFile.shellFallbackPath)}"
         [[ -r "$endpoint_file" ]] || return 0
         local port token
         port=$(command sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
@@ -240,7 +244,13 @@ enum ShellIntegrationInstaller {
     end
 
     function _calyx_post --argument-names body
-        set -l endpoint_file "$HOME/Library/Application Support/Calyx/agent-endpoint.json"
+        # CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController
+        # alongside CALYX_SURFACE_ID, scoped to wherever this Calyx
+        # process actually wrote agent-endpoint.json. The literal
+        # fallback (fish has no ${VAR:-default}) covers a pane launched
+        # before that injection existed.
+        set -l endpoint_file "$CALYX_ENDPOINT_FILE"
+        test -n "$endpoint_file"; or set endpoint_file "\(AgentEndpointFile.shellFallbackPath)"
         test -r "$endpoint_file"; or return 0
         set -l port (command sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
         set -l token (command sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
@@ -312,7 +322,12 @@ enum ShellIntegrationInstaller {
     /// real file and overwritten in place, leaving the symlink itself
     /// intact (ConfigFileUtils.resolveConfigPath, mirroring
     /// OpenCodePluginManager.install's real, verified behavior).
-    /// Idempotent: reinstalling overwrites with the same fixed body.
+    /// Idempotent: reinstalling with the same fixed body writes no bytes
+    /// (`ConfigFileUtils.withExclusiveConfig` skips the write entirely
+    /// when the transformed bytes equal the file's current bytes,
+    /// leaving mtime untouched) but still restores the file's mode to
+    /// 0644 if it has drifted (e.g. a user `chmod`); a body that
+    /// actually differs still overwrites, at 0644, exactly as before.
     /// Returns `directory` itself, so callers can chain straight into
     /// CalyxShellIntegrationEnvironment.apply(rootDirectory:).
     static func install(toDirectory directory: URL) throws -> URL {
@@ -330,14 +345,14 @@ enum ShellIntegrationInstaller {
     }
 
     /// Removes the three integration files from `directory`. Symmetric
-    /// with `install`: resolves a symlinked destination path and removes
-    /// the real target file, leaving the symlink itself intact (now
-    /// dangling). A no-op for any file not present.
+    /// with `install`: routes through `ConfigFileUtils.withExclusiveConfig`,
+    /// which resolves a symlinked destination path and deletes the real
+    /// target file under the same per-path lock `install` uses, leaving
+    /// the symlink itself intact (now dangling). A no-op for any file
+    /// not present.
     static func remove(fromDirectory directory: URL) throws {
         for path in [zshenvPath(in: directory), calyxZshPath(in: directory), fishIntegrationPath(in: directory)] {
-            let resolvedPath = try ConfigFileUtils.resolveConfigPath(path.path)
-            guard FileManager.default.fileExists(atPath: resolvedPath) else { continue }
-            try FileManager.default.removeItem(atPath: resolvedPath)
+            try ConfigFileUtils.withExclusiveConfig(path: path.path) { _ in nil }
         }
     }
 
@@ -351,15 +366,15 @@ enum ShellIntegrationInstaller {
             && fm.fileExists(atPath: fishIntegrationPath(in: directory).path)
     }
 
-    /// Shared write path for `install`: resolves a symlinked destination
-    /// (`ConfigFileUtils.resolveConfigPath`) before writing, so an
-    /// atomic write lands on the symlink's real target rather than
-    /// replacing the symlink itself, then explicitly chmods to 0644 --
-    /// `String.write(atomically:)`'s own permissions follow the
-    /// process's umask, which isn't guaranteed to be 0644.
+    /// Shared write path for `install`: routes through
+    /// `ConfigFileUtils.withExclusiveConfig`, which resolves a symlinked
+    /// destination, takes the path's exclusive lock, and writes
+    /// atomically at 0644 -- the mode a sourced (never executed) file
+    /// needs, applied to the temp file before the rename inside the
+    /// lock, so no other process can observe or race an intermediate
+    /// permission state.
     private static func write(_ body: String, to path: URL) throws {
-        let resolvedPath = try ConfigFileUtils.resolveConfigPath(path.path)
-        try body.write(toFile: resolvedPath, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: resolvedPath)
+        let data = Data(body.utf8)
+        try ConfigFileUtils.withExclusiveConfig(path: path.path, mode: 0o644, restoreModeOnNoWrite: true) { _ in data }
     }
 }

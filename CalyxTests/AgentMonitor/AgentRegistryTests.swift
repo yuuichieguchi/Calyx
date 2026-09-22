@@ -1587,6 +1587,24 @@ final class AgentRegistryTests: XCTestCase {
         registry.reset()
     }
 
+    // MARK: - serverIssues (not cleared by reset())
+
+    func test_setServerIssues_reflectsValue_andResetDoesNotClear() {
+        let registry = AgentRegistry()
+        XCTAssertTrue(registry.serverIssues.isEmpty, "Precondition: a fresh registry has no server issues")
+
+        registry.setServerIssues(["Failed to generate secure token."])
+
+        XCTAssertEqual(registry.serverIssues, ["Failed to generate secure token."],
+                       "setServerIssues must update the observable serverIssues array")
+
+        registry.reset()
+
+        XCTAssertEqual(registry.serverIssues, ["Failed to generate secure token."],
+                       "reset() must NOT clear serverIssues -- it is not called immediately after a start failure, " +
+                       "so clearing it here would erase the banner while the failure is still true")
+    }
+
     // MARK: - Unread message badges (peer binding + syncInboxCounts)
 
     func test_handleHookEvent_preToolUseWithIpcSelfPeerID_learnsBindingReflectedViaSyncInboxCounts() {

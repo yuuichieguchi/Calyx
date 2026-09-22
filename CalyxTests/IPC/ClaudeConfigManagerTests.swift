@@ -135,7 +135,13 @@ final class ClaudeConfigManagerTests: XCTestCase {
         }
     }
 
-    func test_enableIPC_createsBackup() throws {
+    /// Superseded by the L1.2 "no backup at all" rule
+    /// (`.claude/plans/ipc-toggle.md`): `withExclusiveConfig` never
+    /// writes a `.bak`, since L1.3's editors make the write itself
+    /// non-destructive, leaving nothing for a backup to compensate for.
+    /// This replaces the prior `test_enableIPC_createsBackup`, which
+    /// asserted the opposite and is no longer a valid expectation.
+    func test_enableIPC_neverCreatesABackupFile() throws {
         // Given: existing valid config
         let existingJSON = """
         {
@@ -147,17 +153,10 @@ final class ClaudeConfigManagerTests: XCTestCase {
         // When: enableIPC is called
         try ClaudeConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
 
-        // Then: a .bak file should exist with the original content
+        // Then: no .bak file must exist
         let bakPath = configPath + ".bak"
-        XCTAssertTrue(FileManager.default.fileExists(atPath: bakPath),
-                      "Backup file should be created before modification")
-
-        let bakContent = try String(contentsOfFile: bakPath, encoding: .utf8)
-        // The backup should contain the original JSON (before modification)
-        XCTAssertTrue(bakContent.contains("\"mcpServers\""),
-                      "Backup should contain original config content")
-        XCTAssertFalse(bakContent.contains("calyx-ipc"),
-                       "Backup should not contain the newly added calyx-ipc entry")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bakPath),
+                       "enableIPC must not create a .bak file")
     }
 
     func test_enableIPC_preservesOtherKeys() throws {
@@ -270,7 +269,7 @@ final class ClaudeConfigManagerTests: XCTestCase {
         """
         writeConfig(existingJSON)
 
-        // When: enableIPC is called again (e.g. re-running "Enable AI Agent IPC")
+        // When: enableIPC is called again (e.g. clicking Refresh in Settings > Agents)
         try ClaudeConfigManager.enableIPC(port: 55555, token: "new-token", configPath: configPath)
 
         // Then: the regenerated entry gains the X-Calyx-Surface-ID header too

@@ -89,6 +89,17 @@ final class ApprovalHookScriptTests: XCTestCase {
         XCTAssertTrue(body.contains("token=$(sed"), "Script must sed-extract the token field")
     }
 
+    func test_scriptBody_readsEndpointPathFromCalyxEndpointFileWithLiteralFallback() {
+        XCTAssertTrue(
+            ApprovalHookScript.scriptBody.contains(
+                "endpoint_file=\"${CALYX_ENDPOINT_FILE:-\(AgentEndpointFile.shellFallbackPath)}\""
+            ),
+            "Script must read CALYX_ENDPOINT_FILE (injected by GhosttySurfaceController, scoped to " +
+            "wherever Calyx actually wrote agent-endpoint.json), falling back to the literal " +
+            "$HOME-relative path for a pane launched before that injection existed"
+        )
+    }
+
     // MARK: - scriptBody: headers
 
     func test_scriptBody_sendsAuthorizationHeaderWithBearerToken() {
@@ -249,5 +260,31 @@ final class ApprovalHookScriptTests: XCTestCase {
         let content = try String(contentsOfFile: scriptPath, encoding: .utf8)
         XCTAssertEqual(content, ApprovalHookScript.scriptBody,
                        "Installed script content must match scriptBody")
+    }
+
+    /// `calyx-approval-hook` is executed directly by an agent CLI, so a
+    /// lost executable bit breaks approval with no visible signal.
+    /// `ApprovalHookScript.install` shares its write path with
+    /// `AgentHookScript.installScript`, which passes
+    /// `restoreModeOnNoWrite: true` -- a reinstall whose bytes end up
+    /// identical to what's already on disk must still repair a mode that
+    /// drifted behind Calyx's back (a plain `chmod`), since a reinstall
+    /// is the only repair path available to the user for a drifted mode
+    /// on a Calyx-owned file.
+    func test_install_reinstallWithIdenticalContent_restoresDriftedMode() throws {
+        let scriptPath = try ApprovalHookScript.install(toDirectory: tempDir)
+
+        XCTAssertEqual(chmod(scriptPath, 0o644), 0, "precondition: simulate mode drift outside install()")
+
+        var statBefore = stat()
+        XCTAssertEqual(stat(scriptPath, &statBefore), 0)
+        XCTAssertEqual(statBefore.st_mode & ~S_IFMT, 0o644, "precondition: mode must actually be drifted")
+
+        _ = try ApprovalHookScript.install(toDirectory: tempDir)
+
+        var statAfter = stat()
+        XCTAssertEqual(stat(scriptPath, &statAfter), 0)
+        XCTAssertEqual(statAfter.st_mode & ~S_IFMT, 0o755,
+                       "a reinstall with byte-identical content must still restore the drifted mode to 0755")
     }
 }

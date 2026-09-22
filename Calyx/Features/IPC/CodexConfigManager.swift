@@ -9,14 +9,11 @@ import Foundation
 
 enum CodexConfigError: Error, LocalizedError {
     case directoryNotFound
-    case writeFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .directoryNotFound:
             return "The ~/.codex/ directory does not exist"
-        case .writeFailed(let reason):
-            return "Failed to write config file: \(reason)"
         }
     }
 }
@@ -25,29 +22,24 @@ enum CodexConfigError: Error, LocalizedError {
 
 struct CodexConfigManager: Sendable {
 
+    // MARK: - Private
+
+    private static let tableEditor = TOMLTableConfigDocumentEditor(tablePath: "mcp_servers.calyx-ipc")
+
     // MARK: - Public API
 
     static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
-        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
-        let parentDir = (path as NSString).deletingLastPathComponent
+        let path = configPath ?? defaultConfigPath
+        let resolvedPath = try ConfigFileUtils.resolveConfigPath(path)
+        let parentDir = (resolvedPath as NSString).deletingLastPathComponent
 
         // Parent directory must exist
         guard ConfigFileUtils.directoryExists(at: parentDir) else {
             throw CodexConfigError.directoryNotFound
         }
 
-        // Read existing content or start empty
-        let content: String
-        if FileManager.default.fileExists(atPath: path) {
-            content = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
-        } else {
-            content = ""
-        }
-
-        // Remove existing calyx-ipc sections, normalize line endings
-        let cleaned = removeSections(from: content)
-
-        // Build the new section.
+        // The table's body, beneath the synthesized `[mcp_servers.calyx-ipc]`
+        // header `setTable` writes.
         //
         // `env_http_headers` tells Codex to read each header's value from
         // its own process environment rather than send a literal string.
@@ -61,166 +53,51 @@ struct CodexConfigManager: Sendable {
         // Codex omits that header entirely rather than sending an empty
         // value, so the surface header alone still resolves exactly as
         // before.
-        let section = """
-        [mcp_servers.calyx-ipc]
+        let body = """
         url = "http://127.0.0.1:\(port)/mcp"
         http_headers = { "Authorization" = "Bearer \(token)", "X-Calyx-Agent-Kind" = "\(AgentEntry.codexKind)" }
         env_http_headers = { "X-Calyx-Surface-ID" = "CALYX_SURFACE_ID", "X-Calyx-Session-ID" = "CALYX_SESSION_ID" }
         """
 
-        // Append with proper spacing
-        var result = cleaned
-        if !result.isEmpty && !result.hasSuffix("\n\n") {
-            if !result.hasSuffix("\n") {
-                result += "\n"
-            }
-            result += "\n"
+        // 0600: this table carries the bearer token. ~/.codex/config.toml
+        // is shared with CodexHooksConfigManager's hooks block, which
+        // carries no token and therefore leaves the file's mode alone
+        // (mode: nil) -- one file, two policies, deliberately: whichever
+        // manager's write actually contains the secret is the one that
+        // enforces the mode.
+        try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
+            try tableEditor.setTable(body: body, in: current)
         }
-        result += section + "\n"
-
-        // Atomic write
-        guard let data = result.data(using: .utf8) else {
-            throw CodexConfigError.writeFailed("UTF-8 encoding failed")
-        }
-        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     static func disableIPC(configPath: String? = nil) throws {
-        let path = try ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath)
-
-        // No file → no-op
-        guard FileManager.default.fileExists(atPath: path) else { return }
-
-        // Unreadable → no-op
-        guard let content = try? String(contentsOfFile: path, encoding: .utf8) else { return }
-
-        let cleaned = removeSections(from: content)
-
-        // Only write if content actually changed
-        let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
-        guard cleaned != normalized else { return }
-
-        guard let data = cleaned.data(using: .utf8) else {
-            throw CodexConfigError.writeFailed("UTF-8 encoding failed")
+        let path = configPath ?? defaultConfigPath
+        // mode: nil -- disable writes no secret, only removes the table
+        // that carried one, so it must preserve whatever mode the
+        // user's file already has rather than forcing 0600 (that mode
+        // belongs to enableIPC, which writes the token).
+        try ConfigFileUtils.withExclusiveConfig(path: path) { current in
+            try tableEditor.removeTable(in: current)
         }
-        try ConfigFileUtils.atomicWrite(data: data, to: path)
     }
 
     /// Returns `false` (rather than throwing) when `configPath`'s symlink
-    /// chain can't be resolved — this is a read-only status check, and
-    /// every other unreadable-file case here already resolves to `false`
-    /// the same way.
+    /// chain can't be resolved, or the file doesn't exist or can't be
+    /// read — this is a read-only status check.
     static func isIPCEnabled(configPath: String? = nil) -> Bool {
         guard let path = try? ConfigFileUtils.resolveConfigPath(configPath ?? defaultConfigPath) else {
             return false
         }
 
         guard FileManager.default.fileExists(atPath: path),
-              let content = try? String(contentsOfFile: path, encoding: .utf8) else {
+              let data = try? Data(contentsOf: URL(fileURLWithPath: path)) else {
             return false
         }
 
-        let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
-        return normalized.components(separatedBy: "\n").contains { isSectionHeader($0) }
+        return tableEditor.containsTable(in: data)
     }
-
-    // MARK: - Private
 
     private static var defaultConfigPath: String {
         AgentToolPaths.codexConfigDirectory + "/config.toml"
-    }
-
-    /// Regex pattern for `[mcp_servers.calyx-ipc]` section header.
-    private static let sectionHeaderPattern = #"^[ \t]*\[mcp_servers\.calyx-ipc\][ \t]*(#.*)?$"#
-
-    /// Regex pattern for any TOML table header, standard (`[...]`) or
-    /// array-of-tables (`[[...]]`). Per TOML semantics a table header always
-    /// starts a new table and therefore always ends whatever table preceded
-    /// it — including `[mcp_servers.calyx-ipc]` — regardless of whether a
-    /// blank line separates them.
-    private static let anyTableHeaderPattern = #"^[ \t]*\["#
-
-    /// Regex pattern for a `[mcp_servers.calyx-ipc.*]` or
-    /// `[[mcp_servers.calyx-ipc.*]]` sub-table header. Per TOML's dotted-key
-    /// semantics this is still part of the calyx-ipc entry (not a boundary)
-    /// and must be removed along with the rest of the section.
-    private static let calyxIpcSubTableHeaderPattern = #"^[ \t]*\[\[?mcp_servers\.calyx-ipc\."#
-
-    /// Regex pattern for the BEGIN marker of a Calyx-managed block
-    /// (`CodexHooksConfigManager`'s `[[hooks.*]]` block). Recognized as a
-    /// section boundary even though it's an ordinary TOML comment, not a
-    /// table header.
-    private static let calyxManagedBlockMarkerPattern = #"^[ \t]*#\s*BEGIN CALYX"#
-
-    private static func isSectionHeader(_ line: String) -> Bool {
-        line.range(of: sectionHeaderPattern, options: .regularExpression) != nil
-    }
-
-    private static func isAnyTableHeader(_ line: String) -> Bool {
-        line.range(of: anyTableHeaderPattern, options: .regularExpression) != nil
-    }
-
-    private static func isCalyxIpcSubTableHeader(_ line: String) -> Bool {
-        line.range(of: calyxIpcSubTableHeaderPattern, options: .regularExpression) != nil
-    }
-
-    private static func isCalyxManagedBlockMarker(_ line: String) -> Bool {
-        line.range(of: calyxManagedBlockMarkerPattern, options: .regularExpression) != nil
-    }
-
-    /// Remove all `[mcp_servers.calyx-ipc]` sections from the content.
-    /// Normalizes `\r\n` to `\n`.
-    ///
-    /// A section's body ends at the next TOML table header (`[...]` or
-    /// `[[...]]`), or at a `# BEGIN CALYX` managed-block marker — never at a
-    /// blank line. Blank lines are ordinary TOML whitespace and can appear
-    /// inside a section's body without ending it; treating them as a
-    /// terminator would leave the section's tail (including its
-    /// `http_headers` / Bearer-token line) behind in the file.
-    private static func removeSections(from content: String) -> String {
-        let normalized = content.replacingOccurrences(of: "\r\n", with: "\n")
-        let lines = normalized.components(separatedBy: "\n")
-
-        var result: [String] = []
-        var inSection = false
-
-        for line in lines {
-            if isSectionHeader(line) {
-                // Start of a calyx-ipc section — skip this line
-                inSection = true
-                continue
-            }
-
-            if inSection {
-                if isCalyxIpcSubTableHeader(line) {
-                    // A [mcp_servers.calyx-ipc.*] sub-table is still part of
-                    // this entry — remove it along with the rest.
-                    continue
-                }
-                if isAnyTableHeader(line) || isCalyxManagedBlockMarker(line) {
-                    // Hit the next table header, or another managed block's
-                    // BEGIN marker comment — end of calyx-ipc section.
-                    inSection = false
-                    result.append(line)
-                    continue
-                }
-                // Otherwise still inside the section (including blank
-                // lines) — skip
-                continue
-            }
-
-            result.append(line)
-        }
-
-        // Join and trim trailing blank lines that were left from removal,
-        // but preserve a single trailing newline if the file had content.
-        var output = result.joined(separator: "\n")
-
-        // Remove excessive trailing newlines (keep at most one)
-        while output.hasSuffix("\n\n") {
-            output = String(output.dropLast())
-        }
-
-        return output
     }
 }

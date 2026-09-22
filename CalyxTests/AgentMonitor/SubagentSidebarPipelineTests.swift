@@ -78,7 +78,7 @@ final class SubagentSidebarPipelineTests: XCTestCase {
         registry = AgentRegistry()
         server = CalyxMCPServer(agentEndpointDirectory: appSupportDir)
         server.agentRegistry = registry
-        try server.start(token: testToken, preferredPort: Int.random(in: 49_152...65_000))
+        try await server.start(token: testToken, preferredPort: Int.random(in: 49_152...65_000))
 
         scriptPath = try AgentHookScript.install(toDirectory: appSupportDir + "/bin")
     }

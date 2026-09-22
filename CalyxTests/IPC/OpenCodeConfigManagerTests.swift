@@ -661,6 +661,50 @@ final class OpenCodeConfigManagerTests: XCTestCase {
                        "Managed block body should be removed")
     }
 
+    // The managed block's body is Calyx's fixed Markdown prose, which can
+    // change across Calyx releases (see MCPRouter.receiveMessagesOnceNotice).
+    // A well-formed BEGIN...END span must be removed in full regardless of
+    // whether its wording matches what the current Calyx version would
+    // write, so a block installed by an older Calyx release never survives
+    // disableIPC.
+    func test_disableIPC_removesStaleWordingBodyToo() throws {
+        // Given: AGENTS.md has user content surrounding a Calyx IPC block
+        // whose body wording matches neither the current release nor any
+        // recognizable Calyx keyword.
+        let userPrefix = "# My Rules\n- be nice\n"
+        let userSuffix = "\n# Trailing\nmore user content\n"
+        let existing = """
+        \(userPrefix)
+        \(beginDelimiter) (managed by Calyx, do not edit) -->
+        Old release wording, nothing recognizable here.
+        \(endDelimiter)
+        \(userSuffix)
+        """
+        writeAgentsMD(existing)
+
+        // When
+        try OpenCodeConfigManager.disableIPC(configDir: configDir)
+
+        // Then: user content preserved, block (including its stale body)
+        // removed entirely.
+        let content = try readAgentsMD()
+        XCTAssertTrue(content.contains("# My Rules"),
+                      "User heading should be preserved")
+        XCTAssertTrue(content.contains("- be nice"),
+                      "User bullet should be preserved")
+        XCTAssertTrue(content.contains("# Trailing"),
+                      "User trailing heading should be preserved")
+        XCTAssertTrue(content.contains("more user content"),
+                      "User trailing content should be preserved")
+
+        XCTAssertFalse(content.contains(beginDelimiter),
+                       "BEGIN delimiter should be removed")
+        XCTAssertFalse(content.contains(endDelimiter),
+                       "END delimiter should be removed")
+        XCTAssertFalse(content.contains("Old release wording"),
+                       "Stale-wording body must be removed entirely, not preserved")
+    }
+
     func test_disableIPC_noFilesExist_noOp() {
         // Given: neither file exists
         XCTAssertFalse(FileManager.default.fileExists(atPath: opencodeJsonPath))

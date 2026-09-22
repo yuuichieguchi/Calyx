@@ -221,6 +221,41 @@ final class HermesConfigManagerTests: XCTestCase {
                        "Only one mcp_servers: key should exist after Case B insertion")
     }
 
+    // A trailing `# comment` on the `mcp_servers:` header line is valid
+    // YAML for a block-style mapping (the comment is not part of the
+    // value), so it must be treated as Case B, not rejected as an inline
+    // map. The comment survives byte-identically on its own line.
+    func test_enableIPC_insertsIntoExistingMcpServers_headerLineHasTrailingComment() throws {
+        let existing = """
+        mcp_servers: # my servers
+          stripe:
+            url: "https://mcp.stripe.com"
+        """
+        try writeConfig(existing)
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        let expected =
+            "mcp_servers: # my servers\n" +
+            "  stripe:\n" +
+            "    url: \"https://mcp.stripe.com\"\n" +
+            "  # BEGIN CALYX IPC (managed by Calyx, do not edit)\n" +
+            "  calyx-ipc:\n" +
+            "    url: \"http://127.0.0.1:41830/mcp\"\n" +
+            "    headers:\n" +
+            "      Authorization: \"Bearer tok\"\n" +
+            "      X-Calyx-Surface-ID: \"${CALYX_SURFACE_ID}\"\n" +
+            "      X-Calyx-Session-ID: \"${CALYX_SESSION_ID}\"\n" +
+            "      X-Calyx-Agent-Kind: \"hermes\"\n" +
+            "  # END CALYX IPC\n"
+        let content = readConfig()
+        XCTAssertEqual(content, expected,
+                       "The mcp_servers: header's trailing comment must survive byte-identically, and " +
+                       "the managed block must be inserted as a Case B child, not rejected as inline")
+        XCTAssertEqual(occurrences(of: "mcp_servers:", in: content), 1,
+                       "Only one mcp_servers: key should exist after Case B insertion")
+    }
+
     func test_enableIPC_insertsWith4SpaceIndent() throws {
         // Given: pre-existing mcp_servers: with a child indented 4 spaces
         let existing = """
@@ -369,24 +404,27 @@ final class HermesConfigManagerTests: XCTestCase {
 
     // MARK: - enableIPC: Encoding / Security
 
-    func test_enableIPC_throwsOnInvalidEncoding() throws {
+    // HermesConfigManager operates byte-for-byte via LineDoc rather than
+    // decoding the whole file as a `String` up front, so invalid UTF-8
+    // bytes elsewhere in the file are no longer a reason to refuse the
+    // write: the bytes are preserved verbatim and the managed block is
+    // still appended (no line in them decodes to a top-level
+    // `mcp_servers:` match, so this always takes Case A).
+    func test_enableIPC_invalidUTF8Bytes_preservedVerbatim_managedBlockStillAppended() throws {
         // Given: file with invalid UTF-8 bytes
-        try writeRaw(Data([0xFF, 0xFE, 0xFD]))
+        let originalBytes = Data([0xFF, 0xFE, 0xFD])
+        try writeRaw(originalBytes)
 
-        // When/Then: throws .invalidEncoding
-        XCTAssertThrowsError(
+        // When/Then: does not throw
+        XCTAssertNoThrow(
             try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
-        ) { error in
-            guard let configError = error as? HermesConfigError else {
-                XCTFail("Expected HermesConfigError, got \(type(of: error))")
-                return
-            }
-            if case .invalidEncoding = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .invalidEncoding, got \(configError)")
-            }
-        }
+        )
+
+        let finalData = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        XCTAssertTrue(finalData.starts(with: originalBytes),
+                      "The original invalid-UTF-8 bytes must be preserved verbatim")
+        let finalContent = String(decoding: finalData, as: UTF8.self)
+        XCTAssertTrue(finalContent.contains(beginLine), "The managed block should still be appended")
     }
 
     // Contract: dotfiles-managed setups commonly symlink
@@ -684,7 +722,11 @@ final class HermesConfigManagerTests: XCTestCase {
                        "disableIPC must not create the file when it does not exist")
     }
 
-    func test_disableIPC_throwsOnMalformedBlock_beginOnly() throws {
+    // An orphan BEGIN (no matching END) now self-heals instead of
+    // throwing: `isOwnBodyLine` recognizes the stale mcp_servers:/
+    // calyx-ipc:/url: body that follows it as Calyx's own, so the whole
+    // orphan span is removed, leaving the surrounding user content intact.
+    func test_disableIPC_orphanBeginOnly_selfHealsInsteadOfThrowing() throws {
         // Given: pre-existing BEGIN line with no matching END
         let existing = """
         agent_name: "hermes"
@@ -696,23 +738,18 @@ final class HermesConfigManagerTests: XCTestCase {
         """
         try writeConfig(existing)
 
-        // When/Then: throws .malformedManagedBlock
-        XCTAssertThrowsError(
-            try HermesConfigManager.disableIPC(configPath: configPath)
-        ) { error in
-            guard let configError = error as? HermesConfigError else {
-                XCTFail("Expected HermesConfigError, got \(type(of: error))")
-                return
-            }
-            if case .malformedManagedBlock = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .malformedManagedBlock, got \(configError)")
-            }
-        }
+        // When/Then: does not throw
+        XCTAssertNoThrow(try HermesConfigManager.disableIPC(configPath: configPath))
+
+        let content = readConfig()
+        XCTAssertEqual(content, "agent_name: \"hermes\"\nmax_tokens: 4096")
     }
 
-    func test_disableIPC_throwsOnMalformedBlock_endOnly() throws {
+    // An orphan END (no matching BEGIN) now self-heals instead of
+    // throwing: only the orphan END marker itself is removed -- content
+    // that never had a BEGIN marker over it was never inside Calyx's owned
+    // span, so it survives untouched.
+    func test_disableIPC_orphanEndOnly_selfHealsInsteadOfThrowing() throws {
         // Given: pre-existing END line with no matching BEGIN
         let existing = """
         agent_name: "hermes"
@@ -724,23 +761,22 @@ final class HermesConfigManagerTests: XCTestCase {
         """
         try writeConfig(existing)
 
-        // When/Then: throws .malformedManagedBlock
-        XCTAssertThrowsError(
-            try HermesConfigManager.disableIPC(configPath: configPath)
-        ) { error in
-            guard let configError = error as? HermesConfigError else {
-                XCTFail("Expected HermesConfigError, got \(type(of: error))")
-                return
-            }
-            if case .malformedManagedBlock = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .malformedManagedBlock, got \(configError)")
-            }
-        }
+        // When/Then: does not throw
+        XCTAssertNoThrow(try HermesConfigManager.disableIPC(configPath: configPath))
+
+        let content = readConfig()
+        XCTAssertEqual(
+            content,
+            "agent_name: \"hermes\"\nmcp_servers:\n  calyx-ipc:\n    url: \"http://localhost:1111/mcp\"\nmax_tokens: 4096"
+        )
     }
 
-    func test_disableIPC_throwsOnMalformedBlock_missingCalyxIpc() throws {
+    // A well-formed BEGIN/END pair whose body has no calyx-ipc: line is
+    // still Calyx-owned territory (the marker span, not its content,
+    // establishes ownership), but nothing in the body was identified as
+    // Calyx's own -- so the whole body is foreign and is preserved in
+    // place of the removed markers, instead of throwing.
+    func test_disableIPC_beginEndWithNoCalyxIpcBody_preservesBodyInsteadOfThrowing() throws {
         // Given: pre-existing BEGIN/END pair but NO calyx-ipc: key between them
         let existing = """
         agent_name: "hermes"
@@ -751,20 +787,14 @@ final class HermesConfigManagerTests: XCTestCase {
         """
         try writeConfig(existing)
 
-        // When/Then: throws .malformedManagedBlock
-        XCTAssertThrowsError(
-            try HermesConfigManager.disableIPC(configPath: configPath)
-        ) { error in
-            guard let configError = error as? HermesConfigError else {
-                XCTFail("Expected HermesConfigError, got \(type(of: error))")
-                return
-            }
-            if case .malformedManagedBlock = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .malformedManagedBlock, got \(configError)")
-            }
-        }
+        // When/Then: does not throw
+        XCTAssertNoThrow(try HermesConfigManager.disableIPC(configPath: configPath))
+
+        let content = readConfig()
+        XCTAssertEqual(
+            content,
+            "agent_name: \"hermes\"\n# someone deleted the calyx-ipc body\nmax_tokens: 4096"
+        )
     }
 
     // Contract: see the enableIPC symlink tests above —
@@ -806,24 +836,20 @@ final class HermesConfigManagerTests: XCTestCase {
                        "The symlink at configPath must survive the write")
     }
 
-    func test_disableIPC_throwsOnInvalidEncoding() throws {
+    // Same byte-for-byte reasoning as enableIPC's invalid-UTF-8 case above:
+    // no BEGIN/END marker byte sequence matches inside invalid UTF-8 bytes,
+    // so disableIPC finds nothing of its own to remove and leaves the file
+    // untouched rather than throwing.
+    func test_disableIPC_invalidUTF8Bytes_leftUntouched() throws {
         // Given: file with invalid UTF-8 bytes
-        try writeRaw(Data([0xFF, 0xFE, 0xFD]))
+        let originalBytes = Data([0xFF, 0xFE, 0xFD])
+        try writeRaw(originalBytes)
 
-        // When/Then: throws .invalidEncoding
-        XCTAssertThrowsError(
-            try HermesConfigManager.disableIPC(configPath: configPath)
-        ) { error in
-            guard let configError = error as? HermesConfigError else {
-                XCTFail("Expected HermesConfigError, got \(type(of: error))")
-                return
-            }
-            if case .invalidEncoding = configError {
-                // Expected
-            } else {
-                XCTFail("Expected .invalidEncoding, got \(configError)")
-            }
-        }
+        // When/Then: does not throw
+        XCTAssertNoThrow(try HermesConfigManager.disableIPC(configPath: configPath))
+
+        let finalData = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        XCTAssertEqual(finalData, originalBytes, "disableIPC must leave unrecognized bytes untouched")
     }
 
     // MARK: - isIPCEnabled
@@ -836,8 +862,12 @@ final class HermesConfigManagerTests: XCTestCase {
         XCTAssertTrue(HermesConfigManager.isIPCEnabled(configPath: configPath))
     }
 
-    func test_isIPCEnabled_falseForBeginOnly() throws {
-        // Given: BEGIN line only (no END, no calyx-ipc body in well-formed pair)
+    // An orphan BEGIN (no matching END) is still Calyx-owned territory:
+    // disableIPC's own markerEditor.removeBlock self-heals it (see
+    // isOwnBodyLine) rather than leaving it untouched. isIPCEnabled must
+    // use the same detection rule, so it must report true here too.
+    func test_isIPCEnabled_trueForOrphanBeginOnly() throws {
+        // Given: BEGIN line only (no END)
         let existing = """
         # BEGIN CALYX IPC (managed by Calyx, do not edit)
         mcp_servers:
@@ -847,10 +877,12 @@ final class HermesConfigManagerTests: XCTestCase {
         try writeConfig(existing)
 
         // When/Then
-        XCTAssertFalse(HermesConfigManager.isIPCEnabled(configPath: configPath))
+        XCTAssertTrue(HermesConfigManager.isIPCEnabled(configPath: configPath))
     }
 
-    func test_isIPCEnabled_falseForEndOnly() throws {
+    // Same reasoning as the orphan-BEGIN case above: an orphan END (no
+    // matching BEGIN) self-heals too, so isIPCEnabled must report true.
+    func test_isIPCEnabled_trueForOrphanEndOnly() throws {
         // Given: END line only
         let existing = """
         mcp_servers:
@@ -861,11 +893,15 @@ final class HermesConfigManagerTests: XCTestCase {
         try writeConfig(existing)
 
         // When/Then
-        XCTAssertFalse(HermesConfigManager.isIPCEnabled(configPath: configPath))
+        XCTAssertTrue(HermesConfigManager.isIPCEnabled(configPath: configPath))
     }
 
-    func test_isIPCEnabled_falseForBeginEndWithoutCalyxIpc() throws {
-        // Given: BEGIN/END pair but no calyx-ipc: between
+    // A BEGIN/END pair with no calyx-ipc: line between them is still
+    // Calyx-owned territory: disableIPC's own markerEditor.removeBlock
+    // requires only a matched BEGIN/END pair and would remove this exact
+    // block. isIPCEnabled must use the same detection rule, so it must
+    // report true here too.
+    func test_isIPCEnabled_trueForBeginEndWithoutCalyxIpc() throws {
         let existing = """
         # BEGIN CALYX IPC (managed by Calyx, do not edit)
         # nothing useful here
@@ -873,8 +909,19 @@ final class HermesConfigManagerTests: XCTestCase {
         """
         try writeConfig(existing)
 
-        // When/Then
-        XCTAssertFalse(HermesConfigManager.isIPCEnabled(configPath: configPath))
+        XCTAssertTrue(HermesConfigManager.isIPCEnabled(configPath: configPath))
+    }
+
+    // Same content as above, with the document's line endings all CRLF.
+    func test_isIPCEnabled_trueForBeginEndWithoutCalyxIpc_crlfFile() throws {
+        let existing = [
+            "# BEGIN CALYX IPC (managed by Calyx, do not edit)",
+            "# nothing useful here",
+            "# END CALYX IPC",
+        ].joined(separator: "\r\n")
+        try writeConfig(existing)
+
+        XCTAssertTrue(HermesConfigManager.isIPCEnabled(configPath: configPath))
     }
 
     func test_isIPCEnabled_falseForMissingFile() {

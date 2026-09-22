@@ -12,8 +12,22 @@
 //!
 //! The tests below pin `resolve_terminal_env`'s contract: reading each
 //! of `TERM TERMINFO TERM_PROGRAM TERM_PROGRAM_VERSION COLORTERM LANG
-//! LC_ALL LC_CTYPE PATH MANPATH` through the injected `lookup` closure
-//! and forwarding only the keys present, unchanged.
+//! LC_ALL LC_CTYPE PATH MANPATH CALYX_ENDPOINT_FILE` through the
+//! injected `lookup` closure and forwarding only the keys present,
+//! unchanged.
+//!
+//! `CALYX_ENDPOINT_FILE` is included for the same reason as `PATH`,
+//! not the same reason as the terminal/locale keys: it does not come
+//! from the launchd job environment at all. Calyx writes it into every
+//! ghostty surface's own environment (including the surface whose
+//! command is `calyx-session attach`), scoped to wherever that Calyx
+//! process actually wrote `agent-endpoint.json` (the real Application
+//! Support directory in production, or a `--calyx-path-root` scratch
+//! directory under test). The daemon cannot regenerate that path
+//! itself the way it manufactures `CALYX_SESSION_ID`, so the attach
+//! client's own copy -- inherited from the surface exactly like this
+//! function's other keys -- is the only copy that can ever reach the
+//! spawned shell.
 //!
 //! `SHELL` and `HOME` are deliberately excluded: launchd already
 //! supplies both correctly from the user record, and `session.rs`
@@ -53,6 +67,7 @@ const TARGET_KEYS: &[&str] = &[
     "LC_CTYPE",
     "PATH",
     "MANPATH",
+    "CALYX_ENDPOINT_FILE",
 ];
 
 /// Computes the terminal/locale environment `attach` re-supplies into
@@ -95,6 +110,10 @@ mod tests {
             ("LC_CTYPE", "en_US.UTF-8"),
             ("PATH", "/usr/local/bin:/usr/bin:/bin"),
             ("MANPATH", "/usr/local/share/man:/usr/share/man"),
+            (
+                "CALYX_ENDPOINT_FILE",
+                "/Users/alice/Library/Application Support/Calyx/agent-endpoint.json",
+            ),
         ]
         .into_iter()
         .collect();
@@ -108,7 +127,7 @@ mod tests {
         assert_eq!(
             as_map(result),
             expected,
-            "every one of the ten target keys should pass through unchanged when present"
+            "every one of the eleven target keys should pass through unchanged when present"
         );
     }
 

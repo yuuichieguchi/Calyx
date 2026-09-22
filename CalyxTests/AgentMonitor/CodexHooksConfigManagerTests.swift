@@ -408,6 +408,107 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         }
     }
 
+    // MARK: - foreignTableBytes: two shapes not addressed by a table header
+
+    /// A non-table-header line sitting before the block's first
+    /// `[[hooks.*]]` header (Codex, or a user, wrote it directly under
+    /// the BEGIN comment) is foreign content with no table header of its
+    /// own to anchor a chunk -- it must still survive byte-for-byte,
+    /// same as a foreign table that comes after a header.
+    func test_removeHooks_preservesForeignLineBeforeFirstTableHeaderInsideBlock_lf() throws {
+        let content = [
+            "profile = \"default\"",
+            Self.beginLine,
+            "my_key = 1",
+            "[[hooks.Stop]]",
+            "[[hooks.Stop.hooks]]",
+            "type = \"command\"",
+            expectedCommandLine,
+            "timeout = 5",
+            Self.endLine,
+            "",
+        ].joined(separator: "\n")
+        writeConfig(content)
+
+        try CodexHooksConfigManager.removeHooks(configPath: configPath)
+
+        let disabled = readConfig()
+        XCTAssertFalse(disabled.contains(Self.beginLine))
+        XCTAssertFalse(disabled.contains(expectedCommandLine))
+        XCTAssertTrue(disabled.contains("my_key = 1"),
+                      "A line preceding the block's first table header must survive as foreign content, " +
+                      "not be silently dropped")
+        XCTAssertTrue(disabled.contains("profile = \"default\""))
+    }
+
+    func test_removeHooks_preservesForeignLineBeforeFirstTableHeaderInsideBlock_crlf() throws {
+        let content = [
+            "profile = \"default\"",
+            Self.beginLine,
+            "my_key = 1",
+            "[[hooks.Stop]]",
+            "[[hooks.Stop.hooks]]",
+            "type = \"command\"",
+            expectedCommandLine,
+            "timeout = 5",
+            Self.endLine,
+            "",
+        ].joined(separator: "\r\n")
+        writeConfig(content)
+
+        try CodexHooksConfigManager.removeHooks(configPath: configPath)
+
+        let disabled = readConfig()
+        XCTAssertFalse(disabled.contains(Self.beginLine))
+        XCTAssertFalse(disabled.contains(expectedCommandLine))
+        XCTAssertTrue(disabled.contains("my_key = 1"),
+                      "A line preceding the block's first table header must survive as foreign content in a " +
+                      "CRLF file too")
+        XCTAssertTrue(disabled.contains("profile = \"default\""))
+    }
+
+    /// A block body with no table header at all cannot be identified as
+    /// Calyx's own content by any means -- the whole body must be
+    /// preserved as foreign, matching HermesConfigManager.foreignBodyBytes's
+    /// rule for a span with no recognizable calyx-ipc line.
+    func test_removeHooks_preservesEntireBodyWhenNoTableHeaderPresent_lf() throws {
+        let content = [
+            "profile = \"default\"",
+            Self.beginLine,
+            "not_a_table_at_all = true",
+            Self.endLine,
+            "",
+        ].joined(separator: "\n")
+        writeConfig(content)
+
+        try CodexHooksConfigManager.removeHooks(configPath: configPath)
+
+        let disabled = readConfig()
+        XCTAssertFalse(disabled.contains(Self.beginLine))
+        XCTAssertTrue(disabled.contains("not_a_table_at_all = true"),
+                      "A block body with no table header at all must be preserved in full, not discarded")
+        XCTAssertTrue(disabled.contains("profile = \"default\""))
+    }
+
+    func test_removeHooks_preservesEntireBodyWhenNoTableHeaderPresent_crlf() throws {
+        let content = [
+            "profile = \"default\"",
+            Self.beginLine,
+            "not_a_table_at_all = true",
+            Self.endLine,
+            "",
+        ].joined(separator: "\r\n")
+        writeConfig(content)
+
+        try CodexHooksConfigManager.removeHooks(configPath: configPath)
+
+        let disabled = readConfig()
+        XCTAssertFalse(disabled.contains(Self.beginLine))
+        XCTAssertTrue(disabled.contains("not_a_table_at_all = true"),
+                      "A block body with no table header at all must be preserved in full in a CRLF file too")
+        XCTAssertTrue(disabled.contains("profile = \"default\""))
+    }
+
     // MARK: - Migration: approval entry moves from PreToolUse to PermissionRequest
 
     /// The event list a pre-SessionEnd install wrote to its config.
@@ -874,5 +975,47 @@ final class CodexHooksConfigManagerTests: XCTestCase {
 
         XCTAssertFalse(CodexHooksConfigManager.areHooksInstalled(configPath: configPath),
                        "After removeHooks, hooks must no longer be reported as installed")
+    }
+
+    // areHooksInstalled must use the same whitespace-tolerant, byte-level
+    // BEGIN-line match the write side (markerEditor / findBeginLineIndex)
+    // uses, not a separate String-based exact-line match: a second
+    // detection rule for the same file lets a user's own reformatting
+    // (leading/trailing whitespace on the BEGIN line) make this read-only
+    // check disagree with what removeHooks would actually find.
+    func test_areHooksInstalled_beginLineWithSurroundingWhitespace_lfFile_isTrue() throws {
+        let content = [
+            "profile = \"default\"",
+            "  " + Self.beginLine + "  ",
+            "[[hooks.Stop]]",
+            Self.endLine,
+            "",
+        ].joined(separator: "\n")
+        writeConfig(content)
+
+        XCTAssertTrue(CodexHooksConfigManager.areHooksInstalled(configPath: configPath),
+                      "A BEGIN line with leading/trailing whitespace must still be recognized as installed, " +
+                      "matching the write side's own whitespace-tolerant marker scan")
+    }
+
+    func test_areHooksInstalled_beginLineWithSurroundingWhitespace_crlfFile_isTrue() throws {
+        let content = [
+            "profile = \"default\"",
+            "  " + Self.beginLine + "  ",
+            "[[hooks.Stop]]",
+            Self.endLine,
+            "",
+        ].joined(separator: "\r\n")
+        writeConfig(content)
+
+        XCTAssertTrue(CodexHooksConfigManager.areHooksInstalled(configPath: configPath),
+                      "A CRLF file with a whitespace-padded BEGIN line must still be recognized as installed")
+    }
+
+    func test_areHooksInstalled_noManagedBlock_isFalse() throws {
+        writeConfig("profile = \"default\"\n")
+
+        XCTAssertFalse(CodexHooksConfigManager.areHooksInstalled(configPath: configPath),
+                       "A file with no Calyx managed block must not be reported as installed")
     }
 }

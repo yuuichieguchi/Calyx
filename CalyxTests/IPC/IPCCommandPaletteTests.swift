@@ -2,32 +2,23 @@
 //  IPCCommandPaletteTests.swift
 //  CalyxTests
 //
-//  Pins the three-way IPC command-palette split: `ipc.enable` (offered
-//  while the server is not running), `ipc.reconfigure` (offered while it
-//  is running, re-running the same idempotent `enableIPC()` handler so an
-//  agent CLI installed after the first enable gets its config written
-//  without a destructive disable/enable round trip), and `ipc.disable`
-//  (offered while it is running). Queries
-//  `controller.commandRegistry.allCommands` directly, the same style as
-//  `SessionCommandPaletteTests`, rather than driving the real palette UI.
+//  The three IPC palette commands were removed entirely: `ipc.enable`
+//  (logically unreachable from an agent, since MCPCockpitBridge's
+//  palette_execute only runs inside CalyxMCPServer, which cannot be
+//  running yet for this command to matter), `ipc.reconfigure` (lets an
+//  agent rewrite the user's own CLI configs unattended), and
+//  `ipc.disable` (an agent cutting its own connection). AI Agent IPC is
+//  now a persistent Settings > Agents toggle (SettingsRow.agentIPC)
+//  instead of a one-shot palette action, so none of the three commands
+//  -- their registration, their titles, or their availability gates --
+//  exist anymore. This file now pins their ABSENCE.
 //
-//  Availability comes from the live `CalyxMCPServer.shared` singleton's
-//  `isRunning`, which none of these tests may flip: nothing in `CalyxTests`
-//  ever starts `.shared`. Every existing IPC test that calls `start()`/
-//  `stop()` (`CalyxMCPServerTests`, `CalyxMCPServerWiringBugSpecTests`,
-//  `CalyxMCPServerLoopbackBugSpecTests`) does so on its own fresh
-//  `CalyxMCPServer()` instance bound to a real loopback port, never on
-//  `.shared`. `IPCActivationCoordinatorTests` injects a fake
-//  `IPCServerControl` into `IPCActivationCoordinator`, but the palette
-//  closures under test here read `CalyxMCPServer.shared.isRunning`
-//  directly and never go through that seam. `isRunning`'s setter is
-//  `private`, which `@testable import` does not lift across files, and
-//  `CalyxMCPServer` exposes no test-only setter for it (contrast
-//  `_testSetToken`, `_testInjectLSPBridge`). The tests below therefore
-//  only observe the not-running branch of each gate. Observing the
-//  running branch would need either a real `start()` call, which binds a
-//  real port and does not belong in a unit test, or a seam this file does
-//  not add.
+//  showIPCAlert (CalyxWindowController.swift:5944) is NOT removed: two
+//  of its four call sites (:5839, :5873) belong to the review-send flow,
+//  independent of IPC enable/disable. It stays `private`, so it is not
+//  reachable through `@testable import` from this file and cannot be
+//  pinned here -- its survival is a production-code fact for code
+//  review, not a testable one.
 //
 
 import XCTest
@@ -40,8 +31,7 @@ final class IPCCommandPaletteTests: XCTestCase {
     /// Minimal controller for direct registry inspection, mirroring
     /// `SessionCommandPaletteTests.makeController()`. `restoring: true`
     /// skips `setupTerminalSurface()`, which needs a live Ghostty app
-    /// instance; `setupCommandRegistry()` runs regardless of `restoring`,
-    /// so every palette command, IPC included, is registered.
+    /// instance; `setupCommandRegistry()` runs regardless of `restoring`.
     private func makeController() -> CalyxWindowController {
         let window = CalyxWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
@@ -55,113 +45,37 @@ final class IPCCommandPaletteTests: XCTestCase {
         return CalyxWindowController(window: window, windowSession: session, restoring: true)
     }
 
-    private func command(_ id: String, in controller: CalyxWindowController) throws -> PaletteCommand {
-        try XCTUnwrap(
-            controller.commandRegistry.allCommands.first(where: { $0.id == id }),
-            "setupCommandRegistry must register a '\(id)' command"
-        )
+    // MARK: - The three IPC palette commands must not be registered
+
+    func test_ipcEnableCommand_isNotRegistered() {
+        let controller = makeController()
+
+        XCTAssertNil(controller.commandRegistry.allCommands.first(where: { $0.id == "ipc.enable" }),
+                     "ipc.enable must no longer be registered -- IPC is now a persistent Settings toggle, not " +
+                     "a palette action an agent could invoke on itself")
     }
 
-    // MARK: - Registration and titles
-
-    func test_ipcEnableCommand_isRegistered() throws {
+    func test_ipcReconfigureCommand_isNotRegistered() {
         let controller = makeController()
-        _ = try command("ipc.enable", in: controller)
+
+        XCTAssertNil(controller.commandRegistry.allCommands.first(where: { $0.id == "ipc.reconfigure" }),
+                     "ipc.reconfigure must no longer be registered -- it let an agent rewrite the user's own " +
+                     "CLI configs unattended")
     }
 
-    func test_ipcEnableCommand_titleIsEnableAIAgentIPC() throws {
+    func test_ipcDisableCommand_isNotRegistered() {
         let controller = makeController()
-        let enableCommand = try command("ipc.enable", in: controller)
 
-        XCTAssertEqual(enableCommand.title, "Enable AI Agent IPC",
-                       "ipc.enable's title must read exactly \"Enable AI Agent IPC\", the title the " +
-                       "not-running row of the palette must show")
+        XCTAssertNil(controller.commandRegistry.allCommands.first(where: { $0.id == "ipc.disable" }),
+                     "ipc.disable must no longer be registered -- an agent could use it to cut its own connection")
     }
 
-    func test_ipcReconfigureCommand_isRegistered() throws {
+    func test_noCommandInIPCCategory_remainsRegistered() {
         let controller = makeController()
-        _ = try command("ipc.reconfigure", in: controller)
-    }
 
-    func test_ipcReconfigureCommand_titleIsReconfigureAIAgentIPC() throws {
-        let controller = makeController()
-        let reconfigureCommand = try command("ipc.reconfigure", in: controller)
+        let ipcCategoryCommands = controller.commandRegistry.allCommands.filter { $0.category == "IPC" }
 
-        XCTAssertEqual(reconfigureCommand.title, "Reconfigure AI Agent IPC",
-                       "ipc.reconfigure's title must read exactly \"Reconfigure AI Agent IPC\", distinct " +
-                       "from ipc.enable's title so the running-state row never reads as a second Enable")
-    }
-
-    func test_ipcDisableCommand_isRegistered() throws {
-        let controller = makeController()
-        _ = try command("ipc.disable", in: controller)
-    }
-
-    func test_ipcDisableCommand_titleIsDisableAIAgentIPC() throws {
-        let controller = makeController()
-        let disableCommand = try command("ipc.disable", in: controller)
-
-        XCTAssertEqual(disableCommand.title, "Disable AI Agent IPC",
-                       "ipc.disable's title must read exactly \"Disable AI Agent IPC\"")
-    }
-
-    // MARK: - Availability at the live (not-running) singleton state
-
-    /// Not running is the one state from which the server can be
-    /// started, so `ipc.enable` must stay offered in it.
-    func test_ipcEnableCommand_isAvailable_whenServerNotRunning() throws {
-        XCTAssertFalse(CalyxMCPServer.shared.isRunning,
-                       "Precondition: no test starts the shared server, so these gates are read in the not-running state")
-        let controller = makeController()
-        let enableCommand = try command("ipc.enable", in: controller)
-
-        XCTAssertTrue(enableCommand.isAvailable(),
-                      "ipc.enable must be offered while the server is not running, since that is the " +
-                      "only state from which it can be started")
-    }
-
-    func test_ipcReconfigureCommand_isUnavailable_whenServerNotRunning() throws {
-        XCTAssertFalse(CalyxMCPServer.shared.isRunning,
-                       "Precondition: no test starts the shared server, so these gates are read in the not-running state")
-        let controller = makeController()
-        let reconfigureCommand = try command("ipc.reconfigure", in: controller)
-
-        XCTAssertFalse(reconfigureCommand.isAvailable(),
-                       "ipc.reconfigure must be hidden while the server is not running, since there is " +
-                       "no running configuration to reconfigure")
-    }
-
-    /// `ipc.disable`'s gate reads `CalyxMCPServer.shared.isRunning`
-    /// directly. This pins the not-running half of "`ipc.disable` and
-    /// `ipc.reconfigure` agree"; the running half cannot be pinned here,
-    /// per this file's header comment.
-    func test_ipcDisableCommand_isUnavailable_whenServerNotRunning() throws {
-        XCTAssertFalse(CalyxMCPServer.shared.isRunning,
-                       "Precondition: no test starts the shared server, so these gates are read in the not-running state")
-        let controller = makeController()
-        let disableCommand = try command("ipc.disable", in: controller)
-
-        XCTAssertFalse(disableCommand.isAvailable(),
-                       "ipc.disable must be hidden while the server is not running, since there is " +
-                       "nothing running to disable")
-    }
-
-    // MARK: - Enable/reconfigure mutual exclusivity
-
-    /// A plain `XCTAssertNotEqual` on the two `Bool`s is exactly an XOR:
-    /// with only two possible values, "not equal" and "exactly one true"
-    /// coincide. Written this way (rather than two separate `isAvailable`
-    /// assertions) so the test cannot pass with both true or both false;
-    /// either of those is the shape of the regression it pins.
-    func test_ipcEnableAndReconfigureAvailability_areMutuallyExclusive() throws {
-        let controller = makeController()
-        let enableCommand = try command("ipc.enable", in: controller)
-        let reconfigureCommand = try command("ipc.reconfigure", in: controller)
-
-        XCTAssertNotEqual(enableCommand.isAvailable(), reconfigureCommand.isAvailable(),
-                          "exactly one of ipc.enable/ipc.reconfigure must be available at a time. Both " +
-                          "available at once is the regression this pins: \"Enable AI Agent IPC\" showing " +
-                          "in the palette alongside \"Disable AI Agent IPC\" while the server is already " +
-                          "running")
+        XCTAssertTrue(ipcCategoryCommands.isEmpty,
+                      "The entire \"IPC\" palette category must be empty once all three commands are removed")
     }
 }
