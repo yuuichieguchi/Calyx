@@ -51,7 +51,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 
 - **Agents Sidebar** -- live status for Claude Code, Codex, OpenCode, Hermes, Grok, and pi, with every row named after its own pane (title, working directory, agent), unread badges, last-seen timestamps, and click-to-focus navigation
 - **Subagent Rows** -- a pane running subagents gains a count badge and a disclosure chevron that expands them as indented child rows, for the CLIs that report subagents (Claude Code, Codex, OpenCode, Grok); each row carries the child's state, and the child's current tool with the command, path, or URL that call is working on wherever its CLI reports one (Claude Code and Grok; Codex and OpenCode report lifecycle only). Children exist only while the CLI reports them, and a pane whose CLI reports no subagents at all (pi, Hermes, herdr) looks exactly as it always did. Because a CLI reads its hook configuration once at session start, subagent rows appear in sessions started after Calyx installs the hooks, not in one already running
-- **Approval Inbox** -- one opt-in queue across every pane for Claude Code and Codex permission prompts, for the tool calls of always-approve Grok sessions, and for every pi tool call, shown in a notification-style panel with a primary action and an Options pull-down for every other choice (including Allow, Deny, and per-pane or global session-scoped approval), or an inline option list when the question allows several answers at once or carries a preview; Claude Code and Codex queue a request only where the CLI would have prompted you itself and fall back to the agent's own prompt, while an unanswered Grok or pi request is denied
+- **Approval Inbox** -- one opt-in queue across every pane for Claude Code and Codex permission prompts, for the tool calls of always-approve Grok sessions, and for every pi tool call, shown in a notification-style panel at the top-right of the screen with a primary action and an Options pull-down for every other choice (the CLI's own always-allow suggestions, or per-pane session-scoped approval when the CLI offers none, and No), or an inline option list when the question allows several answers at once or carries a preview; Claude Code and Codex queue a request only where the CLI would have prompted you itself and fall back to the agent's own prompt, while an unanswered Grok or pi request is denied
 - **Approval Queue Navigation** -- inspect and decide pending requests in any order, with a preview menu on the position label for jumping straight to one, and automatic navigation to the nearest remaining request
 - **Dismiss** -- the panel's own × is offered only when the CLI's own prompt, or the calling MCP agent, can still decide the request without Calyx: it hands a Claude Code or Codex tool call back to that CLI's own confirmation prompt, or reports a no-decision result to a Calyx MCP tool's own caller. Grok and pi requests must be answered in Calyx -- its own decision is their only gate, so the × is disabled for them
 - **Agent Cockpit** -- MCP tools for listing, creating, and splitting panes; commands and keystrokes remain approval-gated unless auto-approve is enabled
@@ -78,12 +78,14 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 - **libghostty Engine** -- Metal GPU-accelerated rendering powered by Ghostty v1.3.1
 - **Tab Groups and Split Panes** -- color-coded collapsible groups, tab renaming and reordering, horizontal and vertical splits, directional focus, and split zoom
 - **Tab Context Menu** -- right-click or Ctrl+click a tab in the tab bar or sidebar to close it, close the other tabs or the tabs to its right in its group, or rename it, without switching to it
+- **Group Context Menu** -- right-click or Ctrl+click a group header in the sidebar to close it, close the other groups or the groups below it, rename it, or pick its color, without switching to it
 - **Command Palette** -- search and run operations with `Cmd+Shift+P`
 - **Ghostty Compatibility** -- read `~/.config/ghostty/config`, hot-reload most settings, and bind Calyx operations through Ghostty keybind actions
 - **Search and Navigation** -- highlighted scrollback search, native overlay scrollbar, smooth trackpad and mouse-wheel scrolling, and prompt-line cursor click-to-move
 - **Input Tools** -- shell-escaped drag and drop, multiline Compose Overlay, clipboard safety confirmation, and Secure Keyboard Entry
 - **Quick Terminal and Notifications** -- a system-wide drop-down terminal plus OSC 9/99/777 desktop notifications
 - **Liquid Glass Appearance** -- macOS 26-native glass UI drawn as one seamless sheet of window chrome, eight theme presets, custom colors, adaptive text color, an optional opacity pass that reaches cells an app paints itself, and a fully opaque window under Reduce Transparency ([demo video](https://www.youtube.com/watch?v=cUYc7yzI_eM))
+- **About Window and Help Menu** -- **About Calyx** shows the version, build, and a linked git commit with **Docs** and **GitHub** buttons; **Help -> Calyx Help** (`Cmd+?`) opens the help center
 
 ### Browser automation
 
@@ -144,6 +146,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 | `Cmd+Shift+P` | Command palette |
 | `Cmd+Shift+E` | Toggle compose overlay |
 | `Cmd+Shift+B` | Session Browser |
+| `Cmd+?` | Calyx Help (opens the help center) |
 | `Cmd+Enter` / `Ctrl+Cmd+F` | Toggle full screen |
 
 ### Compose Overlay
@@ -158,11 +161,11 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 
 AI agent instances (Claude Code, Codex CLI, OpenCode, Hermes, Grok, pi) running in different Calyx tabs or panes can communicate with each other via a built-in MCP server.
 
-1. Open the command palette (`Cmd+Shift+P`) and run **Enable AI Agent IPC**
+1. Open Settings -> **Agents** and turn on **Enable AI Agent IPC**
 2. Start agents (Claude Code, Codex, OpenCode, Hermes, Grok, or pi) in two or more terminal panes
 3. Each instance automatically registers as a peer and can send/receive messages
 
-Config is auto-written to `~/.claude.json`, `~/.codex/config.toml`, `~/.config/opencode/{opencode.json,AGENTS.md}`, `~/.hermes/config.yaml`, and `~/.grok/config.toml` when the respective tool is installed. Restart running agent instances to pick up the new MCP server. If you install a supported agent later, run **Reconfigure AI Agent IPC** to write its config and hooks. It never restarts a server that is already running, so agents already connected keep working.
+Config is auto-written to `~/.claude.json`, `~/.codex/config.toml`, `~/.config/opencode/{opencode.json,AGENTS.md}`, `~/.hermes/config.yaml`, and `~/.grok/config.toml` when the respective tool is installed. Restart running agent instances to pick up the new MCP server. If you install a supported agent later, click **Refresh** under the switch to write its config and hooks. It never restarts a server that is already running, so agents already connected keep working. Calyx remembers the switch: while it is on, every launch starts the server and rewrites these entries, changing only Calyx's own entry in each file.
 
 pi has no MCP client configuration file at all, so it reaches Calyx through a single TypeScript extension written to `~/.pi/agent/extensions/calyx.ts`, which pi auto-loads. It carries the whole integration: the sidebar row, the approval gate, and a `calyx` tool that bridges the MCP tools above (call it with `{"tool": "list"}` to enumerate them). A pi started outside Calyx, or inside a herdr pane, registers nothing.
 
@@ -170,7 +173,7 @@ Available MCP tools: `register_peer`, `list_peers`, `send_message`, `broadcast`,
 
 The same server exposes cockpit tools that control Calyx (`pane_list`, `pane_split`, `tab_create`; approval-gated: `pane_run`, `pane_send_keys`, `palette_execute`) and command-log tools (`terminal_list_commands`, `terminal_read_output`, `terminal_await_command`; requires the zsh/fish shell integration, installed automatically while Settings -> Agents -> **Track shell commands** is on). Command text and output are redacted for known secret patterns (tokens, passwords, API keys, JWTs) before agents can read them; output still being redacted reports `{"output_pending": true}` from `terminal_read_output` until it finishes.
 
-To disable, open the command palette and run **Disable AI Agent IPC**.
+To disable, turn the switch off. Calyx removes its own entries and hooks, deletes the files it owns outright, and leaves a shared file that ends up empty in place.
 
 ## LSP Proxy MCP
 
@@ -178,7 +181,7 @@ Calyx can expose language server features to CLI AI agents through the same MCP 
 
 ### Setup
 
-1. Open the command palette (`Cmd+Shift+P`) and run **Enable AI Agent IPC**.
+1. Open Settings -> **Agents** and turn on **Enable AI Agent IPC**.
 2. Restart or reconnect your AI agent so it picks up the `calyx-ipc` MCP server.
 3. Optional: open Settings -> **LSP** and enable auto-install for missing language servers.
 
