@@ -251,6 +251,32 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertTrue(content.contains("http://localhost:9999/mcp"))
     }
 
+    // MARK: - Quote-aware table header detection
+
+    /// A user table header immediately following Calyx's own table, with a
+    /// trailing comment that itself contains a bracketed number
+    /// (`# see [1] for details`), must not be folded into Calyx's own
+    /// region: the header line's own FIRST closing bracket is what ends
+    /// `[mcp_servers.calyx-ipc]`'s header syntax, not the last `]` found
+    /// anywhere on the line.
+    func test_disableIPC_userTableHeaderWithBracketedTrailingComment_isPreserved() throws {
+        let existing = """
+        [mcp_servers.calyx-ipc]
+        url = "http://localhost:41830/mcp"
+        [profiles.work] # see [1] for details
+        key = "value"
+        """
+        writeConfig(existing)
+
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertEqual(
+            content, "[profiles.work] # see [1] for details\nkey = \"value\"",
+            "the user's table (header and body) must survive byte-for-byte, not be folded into Calyx's own removed region"
+        )
+    }
+
     func test_disableIPC_noFile() {
         // Given: no file exists
         XCTAssertFalse(FileManager.default.fileExists(atPath: configPath))

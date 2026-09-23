@@ -79,4 +79,54 @@ final class TOMLTableConfigDocumentEditorTests: XCTestCase {
         XCTAssertNotNil(result, "removeTable must never signal file deletion (nil) -- Calyx never deletes a user-owned file")
         XCTAssertEqual(result, Data(), "once nothing but Calyx's own table remains, removeTable must return empty Data(), not nil")
     }
+
+    // MARK: - isAnyTableHeader: quote-aware first-closing-bracket detection
+    //
+    // Each case places a real user table header immediately after Calyx's
+    // own region. removeTable must end Calyx's region at Calyx's own last
+    // content line and leave the user's header (and its body) byte-for-byte
+    // untouched; setTable must replace only Calyx's own region, never
+    // folding the user's table into it.
+
+    private func headerCases() -> [(label: String, header: String, body: String)] {
+        [
+            ("header with a trailing comment containing a bracketed number",
+             "[profiles.work] # see [1] for details", "key = \"value\""),
+            ("header whose quoted key contains a bracket",
+             "[\"a]b\"]", "key = \"value\""),
+            ("header whose literal-string key contains a bracket",
+             "['a]b']", "key = \"value\""),
+            ("header whose quoted key contains an escaped-quote then a bracket",
+             "[\"a\\\"]b\"]", "key = \"value\""),
+            ("header with interior whitespace around the quoted key",
+             "[ \"a]b\" ]", "key = \"value\""),
+            ("array-of-tables header with a bracketed trailing comment",
+             "[[profiles]] # [x]", "name = \"p1\""),
+        ]
+    }
+
+    func test_removeTable_userHeaderImmediatelyAfterCalyxRegion_keepsUserTableByteForByte() throws {
+        for testCase in headerCases() {
+            let content = "[mcp_servers.calyx-ipc]\nurl = \"x\"\n\(testCase.header)\n\(testCase.body)\n"
+            let result = try editor.removeTable(in: Data(content.utf8))
+            let expected = "\(testCase.header)\n\(testCase.body)\n"
+            XCTAssertEqual(
+                result.map { String(decoding: $0, as: UTF8.self) }, expected,
+                "[\(testCase.label)] removeTable must keep the user's table byte-for-byte, not fold it into " +
+                "Calyx's own region"
+            )
+        }
+    }
+
+    func test_setTable_userHeaderImmediatelyAfterCalyxRegion_replacesOnlyCalyxRegion() throws {
+        for testCase in headerCases() {
+            let content = "[mcp_servers.calyx-ipc]\nurl = \"old\"\n\(testCase.header)\n\(testCase.body)\n"
+            let result = try editor.setTable(body: "url = \"new\"", in: Data(content.utf8))
+            let expected = "[mcp_servers.calyx-ipc]\nurl = \"new\"\n\(testCase.header)\n\(testCase.body)\n"
+            XCTAssertEqual(
+                String(decoding: result, as: UTF8.self), expected,
+                "[\(testCase.label)] setTable must replace only Calyx's own region, leaving the user's table untouched"
+            )
+        }
+    }
 }

@@ -191,16 +191,20 @@ struct TOMLTableConfigDocumentEditor: Sendable {
     /// to recognize where the NEXT (unrelated) table begins, ending the
     /// current region.
     ///
-    /// A bare "starts with `[`" check (this function's previous body) is
-    /// too loose: a multi-line array value's own continuation line
-    /// (`["a", "b"],`, the last element of an array-of-arrays written
-    /// across several lines) also starts with `[` after leading
-    /// whitespace, and would wrongly be read as a header, truncating the
-    /// region mid-array. This instead requires the line to actually
-    /// close (the closing bracket sequence, `]` or `]]` matching the
-    /// opener) with nothing after it but optional whitespace and an
-    /// optional trailing comment -- a trailing comma (what an array
-    /// element's continuation line has instead) fails that check.
+    /// After the opening `[` or `[[`, the scan finds the FIRST closing
+    /// `]` or `]]` (matching the opener), skipping any bracket inside a
+    /// quoted key: a basic string (`"..."`, where `\` escapes the next
+    /// byte) or a literal string (`'...'`, no escapes). The line is a
+    /// header iff what follows that closer is empty or starts with `#`
+    /// once leading whitespace is trimmed, so a bracket inside a quoted
+    /// key or inside a trailing comment never moves the closer. An
+    /// unterminated quote, or no closer at all, means not a header.
+    ///
+    /// A multi-line array value's own continuation line (`["a", "b"],`,
+    /// an element of an array-of-arrays written across several lines)
+    /// also starts with `[` after leading whitespace; its trailing comma
+    /// after the first closer fails the rule above, so it never ends the
+    /// region mid-array.
     ///
     /// Known gap, accepted as-is: a multi-line array's LAST element
     /// (`["c", "d"]` with no trailing comma, since it's followed by the
@@ -208,27 +212,58 @@ struct TOMLTableConfigDocumentEditor: Sendable {
     /// nothing distinguishes it from a real header by this line alone.
     private func isAnyTableHeader(_ line: [UInt8]) -> Bool {
         let t = trimLeading(line)
-        guard t.first == UInt8(ascii: "[") else { return false }
-        let isDoubleBracketed = t.count > 1 && t[1] == UInt8(ascii: "[")
-        let closer = Array((isDoubleBracketed ? "]]" : "]").utf8)
-        guard let closerStart = lastRangeStart(of: closer, in: t) else { return false }
-        let afterCloser = trimLeading(Array(t[(closerStart + closer.count)...]))
-        return afterCloser.isEmpty || afterCloser.first == UInt8(ascii: "#")
-    }
+        let open = UInt8(ascii: "[")
+        let close = UInt8(ascii: "]")
+        let basicQuote = UInt8(ascii: "\"")
+        let literalQuote = UInt8(ascii: "'")
+        let backslash = UInt8(ascii: "\\")
+        guard t.first == open else { return false }
+        let isDoubleBracketed = t.count > 1 && t[1] == open
 
-    /// The start index of the LAST occurrence of `needle` in `haystack`,
-    /// or `nil` if `needle` does not occur at all.
-    private func lastRangeStart(of needle: [UInt8], in haystack: [UInt8]) -> Int? {
-        guard !needle.isEmpty, haystack.count >= needle.count else { return nil }
-        var result: Int?
-        var i = 0
-        while i <= haystack.count - needle.count {
-            if Array(haystack[i..<(i + needle.count)]) == needle {
-                result = i
+        var i = isDoubleBracketed ? 2 : 1
+        var closerEnd: Int?
+        scan: while i < t.count {
+            switch t[i] {
+            case basicQuote:
+                i += 1
+                while true {
+                    guard i < t.count else { return false }
+                    if t[i] == backslash {
+                        i += 2
+                    } else if t[i] == basicQuote {
+                        i += 1
+                        break
+                    } else {
+                        i += 1
+                    }
+                }
+            case literalQuote:
+                i += 1
+                while true {
+                    guard i < t.count else { return false }
+                    if t[i] == literalQuote {
+                        i += 1
+                        break
+                    }
+                    i += 1
+                }
+            case close:
+                if !isDoubleBracketed {
+                    closerEnd = i + 1
+                    break scan
+                }
+                if i + 1 < t.count, t[i + 1] == close {
+                    closerEnd = i + 2
+                    break scan
+                }
+                i += 1
+            default:
+                i += 1
             }
-            i += 1
         }
-        return result
+        guard let closerEnd else { return false }
+        let afterCloser = trimLeading(Array(t[closerEnd...]))
+        return afterCloser.isEmpty || afterCloser.first == UInt8(ascii: "#")
     }
 
     private func isCalyxManagedBlockMarker(_ line: [UInt8]) -> Bool {
