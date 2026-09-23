@@ -945,6 +945,336 @@ final class LSPClientTests: XCTestCase {
         XCTAssertEqual(errObj?["code"] as? Int, -32602, "DecodingError must map to InvalidParams")
         XCTAssertNotNil(errObj?["message"])
     }
+
+    // MARK: - Inbound ordering and server-side cancellation
+
+    private struct IndexParams: Codable, Sendable {
+        let i: Int
+    }
+
+    /// Notifications arrive one at a time and each handler invocation
+    /// runs to completion before the next one starts, so the order
+    /// handlers observably finish in matches the order the notifications
+    /// arrived on the wire, independent of how long any individual
+    /// handler takes.
+    func test_notifications_areProcessedSerially_inArrivalOrder() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let log = OrderLog()
+        let n = 20
+
+        await client.setNotificationHandler(method: "test/ordered") { params in
+            guard let params,
+                  let data = try? JSONEncoder().encode(params),
+                  let decoded = try? JSONDecoder().decode(IndexParams.self, from: data) else {
+                return
+            }
+            let delayMs = (n - decoded.i) * 2
+            try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+            await log.append(decoded.i)
+        }
+
+        for i in 0..<n {
+            let payload = jsonRPCNotification(method: "test/ordered", paramsJSON: #"{"i":\#(i)}"#)
+            await transport.simulateServerMessage(lspFrame(payload))
+        }
+
+        let done = await waitUntil(timeout: 3.0) { await log.entries.count == n }
+        let entries = await log.entries
+        XCTAssertTrue(done, "expected \(n) notifications to be handled, got \(entries.count)")
+
+        XCTAssertEqual(entries, Array(0..<n), "notification handlers must complete in arrival order")
+    }
+
+    /// Server-initiated requests are handled one at a time, so both the
+    /// order handlers finish in and the order responses are written to
+    /// the transport match the order the requests arrived in, even when
+    /// earlier requests have a longer artificial handler delay than
+    /// later ones.
+    func test_serverRequests_areProcessedSerially_responsesArriveInOrder() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let completionLog = OrderLog()
+
+        await client.setRequestHandler(method: "test/ordered-request") { params in
+            guard let params,
+                  let data = try? JSONEncoder().encode(params),
+                  let decoded = try? JSONDecoder().decode(IndexParams.self, from: data) else {
+                return AnyCodable(NSNull())
+            }
+            let delayMs = (4 - decoded.i) * 20
+            try? await Task.sleep(nanoseconds: UInt64(delayMs) * 1_000_000)
+            await completionLog.append(decoded.i)
+            return AnyCodable(["i": AnyCodable(decoded.i)])
+        }
+
+        for id in [1, 2, 3] {
+            let req = jsonRPCRequest(id: id, method: "test/ordered-request", paramsJSON: #"{"i":\#(id)}"#)
+            await transport.simulateServerMessage(lspFrame(req))
+        }
+
+        let done = await waitUntil(timeout: 3.0) { await transport.sentMessages().count >= 3 }
+        let sent = await transport.sentMessages()
+        XCTAssertTrue(done, "expected 3 responses, got \(sent.count)")
+
+        let responseIds: [Int] = sent.compactMap { data in
+            (try? parseFramedJSON(data))?["id"] as? Int
+        }
+        XCTAssertEqual(responseIds, [1, 2, 3], "responses must be written in arrival order")
+
+        for id in [1, 2, 3] {
+            let response = responseFor(id: id, in: sent)
+            XCTAssertNil(response?["error"], "request \(id) must succeed")
+        }
+
+        let completionOrder = await completionLog.entries
+        XCTAssertEqual(completionOrder, [1, 2, 3], "handlers must complete in arrival order")
+    }
+
+    /// A `$/cancelRequest` for a request whose handler is currently
+    /// running cancels that handler's Task. The handler observes the
+    /// cancellation, throws `CancellationError`, and the client replies
+    /// with JSON-RPC error -32800 (RequestCancelled) instead of a
+    /// success or a generic internal error.
+    func test_serverCancelRequest_cancelsRunningHandler_repliesWithRequestCancelled() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let entered = ActorBox<Bool>(false)
+        let observedCancellation = ActorBox<Bool>(false)
+
+        await client.setRequestHandler(method: "test/cancellable") { _ in
+            await entered.set(true)
+            for _ in 0..<400 {
+                if Task.isCancelled { break }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+            let cancelled = Task.isCancelled
+            await observedCancellation.set(cancelled)
+            if cancelled {
+                throw CancellationError()
+            }
+            return AnyCodable(["ok": AnyCodable(true)])
+        }
+
+        let req = jsonRPCRequest(id: 7, method: "test/cancellable", paramsJSON: "{}")
+        await transport.simulateServerMessage(lspFrame(req))
+
+        let started = await waitUntil { await entered.get() }
+        XCTAssertTrue(started, "handler must have started before cancelling")
+
+        let cancelNotification = jsonRPCNotification(
+            method: "$/cancelRequest",
+            paramsJSON: #"{"id":7}"#
+        )
+        await transport.simulateServerMessage(lspFrame(cancelNotification))
+
+        let responded = await waitUntil(timeout: 4.0) {
+            let sent = await transport.sentMessages()
+            return responseFor(id: 7, in: sent) != nil
+        }
+        XCTAssertTrue(responded, "expected a response for the cancelled request")
+
+        let cancelled = await waitUntil(timeout: 4.0) { await observedCancellation.get() }
+        XCTAssertTrue(cancelled, "handler must observe cancellation before the 2s poll bound")
+
+        let sent = await transport.sentMessages()
+        let response = responseFor(id: 7, in: sent)
+        let err = response?["error"] as? [String: Any]
+        XCTAssertEqual(err?["code"] as? Int, -32800, "cancelled request must reply with RequestCancelled")
+    }
+
+    /// A `$/cancelRequest` for a running request whose handler does not
+    /// act on the cancellation and returns normally is answered with the
+    /// handler's real result, since the work it did (for example an
+    /// applied edit) has already taken effect.
+    func test_serverCancelRequest_handlerIgnoringCancellation_repliesWithItsResult() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let gate = Gate()
+        let entered = ActorBox<Bool>(false)
+        let wasCancelledOnReturn = ActorBox<Bool>(false)
+
+        await client.setRequestHandler(method: "test/ignores-cancel") { _ in
+            await entered.set(true)
+            // Wait until the test has sent `$/cancelRequest` and the
+            // client has cancelled this Task. The sleep does not observe
+            // cancellation, so each iteration takes a real 5 ms and the
+            // loop is bounded at about 3 s.
+            for _ in 0..<600 {
+                if await gate.isOpen && Task.isCancelled { break }
+                await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                    DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(5)) {
+                        cont.resume()
+                    }
+                }
+            }
+            await wasCancelledOnReturn.set(Task.isCancelled)
+            return AnyCodable(["ok": AnyCodable(true)])
+        }
+
+        let req = jsonRPCRequest(id: 8, method: "test/ignores-cancel", paramsJSON: "{}")
+        await transport.simulateServerMessage(lspFrame(req))
+
+        let started = await waitUntil { await entered.get() }
+        XCTAssertTrue(started, "handler must have started before cancelling")
+
+        let cancelNotification = jsonRPCNotification(
+            method: "$/cancelRequest",
+            paramsJSON: #"{"id":8}"#
+        )
+        await transport.simulateServerMessage(lspFrame(cancelNotification))
+        await gate.open()
+
+        let responded = await waitUntil(timeout: 4.0) {
+            let sent = await transport.sentMessages()
+            return responseFor(id: 8, in: sent) != nil
+        }
+        XCTAssertTrue(responded, "expected a response for the cancelled request")
+
+        let cancelledOnReturn = await wasCancelledOnReturn.get()
+        XCTAssertTrue(cancelledOnReturn, "handler must return after its Task has been cancelled")
+
+        let sent = await transport.sentMessages()
+        let response = responseFor(id: 8, in: sent)
+        XCTAssertNil(response?["error"], "a handler that returns normally must not be answered with an error")
+        let result = response?["result"] as? [String: Any]
+        XCTAssertEqual(result?["ok"] as? Bool, true, "the handler's real result must be sent")
+    }
+
+    /// A `$/cancelRequest` for a request that is still waiting behind an
+    /// earlier, still-running request never invokes that request's
+    /// handler at all: when it is dequeued the client sees it has
+    /// already been cancelled and replies with -32800 directly.
+    func test_serverCancelRequest_forQueuedRequest_neverInvokesHandler() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let gate = Gate()
+        let aEntered = ActorBox<Bool>(false)
+        let bCalled = ActorBox<Bool>(false)
+
+        await client.setRequestHandler(method: "test/blocks-on-gate") { _ in
+            await aEntered.set(true)
+            for _ in 0..<600 {
+                if await gate.isOpen { break }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+            return AnyCodable(["ok": AnyCodable(true)])
+        }
+        await client.setRequestHandler(method: "test/should-not-run") { _ in
+            await bCalled.set(true)
+            return AnyCodable(["ok": AnyCodable(true)])
+        }
+
+        let reqA = jsonRPCRequest(id: 10, method: "test/blocks-on-gate", paramsJSON: "{}")
+        await transport.simulateServerMessage(lspFrame(reqA))
+
+        let aStarted = await waitUntil { await aEntered.get() }
+        XCTAssertTrue(aStarted, "request A's handler must have started before B is sent")
+
+        let reqB = jsonRPCRequest(id: 11, method: "test/should-not-run", paramsJSON: "{}")
+        await transport.simulateServerMessage(lspFrame(reqB))
+
+        let cancelB = jsonRPCNotification(method: "$/cancelRequest", paramsJSON: #"{"id":11}"#)
+        await transport.simulateServerMessage(lspFrame(cancelB))
+
+        await gate.open()
+
+        let done = await waitUntil(timeout: 4.0) {
+            let sent = await transport.sentMessages()
+            return responseFor(id: 10, in: sent) != nil && responseFor(id: 11, in: sent) != nil
+        }
+        XCTAssertTrue(done, "expected responses for both request 10 and 11")
+
+        let called = await bCalled.get()
+        XCTAssertFalse(called, "a queued request cancelled before it is dequeued must never invoke its handler")
+
+        let sent = await transport.sentMessages()
+        let responseA = responseFor(id: 10, in: sent)
+        XCTAssertNil(responseA?["error"], "request A must succeed")
+
+        let responseB = responseFor(id: 11, in: sent)
+        let errB = responseB?["error"] as? [String: Any]
+        XCTAssertEqual(errB?["code"] as? Int, -32800, "cancelled queued request must reply with RequestCancelled")
+    }
+
+    /// Responses to client-initiated `sendRequest` calls resolve as soon
+    /// as the matching response arrives, without waiting for an
+    /// unrelated, still-running notification handler to finish.
+    func test_response_toSendRequest_resolvesWhileNotificationHandlerIsBlocked() async throws {
+        let transport = InMemoryLSPTransport()
+        let client = LSPClient(transport: transport)
+        try await client.start()
+        defer { Task { await client.close() } }
+
+        let gate = Gate()
+        let notificationEntered = ActorBox<Bool>(false)
+
+        await client.setNotificationHandler(method: "test/blocks") { _ in
+            await notificationEntered.set(true)
+            for _ in 0..<600 {
+                if await gate.isOpen { break }
+                try? await Task.sleep(nanoseconds: 5_000_000)
+            }
+            await gate.markExited()
+        }
+
+        let blocking = jsonRPCNotification(method: "test/blocks")
+        await transport.simulateServerMessage(lspFrame(blocking))
+
+        let started = await waitUntil { await notificationEntered.get() }
+        XCTAssertTrue(started, "notification handler must have started before the request is sent")
+
+        let requestTask = Task {
+            try await client.sendRequest(
+                method: "test/echo",
+                params: EchoParams(text: "while-blocked"),
+                resultType: EchoResult.self
+            )
+        }
+
+        let emitted = await waitUntil { await !transport.sentMessages().isEmpty }
+        XCTAssertTrue(emitted, "the outbound request must be written even while the notification handler blocks")
+
+        let sent = await transport.sentMessages()
+        let req = try parseFramedJSON(sent[0])
+        guard let id = req["id"] as? Int else {
+            return XCTFail("outbound request must carry an id")
+        }
+
+        let response = jsonRPCResponse(id: id, resultJSON: #"{"echoed":"while-blocked"}"#)
+        await transport.simulateServerMessage(lspFrame(response))
+
+        let result = try await requestTask.value
+
+        // The gate has not been released yet at this point, so if the
+        // result already arrived the notification handler is still
+        // suspended waiting on it.
+        let gateOpenAtResolution = await gate.isOpen
+        let handlerExitedAtResolution = await gate.hasExited
+        XCTAssertFalse(gateOpenAtResolution, "gate must still be closed when sendRequest resolves")
+        XCTAssertFalse(handlerExitedAtResolution, "notification handler must still be blocked when sendRequest resolves")
+
+        XCTAssertEqual(result, EchoResult(echoed: "while-blocked"))
+
+        await gate.open()
+        let handlerFinished = await waitUntil(timeout: 3.0) { await gate.hasExited }
+        XCTAssertTrue(handlerFinished, "blocked notification handler must be released before the test ends")
+    }
 }
 
 // MARK: - Test-only Helpers
@@ -960,6 +1290,41 @@ private actor ActorBox<T: Sendable> {
 private actor CounterActor {
     private(set) var value: Int = 0
     func bump() { value += 1 }
+}
+
+/// Locate the framed response addressed to a given request id among a
+/// snapshot of `sentMessages()`. Free function (not a method) so it can
+/// be called from inside a `@Sendable` `waitUntil` predicate without
+/// capturing the non-Sendable test case instance.
+private func responseFor(id: Int, in sent: [Data]) -> [String: Any]? {
+    let terminator = Data("\r\n\r\n".utf8)
+    for data in sent {
+        guard let headerEnd = data.range(of: terminator) else { continue }
+        let body = data.subdata(in: headerEnd.upperBound..<data.endIndex)
+        guard let dict = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { continue }
+        if (dict["id"] as? Int) == id {
+            return dict
+        }
+    }
+    return nil
+}
+
+/// Records the order in which values are appended, for asserting a
+/// handler-completion sequence from concurrent Task contexts.
+private actor OrderLog {
+    private(set) var entries: [Int] = []
+    func append(_ value: Int) { entries.append(value) }
+}
+
+/// A controllable gate a test can hold a handler open on and release on
+/// demand. `isOpen` is polled from inside the handler with a bounded
+/// loop, so a handler waiting on the gate always has its own escape
+/// hatch and can never hang the test.
+private actor Gate {
+    private(set) var isOpen: Bool = false
+    private(set) var hasExited: Bool = false
+    func open() { isOpen = true }
+    func markExited() { hasExited = true }
 }
 
 /// Run an async closure with a wall-clock timeout. Returns nil on timeout.

@@ -437,11 +437,12 @@ final class LSPSessionServerHandlersTests: XCTestCase {
         }
 
         let stabilized = await waitUntil(timeout: 3.0) {
-            await session.recentServerMessages().count == 100
+            await session.recentServerMessages().last?.message == "line-\(total - 1)"
         }
-        XCTAssertTrue(stabilized, "recentServerMessages must cap at 100 entries")
+        XCTAssertTrue(stabilized, "recentServerMessages must settle with line-\(total - 1) as the newest entry")
 
         let log = await session.recentServerMessages()
+        XCTAssertEqual(log.count, 100, "recentServerMessages must cap at 100 entries")
         // The oldest 5 must be dropped: first surviving message is "line-5".
         XCTAssertEqual(log.first?.message, "line-5", "oldest entries must be evicted, expected line-5 first")
         XCTAssertEqual(log.last?.message, "line-\(total - 1)", "newest entry must be line-\(total - 1)")

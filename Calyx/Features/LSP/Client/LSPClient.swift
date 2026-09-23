@@ -18,9 +18,16 @@
 //      still matched correctly (with a lenient `string("N")` →
 //      `int(N)` fallback at lookup time).
 //    - Dispatch server-originated notifications/requests to handlers
-//      registered by the application layer, replying with -32601
-//      MethodNotFound when no handler is registered and -32602
-//      InvalidParams when the handler raises a `DecodingError`.
+//      registered by the application layer through one serial inbound
+//      queue, so each message is fully processed before the next one
+//      starts and handlers finish in arrival order. Requests reply with
+//      -32601 MethodNotFound when no handler is registered, -32602
+//      InvalidParams when the handler raises a `DecodingError`, and
+//      -32800 RequestCancelled when the server cancels them before
+//      their handler runs, or while it runs and it throws. A handler
+//      that returns normally despite a cancel has its result sent.
+//      Responses to our own requests and the server's `$/cancelRequest`
+//      bypass the queue and are handled as soon as they arrive.
 //    - Honor cooperative task cancellation: on cancel, the in-flight
 //      `sendRequest` resumes with `CancellationError` and a
 //      `$/cancelRequest` notification is sent to the server.
@@ -165,10 +172,41 @@ actor LSPClient {
         "workspace/configuration",
     ]
 
+    /// One unit of server-originated work waiting on the serial inbound
+    /// queue. Notification handlers are resolved when the message
+    /// arrives (an unregistered notification is dropped without being
+    /// queued); request handlers are resolved when the request is
+    /// dequeued, so the -32601 reply for an unregistered method is
+    /// written in arrival order too.
+    private enum InboundWork: Sendable {
+        case notification(handler: @Sendable (AnyCodable?) async -> Void, params: AnyCodable?)
+        case request(id: LSPRequestID, method: String, params: AnyCodable?)
+    }
+
+    /// Producer side of the serial inbound queue. Set in `start()` and
+    /// finished (then cleared) on `close()`, transport end, or a fatal
+    /// framing error.
+    private var inboundContinuation: AsyncStream<InboundWork>.Continuation?
+
+    /// Consumer task that takes one `InboundWork` at a time and awaits
+    /// its full processing before taking the next.
+    private var inboundTask: Task<Void, Never>?
+
+    /// Ids of server-initiated requests that are on the inbound queue
+    /// and have not been dequeued yet. Inserted on enqueue, removed on
+    /// dequeue. Lets `$/cancelRequest` tell a queued request apart from
+    /// one that was already answered.
+    private var queuedServerRequestIDs: Set<LSPRequestID> = []
+
+    /// Ids of queued server-initiated requests the server has cancelled
+    /// via `$/cancelRequest`. At dequeue such a request skips its
+    /// handler and is answered with -32800 RequestCancelled.
+    private var cancelledRequestIDs: Set<LSPRequestID> = []
+
     /// In-flight handler tasks for server-initiated requests, keyed by
-    /// the server's request id. Populated when `handleServerRequest`
-    /// spawns the handler Task and cleared when the handler completes
-    /// (success or failure). The `$/cancelRequest` notification handler
+    /// the server's request id. Populated when the inbound consumer
+    /// dequeues a request and spawns its handler Task, and cleared when
+    /// that Task completes (success or failure). `$/cancelRequest`
     /// looks up this map and cancels the corresponding Task so the
     /// handler can observe `Task.isCancelled` / `CancellationError` and
     /// short-circuit.
@@ -224,6 +262,17 @@ actor LSPClient {
 
         installBuiltinNotificationHandlers()
 
+        // Serial inbound queue: one consumer processes server-originated
+        // notifications and requests strictly one after another.
+        let (inboundStream, inboundContinuation) = AsyncStream.makeStream(of: InboundWork.self)
+        self.inboundContinuation = inboundContinuation
+        inboundTask = Task { [weak self] in
+            for await work in inboundStream {
+                guard let self else { return }
+                await self.processInbound(work)
+            }
+        }
+
         let stream = transport.incoming
         let task = Task { [weak self] in
             for await chunk in stream {
@@ -244,16 +293,12 @@ actor LSPClient {
     /// future refactor of `handleNotification` — for example, adding a
     /// warning for unknown notifications — cannot silently regress them
     /// onto the default-drop path.
+    ///
+    /// `$/cancelRequest` is not among them: `dispatch` intercepts it
+    /// before any handler lookup and calls `handleServerCancelRequest`
+    /// directly, so it takes effect even while the inbound queue is
+    /// busy with the request it cancels.
     private func installBuiltinNotificationHandlers() {
-        // `$/cancelRequest`: spec-required. When the server cancels a
-        // server-initiated request, look up the in-flight handler Task
-        // for that id and cancel it so the handler observes
-        // `Task.isCancelled` and can return early.
-        notificationHandlers["$/cancelRequest"] = { [weak self] params in
-            guard let self else { return }
-            await self.handleServerCancelRequest(params: params)
-        }
-
         // `$/setTrace`: spec defines this as CLIENT→SERVER. Some servers
         // emit it back at the client by mistake; pin a no-op so the
         // contract is explicit and the default-drop path stays
@@ -278,10 +323,18 @@ actor LSPClient {
         }
     }
 
-    /// Handle a `$/cancelRequest` notification from the server. If the
-    /// id matches an in-flight handler Task we cancel it; if not the
-    /// notification is dropped (the response has already been sent or
-    /// the request was never seen).
+    /// Handle a `$/cancelRequest` notification from the server. Runs
+    /// synchronously from `dispatch`, bypassing the inbound queue.
+    ///
+    /// - If the id matches an in-flight handler Task, that Task is
+    ///   cancelled. If the handler still returns normally, its result
+    ///   is sent. If it throws, the request is answered with -32800,
+    ///   except that a `DecodingError` is answered with -32602.
+    /// - If the id belongs to a request still waiting on the inbound
+    ///   queue, it is marked cancelled; at dequeue its handler is
+    ///   skipped and it is answered with -32800.
+    /// - Otherwise the notification is dropped (the response has
+    ///   already been sent or the request was never seen).
     ///
     /// `AnyCodable` is opaque-by-design, so the cleanest way to lift
     /// out the structured `id` field is to round-trip through JSON.
@@ -298,11 +351,42 @@ actor LSPClient {
         }
         if let task = inflightServerRequests[id] {
             task.cancel()
+        } else if queuedServerRequestIDs.contains(id) {
+            cancelledRequestIDs.insert(id)
         }
     }
 
-    /// Idempotent shutdown. Cancels the receive loop, closes the
-    /// transport, and fails any in-flight `sendRequest`.
+    /// Stop the serial inbound queue: finish the stream, cancel the
+    /// consumer task without awaiting it, and forget every queued or
+    /// cancelled request id. Items still buffered in the stream are
+    /// dropped by `processInbound` because the client is `.closed` by
+    /// the time this runs.
+    private func stopInboundQueue() {
+        inboundContinuation?.finish()
+        inboundContinuation = nil
+        inboundTask?.cancel()
+        inboundTask = nil
+        queuedServerRequestIDs.removeAll()
+        cancelledRequestIDs.removeAll()
+    }
+
+    /// Cancel every still-running server-initiated request handler so
+    /// it observes `Task.isCancelled` and stops touching the transport
+    /// on the way out. Handler Tasks do not inherit the consumer task's
+    /// cancellation, so they are cancelled explicitly here.
+    private func cancelInflightServerRequests() {
+        let inflightSnapshot = inflightServerRequests
+        inflightServerRequests.removeAll()
+        for (_, task) in inflightSnapshot {
+            task.cancel()
+        }
+    }
+
+    /// Idempotent shutdown. Cancels the receive loop, stops the serial
+    /// inbound queue (queued server messages are dropped without
+    /// running their handlers), cancels running server-initiated
+    /// request handlers, closes the transport, and fails any in-flight
+    /// `sendRequest`.
     ///
     /// Drops every registered request/notification handler before
     /// returning. The handlers installed by `LSPSession` capture the
@@ -322,6 +406,9 @@ actor LSPClient {
             state = .closed
         }
 
+        stopInboundQueue()
+        cancelInflightServerRequests()
+
         // Drain any `$/cancelRequest` emission tasks spawned by an
         // in-flight `sendRequest`'s `onCancel` before tearing down the
         // transport. Without this `await`, a `sendRequest` whose calling
@@ -333,15 +420,6 @@ actor LSPClient {
         pendingCancelTasks.removeAll()
         for task in cancelTasksSnapshot {
             await task.value
-        }
-
-        // Cancel any still-running server-initiated request handlers so
-        // they observe `Task.isCancelled` and stop touching the
-        // transport on the way out.
-        let inflightSnapshot = inflightServerRequests
-        inflightServerRequests.removeAll()
-        for (_, task) in inflightSnapshot {
-            task.cancel()
         }
 
         await transport.close()
@@ -680,12 +758,15 @@ actor LSPClient {
 
     private func handleTransportFinished() {
         // Transport ended. If we are not already closed, transition to
-        // closed and fail every in-flight request.
+        // closed, stop the inbound queue, cancel running server request
+        // handlers, and fail every in-flight request.
         switch state {
         case .closed:
             return
         case .notStarted, .started:
             state = .closed
+            stopInboundQueue()
+            cancelInflightServerRequests()
             failAllPending(.transportClosed)
         }
     }
@@ -805,7 +886,8 @@ actor LSPClient {
     }
 
     /// Fatal framing failure: surface `.malformedFraming(reason:)` to
-    /// every in-flight request, close the transport, and stop draining.
+    /// every in-flight request, stop the inbound queue, cancel running
+    /// server request handlers, close the transport, and stop draining.
     /// The receive loop's outer `for await` will then terminate when
     /// `transport.close()` finishes the incoming stream.
     private func failFatal(reason: String) async {
@@ -816,12 +898,16 @@ actor LSPClient {
             break
         case .notStarted, .started:
             state = .closed
+            stopInboundQueue()
+            cancelInflightServerRequests()
             await transport.close()
         }
     }
 
-    /// Parse a single JSON body and route it to a pending request, a
-    /// notification handler, or a request handler.
+    /// Parse a single JSON body and route it. Responses resolve their
+    /// pending request and `$/cancelRequest` is applied immediately;
+    /// every other notification and every server-initiated request is
+    /// appended to the serial inbound queue.
     private func dispatch(body: Data) {
         guard let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else {
             // Malformed JSON — log and ignore. We can't usefully respond
@@ -849,6 +935,10 @@ actor LSPClient {
         if let reqId {
             // Server-initiated request — needs a response.
             handleServerRequest(id: reqId, method: method, params: params)
+        } else if method == "$/cancelRequest" {
+            // Applied at once rather than queued, so it can reach a
+            // request that is running or still waiting on the queue.
+            handleServerCancelRequest(params: params)
         } else {
             // Notification.
             handleNotification(method: method, params: params)
@@ -918,55 +1008,122 @@ actor LSPClient {
         }
     }
 
+    /// Queue a server notification for serial processing. A method with
+    /// no registered handler is dropped silently.
     private func handleNotification(method: String, params: AnyCodable?) {
         guard let handler = notificationHandlers[method] else {
             // No handler — drop silently.
             return
         }
-        Task {
-            await handler(params)
+        inboundContinuation?.yield(.notification(handler: handler, params: params))
+    }
+
+    /// Queue a server-initiated request for serial processing and
+    /// record its id as queued so `$/cancelRequest` can reach it before
+    /// it is dequeued.
+    private func handleServerRequest(id: LSPRequestID, method: String, params: AnyCodable?) {
+        guard let inboundContinuation else { return }
+        if case .enqueued = inboundContinuation.yield(.request(id: id, method: method, params: params)) {
+            queuedServerRequestIDs.insert(id)
         }
     }
 
-    private func handleServerRequest(id: LSPRequestID, method: String, params: AnyCodable?) {
-        if let handler = requestHandlers[method] {
-            Task { [weak self] in
-                do {
-                    let result = try await handler(params)
-                    await self?.sendServerRequestResult(id: id, result: result)
-                } catch {
-                    // `error.localizedDescription` is often the useless
-                    // boilerplate `"The operation couldn't be
-                    // completed. (… error 1.)"`. Use `String(describing:)`
-                    // instead so JSON-RPC error messages carry the
-                    // actual underlying cause.
-                    //
-                    // `DecodingError` is the canonical "the caller sent
-                    // garbage" signal — surface it as JSON-RPC
-                    // `-32602 InvalidParams` rather than the generic
-                    // `-32603 InternalError`.
-                    var code = -32603
-                    var message = String(describing: error)
-                    if let decodingError = error as? DecodingError {
-                        code = -32602
-                        message = String(describing: decodingError)
-                    }
-                    await self?.sendServerRequestError(
-                        id: id,
-                        code: code,
-                        message: message
-                    )
+    /// Process one item from the serial inbound queue. The consumer
+    /// task awaits this call before taking the next item, so handlers
+    /// finish in arrival order and responses to server requests are
+    /// written in arrival order.
+    ///
+    /// Items still buffered after the client closes are dropped
+    /// without running their handlers.
+    private func processInbound(_ work: InboundWork) async {
+        if case .closed = state { return }
+        if Task.isCancelled { return }
+
+        switch work {
+        case .notification(let handler, let params):
+            await handler(params)
+        case .request(let id, let method, let params):
+            await processServerRequest(id: id, method: method, params: params)
+        }
+    }
+
+    /// Run a dequeued server-initiated request and write its response.
+    ///
+    /// Between dequeue and registering the handler Task in
+    /// `inflightServerRequests` there is no suspension point, so a
+    /// `$/cancelRequest` always finds the id in either
+    /// `queuedServerRequestIDs` or `inflightServerRequests`.
+    private func processServerRequest(id: LSPRequestID, method: String, params: AnyCodable?) async {
+        queuedServerRequestIDs.remove(id)
+        if cancelledRequestIDs.remove(id) != nil {
+            await sendServerRequestCancelled(id: id)
+            return
+        }
+
+        guard let handler = requestHandlers[method] else {
+            await sendServerRequestError(
+                id: id,
+                code: -32601,
+                message: "Method not found: \(method)"
+            )
+            return
+        }
+
+        let task = Task { [weak self] in
+            do {
+                // A handler that returns normally is answered with its
+                // result even if the server cancelled the request while
+                // it ran: its work (for example an applied edit) has
+                // taken effect, and LSP lets such a request report it.
+                let result = try await handler(params)
+                await self?.sendServerRequestResult(id: id, result: result)
+            } catch {
+                // `error.localizedDescription` is often the useless
+                // boilerplate `"The operation couldn't be
+                // completed. (… error 1.)"`. Use `String(describing:)`
+                // instead so JSON-RPC error messages carry the
+                // actual underlying cause.
+                //
+                // `CancellationError` maps to JSON-RPC
+                // `-32800 RequestCancelled`. `DecodingError` is the
+                // canonical "the caller sent garbage" signal, so it
+                // maps to `-32602 InvalidParams` even when the request
+                // was cancelled. Any other error thrown by a cancelled
+                // handler maps to `-32800`; otherwise it is the generic
+                // `-32603 InternalError`.
+                if error is CancellationError {
+                    await self?.sendServerRequestCancelled(id: id)
+                    return
                 }
-            }
-        } else {
-            Task { [weak self] in
+                var code = -32603
+                var message = String(describing: error)
+                if let decodingError = error as? DecodingError {
+                    code = -32602
+                    message = String(describing: decodingError)
+                } else if Task.isCancelled {
+                    await self?.sendServerRequestCancelled(id: id)
+                    return
+                }
                 await self?.sendServerRequestError(
                     id: id,
-                    code: -32601,
-                    message: "Method not found: \(method)"
+                    code: code,
+                    message: message
                 )
             }
         }
+        inflightServerRequests[id] = task
+        await task.value
+        if inflightServerRequests[id] == task {
+            inflightServerRequests.removeValue(forKey: id)
+        }
+    }
+
+    private func sendServerRequestCancelled(id: LSPRequestID) async {
+        await sendServerRequestError(
+            id: id,
+            code: -32800,
+            message: "Request cancelled"
+        )
     }
 
     private func sendServerRequestResult(id: LSPRequestID, result: AnyCodable?) async {
