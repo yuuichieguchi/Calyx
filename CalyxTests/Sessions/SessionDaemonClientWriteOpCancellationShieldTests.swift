@@ -56,6 +56,7 @@ private final class CancellationRecordingCommandRunner: LSPCommandRunner, @unche
     private var _hasEnteredRun = false
     private var _observedCancellation = false
     private var _didComplete = false
+    private var _resumeRequested = false
     private var pendingContinuation: CheckedContinuation<Void, Never>?
 
     var hasEnteredRun: Bool {
@@ -71,9 +72,6 @@ private final class CancellationRecordingCommandRunner: LSPCommandRunner, @unche
         return _didComplete
     }
 
-    private func markEntered() {
-        lock.lock(); _hasEnteredRun = true; lock.unlock()
-    }
     private func markObservedCancellation() {
         lock.lock(); _observedCancellation = true; lock.unlock()
     }
@@ -87,12 +85,22 @@ private final class CancellationRecordingCommandRunner: LSPCommandRunner, @unche
         workingDirectory: URL?,
         environment: [String: String]?
     ) async throws -> CommandResult {
-        markEntered()
         await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                // "Entered" is set under the same lock that stores the
+                // continuation, so hasEnteredRun == true guarantees
+                // resumeRun() finds it. A resume requested before this
+                // point is honored immediately instead of being lost.
                 self.lock.lock()
-                self.pendingContinuation = continuation
+                self._hasEnteredRun = true
+                let resumeNow = self._resumeRequested
+                if !resumeNow {
+                    self.pendingContinuation = continuation
+                }
                 self.lock.unlock()
+                if resumeNow {
+                    continuation.resume()
+                }
             }
         } onCancel: {
             self.markObservedCancellation()
@@ -104,11 +112,16 @@ private final class CancellationRecordingCommandRunner: LSPCommandRunner, @unche
     func locate(_ executable: String) async -> URL? { nil }
 
     /// Lets the "IPC round-trip" finish, mirroring the daemon's actual
-    /// process eventually exiting.
+    /// process eventually exiting. If run(...) has not stored its
+    /// continuation yet, the request is recorded and run(...) resumes
+    /// as soon as it does.
     func resumeRun() {
         lock.lock()
         let continuation = pendingContinuation
         pendingContinuation = nil
+        if continuation == nil {
+            _resumeRequested = true
+        }
         lock.unlock()
         continuation?.resume()
     }
@@ -121,14 +134,15 @@ private struct FixedBinaryResolver: SessionBinaryResolverProtocol {
 
 final class SessionDaemonClientWriteOpCancellationShieldTests: XCTestCase {
 
-    /// Cooperatively yields until `condition()` is true, bounded by
-    /// `maxYields` as a safety valve, mirroring
-    /// SessionBrowserModelRefreshDedupeTests' `waitUntil` helper.
-    private func waitUntil(maxYields: Int = 10_000, _ condition: () -> Bool) async {
-        var iterations = 0
-        while !condition(), iterations < maxYields {
+    /// Polls until `condition()` is true or `timeout` of wall-clock time
+    /// elapses. A wall-clock bound, unlike a yield count, still gives a
+    /// Task that is slow to be scheduled under load time to start.
+    private func waitUntil(timeout: Duration = .seconds(10), _ condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !condition(), clock.now < deadline {
             await Task.yield()
-            iterations += 1
+            try await Task.sleep(for: .milliseconds(1))
         }
     }
 
@@ -136,7 +150,7 @@ final class SessionDaemonClientWriteOpCancellationShieldTests: XCTestCase {
     /// must NOT reach the runner's own Task -- today it does, because
     /// kill(id:) awaits commandRunner.run(...) directly in the caller's
     /// Task instead of an insulated inner one.
-    func test_kill_shieldsRunnerFromHostTaskCancellation() async {
+    func test_kill_shieldsRunnerFromHostTaskCancellation() async throws {
         let resolver = FixedBinaryResolver(path: "/opt/calyx-fixture/bin/calyx-session")
         let runner = CancellationRecordingCommandRunner()
         let client = SessionDaemonClient(resolver: resolver, commandRunner: runner)
@@ -146,7 +160,12 @@ final class SessionDaemonClientWriteOpCancellationShieldTests: XCTestCase {
         // Let the kill actually reach the runner before cancelling, so
         // the cancellation below is provably issued while the IPC write
         // is genuinely in flight, not merely racing its start.
-        await waitUntil { runner.hasEnteredRun }
+        try await waitUntil { runner.hasEnteredRun }
+        XCTAssertTrue(
+            runner.hasEnteredRun,
+            "kill(id:) must reach commandRunner.run(...) within the wait; without that the cancellation " +
+            "assertion below would not exercise an in-flight write"
+        )
 
         hostTask.cancel()
 
