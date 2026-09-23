@@ -8,8 +8,8 @@
 //
 //  Coverage:
 //  - trackingEnabled defaults to true when the key has never been written
-//  - Setting it false persists, in an isolated UserDefaults suite (never
-//    touches the user's real defaults domain)
+//  - Writing it persists, in an isolated UserDefaults suite (never touches
+//    the user's real defaults domain)
 //
 
 import XCTest
@@ -18,14 +18,17 @@ import XCTest
 final class CommandTrackingSettingsTests: XCTestCase {
 
     private let suiteName = "com.calyx.tests.CommandTrackingSettingsTests"
+    private var standardDefaultsTripwire: StandardDefaultsTripwire!
 
     override func setUp() {
         super.setUp()
+        standardDefaultsTripwire = StandardDefaultsTripwire(key: CommandTrackingSettings.trackingEnabledKey)
         CommandTrackingSettings._testUseSuite(named: suiteName)
     }
 
     override func tearDown() {
         CommandTrackingSettings._testTeardownSuite(named: suiteName)
+        standardDefaultsTripwire.assertUnchanged()
         super.tearDown()
     }
 
@@ -35,20 +38,20 @@ final class CommandTrackingSettingsTests: XCTestCase {
                      "command tracking ships on")
     }
 
-    func test_trackingEnabled_setFalse_persistsInIsolatedSuiteOnly() {
+    func test_trackingEnabled_write_persistsInIsolatedSuiteOnly() {
+        // Write the non-default value and verify both the typed getter
+        // and the raw isolated suite reflect a value, not merely absence.
         CommandTrackingSettings.trackingEnabled = false
 
         XCTAssertFalse(CommandTrackingSettings.trackingEnabled,
-                      "Setting trackingEnabled to false must be readable back as false")
+                      "Setting trackingEnabled must be readable back as the value written")
 
-        // Verify the write actually reached the isolated test suite --
-        // otherwise the assertion above would be indistinguishable from a
-        // getter that simply always returns false regardless of any set.
         let rawSuite = UserDefaults(suiteName: suiteName)!
-        XCTAssertNotNil(rawSuite.object(forKey: CommandTrackingSettings.trackingEnabledKey),
+        XCTAssertEqual(rawSuite.object(forKey: CommandTrackingSettings.trackingEnabledKey) as? Bool, false,
                         "Setting trackingEnabled must actually persist a value into the isolated test suite")
 
-        XCTAssertNil(UserDefaults.standard.object(forKey: CommandTrackingSettings.trackingEnabledKey),
-                     "The real .standard defaults domain must never be touched while using _testUseSuite")
+        assertStandardDefaultsUntouched(key: CommandTrackingSettings.trackingEnabledKey) { before in
+            CommandTrackingSettings.trackingEnabled = !(before ?? true)
+        }
     }
 }

@@ -24,14 +24,17 @@ import XCTest
 final class IPCSettingsTests: XCTestCase {
 
     private let suiteName = "com.calyx.tests.IPCSettingsTests"
+    private var standardDefaultsTripwire: StandardDefaultsTripwire!
 
     override func setUp() {
         super.setUp()
+        standardDefaultsTripwire = StandardDefaultsTripwire(key: IPCSettings.enabledKey)
         IPCSettings._testUseSuite(named: suiteName)
     }
 
     override func tearDown() {
         IPCSettings._testTeardownSuite(named: suiteName)
+        standardDefaultsTripwire.assertUnchanged()
         super.tearDown()
     }
 
@@ -63,21 +66,14 @@ final class IPCSettingsTests: XCTestCase {
     }
 
     func test_testStoreIsolation() {
-        // The unit test host is the app itself (bundle id com.calyx.terminal),
-        // so UserDefaults.standard is the developer's real defaults domain,
-        // not a blank one -- it may already hold a value for this key from
-        // ordinary app use. Capture that value before touching the isolated
-        // suite and assert it is unchanged afterward, rather than asserting
-        // it is nil.
-        let before = UserDefaults.standard.object(forKey: IPCSettings.enabledKey) as? Bool
+        assertStandardDefaultsUntouched(key: IPCSettings.enabledKey) { before in
+            IPCSettings.enabled = !(before ?? false)
+        }
 
-        // Write a value that always differs from `before`, so a regression
-        // to `.standard` cannot hide behind writing the same value that was
-        // already there.
-        IPCSettings.enabled = !(before ?? false)
-
-        XCTAssertEqual(UserDefaults.standard.object(forKey: IPCSettings.enabledKey) as? Bool, before,
-                       "The real .standard defaults domain must never be touched while using _testStore")
+        // Write the non-default value unconditionally so the assertion
+        // below can never be satisfied by the suite above already
+        // holding false.
+        IPCSettings.enabled = true
 
         // A different, never-before-used suite must read the default
         // (off), not leak state from the suite above.

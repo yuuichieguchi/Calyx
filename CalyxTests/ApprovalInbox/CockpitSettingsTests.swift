@@ -21,14 +21,17 @@ import XCTest
 final class CockpitSettingsTests: XCTestCase {
 
     private let suiteName = "com.calyx.tests.CockpitSettingsTests"
+    private var standardDefaultsTripwire: StandardDefaultsTripwire!
 
     override func setUp() {
         super.setUp()
+        standardDefaultsTripwire = StandardDefaultsTripwire(key: CockpitSettings.autoApproveEnabledKey)
         CockpitSettings._testUseSuite(named: suiteName)
     }
 
     override func tearDown() {
         CockpitSettings._testTeardownSuite(named: suiteName)
+        standardDefaultsTripwire.assertUnchanged()
         super.tearDown()
     }
 
@@ -50,15 +53,19 @@ final class CockpitSettingsTests: XCTestCase {
         // otherwise the assertions above would be indistinguishable from a
         // getter that simply ignores any set.
         let rawSuite = UserDefaults(suiteName: suiteName)!
-        XCTAssertFalse(rawSuite.bool(forKey: CockpitSettings.autoApproveEnabledKey),
+        XCTAssertEqual(rawSuite.object(forKey: CockpitSettings.autoApproveEnabledKey) as? Bool, false,
                       "Setting autoApproveEnabled must actually persist the value into the isolated test suite")
     }
 
     func test_testStoreIsolation() {
-        CockpitSettings.autoApproveEnabled = true
+        assertStandardDefaultsUntouched(key: CockpitSettings.autoApproveEnabledKey) { before in
+            CockpitSettings.autoApproveEnabled = !(before ?? false)
+        }
 
-        XCTAssertNil(UserDefaults.standard.object(forKey: CockpitSettings.autoApproveEnabledKey),
-                     "The real .standard defaults domain must never be touched while using _testStore")
+        // Write the non-default value unconditionally so the assertion
+        // below can never be satisfied by the suite above already
+        // holding false.
+        CockpitSettings.autoApproveEnabled = true
 
         // A different, never-before-used suite must read the default
         // (off), not leak state from the suite above.
