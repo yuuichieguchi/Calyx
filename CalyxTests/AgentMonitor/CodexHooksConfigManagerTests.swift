@@ -1018,4 +1018,27 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         XCTAssertFalse(CodexHooksConfigManager.areHooksInstalled(configPath: configPath),
                        "A file with no Calyx managed block must not be reported as installed")
     }
+
+    // MARK: - Never delete a user-owned file
+
+    func test_removeHooks_afterInstall_onUserCreatedEmptyFile_leavesFilePresentAndEmpty() throws {
+        FileManager.default.createFile(atPath: configPath, contents: Data())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configPath), "precondition: empty file exists")
+
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        try CodexHooksConfigManager.removeHooks(configPath: configPath)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: configPath),
+            "a file the user created must never be deleted by Calyx, even once it became entirely Calyx's own region"
+        )
+        let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        XCTAssertEqual(data, Data(), "the file must be left behind empty, not with a leftover blank line or deleted")
+    }
+
+    func test_removeHooks_onAbsentFile_leavesFileAbsent() throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configPath))
+        try CodexHooksConfigManager.removeHooks(configPath: configPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configPath), "removeHooks must never create a file that never existed")
+    }
 }

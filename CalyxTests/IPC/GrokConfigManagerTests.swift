@@ -291,6 +291,29 @@ final class GrokConfigManagerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: configPath))
     }
 
+    // MARK: - Never delete a user-owned file
+
+    func test_disableIPC_afterEnable_onUserCreatedEmptyFile_leavesFilePresentAndEmpty() throws {
+        FileManager.default.createFile(atPath: configPath, contents: Data())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configPath), "precondition: empty file exists")
+
+        try GrokConfigManager.enableIPC(port: 41830, token: dummyToken, configPath: configPath)
+        try GrokConfigManager.disableIPC(configPath: configPath)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: configPath),
+            "a file the user created must never be deleted by Calyx, even once it became entirely Calyx's own region"
+        )
+        let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        XCTAssertEqual(data, Data(), "the file must be left behind empty, not with a leftover blank line or deleted")
+    }
+
+    func test_disableIPC_onAbsentFile_leavesFileAbsent() throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configPath))
+        try GrokConfigManager.disableIPC(configPath: configPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configPath), "disableIPC must never create a file that never existed")
+    }
+
     // MARK: - isIPCEnabled
 
     func test_isIPCEnabled_trueOnlyWhenSectionPresent() throws {

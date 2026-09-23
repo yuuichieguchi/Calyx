@@ -49,4 +49,25 @@ final class MarkerConfigDocumentEditorTests: XCTestCase {
         let expected = "mcp_servers:\n  # BEGIN X\n  calyx-ipc:\n    url: \"new\"\n  # END X\n"
         XCTAssertEqual(String(decoding: result, as: UTF8.self), expected)
     }
+
+    // MARK: - Never delete a user-owned file: removeBlock returns empty Data(), never nil, once content existed
+
+    func test_removeBlock_nilInput_returnsNil() throws {
+        let result = try editor.removeBlock(in: nil)
+        XCTAssertNil(result, "an absent file must stay absent -- removeBlock must never conjure a file")
+    }
+
+    func test_removeBlock_onlyCalyxBlockRemains_returnsNonNilEmptyData() throws {
+        let content = "# BEGIN X\nbody\n# END X\n"
+        let result = try editor.removeBlock(in: Data(content.utf8))
+        XCTAssertNotNil(result, "removeBlock must never signal file deletion (nil) -- Calyx never deletes a user-owned file")
+        XCTAssertEqual(result, Data(), "once nothing but Calyx's own block remains, removeBlock must return empty Data(), not nil")
+    }
+
+    func test_removeBlock_onlyCalyxBlockRemains_crlf_returnsNonNilEmptyData() throws {
+        let content = "# BEGIN X\r\nbody\r\n# END X\r\n"
+        let result = try editor.removeBlock(in: Data(content.utf8))
+        XCTAssertNotNil(result, "removeBlock must never signal file deletion (nil) -- Calyx never deletes a user-owned file")
+        XCTAssertEqual(result, Data(), "once nothing but Calyx's own block remains, removeBlock must return empty Data(), not nil")
+    }
 }

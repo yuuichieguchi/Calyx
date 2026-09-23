@@ -337,6 +337,32 @@ final class CodexConfigManagerTests: XCTestCase {
         XCTAssertFalse(CodexConfigManager.isIPCEnabled(configPath: configPath))
     }
 
+    // MARK: - Never delete a user-owned file
+
+    /// A user-created, 0-byte config.toml -> enable -> disable must leave
+    /// the file present and empty, not delete it: Calyx never deletes a
+    /// user-owned file, even one that became entirely its own region.
+    func test_disableIPC_afterEnable_onUserCreatedEmptyFile_leavesFilePresentAndEmpty() throws {
+        FileManager.default.createFile(atPath: configPath, contents: Data())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: configPath), "precondition: empty file exists")
+
+        try CodexConfigManager.enableIPC(port: 41830, token: "abc123", configPath: configPath)
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: configPath),
+            "a file the user created must never be deleted by Calyx, even once it became entirely Calyx's own region"
+        )
+        let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
+        XCTAssertEqual(data, Data(), "the file must be left behind empty, not with a leftover blank line or deleted")
+    }
+
+    func test_disableIPC_onAbsentFile_leavesFileAbsent() throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configPath))
+        try CodexConfigManager.disableIPC(configPath: configPath)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configPath), "disableIPC must never create a file that never existed")
+    }
+
     // MARK: - Directory Tests
 
     func test_enableIPC_directoryNotFound() {

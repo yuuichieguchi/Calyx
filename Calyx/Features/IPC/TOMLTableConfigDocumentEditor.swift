@@ -63,12 +63,15 @@ struct TOMLTableConfigDocumentEditor: Sendable {
     }
 
     /// Removes every table region, each together with the one blank line
-    /// immediately before it, if any. Returns `nil` (delete the file) when
-    /// nothing but Calyx's own region(s) remain, matching
-    /// `MarkerConfigDocumentEditor.removeBlock`. A region never includes
-    /// trailing blank lines past its own last content line, so blank
-    /// lines the user owns beyond the region survive untouched -- the F16
+    /// immediately before it, if any. A region never includes trailing
+    /// blank lines past its own last content line, so blank lines the
+    /// user owns beyond the region survive untouched -- the F16
     /// destruction this editor exists to not repeat.
+    ///
+    /// This editor edits files Calyx does not own outright, so it never
+    /// signals deletion: absent input stays `nil`, and a document emptied
+    /// by the removal is returned as empty `Data()`, leaving the file in
+    /// place, empty, matching `MarkerConfigDocumentEditor.removeBlock`.
     func removeTable(in current: Data?) throws -> Data? {
         guard let current, !current.isEmpty else { return current }
         let bytes = Array(current)
@@ -82,7 +85,6 @@ struct TOMLTableConfigDocumentEditor: Sendable {
             result.removeSubrange(range)
         }
 
-        if result.isEmpty { return nil }
         return Data(result)
     }
 

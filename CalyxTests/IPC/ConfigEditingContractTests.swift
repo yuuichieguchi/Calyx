@@ -288,6 +288,7 @@ final class ConfigEditingContractTests: XCTestCase {
         relativePath: String,
         initialContent: String,
         expectedFinalContent: String,
+        additionalSiblings: [String] = [],
         enable: @escaping (String) throws -> Void,
         disable: @escaping (String) throws -> Void
     ) -> ContractCheck {
@@ -296,7 +297,7 @@ final class ConfigEditingContractTests: XCTestCase {
             fixtureLabel: fixtureLabel,
             relativePath: relativePath,
             expectedFinalContent: expectedFinalContent,
-            expectedSiblingRelativePaths: [relativePath],
+            expectedSiblingRelativePaths: [relativePath] + additionalSiblings,
             prepareRoot: { root in
                 try Data(initialContent.utf8).write(to: URL(fileURLWithPath: root + "/" + relativePath))
             },
@@ -306,10 +307,19 @@ final class ConfigEditingContractTests: XCTestCase {
         )
     }
 
-    /// A check for L1.3.2's "whole file becomes Calyx's region" case: no
-    /// fixture is written up front, and the file must be ABSENT again
-    /// after the cycle (a `nil`-returning transform deletes it).
-    private func absentBecomesNilCheck(
+    /// A check for the marker-block editors' "whole file becomes Calyx's
+    /// region" case: no fixture is written up front, and the file must
+    /// still be PRESENT, empty, after the cycle. Calyx never deletes a
+    /// user-owned file: `MarkerConfigDocumentEditor.removeBlock` returns
+    /// empty `Data()`, never `nil`, once nothing but Calyx's own block
+    /// remains -- the accepted consequence being that a never-before-seen
+    /// file Calyx itself creates on enable, then fully empties on disable,
+    /// is left behind as a 0-byte file rather than removed. `nil` in still
+    /// means `nil` out (an absent file is never conjured into existence by
+    /// a disable that finds nothing to remove); this check starts the file
+    /// absent specifically to pin the "went through a real Calyx-owned
+    /// span" path, not that no-op path.
+    private func absentBecomesPresentButEmptyCheck(
         managerName: String,
         relativePath: String,
         expectedSiblings: [String] = [],
@@ -319,10 +329,10 @@ final class ConfigEditingContractTests: XCTestCase {
     ) -> ContractCheck {
         ContractCheck(
             managerName: managerName,
-            fixtureLabel: "absent file becomes fully Calyx-owned, then deleted",
+            fixtureLabel: "absent file becomes fully Calyx-owned, then left behind empty (never deleted)",
             relativePath: relativePath,
-            expectedFinalContent: nil,
-            expectedSiblingRelativePaths: expectedSiblings,
+            expectedFinalContent: "",
+            expectedSiblingRelativePaths: [relativePath] + expectedSiblings,
             prepareRoot: prepareRoot,
             enable: enable,
             disable: disable,
@@ -680,6 +690,7 @@ final class ConfigEditingContractTests: XCTestCase {
                 relativePath: "opencode.json",
                 initialContent: "{\n  \"other\": 1,\n  \"mcp\": {}\n}\n",
                 expectedFinalContent: "{\n  \"other\": 1\n}\n",
+                additionalSiblings: ["AGENTS.md"],
                 enable: { root in
                     try OpenCodeConfigManager.enableIPC(port: 41830, token: "t", configDir: root)
                 },
@@ -693,6 +704,7 @@ final class ConfigEditingContractTests: XCTestCase {
                 relativePath: "opencode.json",
                 initialContent: "{\n  \"other\": 1,\n  \"mcp\": {\n    \"other-server\": {\n      \"type\": \"remote\"\n    }\n  }\n}\n",
                 expectedFinalContent: "{\n  \"other\": 1,\n  \"mcp\": {\n    \"other-server\": {\n      \"type\": \"remote\"\n    }\n  }\n}\n",
+                additionalSiblings: ["AGENTS.md"],
                 enable: { root in
                     try OpenCodeConfigManager.enableIPC(port: 41830, token: "t", configDir: root)
                 },
@@ -728,9 +740,9 @@ final class ConfigEditingContractTests: XCTestCase {
 
     // MARK: - L1.3.2 marker owned-region boundary: "absent -> nil" checks
 
-    private func markerAbsentBecomesNilChecks() -> [ContractCheck] {
+    private func markerAbsentBecomesPresentButEmptyChecks() -> [ContractCheck] {
         [
-            absentBecomesNilCheck(
+            absentBecomesPresentButEmptyCheck(
                 managerName: "HermesConfigManager",
                 relativePath: "config.yaml",
                 enable: { root in
@@ -740,7 +752,7 @@ final class ConfigEditingContractTests: XCTestCase {
                     try HermesConfigManager.disableIPC(configPath: root + "/config.yaml")
                 }
             ),
-            absentBecomesNilCheck(
+            absentBecomesPresentButEmptyCheck(
                 managerName: "CodexHooksConfigManager",
                 relativePath: "config.toml",
                 enable: { root in
@@ -754,7 +766,7 @@ final class ConfigEditingContractTests: XCTestCase {
                     try CodexHooksConfigManager.removeHooks(configPath: root + "/config.toml")
                 }
             ),
-            absentBecomesNilCheck(
+            absentBecomesPresentButEmptyCheck(
                 managerName: "OpenCodeConfigManager (AGENTS.md)",
                 relativePath: "AGENTS.md",
                 expectedSiblings: ["opencode.json"],
@@ -781,6 +793,14 @@ final class ConfigEditingContractTests: XCTestCase {
         let checkedPath = root + "/" + check.relativePath
 
         if let expected = check.expectedFinalContent {
+            guard FileManager.default.fileExists(atPath: checkedPath) else {
+                XCTFail(
+                    "\(check.managerName) [\(check.fixtureLabel)]: Calyx never deletes a user-owned file -- " +
+                    "a file that became entirely Calyx's own region must be left behind (empty), not removed",
+                    file: file, line: line
+                )
+                return
+            }
             let finalData = try Data(contentsOf: URL(fileURLWithPath: checkedPath))
             let finalContent = String(decoding: finalData, as: UTF8.self)
             XCTAssertEqual(
@@ -790,10 +810,10 @@ final class ConfigEditingContractTests: XCTestCase {
                 file: file, line: line
             )
         } else {
-            XCTAssertFalse(
-                FileManager.default.fileExists(atPath: checkedPath),
-                "\(check.managerName) [\(check.fixtureLabel)]: a file that became entirely Calyx's own " +
-                "region must be deleted (transform returns nil), not left behind empty",
+            XCTFail(
+                "\(check.managerName) [\(check.fixtureLabel)]: every ContractCheck now expects concrete " +
+                "final content -- Calyx never deletes a user-owned file, so no check should reach this " +
+                "nil-content branch",
                 file: file, line: line
             )
         }
@@ -851,7 +871,7 @@ final class ConfigEditingContractTests: XCTestCase {
         }
 
         checks.append(contentsOf: jsonBoundaryChecks())
-        checks.append(contentsOf: markerAbsentBecomesNilChecks())
+        checks.append(contentsOf: markerAbsentBecomesPresentButEmptyChecks())
 
         for check in checks {
             try runContractCheck(check)

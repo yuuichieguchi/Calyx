@@ -178,7 +178,10 @@ struct MarkerConfigDocumentEditor: Sendable {
     /// pair, so this never requires the caller to hand-edit the file
     /// before Calyx can proceed.
     ///
-    /// Returns `nil` (delete the file) once nothing remains.
+    /// This editor edits files Calyx does not own outright, so it never
+    /// signals deletion: absent input stays `nil`, and a document emptied
+    /// by the removal is returned as empty `Data()`, leaving the file in
+    /// place, empty.
     func removeBlock(in current: Data?) throws -> Data? {
         guard let current, !current.isEmpty else { return current }
         var bytes = Array(current)
@@ -233,7 +236,6 @@ struct MarkerConfigDocumentEditor: Sendable {
             }
         }
 
-        if bytes.isEmpty { return nil }
         return Data(bytes)
     }
 

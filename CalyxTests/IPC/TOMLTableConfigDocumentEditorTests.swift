@@ -58,4 +58,25 @@ final class TOMLTableConfigDocumentEditorTests: XCTestCase {
             "scan before the region's own content (here, timeout = 5) is reached"
         )
     }
+
+    // MARK: - Never delete a user-owned file: removeTable returns empty Data(), never nil, once content existed
+
+    func test_removeTable_nilInput_returnsNil() throws {
+        let result = try editor.removeTable(in: nil)
+        XCTAssertNil(result, "an absent file must stay absent -- removeTable must never conjure a file")
+    }
+
+    func test_removeTable_onlyCalyxTableRemains_returnsNonNilEmptyData() throws {
+        let content = "[mcp_servers.calyx-ipc]\nurl = \"x\"\n"
+        let result = try editor.removeTable(in: Data(content.utf8))
+        XCTAssertNotNil(result, "removeTable must never signal file deletion (nil) -- Calyx never deletes a user-owned file")
+        XCTAssertEqual(result, Data(), "once nothing but Calyx's own table remains, removeTable must return empty Data(), not nil")
+    }
+
+    func test_removeTable_onlyCalyxTableRemains_crlf_returnsNonNilEmptyData() throws {
+        let content = "[mcp_servers.calyx-ipc]\r\nurl = \"x\"\r\n"
+        let result = try editor.removeTable(in: Data(content.utf8))
+        XCTAssertNotNil(result, "removeTable must never signal file deletion (nil) -- Calyx never deletes a user-owned file")
+        XCTAssertEqual(result, Data(), "once nothing but Calyx's own table remains, removeTable must return empty Data(), not nil")
+    }
 }

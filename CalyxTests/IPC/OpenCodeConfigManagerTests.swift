@@ -857,6 +857,29 @@ final class OpenCodeConfigManagerTests: XCTestCase {
         XCTAssertFalse(OpenCodeConfigManager.isIPCEnabled(configDir: configDir))
     }
 
+    // MARK: - Never delete a user-owned file (AGENTS.md)
+
+    func test_disableIPC_afterEnable_onUserCreatedEmptyAgentsMD_leavesFilePresentAndEmpty() throws {
+        FileManager.default.createFile(atPath: agentsMDPath, contents: Data())
+        XCTAssertTrue(FileManager.default.fileExists(atPath: agentsMDPath), "precondition: empty AGENTS.md exists")
+
+        try OpenCodeConfigManager.enableIPC(port: 41830, token: "abc123", configDir: configDir)
+        try OpenCodeConfigManager.disableIPC(configDir: configDir)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: agentsMDPath),
+            "a file the user created must never be deleted by Calyx, even once it became entirely Calyx's own region"
+        )
+        let data = try Data(contentsOf: URL(fileURLWithPath: agentsMDPath))
+        XCTAssertEqual(data, Data(), "AGENTS.md must be left behind empty, not with a leftover blank line or deleted")
+    }
+
+    func test_disableIPC_onAbsentAgentsMD_leavesFileAbsent() throws {
+        XCTAssertFalse(FileManager.default.fileExists(atPath: agentsMDPath))
+        try OpenCodeConfigManager.disableIPC(configDir: configDir)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: agentsMDPath), "disableIPC must never create AGENTS.md when it never existed")
+    }
+
     func test_isIPCEnabled_falseWhenNoFile() {
         // Given: no opencode.json
         XCTAssertFalse(FileManager.default.fileExists(atPath: opencodeJsonPath))
