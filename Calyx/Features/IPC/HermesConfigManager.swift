@@ -74,11 +74,23 @@ struct HermesConfigManager: Sendable {
     // MARK: - Public API
 
     /// Enables Calyx IPC by upserting the managed block in the Hermes
-    /// config. Self-heals over any previously malformed managed block
-    /// (orphan BEGIN/END, or a BEGIN/END pair whose body isn't
-    /// recognizably Calyx's own) via `markerEditor.removeBlock`, which also
-    /// preserves any foreign content found inside it, before writing fresh
-    /// content.
+    /// config. Where a fresh block belongs (Case A or Case B, and Case B's
+    /// header line and indent unit) is decided on the document with every
+    /// managed block removed via `markerEditor.removeBlock`, which also
+    /// self-heals any malformed managed block (orphan BEGIN/END, or a
+    /// BEGIN/END pair whose body isn't recognizably Calyx's own) and
+    /// preserves any foreign content found inside it.
+    ///
+    /// An existing well-formed block already sitting where that decision
+    /// puts one (Case A: a BEGIN line at indent 0; Case B: a BEGIN line at
+    /// the learned child indent directly under the top-level block-style
+    /// `mcp_servers:` key) is rewritten at its own position via
+    /// `markerEditor.replaceBlock`, so a block the user's own content
+    /// follows never moves, and identical port/token leave the file
+    /// byte-identical. Otherwise the fresh block is placed on the cleaned
+    /// document: appended at EOF (Case A) or inserted as the mapping's
+    /// last child (Case B), so a stale Case A block next to the user's own
+    /// top-level `mcp_servers:` merges into that single mapping.
     static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
 
@@ -105,6 +117,10 @@ struct HermesConfigManager: Sendable {
                     sessionIDScalar: sessionIDScalar,
                     agentKindScalar: agentKindScalar
                 )
+                let replaced = try markerEditor.replaceBlock(body: body, in: current) { original, beginIndex in
+                    original.leadingSpaceCount(original.lines[beginIndex]) == 0
+                }
+                if let replaced { return replaced }
                 return try markerEditor.setBlock(body: body, in: cleaned)
             }
 
@@ -122,6 +138,10 @@ struct HermesConfigManager: Sendable {
                 sessionIDScalar: sessionIDScalar,
                 agentKindScalar: agentKindScalar
             )
+            let replaced = try markerEditor.replaceBlock(body: body, in: current) { original, beginIndex in
+                isCaseBChildPlacement(beginLine: beginIndex, unit: unit, in: original)
+            }
+            if let replaced { return replaced }
             return markerEditor.insertBlock(body: body, asChildOfLine: headerLine, unit: unit, in: cleaned)
         }
     }
@@ -228,17 +248,47 @@ struct HermesConfigManager: Sendable {
     /// `mcp_servers: [...]`) — there's no safe place to splice a child into
     /// that.
     private static func topLevelMcpServersHeaderLine(in doc: LineDoc) throws -> Int? {
-        let key = "mcp_servers:"
         for i in doc.lines.indices {
-            let raw = doc.lineBytes(doc.lines[i])
-            guard let first = raw.first, first != UInt8(ascii: " "), first != UInt8(ascii: "\t") else { continue }
-            let text = String(decoding: raw, as: UTF8.self)
-            guard text.hasPrefix(key) else { continue }
-            let remainder = String(text.dropFirst(key.count)).trimmingCharacters(in: .whitespaces)
-            if remainder.isEmpty || remainder.hasPrefix("#") { return i }
+            guard let isBlockStyle = topLevelMcpServersKeyIsBlockStyle(doc.lineBytes(doc.lines[i])) else { continue }
+            if isBlockStyle { return i }
             throw HermesConfigError.unsupportedYamlStructure("inline mcp_servers map not supported")
         }
         return nil
+    }
+
+    /// `nil` when `raw` (one line's own content bytes) is not a top-level
+    /// (indent-0) `mcp_servers:` key; otherwise whether it is the
+    /// block-style form (nothing after the colon but whitespace and an
+    /// optional `#` comment) rather than an inline one.
+    private static func topLevelMcpServersKeyIsBlockStyle(_ raw: [UInt8]) -> Bool? {
+        let key = "mcp_servers:"
+        guard let first = raw.first, first != UInt8(ascii: " "), first != UInt8(ascii: "\t") else { return nil }
+        let text = String(decoding: raw, as: UTF8.self)
+        guard text.hasPrefix(key) else { return nil }
+        let remainder = String(text.dropFirst(key.count)).trimmingCharacters(in: .whitespaces)
+        return remainder.isEmpty || remainder.hasPrefix("#")
+    }
+
+    /// Whether a Case B block whose BEGIN line is `beginLine` sits where
+    /// `insertBlock` would place one: at exactly `unit` spaces of indent,
+    /// with the nearest preceding non-blank, non-comment line at indent 0
+    /// being a top-level block-style `mcp_servers:` key (the same
+    /// recognition rule as `topLevelMcpServersHeaderLine`). Comment lines
+    /// (first non-space/tab byte `#`) are skipped at any indent, because a
+    /// YAML comment does not end a mapping.
+    private static func isCaseBChildPlacement(beginLine: Int, unit: Int, in doc: LineDoc) -> Bool {
+        guard doc.leadingSpaceCount(doc.lines[beginLine]) == unit else { return false }
+        var i = beginLine - 1
+        while i >= 0 {
+            let raw = doc.lineBytes(doc.lines[i])
+            let firstContent = raw.first { $0 != UInt8(ascii: " ") && $0 != UInt8(ascii: "\t") }
+            if let first = raw.first, first != UInt8(ascii: " "), first != UInt8(ascii: "\t"),
+               firstContent != UInt8(ascii: "#") {
+                return topLevelMcpServersKeyIsBlockStyle(raw) == true
+            }
+            i -= 1
+        }
+        return false
     }
 
     // MARK: - Private: Owned-region predicates

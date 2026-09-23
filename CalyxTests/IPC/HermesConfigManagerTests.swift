@@ -983,4 +983,180 @@ final class HermesConfigManagerTests: XCTestCase {
         try HermesConfigManager.disableIPC(configPath: configPath)
         XCTAssertFalse(FileManager.default.fileExists(atPath: configPath), "disableIPC must never create a file that never existed")
     }
+
+    // MARK: - An existing block is replaced in place, never moved to EOF
+
+    func test_enableIPC_caseABlockFollowedByUserKey_samePortToken_isNoOpByteIdenticalAndUnwritten() throws {
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+        let generatedBlock = readConfig()
+        let userKey = "other_setting: 1\n"
+        try writeConfig(generatedBlock + userKey)
+
+        let attrsBefore = try FileManager.default.attributesOfItem(atPath: configPath)
+        let inodeBefore = attrsBefore[.systemFileNumber] as? Int
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertEqual(
+            content, generatedBlock + userKey,
+            "re-enabling with identical port/token must leave the file byte-identical, the block staying in " +
+            "place before the user's key rather than moving to EOF"
+        )
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(
+            inodeBefore, attrsAfter[.systemFileNumber] as? Int,
+            "byte-identical output must skip the write entirely (inode unchanged)"
+        )
+    }
+
+    func test_enableIPC_caseABlockFollowedByUserKey_differentToken_keepsPositionChangesOnlyAuthorization() throws {
+        try HermesConfigManager.enableIPC(port: 41830, token: "old-tok", configPath: configPath)
+        let generatedBlock = readConfig()
+        let userKey = "other_setting: 1\n"
+        try writeConfig(generatedBlock + userKey)
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "new-tok", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertTrue(content.hasSuffix(userKey), "the user's key must remain at EOF, untouched")
+        XCTAssertTrue(content.contains("Bearer new-tok"))
+        XCTAssertFalse(content.contains("Bearer old-tok"))
+        let beginRange = try XCTUnwrap(content.range(of: beginLine))
+        let userRange = try XCTUnwrap(content.range(of: "other_setting: 1"))
+        XCTAssertLessThan(
+            beginRange.lowerBound, userRange.lowerBound,
+            "the block must stay before the user's key, not move to after it"
+        )
+    }
+
+    func test_enableIPC_caseBBlockFollowedByAnotherUserChild_samePortToken_isNoOpByteIdenticalAndUnwritten() throws {
+        try writeConfig("mcp_servers:\n  other:\n    url: \"x\"\n")
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+        let afterFirstEnable = readConfig()
+        let fixture = afterFirstEnable + "  another_child: 2\n"
+        try writeConfig(fixture)
+
+        let attrsBefore = try FileManager.default.attributesOfItem(atPath: configPath)
+        let inodeBefore = attrsBefore[.systemFileNumber] as? Int
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertEqual(
+            content, fixture,
+            "re-enabling with identical port/token must leave the file byte-identical, the Case B block " +
+            "staying in place before the mapping's other child rather than moving to EOF"
+        )
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(
+            inodeBefore, attrsAfter[.systemFileNumber] as? Int,
+            "byte-identical output must skip the write entirely (inode unchanged)"
+        )
+    }
+
+    func test_enableIPC_caseBBlockFollowedByAnotherUserChild_differentToken_keepsPosition() throws {
+        try writeConfig("mcp_servers:\n  other:\n    url: \"x\"\n")
+        try HermesConfigManager.enableIPC(port: 41830, token: "old-tok", configPath: configPath)
+        let afterFirstEnable = readConfig()
+        try writeConfig(afterFirstEnable + "  another_child: 2\n")
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "new-tok", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertTrue(content.hasSuffix("  another_child: 2\n"), "the sibling child must remain the mapping's last child, untouched")
+        XCTAssertTrue(content.contains("Bearer new-tok"))
+        XCTAssertFalse(content.contains("Bearer old-tok"))
+        let beginRange = try XCTUnwrap(content.range(of: beginLine))
+        let siblingRange = try XCTUnwrap(content.range(of: "another_child: 2"))
+        XCTAssertLessThan(
+            beginRange.lowerBound, siblingRange.lowerBound,
+            "the block must stay before the sibling child, not move to after it"
+        )
+    }
+
+    /// Builds a Case B document in which a column-0 YAML comment line sits
+    /// between the user's first child and Calyx's block, with another user
+    /// child after the block. A column-0 comment does not end the
+    /// `mcp_servers:` mapping, so the block is still a child of it.
+    private func caseBFixtureWithColumnZeroCommentBeforeBlock(token: String) throws -> String {
+        try writeConfig("mcp_servers:\n  other:\n    url: \"x\"\n")
+        try HermesConfigManager.enableIPC(port: 41830, token: token, configPath: configPath)
+        let afterFirstEnable = readConfig()
+        let blockStart = try XCTUnwrap(afterFirstEnable.range(of: "  " + beginLine))
+        return afterFirstEnable[..<blockStart.lowerBound] + "# user note\n" +
+            afterFirstEnable[blockStart.lowerBound...] + "  another_child: 2\n"
+    }
+
+    func test_enableIPC_caseBBlockAfterColumnZeroComment_samePortToken_isNoOpByteIdenticalAndUnwritten() throws {
+        let fixture = try caseBFixtureWithColumnZeroCommentBeforeBlock(token: "tok")
+        try writeConfig(fixture)
+
+        let attrsBefore = try FileManager.default.attributesOfItem(atPath: configPath)
+        let inodeBefore = attrsBefore[.systemFileNumber] as? Int
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "tok", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertEqual(
+            content, fixture,
+            "re-enabling with identical port/token must leave the file byte-identical: a column-0 comment " +
+            "between mcp_servers: and the Case B block does not end the mapping"
+        )
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(
+            inodeBefore, attrsAfter[.systemFileNumber] as? Int,
+            "byte-identical output must skip the write entirely (inode unchanged)"
+        )
+    }
+
+    func test_enableIPC_caseBBlockAfterColumnZeroComment_differentToken_keepsPositionChangesOnlyAuthorization() throws {
+        let fixture = try caseBFixtureWithColumnZeroCommentBeforeBlock(token: "old-tok")
+        try writeConfig(fixture)
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "new-tok", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertEqual(
+            content, fixture.replacingOccurrences(of: "Bearer old-tok", with: "Bearer new-tok"),
+            "only the Authorization value may change; the block must stay in place after the comment and " +
+            "before the later sibling child"
+        )
+        let beginRange = try XCTUnwrap(content.range(of: beginLine))
+        let siblingRange = try XCTUnwrap(content.range(of: "another_child: 2"))
+        XCTAssertLessThan(
+            beginRange.lowerBound, siblingRange.lowerBound,
+            "the block must stay before the sibling child, not move to after it"
+        )
+    }
+
+    /// Regression guard: a stale Case A block (its own self-contained
+    /// `mcp_servers:` parent) plus the user's OWN, separate top-level
+    /// `mcp_servers:` mapping elsewhere in the file. After enable, the
+    /// file must have exactly one top-level `mcp_servers:` key, with
+    /// `calyx-ipc` nested under it alongside the user's own child.
+    func test_enableIPC_staleCaseABlockPlusUsersOwnTopLevelMcpServers_mergesIntoSingleMapping() throws {
+        let staleBlock =
+            beginLine + "\n" +
+            "mcp_servers:\n" +
+            "  calyx-ipc:\n" +
+            "    url: \"http://127.0.0.1:9999/mcp\"\n" +
+            "    headers:\n" +
+            "      Authorization: \"Bearer stale\"\n" +
+            endLine + "\n"
+        let usersOwnMapping = "mcp_servers:\n  their_own: 1\n"
+        try writeConfig(staleBlock + "\n" + usersOwnMapping)
+
+        try HermesConfigManager.enableIPC(port: 41830, token: "fresh", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertEqual(
+            occurrences(of: "mcp_servers:", in: content), 1,
+            "there must be exactly one top-level mcp_servers: key after merging the stale Case A block into it"
+        )
+        XCTAssertTrue(content.contains("their_own: 1"), "the user's own child must survive")
+        XCTAssertTrue(content.contains("calyx-ipc:"), "calyx-ipc must be nested under the single mcp_servers: mapping")
+        XCTAssertTrue(content.contains("Bearer fresh"))
+        XCTAssertFalse(content.contains("Bearer stale"))
+    }
 }

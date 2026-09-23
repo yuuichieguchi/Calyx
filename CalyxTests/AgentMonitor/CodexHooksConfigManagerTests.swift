@@ -1041,4 +1041,90 @@ final class CodexHooksConfigManagerTests: XCTestCase {
         try CodexHooksConfigManager.removeHooks(configPath: configPath)
         XCTAssertFalse(FileManager.default.fileExists(atPath: configPath), "removeHooks must never create a file that never existed")
     }
+
+    // MARK: - An existing managed block is replaced in place, never moved to EOF
+
+    func test_installHooks_blockFollowedByUserTable_sameScriptPath_isNoOpByteIdenticalAndUnwritten() throws {
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        let generatedBlock = readConfig()
+        let userTable = "\n[profiles.work]\nkey = \"value\"\n"
+        writeConfig(generatedBlock + userTable)
+
+        let attrsBefore = try FileManager.default.attributesOfItem(atPath: configPath)
+        let inodeBefore = attrsBefore[.systemFileNumber] as? Int
+
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertEqual(
+            content, generatedBlock + userTable,
+            "re-installing with an identical scriptPath must leave the file byte-identical, the managed " +
+            "block staying in place before the user's table rather than moving to EOF"
+        )
+        let attrsAfter = try FileManager.default.attributesOfItem(atPath: configPath)
+        XCTAssertEqual(
+            inodeBefore, attrsAfter[.systemFileNumber] as? Int,
+            "byte-identical output must skip the write entirely (inode unchanged)"
+        )
+    }
+
+    func test_installHooks_blockFollowedByUserTable_differentScriptPath_keepsPositionChangesOnlyBody() throws {
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        let generatedBlock = readConfig()
+        let userTable = "\n[profiles.work]\nkey = \"value\"\n"
+        writeConfig(generatedBlock + userTable)
+
+        let newScriptPath = tempDir + "/bin2/calyx-agent-hook"
+        try CodexHooksConfigManager.installHooks(scriptPath: newScriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertTrue(content.hasSuffix(userTable), "the user's table must remain at EOF, untouched")
+        XCTAssertTrue(content.contains("\"\(newScriptPath)\" codex"), "the block body must use the new scriptPath")
+        XCTAssertFalse(content.contains(expectedCommandLine), "the old scriptPath's command line must no longer appear")
+
+        let beginRange = try XCTUnwrap(content.range(of: Self.beginLine))
+        let tableRange = try XCTUnwrap(content.range(of: "[profiles.work]"))
+        XCTAssertLessThan(
+            beginRange.lowerBound, tableRange.lowerBound,
+            "the block must stay before the user's table, not move to after it"
+        )
+    }
+
+    func test_installHooks_foreignTableInsideBlockFollowedByUserTable_liftsBeforeBlockThenSecondInstallIsNoOp() throws {
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        let generatedBlock = readConfig()
+
+        let foreignTable = """
+        [shell_environment_policy.set]
+        USER_OWNED_SETTING = "preserve-me"
+        """
+        let approvalEntry = """
+        [[hooks.PermissionRequest]]
+        [[hooks.PermissionRequest.hooks]]
+        type = "command"
+        \(expectedApprovalCommandLine)
+        timeout = 600
+        """
+        let withForeignTable = generatedBlock.replacingOccurrences(
+            of: approvalEntry, with: foreignTable + "\n" + approvalEntry
+        )
+        XCTAssertNotEqual(generatedBlock, withForeignTable, "precondition: foreign table injected inside the markers")
+
+        let userTable = "[profiles.work]\nkey = \"value\"\n"
+        writeConfig(withForeignTable + userTable)
+
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+
+        let afterFirstInstall = readConfig()
+        XCTAssertTrue(afterFirstInstall.contains("USER_OWNED_SETTING = \"preserve-me\""), "the foreign table's content must survive")
+        let foreignRange = try XCTUnwrap(afterFirstInstall.range(of: "[shell_environment_policy.set]"))
+        let beginRange = try XCTUnwrap(afterFirstInstall.range(of: Self.beginLine))
+        let tableRange = try XCTUnwrap(afterFirstInstall.range(of: "[profiles.work]"))
+        XCTAssertLessThan(foreignRange.lowerBound, beginRange.lowerBound, "the foreign table must sit right before the rewritten block")
+        XCTAssertLessThan(beginRange.lowerBound, tableRange.lowerBound, "the block must stay before the user's table, not move after it")
+
+        try CodexHooksConfigManager.installHooks(scriptPath: scriptPath, approvalScriptPath: approvalScriptPath, configPath: configPath)
+        let afterSecondInstall = readConfig()
+        XCTAssertEqual(afterSecondInstall, afterFirstInstall, "a second install with identical inputs must be a no-op")
+    }
 }

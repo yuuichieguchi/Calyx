@@ -160,6 +160,63 @@ struct MarkerConfigDocumentEditor: Sendable {
         return Data(result)
     }
 
+    /// Rewrites the first well-formed BEGIN...END occurrence at its own
+    /// position with `body`, keeping its BEGIN line's own indentation
+    /// and the document's detected EOL, so a block the user's own content
+    /// follows is never moved to EOF. Foreign content `foreignBodyBytes`
+    /// finds inside that first block's body is written immediately before
+    /// the rewritten block. Every further well-formed occurrence is
+    /// handled exactly as `removeBlock` handles it, and orphan BEGIN /
+    /// orphan END markers self-heal under `removeBlock`'s own rules; the
+    /// rewritten block's own marker lines are never treated as orphans.
+    ///
+    /// Returns `nil` when `current` is absent or empty, holds no
+    /// well-formed occurrence, or `acceptsPlacement` rejects the first
+    /// occurrence's BEGIN line (called with the original document and
+    /// that line's index): the caller then decides where a fresh block
+    /// belongs. The same `body` on an already-current document returns
+    /// byte-identical data.
+    func replaceBlock(
+        body: String,
+        in current: Data?,
+        acceptsPlacement: ((LineDoc, Int) -> Bool)? = nil
+    ) throws -> Data? {
+        guard let current, !current.isEmpty else { return nil }
+        var bytes = Array(current)
+        let doc = LineDoc(bytes: bytes)
+        let blocks = doc.findBlocks(beginLine: beginLine, endLine: endLine)
+        guard let first = blocks.first else { return nil }
+        if let acceptsPlacement, !acceptsPlacement(doc, first.beginLineIndex) { return nil }
+
+        let eol = doc.detectEOL()
+        for (i, block) in blocks.enumerated().reversed() {
+            if i == 0 {
+                let indentCount = doc.leadingSpaceCount(doc.lines[block.beginLineIndex])
+                let indent = Array(String(repeating: " ", count: indentCount).utf8)
+                let bodyRange = (block.beginLineIndex + 1)..<block.endLineIndex
+                var replacement = foreignBodyBytes?(doc, bodyRange) ?? []
+                replacement.append(contentsOf: blockBytes(body: body, eol: eol, indent: indent))
+                let range = doc.blockRange(startLine: block.beginLineIndex, endLine: block.endLineIndex)
+                bytes.replaceSubrange(range, with: replacement)
+            } else {
+                removeWellFormedBlock(block, of: doc, from: &bytes)
+            }
+        }
+
+        healOrphans(in: &bytes, protectingFirstBlock: true)
+        return Data(bytes)
+    }
+
+    /// `replaceBlock(body:in:)` when `current` already holds a
+    /// well-formed occurrence. Otherwise self-heals any orphan marker via
+    /// `removeBlock`, then appends via `setBlock`: at EOF after one blank
+    /// separator line, or the block alone when nothing remains.
+    func upsertBlock(body: String, in current: Data?) throws -> Data {
+        if let replaced = try replaceBlock(body: body, in: current) { return replaced }
+        let healed = try removeBlock(in: current)
+        return try setBlock(body: body, in: healed)
+    }
+
     /// Removes every well-formed BEGIN...END occurrence. Each is either
     /// deleted together with the one blank line immediately before it (no
     /// foreign content to keep), or -- when `foreignBodyBytes` finds
@@ -189,54 +246,82 @@ struct MarkerConfigDocumentEditor: Sendable {
         let doc = LineDoc(bytes: bytes)
         let blocks = doc.findBlocks(beginLine: beginLine, endLine: endLine)
         for block in blocks.reversed() {
-            let bodyRange = (block.beginLineIndex + 1)..<block.endLineIndex
-            let foreign = foreignBodyBytes?(doc, bodyRange) ?? []
+            removeWellFormedBlock(block, of: doc, from: &bytes)
+        }
+
+        healOrphans(in: &bytes, protectingFirstBlock: false)
+        return Data(bytes)
+    }
+
+    /// Removes one well-formed occurrence from `bytes` (which must still
+    /// match `doc` at and after `block`): together with the one blank
+    /// line before it when `foreignBodyBytes` finds nothing to keep,
+    /// otherwise replaced in place by exactly that foreign content.
+    private func removeWellFormedBlock(_ block: BlockMatch, of doc: LineDoc, from bytes: inout [UInt8]) {
+        let bodyRange = (block.beginLineIndex + 1)..<block.endLineIndex
+        let foreign = foreignBodyBytes?(doc, bodyRange) ?? []
+        if foreign.isEmpty {
+            let range = doc.removalRange(startLine: block.beginLineIndex, endLine: block.endLineIndex)
+            bytes.removeSubrange(range)
+        } else {
+            let range = doc.blockRange(startLine: block.beginLineIndex, endLine: block.endLineIndex)
+            bytes.replaceSubrange(range, with: foreign)
+        }
+    }
+
+    /// The orphan BEGIN / orphan END self-heal `removeBlock` documents; a
+    /// no-op when `isOwnBodyLine` is `nil`. With `protectingFirstBlock`,
+    /// the lines of the document's first well-formed occurrence (the
+    /// block `replaceBlock` just wrote) are never picked as an orphan
+    /// marker. Recomputed on every pass, since each removal shifts line
+    /// indices. An orphan BEGIN can only follow the last END in the
+    /// document (`findBlocks` pairs every BEGIN with the next END), so an
+    /// orphan's body scan never runs into that protected block.
+    private func healOrphans(in bytes: inout [UInt8], protectingFirstBlock: Bool) {
+        guard let isOwnBodyLine else { return }
+
+        let beginBytes = Array(beginLine.utf8)
+        while true {
+            let scanDoc = LineDoc(bytes: bytes)
+            let protected = protectedLines(in: scanDoc, enabled: protectingFirstBlock)
+            guard let beginIndex = scanDoc.lines.indices.first(
+                where: { !protected.contains($0) && scanDoc.trimmedLineBytes(scanDoc.lines[$0]) == beginBytes }
+            ) else { break }
+
+            var lastRecognized = beginIndex
+            var scan = beginIndex + 1
+            while scan < scanDoc.lines.count, isOwnBodyLine(scanDoc, scan) {
+                lastRecognized = scan
+                scan += 1
+            }
+            let bodyRange = (beginIndex + 1)..<(lastRecognized + 1)
+            let foreign = foreignBodyBytes?(scanDoc, bodyRange) ?? []
             if foreign.isEmpty {
-                let range = doc.removalRange(startLine: block.beginLineIndex, endLine: block.endLineIndex)
-                bytes.removeSubrange(range)
+                let removal = scanDoc.removalRange(startLine: beginIndex, endLine: lastRecognized)
+                bytes.removeSubrange(removal)
             } else {
-                let range = doc.blockRange(startLine: block.beginLineIndex, endLine: block.endLineIndex)
+                let range = scanDoc.blockRange(startLine: beginIndex, endLine: lastRecognized)
                 bytes.replaceSubrange(range, with: foreign)
             }
         }
 
-        if let isOwnBodyLine {
-            let beginBytes = Array(beginLine.utf8)
-            while true {
-                let scanDoc = LineDoc(bytes: bytes)
-                guard let beginIndex = scanDoc.lines.indices.first(
-                    where: { scanDoc.trimmedLineBytes(scanDoc.lines[$0]) == beginBytes }
-                ) else { break }
-
-                var lastRecognized = beginIndex
-                var scan = beginIndex + 1
-                while scan < scanDoc.lines.count, isOwnBodyLine(scanDoc, scan) {
-                    lastRecognized = scan
-                    scan += 1
-                }
-                let bodyRange = (beginIndex + 1)..<(lastRecognized + 1)
-                let foreign = foreignBodyBytes?(scanDoc, bodyRange) ?? []
-                if foreign.isEmpty {
-                    let removal = scanDoc.removalRange(startLine: beginIndex, endLine: lastRecognized)
-                    bytes.removeSubrange(removal)
-                } else {
-                    let range = scanDoc.blockRange(startLine: beginIndex, endLine: lastRecognized)
-                    bytes.replaceSubrange(range, with: foreign)
-                }
-            }
-
-            let endBytes = Array(endLine.utf8)
-            while true {
-                let scanDoc = LineDoc(bytes: bytes)
-                guard let endIndex = scanDoc.lines.indices.first(
-                    where: { scanDoc.trimmedLineBytes(scanDoc.lines[$0]) == endBytes }
-                ) else { break }
-                let removal = scanDoc.removalRange(startLine: endIndex, endLine: endIndex)
-                bytes.removeSubrange(removal)
-            }
+        let endBytes = Array(endLine.utf8)
+        while true {
+            let scanDoc = LineDoc(bytes: bytes)
+            let protected = protectedLines(in: scanDoc, enabled: protectingFirstBlock)
+            guard let endIndex = scanDoc.lines.indices.first(
+                where: { !protected.contains($0) && scanDoc.trimmedLineBytes(scanDoc.lines[$0]) == endBytes }
+            ) else { break }
+            let removal = scanDoc.removalRange(startLine: endIndex, endLine: endIndex)
+            bytes.removeSubrange(removal)
         }
+    }
 
-        return Data(bytes)
+    /// The line indices of `doc`'s first well-formed occurrence, or an
+    /// empty range when `enabled` is false or there is none.
+    private func protectedLines(in doc: LineDoc, enabled: Bool) -> Range<Int> {
+        guard enabled, let first = doc.findBlocks(beginLine: beginLine, endLine: endLine).first else { return 0..<0 }
+        return first.beginLineIndex..<(first.endLineIndex + 1)
     }
 
     /// Whether Calyx owns any region in `current`: a well-formed

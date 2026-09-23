@@ -11,7 +11,8 @@
 // no syntax for replacing "our" entries within a user's own array without
 // risking corruption of entries we don't own — so, like
 // `HermesConfigManager`'s YAML block, the whole thing is wrapped in a
-// single BEGIN/END comment span that's always appended at EOF (TOML has no
+// single BEGIN/END comment span: appended at EOF on first install,
+// rewritten at its own position after that (TOML has no
 // "insert at top" primitive either — a leading array-of-tables would swallow
 // any of the user's own un-headered root keys that follow it). Codex may insert
 // its own tables between those comment markers (comments do not establish
@@ -71,9 +72,11 @@ struct CodexHooksConfigManager: Sendable {
     /// Replaces Calyx's managed block in `configPath` with a freshly built
     /// one for `scriptPath`'s 9 target events plus `approvalScriptPath`'s
     /// extra synchronous `PermissionRequest` pair, preserving everything
-    /// else in the file verbatim. Idempotent: re-running strips the prior
-    /// managed block (wherever it is) before appending the new one at
-    /// EOF, rather than duplicating it.
+    /// else in the file verbatim. An existing well-formed managed block is
+    /// rewritten at its own position, never moved to EOF; with none
+    /// present, any orphan marker self-heals first and the new block is
+    /// appended at EOF. Idempotent: identical inputs on an already-current
+    /// file produce byte-identical output, so the file is not rewritten.
     static func installHooks(scriptPath: String, approvalScriptPath: String, configPath: String? = nil) throws {
         guard !scriptPath.contains("'"), !approvalScriptPath.contains("'") else {
             // TOML literal strings (`'...'`) have no escape mechanism, and
@@ -100,11 +103,12 @@ struct CodexHooksConfigManager: Sendable {
         // policies, deliberately: whichever manager's write actually
         // contains the secret is the one that enforces the mode.
         try ConfigFileUtils.withExclusiveConfig(path: path) { current in
-            // Strips any existing managed block first (self-healing an
-            // orphan BEGIN and preserving any foreign TOML table found
-            // inside it, if present) so reinstalling never duplicates it.
-            let stripped = try markerEditor.removeBlock(in: current)
-            return try markerEditor.setBlock(body: freshBody, in: stripped)
+            // Rewrites the first managed block in place (lifting any
+            // foreign TOML table found inside it to just before it, and
+            // removing every further block) or, with none present,
+            // self-heals any orphan marker and appends at EOF, so
+            // reinstalling never duplicates or moves it.
+            try markerEditor.upsertBlock(body: freshBody, in: current)
         }
     }
 
@@ -179,7 +183,8 @@ struct CodexHooksConfigManager: Sendable {
     }
 
     /// The managed block's body (everything between the BEGIN and END
-    /// lines, which `MarkerConfigDocumentEditor.setBlock` supplies itself).
+    /// lines, which `MarkerConfigDocumentEditor.upsertBlock` supplies
+    /// itself).
     private static func managedBlockBody(scriptPath: String, approvalScriptPath: String) -> String {
         let eventEntries = targetEvents.map { hookEntry(eventName: $0, scriptPath: scriptPath) }
         return (eventEntries + [approvalHookEntry(approvalScriptPath: approvalScriptPath)]).joined(separator: "\n")
