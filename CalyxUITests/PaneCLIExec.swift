@@ -35,15 +35,20 @@
 // as a different character entirely (field-verified: `sh '<path>`
 // arrived in the pane as `sh ;Su/Users/...`, and the mangled `sh`
 // argument then started an interactive shell instead of running the
-// script). The script path is always composed only from
-// `FileManager.default.temporaryDirectory` plus filename characters
-// this file itself controls (`calyx-e2e`, digits, `-`, `_`, `.`, `/`),
-// so it never needs quoting for spaces or shell metacharacters --
-// every path passed to `typePaneScript` below is asserted (via
-// `XCTFail`, not `precondition`, so a violation reports as a normal
-// test failure rather than aborting the process) to contain only
-// `[A-Za-z0-9/._-]` before it is typed, so a future caller can never
-// reintroduce the need for quoting without that assertion firing.
+// script). `FileManager.default.temporaryDirectory` is OS-generated
+// and can contain `_` (observed in both an unsandboxed runner's
+// `/var/folders/.../T` path and a sandboxed container path derived
+// from a system username), so every path passed to `typePaneScript`
+// below is asserted (via `XCTFail`, not `precondition`, so a violation
+// reports as a normal test failure rather than aborting the process)
+// to contain only `[A-Za-z0-9/._-]` before it is typed -- this guard
+// exists to catch a character that would require quoting (a space or
+// a shell metacharacter), never `_`, which this typed line handles
+// directly via `app.typeText` rather than through `typeIntoPane`. The
+// layout-invariant character-set constraint on a typed line (which
+// does exclude `_` and `'`) applies only to `typeIntoPane`, used for
+// literal command text, not to `typePaneScript`'s own `sh <path>`
+// line.
 //
 // Rationale for running a command in a live pane at all, instead of
 // spawning `calyx-session` as an out-of-process `Process` from inside
@@ -107,13 +112,12 @@ extension CalyxUITestCase {
         "--runtime-dir \(homeDir)/.calyx/run --state-dir \(homeDir)/.calyx/state"
     }
 
-    /// Types `sh <scriptPath>\n` into the frontmost pane, with no
-    /// quoting around `scriptPath` (see this file's header for why a
-    /// typed quote character is layout-dependent and must never be
-    /// used). Fails the test via `XCTFail` -- without typing anything
-    /// -- if `scriptPath` contains a space or any character outside
-    /// `[A-Za-z0-9/._-]`, since such a path would require quoting this
-    /// function does not perform.
+    /// Types `sh <scriptPath>\n` into the frontmost pane directly via
+    /// `app.typeText`, with no quoting around `scriptPath` (see this
+    /// file's header for why a typed quote character is layout-dependent
+    /// and must never be used). Fails the test via `XCTFail` -- without
+    /// typing anything -- if `scriptPath` contains a character requiring
+    /// quoting: a space or any character outside `[A-Za-z0-9/._-]`.
     private func typePaneScript(_ scriptPath: String) {
         let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/._-")
         guard scriptPath.unicodeScalars.allSatisfy(allowed.contains) else {
@@ -121,6 +125,29 @@ extension CalyxUITestCase {
             return
         }
         app.typeText("sh \(scriptPath)\n")
+    }
+
+    /// Types `line` (literal command text, not a script path -- a
+    /// script path is typed by `typePaneScript`/`terminalExec` under
+    /// their own path guard) into the frontmost pane via `app.typeText`.
+    /// Fails the test via `XCTFail` -- without typing anything -- if
+    /// `line` contains a character outside `ABCDEFGHIJKLMNOPQRSTUVWXYZ
+    /// abcdefghijklmnopqrstuvwxyz0123456789 /.;-\n`: `app.typeText`
+    /// presses the key that produces each character under the test
+    /// runner's keyboard layout, and the pane translates that key under
+    /// its own layout, so a character whose key position differs
+    /// between the two layouts arrives in the pane as a different
+    /// character. This set is what has arrived intact between the
+    /// runner's ABC layout and the pane's layout in recorded runs;
+    /// `_` and `'` are not in it because they arrived as other
+    /// characters (`_` as `=`, `'` as `;`).
+    func typeIntoPane(_ line: String) {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 /.;-\n")
+        guard line.unicodeScalars.allSatisfy(allowed.contains) else {
+            XCTFail("pane text contains a character that is not layout-invariant: \(line.debugDescription)")
+            return
+        }
+        app.typeText(line)
     }
 
     /// Writes `command` (with its stdout+stderr redirected to a fresh
@@ -131,9 +158,9 @@ extension CalyxUITestCase {
     /// pane (via `typePaneScript`, no quoting), and polls the output
     /// file until it has content
     /// (or a bounded number of attempts elapse), returning the trimmed
-    /// content. Mirrors `BrowserScriptingUITests.terminalExec` exactly;
-    /// kept as a near-duplicate rather than a shared call so neither
-    /// file depends on the other.
+    /// content. Mirrors `BrowserScriptingUITests.terminalExec`, which
+    /// applies the same path guard to its own script path before
+    /// typing it.
     func paneExec(_ command: String, counter: inout Int, timeoutAttempts: Int = 20) -> String {
         counter += 1
         let pid = ProcessInfo.processInfo.processIdentifier

@@ -121,13 +121,15 @@ final class CommandLogE2ETests: CalyxUITestCase {
         // tracked `command` field unable to match either marker below.
         // Typing the literal command text directly makes preexec capture
         // exactly what this test needs to find via terminal_list_commands.
-        // This suite only needs the SERVER-side tracked record, never the
-        // pane's own stdout, so there is nothing to read back from either
-        // command.
+        // Typed pane text must consist only of characters whose key
+        // position is the same under the test runner's and the pane's
+        // keyboard layouts: letters, digits, space, `;`, Return. `_` and
+        // `'` are not, and arrive as other characters -- see
+        // `typeIntoPane` in PaneCLIExec.swift.
         Thread.sleep(forTimeInterval: 1)
-        app.typeText("echo CALYX_CMDLOG_MARKER_A1; false\n")
+        typeIntoPane("echo CALYXCMDLOGMARKERA1; false\n")
         Thread.sleep(forTimeInterval: 1)
-        app.typeText("echo done\n")
+        typeIntoPane("echo done\n")
 
         let encodedScript = Data(Self.queryScript.utf8).base64EncodedString()
         let queryCommand = "printf '%s' '\(encodedScript)' | base64 -d > /tmp/calyx-e2e-cmdlog-query.py && " +
@@ -167,9 +169,9 @@ final class CommandLogE2ETests: CalyxUITestCase {
         XCTAssertGreaterThanOrEqual(commands.count, 2,
                                     "both the marker command and \"echo done\" must be tracked -- found \(commands.count)")
 
-        let markerIndex = commands.firstIndex { ($0["command"] as? String)?.contains("CALYX_CMDLOG_MARKER_A1") == true }
+        let markerIndex = commands.firstIndex { ($0["command"] as? String)?.contains("CALYXCMDLOGMARKERA1") == true }
         let doneIndex = commands.firstIndex { ($0["command"] as? String)?.contains("echo done") == true }
-        let markerCommandIndex = try XCTUnwrap(markerIndex, "no tracked command's text contains CALYX_CMDLOG_MARKER_A1")
+        let markerCommandIndex = try XCTUnwrap(markerIndex, "no tracked command's text contains CALYXCMDLOGMARKERA1")
         let doneCommandIndex = try XCTUnwrap(doneIndex, "no tracked command's text contains \"echo done\"")
         XCTAssertLessThan(
             markerCommandIndex, doneCommandIndex,
@@ -182,7 +184,7 @@ final class CommandLogE2ETests: CalyxUITestCase {
         XCTAssertEqual(markerCommand["state"] as? String, "finished",
                        "the marker command must have finished (preexec+precmd both fired) by the time it's queryable")
         XCTAssertEqual(markerCommand["exit_code"] as? Int, 1,
-                       "`echo CALYX_CMDLOG_MARKER_A1; false` must report exit_code 1 -- the LAST command in the " +
+                       "`echo CALYXCMDLOGMARKERA1; false` must report exit_code 1 -- the LAST command in the " +
                        "`;`-separated line determines the compound line's own exit status")
         XCTAssertNotNil(markerCommand["duration_ms"], "a finished command must carry a duration_ms")
 
@@ -190,7 +192,7 @@ final class CommandLogE2ETests: CalyxUITestCase {
 
         let readOutput = try XCTUnwrap(result["read_output"] as? [String: Any], "result must carry the read_output response")
         let outputText = try XCTUnwrap(readOutput["text"] as? String, "read_output response must carry a text field")
-        XCTAssertTrue(outputText.contains("CALYX_CMDLOG_MARKER_A1"),
+        XCTAssertTrue(outputText.contains("CALYXCMDLOGMARKERA1"),
                      "the marker command's captured output must contain the literal marker text it echoed")
     }
 
@@ -255,7 +257,7 @@ final class CommandLogE2ETests: CalyxUITestCase {
         for _ in range(20):
             list_result = call_tool("terminal_list_commands", {"surface_id": surface_id})
             marker_command = next(
-                (c for c in list_result.get("commands", []) if "CALYX_CMDLOG_MARKER_A1" in c.get("command", "")),
+                (c for c in list_result.get("commands", []) if "CALYXCMDLOGMARKERA1" in c.get("command", "")),
                 None,
             )
             if marker_command is not None and len(list_result.get("commands", [])) >= 2:

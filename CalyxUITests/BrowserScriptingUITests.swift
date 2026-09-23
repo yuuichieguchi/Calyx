@@ -22,17 +22,12 @@ final class BrowserScriptingUITests: CalyxUITestCase {
     /// Types a command into the terminal, run it, read output from file. The command itself is
     /// written to a script file under the runner's own sandboxed container tmp (`/tmp` itself is
     /// not writable by the sandboxed test runner) and only `sh <scriptPath>` followed by Return is
-    /// typed via `app.typeText`, never pasted: a paste long/slow enough that it is still being
-    /// delivered to the pane when Return arrives lands that Return inside the bracketed paste, so
-    /// the command is never executed, while typed keystrokes always arrive in order. `scriptPath`
-    /// is typed with NO surrounding quote: a typed `'` is delivered via whatever physical key
-    /// produces `'` under the OS's active keyboard layout, so under a non-US layout it can arrive
-    /// as a different character entirely (field-verified: `sh '<path>` arrived as `sh ;Su/...`,
-    /// and the mangled `sh` argument started an interactive shell instead of running the script).
-    /// Quoting is unnecessary since `scriptFile` here is always composed only from
-    /// `FileManager.default.temporaryDirectory` plus filename characters this function itself
-    /// controls, so `XCTFail`s (without typing anything) if that composition ever changes to
-    /// include a character requiring quoting.
+    /// typed into the pane, directly via `app.typeText` (not `typeIntoPane` -- see
+    /// `PaneCLIExec.swift` for why: `typeIntoPane`'s layout-invariance constraint on a typed line
+    /// applies to literal command text, not to a script path, which is typed under its own guard
+    /// here). `scriptFile` is checked here against `[A-Za-z0-9/._-]` before typing: this guard
+    /// exists to catch a character that would require quoting (a space or a shell metacharacter),
+    /// since `FileManager.default.temporaryDirectory` is OS-generated and can contain `_`.
     private func terminalExec(_ command: String) -> String {
         cmdCounter += 1
         let outFile = "/tmp/calyx-e2e-\(cmdCounter).txt"
