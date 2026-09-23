@@ -85,8 +85,10 @@ struct OpenCodeConfigManager: Sendable {
         return ownIdentifiers.contains { line.contains($0) }
     }
 
-    /// Managed-block body injected into AGENTS.md. This is MCPProtocol.instructions
-    /// minus the browser-automation paragraph, formatted as Markdown.
+    /// Managed-block body injected into AGENTS.md. This is the peer-messaging
+    /// part of `MCPRouter.instructions` (the intro sentence, the
+    /// register_peer paragraph, the receive_messages paragraph, and the
+    /// list_peers/broadcast paragraph), formatted as Markdown.
     ///
     /// Note: kept as a stable constant so the canary substring
     /// `"call register_peer once"` remains present. The receive_messages

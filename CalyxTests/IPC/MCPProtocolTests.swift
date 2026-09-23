@@ -276,6 +276,87 @@ final class MCPProtocolTests: XCTestCase {
         )
     }
 
+    // ==================== instructions must not advertise browser_* tools ====================
+    //
+    // MCPRouter.allTools has no browser_* tools: browser control is served
+    // by BrowserServer over TCP and the `calyx browser` CLI. The
+    // instructions text must therefore not advertise any browser_* tool.
+
+    func test_instructions_withoutPeerID_doesNotMentionBrowserTools() throws {
+        let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
+        let resultData = try jsonEncoder.encode(response.result!)
+        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let instructions = try XCTUnwrap(initResult.instructions)
+
+        XCTAssertFalse(
+            instructions.contains("browser_"),
+            "instructions for a connection with no auto-registered peerID must not mention " +
+            "browser_* tools: browser control is served by BrowserServer over TCP and the " +
+            "calyx browser CLI, not by MCPRouter.allTools"
+        )
+    }
+
+    func test_instructions_withPeerID_doesNotMentionBrowserTools() throws {
+        let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: UUID())
+        let resultData = try jsonEncoder.encode(response.result!)
+        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let instructions = try XCTUnwrap(initResult.instructions)
+
+        XCTAssertFalse(
+            instructions.contains("browser_"),
+            "instructions for a connection with an auto-registered peerID must not mention " +
+            "browser_* tools: browser control is served by BrowserServer over TCP and the " +
+            "calyx browser CLI, not by MCPRouter.allTools"
+        )
+    }
+
+    func test_instructions_toolFamilyWildcards_allHaveToolsInCatalogue() throws {
+        // Every "<prefix>_*" wildcard the instructions text advertises must
+        // correspond to at least one real tool name in MCPRouter.allTools.
+        // An advertised family with no matching tool is stale documentation.
+        let catalogueNames = MCPRouter.allTools.map(\.name)
+        let wildcardRegex = try NSRegularExpression(pattern: #"\b([a-z]+)_\*"#)
+
+        func extractPrefixes(from instructions: String, variant: String) throws -> Set<String> {
+            let range = NSRange(instructions.startIndex..., in: instructions)
+            let matches = wildcardRegex.matches(in: instructions, range: range)
+            var prefixes = Set<String>()
+            for match in matches {
+                guard let prefixRange = Range(match.range(at: 1), in: instructions) else { continue }
+                prefixes.insert(String(instructions[prefixRange]))
+            }
+
+            // Non-vacuity guard: if the regex stops matching anything (or
+            // stops matching the known, still-present families), the
+            // assertions below would pass vacuously and prove nothing.
+            XCTAssertFalse(prefixes.isEmpty,
+                           "no <prefix>_* wildcard was extracted from the \(variant) instructions; " +
+                           "the extraction regex itself is broken")
+            XCTAssertTrue(prefixes.contains("lsp"),
+                          "expected the \(variant) instructions to still advertise lsp_* " +
+                          "(a family that legitimately has tools in the catalogue)")
+            XCTAssertTrue(prefixes.contains("terminal"),
+                          "expected the \(variant) instructions to still advertise terminal_* " +
+                          "(a family that legitimately has tools in the catalogue)")
+            return prefixes
+        }
+
+        for (peerID, variant) in [(UUID?.none, "peerID: nil"), (UUID?.some(UUID()), "peerID: UUID()")] {
+            let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: peerID)
+            let resultData = try jsonEncoder.encode(response.result!)
+            let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+            let instructions = try XCTUnwrap(initResult.instructions)
+
+            let prefixes = try extractPrefixes(from: instructions, variant: variant)
+            for prefix in prefixes {
+                let hasMatchingTool = catalogueNames.contains { $0.hasPrefix(prefix + "_") }
+                XCTAssertTrue(hasMatchingTool,
+                              "instructions (\(variant)) advertise the '\(prefix)_*' tool family, but " +
+                              "no tool name in MCPRouter.allTools starts with '\(prefix)_'")
+            }
+        }
+    }
+
     func test_instructions_describesReceiveMessagesAsDeleteOnRead() throws {
         // The receive_messages guidance paragraph must explain the new
         // at-most-once contract — that retrieving a message removes it
