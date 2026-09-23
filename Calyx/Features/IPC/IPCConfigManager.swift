@@ -24,11 +24,11 @@ struct IPCConfigResult: Sendable {
     let hermes: ConfigStatus
     let grok: ConfigStatus
 
-    /// Every axis paired with the label the alert renders for it, in
-    /// print order. `anySucceeded` and `issueMessages` both derive from
-    /// this, and so does `IPCActivationPresenter`'s rendering of this
-    /// result -- a newly supported agent CLI is added here once, not
-    /// separately in each of those.
+    /// Every axis paired with the label rendered for it, in print order.
+    /// `anySucceeded` and `issueMessages` both derive from this, and so
+    /// does `AgentIPCRowResolver`'s rendering of this result -- a newly
+    /// supported agent CLI is added here once, not separately in each of
+    /// those.
     var axes: [(name: String, status: ConfigStatus)] {
         [
             ("Claude Code config", claudeCode),

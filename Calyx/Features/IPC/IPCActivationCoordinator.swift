@@ -13,7 +13,7 @@
 // end across both production call sites (the Settings toggle and launch-
 // time auto-activation) so a rapid enable-then-disable cannot land its
 // file writes out of order, and records each outcome as the chain's own
-// `lastReport` before the chain's in-flight flag drops. The config/hooks
+// `lastActivation` before the chain's in-flight flag drops. The config/hooks
 // I/O inside each call hops off `@MainActor` (`IPCConfigManager` and
 // `AgentHooksCoordinator` are synchronous I/O behind an untimed
 // `flock`), but stays inside the chain's queued work so ordering and the
@@ -83,20 +83,31 @@ protocol IPCIntegrationIssueReporting {
 /// integration step has run exactly once.
 struct IPCActivationReport: Sendable {
     let port: Int
-    let wasAlreadyRunning: Bool
     let config: IPCConfigResult
     let hooks: AgentHooksResult
+}
 
-    /// True when at least one agent CLI is reachable through either its
-    /// config file or its hooks/plugin/extension axis. pi has no config
-    /// axis at all, so `hooks.anySucceeded` is its only signal here.
-    var anyAgentWired: Bool { config.anySucceeded || hooks.anySucceeded }
+/// Why a server-start attempt failed, in the one place both the sidebar
+/// banner (`IPCActivationCoordinator.enableLocked`) and the Settings >
+/// Agents row summary (`AgentIPCRowResolver`) read it from, so the two
+/// surfaces can never disagree on the wording.
+enum IPCServerFailure: Sendable {
+    case tokenGeneration
+    case start(Error)
+
+    var description: String {
+        switch self {
+        case .tokenGeneration:
+            return "Failed to generate secure token."
+        case .start(let error):
+            return error.localizedDescription
+        }
+    }
 }
 
 enum IPCActivationOutcome: Sendable {
     case enabled(IPCActivationReport)
-    case tokenGenerationFailed
-    case serverStartFailed(Error)
+    case serverFailed(IPCServerFailure)
 }
 
 struct IPCDeactivationReport: Sendable {
@@ -140,7 +151,7 @@ struct IPCActivationCoordinator {
     /// Runs through `IPCActivationChain.shared` so a rapid enable-then-
     /// disable (or the reverse) cannot land its file writes out of order
     /// against the other call. The chain itself records the returned
-    /// outcome as `lastReport` before its in-flight flag drops.
+    /// outcome as `lastActivation` before its in-flight flag drops.
     func enable() async -> IPCActivationOutcome {
         await IPCActivationChain.shared.runEnable { [self] in
             await enableLocked()
@@ -150,7 +161,6 @@ struct IPCActivationCoordinator {
     private func enableLocked() async -> IPCActivationOutcome {
         let port: Int
         let token: String
-        let wasAlreadyRunning: Bool
 
         if server.isRunning {
             // Reuse the live endpoint. CalyxMCPServer.start(token:)
@@ -161,26 +171,17 @@ struct IPCActivationCoordinator {
             // config/hooks install.
             port = server.port
             token = server.token
-            wasAlreadyRunning = true
         } else {
             let generatedToken: String
             do {
                 generatedToken = try tokenGenerator.makeToken()
             } catch {
-                let outcome = IPCActivationOutcome.tokenGenerationFailed
-                // Reuses the presenter's own message for this outcome
-                // rather than a second copy of the string, so the
-                // sidebar banner and the Settings/alert text can never
-                // drift apart.
-                issueReporter.reportServerIssues([IPCActivationPresenter.enableAlert(for: outcome).message])
-                return outcome
+                return reportServerFailure(.tokenGeneration)
             }
             do {
                 try await server.start(token: generatedToken)
             } catch {
-                let outcome = IPCActivationOutcome.serverStartFailed(error)
-                issueReporter.reportServerIssues([IPCActivationPresenter.enableAlert(for: outcome).message])
-                return outcome
+                return reportServerFailure(.start(error))
             }
             // Read BOTH back after start() returns: the server resolves
             // its own token and its actual listening port during start,
@@ -190,7 +191,6 @@ struct IPCActivationCoordinator {
             // desync the server's own token from the CLI config's token.
             token = server.token
             port = server.port
-            wasAlreadyRunning = false
         }
 
         let configInstaller = self.configInstaller
@@ -204,7 +204,14 @@ struct IPCActivationCoordinator {
         // this point.
         issueReporter.reportServerIssues([])
 
-        return .enabled(IPCActivationReport(port: port, wasAlreadyRunning: wasAlreadyRunning, config: config, hooks: hooks))
+        return .enabled(IPCActivationReport(port: port, config: config, hooks: hooks))
+    }
+
+    /// Reports `failure`'s description to the server-issue domain and
+    /// returns the matching `.serverFailed` outcome.
+    private func reportServerFailure(_ failure: IPCServerFailure) -> IPCActivationOutcome {
+        issueReporter.reportServerIssues([failure.description])
+        return .serverFailed(failure)
     }
 
     /// Stops the server (this type's only stop call site), then removes
@@ -323,9 +330,10 @@ struct LiveIPCAgentHooksInstaller: IPCAgentHooksInstalling {
 }
 
 /// Thrown by `SecureRandomTokenGenerator.makeToken()` when
-/// `SecRandomCopyBytes` reports a non-success status. The presenter
-/// renders a fixed message for `.tokenGenerationFailed` regardless of
-/// the underlying status, so this carries it only for diagnostics.
+/// `SecRandomCopyBytes` reports a non-success status.
+/// `IPCServerFailure.description` renders a fixed message for
+/// `.tokenGeneration` regardless of the underlying status, so this
+/// carries it only for diagnostics.
 enum TokenGenerationError: Error, Sendable {
     case secureRandomFailed(OSStatus)
 }

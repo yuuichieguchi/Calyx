@@ -44,6 +44,15 @@ final class IPCActivationChain {
         case disabling
     }
 
+    /// The structured result of the last operation this chain completed.
+    /// The two directions carry different payloads (`IPCActivationOutcome`
+    /// vs. `IPCDeactivationReport`), so this enum is direction-tagged
+    /// rather than holding one shared type.
+    enum LastActivation: Sendable {
+        case enable(IPCActivationOutcome)
+        case disable(IPCDeactivationReport)
+    }
+
     private var tail: Task<Void, Never>?
     private var pendingCount = 0
 
@@ -55,13 +64,13 @@ final class IPCActivationChain {
     /// Settings row never shows "Stopping…" for an enable that is still
     /// running, or vice versa.
     private(set) var runningOperation: Operation?
-    private(set) var lastReport: IPCActivationPresenter.AlertContent?
+    private(set) var lastActivation: LastActivation?
 
     init() {}
 
     /// Queues `work` after every previously queued operation on this
-    /// chain, records its result as `lastReport`, and returns the result
-    /// once it runs. The tail swap and the
+    /// chain, records its result as `lastActivation`, and returns the
+    /// result once it runs. The tail swap and the
     /// `pendingCount` increment below both complete synchronously before
     /// `work`'s first suspension point, so two calls made back to back
     /// on @MainActor are strictly ordered: the second call's `Task` body
@@ -85,11 +94,11 @@ final class IPCActivationChain {
     }
 
     private func record(_ outcome: IPCActivationOutcome) {
-        lastReport = IPCActivationPresenter.enableAlert(for: outcome)
+        lastActivation = .enable(outcome)
     }
 
     private func record(_ report: IPCDeactivationReport) {
-        lastReport = IPCActivationPresenter.disableAlert(for: report)
+        lastActivation = .disable(report)
     }
 
     private func run<T: Sendable>(_ operation: Operation, _ work: @escaping @MainActor () async -> T) async -> T {
@@ -162,7 +171,7 @@ extension Notification.Name {
     /// switching direction (a queued call taking over from the one that
     /// just finished), and leaving flight once `runningOperation` drops
     /// back to `nil` AND the finishing operation's outcome has already
-    /// been recorded into `lastReport` -- so `SettingsWindowController`,
+    /// been recorded into `lastActivation` -- so `SettingsWindowController`,
     /// the only observer, always reads state that matches what just
     /// happened.
     static let calyxIPCStateDidChange = Notification.Name("com.calyx.ipc.stateDidChange")

@@ -29,6 +29,9 @@ class SettingsWindowController: NSWindowController {
     /// window's height, matching standard macOS Settings behavior.
     private static let paneWidth: CGFloat = 560
     private static let paneContentInset: CGFloat = 24
+    /// Shared by `agentIPCStatusLabel.font` and `attributedStatusText`, so
+    /// the two can never drift apart.
+    private static let agentIPCStatusFont = NSFont.systemFont(ofSize: 11)
 
     #if DEBUG
     /// Test seam: overrides the root `commandTrackingDidChange(_:)`
@@ -104,12 +107,12 @@ class SettingsWindowController: NSWindowController {
     /// A heading rendered immediately before the row that starts a new
     /// visual group within a pane. Rows with no heading continue the
     /// previous group.
-    private struct SectionHeading {
+    struct SectionHeading {
         let title: String?
         let subtitle: String?
     }
 
-    private func sectionHeading(for row: SettingsRow) -> SectionHeading? {
+    static func sectionHeading(for row: SettingsRow) -> SectionHeading? {
         switch row {
         case .themeColorPreset:
             return SectionHeading(title: "Theme Color", subtitle: "Choose a preset or pick a custom color.")
@@ -126,6 +129,11 @@ class SettingsWindowController: NSWindowController {
             return SectionHeading(
                 title: "Persistence",
                 subtitle: "Persistent terminal sessions survive a crash or quit and can be reattached later, from this window or from the session browser."
+            )
+        case .agentIPC:
+            return SectionHeading(
+                title: "AI Agent IPC",
+                subtitle: "Connects installed agent CLIs to Calyx over MCP."
             )
         case .agentResume:
             return SectionHeading(
@@ -148,7 +156,7 @@ class SettingsWindowController: NSWindowController {
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .glassOpacityCells, .themeColorWell, .themeColorHex, .lspRequireConfirmation,
-             .historyPersistence, .agentResumeAutoExecute, .agentIPC,
+             .historyPersistence, .agentResumeAutoExecute,
              .openSessionBrowserButton:
             return nil
         }
@@ -163,7 +171,7 @@ class SettingsWindowController: NSWindowController {
 
         let rowsInPane = SettingsRow.allCases.filter { $0.pane == pane }
         for (index, settingsRow) in rowsInPane.enumerated() {
-            if let heading = sectionHeading(for: settingsRow) {
+            if let heading = Self.sectionHeading(for: settingsRow) {
                 if index > 0 {
                     stack.addArrangedSubview(sectionDivider())
                 }
@@ -347,12 +355,13 @@ class SettingsWindowController: NSWindowController {
         return controlRow(label: "Persist session history to disk", control: toggleSwitch)
     }
 
-    /// Hand-built (not `controlRow`, which takes exactly one control):
-    /// label + switch + Refresh button on one line, status text on the
-    /// next. The switch mirrors `IPCSettings.enabled` (the setting, never
-    /// the live server); flipping it and pressing Refresh both run
-    /// through `IPCActivationChain.shared` so a rapid pair of toggles
-    /// lands in order. All visible state comes from
+    /// Three stacked rows, matching every other section in this pane
+    /// (heading + `controlRow(label:control:)`): the enable switch, the
+    /// status text, and a `sessionBrowserButtonRow()`-shaped Refresh
+    /// button row. The switch mirrors `IPCSettings.enabled` (the
+    /// setting, never the live server); flipping it and pressing Refresh
+    /// both run through `IPCActivationChain.shared` so a rapid pair of
+    /// toggles lands in order. All visible state comes from
     /// `AgentIPCRowResolver.resolve`, re-applied by `updateAgentIPCRow()`
     /// on every `.calyxIPCStateDidChange` notification.
     private func agentIPCRow() -> NSView {
@@ -366,26 +375,21 @@ class SettingsWindowController: NSWindowController {
         agentIPCRefreshButton.action = #selector(agentIPCRefreshButtonPressed(_:))
 
         agentIPCStatusLabel.setAccessibilityIdentifier(AccessibilityID.Settings.agentIPCStatusLabel)
-        agentIPCStatusLabel.textColor = .secondaryLabelColor
-        agentIPCStatusLabel.font = .systemFont(ofSize: 11)
+        agentIPCStatusLabel.font = Self.agentIPCStatusFont
         agentIPCStatusLabel.preferredMaxLayoutWidth = Self.paneWidth - 2 * Self.paneContentInset
 
-        let controlsRow = NSStackView()
-        controlsRow.orientation = .horizontal
-        controlsRow.spacing = 12
-        controlsRow.alignment = .centerY
-        let text = NSTextField(labelWithString: "AI Agent IPC")
-        text.setContentHuggingPriority(.required, for: .horizontal)
-        controlsRow.addArrangedSubview(text)
-        controlsRow.addArrangedSubview(agentIPCSwitch)
-        controlsRow.addArrangedSubview(agentIPCRefreshButton)
+        let refreshRow = NSStackView()
+        refreshRow.orientation = .horizontal
+        refreshRow.addArrangedSubview(agentIPCRefreshButton)
+        refreshRow.addArrangedSubview(NSView())
 
         let column = NSStackView()
         column.orientation = .vertical
         column.alignment = .leading
-        column.spacing = 4
-        column.addArrangedSubview(controlsRow)
+        column.spacing = 18
+        column.addArrangedSubview(controlRow(label: "Enable AI Agent IPC", control: agentIPCSwitch))
         column.addArrangedSubview(agentIPCStatusLabel)
+        column.addArrangedSubview(refreshRow)
 
         updateAgentIPCRow()
         return column
@@ -685,12 +689,55 @@ class SettingsWindowController: NSWindowController {
         let state = AgentIPCRowResolver.resolve(
             settingEnabled: IPCSettings.enabled,
             inFlight: inFlight,
-            lastReport: IPCActivationChain.shared.lastReport
+            lastActivation: IPCActivationChain.shared.lastActivation
         )
         agentIPCSwitch.state = state.switchOn ? .on : .off
         agentIPCSwitch.isEnabled = state.switchEnabled
         agentIPCRefreshButton.isEnabled = state.refreshEnabled
-        agentIPCStatusLabel.stringValue = state.statusText
+        agentIPCStatusLabel.isHidden = Self.statusLabelIsHidden(for: state)
+        agentIPCStatusLabel.attributedStringValue = Self.attributedStatusText(state.statusText)
+    }
+
+    /// Whether the status label should be hidden for a given resolved
+    /// row state. Extracted as its own pure function (rather than
+    /// inlined in `updateAgentIPCRow()`) because `IPCActivationChain.shared`
+    /// is a process-lifetime singleton with no test seam for
+    /// `lastActivation` -- same reason this file's Sessions-toggle
+    /// initial-state seeding was pulled into
+    /// `sessionToggleInitialState(for:)`. `NSStackView.detachesHiddenViews`
+    /// defaults to `true`, so hiding this label also collapses the
+    /// 18pt gaps on both sides of it, matching every other section's
+    /// row spacing when there is no status text yet to show.
+    static func statusLabelIsHidden(for state: AgentIPCRowResolver.State) -> Bool {
+        state.statusText.isEmpty
+    }
+
+    /// Renders `statusText`'s lines (see `AgentIPCRowResolver`: line 0 is
+    /// the one-line summary, any further lines are failure/skip detail)
+    /// with the summary in `.labelColor` and every detail line in
+    /// `.secondaryLabelColor`, so a failure is visually distinguishable
+    /// from the summary it follows. `NSTextField.attributedStringValue`
+    /// does not fall back to the field's own `font`, so every segment
+    /// (including the `"\n"` joiners) carries it explicitly. Also carries
+    /// a word-wrapping paragraph style, since an attributed string does
+    /// not inherit the field cell's own wrap mode.
+    private static func attributedStatusText(_ statusText: String) -> NSAttributedString {
+        let font = agentIPCStatusFont
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineBreakMode = .byWordWrapping
+        let lines = statusText.components(separatedBy: "\n")
+        let result = NSMutableAttributedString()
+        for (index, line) in lines.enumerated() {
+            if index > 0 {
+                result.append(NSAttributedString(string: "\n", attributes: [.font: font, .paragraphStyle: paragraphStyle]))
+            }
+            let color: NSColor = index == 0 ? .labelColor : .secondaryLabelColor
+            result.append(NSAttributedString(
+                string: line,
+                attributes: [.font: font, .foregroundColor: color, .paragraphStyle: paragraphStyle]
+            ))
+        }
+        return result
     }
 
     @objc private func agentIPCStateDidChange(_ notification: Notification) {

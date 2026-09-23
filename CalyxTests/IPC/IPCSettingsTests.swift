@@ -63,10 +63,21 @@ final class IPCSettingsTests: XCTestCase {
     }
 
     func test_testStoreIsolation() {
-        IPCSettings.enabled = true
+        // The unit test host is the app itself (bundle id com.calyx.terminal),
+        // so UserDefaults.standard is the developer's real defaults domain,
+        // not a blank one -- it may already hold a value for this key from
+        // ordinary app use. Capture that value before touching the isolated
+        // suite and assert it is unchanged afterward, rather than asserting
+        // it is nil.
+        let before = UserDefaults.standard.object(forKey: IPCSettings.enabledKey) as? Bool
 
-        XCTAssertNil(UserDefaults.standard.object(forKey: IPCSettings.enabledKey),
-                     "The real .standard defaults domain must never be touched while using _testStore")
+        // Write a value that always differs from `before`, so a regression
+        // to `.standard` cannot hide behind writing the same value that was
+        // already there.
+        IPCSettings.enabled = !(before ?? false)
+
+        XCTAssertEqual(UserDefaults.standard.object(forKey: IPCSettings.enabledKey) as? Bool, before,
+                       "The real .standard defaults domain must never be touched while using _testStore")
 
         // A different, never-before-used suite must read the default
         // (off), not leak state from the suite above.

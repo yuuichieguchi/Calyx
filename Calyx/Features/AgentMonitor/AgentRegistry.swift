@@ -709,10 +709,10 @@ final class AgentRegistry {
 
     /// Replaces `serverIssues` wholesale. Called by
     /// `IPCActivationCoordinator` with the same one-line reason
-    /// `IPCActivationPresenter` renders for `.tokenGenerationFailed` /
-    /// `.serverStartFailed`, or `[]` on a successful `enable()` or on
-    /// `disable()`. See `serverIssues`'s own doc comment for why
-    /// `reset()` never clears this domain.
+    /// `IPCServerFailure.description` produces for
+    /// `.tokenGeneration` / `.start`, or `[]` on a
+    /// successful `enable()` or on `disable()`. See `serverIssues`'s own
+    /// doc comment for why `reset()` never clears this domain.
     func setServerIssues(_ issues: [String]) {
         serverIssues = issues
     }

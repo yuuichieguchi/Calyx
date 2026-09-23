@@ -200,7 +200,7 @@ final class IPCActivationChainTests: XCTestCase {
             await chain.runEnable { () async -> IPCActivationOutcome in
                 await enableStarted.fire()
                 await releaseEnable.wait()
-                return .tokenGenerationFailed
+                return .serverFailed(.tokenGeneration)
             }
         }
 
@@ -312,7 +312,7 @@ final class IPCActivationChainTests: XCTestCase {
             await chain.runEnable { () async -> IPCActivationOutcome in
                 await enableStarted.fire()
                 await releaseEnable.wait()
-                return .tokenGenerationFailed
+                return .serverFailed(.tokenGeneration)
             }
         }
 

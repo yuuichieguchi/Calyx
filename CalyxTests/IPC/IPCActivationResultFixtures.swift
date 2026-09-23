@@ -2,9 +2,9 @@
 //  IPCActivationResultFixtures.swift
 //  CalyxTests
 //
-//  Shared IPCConfigResult / AgentHooksResult builders for
-//  IPCActivationCoordinatorTests and IPCActivationPresenterTests: every
-//  axis skipped by default, only the axes a test cares about overridden.
+//  Shared IPCConfigResult / AgentHooksResult builders for the IPC
+//  coordinator and config manager tests: every axis skipped by
+//  default, only the axes a test cares about overridden.
 //  One copy so this fixture's own axis list stays in lockstep with
 //  IPCConfigResult.axes / AgentHooksResult.axes -- the same reason those
 //  two collapsed their own six duplicated per-agent lists down to one

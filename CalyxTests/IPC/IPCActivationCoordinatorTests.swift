@@ -163,14 +163,14 @@ private final class FakeIPCIssueReporter: IPCIntegrationIssueReporting {
 // MARK: - Tests
 //
 // configResult(...) / hooksResult(...) below come from
-// IPCActivationResultFixtures.swift, shared with IPCActivationPresenterTests.
+// IPCActivationResultFixtures.swift.
 
 @MainActor
 final class IPCActivationCoordinatorTests: XCTestCase {
 
     // MARK: - enable(): pi-only and agentless machines
 
-    func test_enable_piOnlyMachine_installsHooksNeverStopsServerAndReportsWired() async {
+    func test_enable_piOnlyMachine_installsHooksNeverStopsServerAndReportsHooksSucceeded() async {
         // Given: every IPCConfigResult axis is skipped (no agent has an MCP
         // client config file), but pi's hooks axis succeeded.
         let server = FakeIPCServerControl()
@@ -195,11 +195,11 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             XCTFail("Expected .enabled for a machine where every config axis is skipped but pi's hooks installed")
             return
         }
-        XCTAssertTrue(report.anyAgentWired,
-                      "pi wiring only shows up through hooks.anySucceeded; a pi-only machine must still report as wired")
+        XCTAssertTrue(report.hooks.anySucceeded,
+                      "pi has no config axis at all, so its only integration signal is hooks.anySucceeded")
     }
 
-    func test_enable_nothingInstalledAtAll_stillInstallsHooksNeverStopsServerAndReportsNotWired() async {
+    func test_enable_nothingInstalledAtAll_stillInstallsHooksNeverStopsServerAndReportsNothingSucceeded() async {
         // Given: every config axis skipped AND every hooks axis skipped, i.e.
         // a machine with no supported agent CLI at all.
         let server = FakeIPCServerControl()
@@ -221,10 +221,11 @@ final class IPCActivationCoordinatorTests: XCTestCase {
                        "A completely agentless machine must not have the MCP server it just started torn down. The " +
                        "server keeps serving the LSP proxy, cockpit tools, and any hand-configured MCP client")
         guard case .enabled(let report) = outcome else {
-            XCTFail("Expected .enabled even when nothing is wired: the server itself started fine")
+            XCTFail("Expected .enabled even when nothing succeeded on either axis: the server itself started fine")
             return
         }
-        XCTAssertFalse(report.anyAgentWired, "Nothing succeeded on either axis, so anyAgentWired must be false")
+        XCTAssertFalse(report.config.anySucceeded, "Nothing succeeded on the config axis")
+        XCTAssertFalse(report.hooks.anySucceeded, "Nothing succeeded on the hooks axis")
     }
 
     func test_enable_everyConfigAxisFailed_stillInstallsHooksAndNeverStopsServer() async {
@@ -294,8 +295,6 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             XCTFail("Expected .enabled when the server is already running and config/hooks are wired")
             return
         }
-        XCTAssertTrue(report.wasAlreadyRunning,
-                      "The report must flag that enable() reused a running server rather than starting a new one")
         XCTAssertEqual(report.port, 41835, "The reported port must be the running server's own port")
     }
 
@@ -326,7 +325,6 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             XCTFail("Expected .enabled for a clean fresh start")
             return
         }
-        XCTAssertFalse(report.wasAlreadyRunning, "A fresh start must not be reported as reusing an already-running server")
         XCTAssertEqual(report.port, 41830, "The reported port must be the port the server started on")
     }
 
@@ -346,8 +344,8 @@ final class IPCActivationCoordinatorTests: XCTestCase {
 
         let outcome = await coordinator.enable()
 
-        guard case .tokenGenerationFailed = outcome else {
-            XCTFail("Expected .tokenGenerationFailed when the token generator throws")
+        guard case .serverFailed(.tokenGeneration) = outcome else {
+            XCTFail("Expected .serverFailed(.tokenGeneration) when the token generator throws")
             return
         }
         XCTAssertEqual(server.startCallCount, 0, "The server must never start without a token to hand it")
@@ -358,8 +356,9 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         XCTAssertEqual(issueReporter.reportedHooksIssues, [],
                        "A token-generation failure must not report any hooks issues; there is nothing to report yet")
         XCTAssertEqual(issueReporter.reportedServerIssues, [["Failed to generate secure token."]],
-                       "A token-generation failure must reach the server-issue domain with the same text the enable " +
-                       "alert would show, so the sidebar and Settings never disagree")
+                       "A token-generation failure must reach the server-issue domain with the same text " +
+                       "IPCServerFailure.description produces, so the sidebar and the Settings row " +
+                       "summary can never drift apart")
     }
 
     func test_enable_serverStartThrows_touchesNothingElse() async {
@@ -376,8 +375,8 @@ final class IPCActivationCoordinatorTests: XCTestCase {
 
         let outcome = await coordinator.enable()
 
-        guard case .serverStartFailed = outcome else {
-            XCTFail("Expected .serverStartFailed when server.start throws")
+        guard case .serverFailed(.start) = outcome else {
+            XCTFail("Expected .serverFailed(.start) when server.start throws")
             return
         }
         XCTAssertEqual(configInstaller.enableCallCount, 0, "No config should be written when the server never actually started")
@@ -387,8 +386,19 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         XCTAssertEqual(
             issueReporter.reportedServerIssues.first,
             [server.startError!.localizedDescription],
-            "The reported reason must match the same text the enable alert shows for .serverStartFailed, not a second copy"
+            "The reported reason must match the text IPCServerFailure.description produces for .start, not a second copy"
         )
+    }
+
+    // MARK: - IPCServerFailure.description
+
+    func test_ipcServerFailureDescription_isTheSingleSourceForBothTheSidebarAndTheSettingsRow() {
+        let startError = NSError(
+            domain: "test.ipc.outcome", code: 9, userInfo: [NSLocalizedDescriptionKey: "port 41830 already in use"]
+        )
+
+        XCTAssertEqual(IPCServerFailure.tokenGeneration.description, "Failed to generate secure token.")
+        XCTAssertEqual(IPCServerFailure.start(startError).description, "port 41830 already in use")
     }
 
     // MARK: - enable(): issue reporting
@@ -476,10 +486,10 @@ final class IPCActivationCoordinatorTests: XCTestCase {
         XCTAssertEqual(hooksInstaller.removeCallCount, 1, "disable() must remove the agent hooks exactly once")
         XCTAssertEqual(issueReporter.reportedConfigIssues, [[]],
                        "disable() must clear the config domain's banner exactly once; removal failures surface only " +
-                       "in the returned alert, not as a standing banner")
+                       "in the returned report, not as a standing banner")
         XCTAssertEqual(issueReporter.reportedHooksIssues, [[]],
                        "disable() must clear the hooks domain's banner exactly once; removal failures surface only " +
-                       "in the returned alert, not as a standing banner")
+                       "in the returned report, not as a standing banner")
         XCTAssertEqual(issueReporter.reportedServerIssues, [[]],
                        "disable() must clear the server-issue domain too, so the sidebar drops a stale start-failure " +
                        "banner once the setting is off")
@@ -564,8 +574,6 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             XCTFail("Expected .enabled from a fresh start immediately after disable()")
             return
         }
-        XCTAssertFalse(report.wasAlreadyRunning,
-                       "A disable() immediately followed by enable() must take the fresh-start branch, never the reuse branch")
         XCTAssertEqual(report.port, 41840, "The fresh start must report the newly started port, not the pre-disable port")
     }
 }
