@@ -265,4 +265,44 @@ final class JSONConfigDocumentEditorTests: XCTestCase {
         XCTAssertEqual(Array(unwrappedWithBOM.prefix(3)), [0xEF, 0xBB, 0xBF])
         XCTAssertEqual(unwrappedWithBOM.dropFirst(3), unwrappedNoBOM)
     }
+
+    // MARK: - An undecodable array element must be treated as "no match", not thrown
+    //
+    // `JSONSerialization.jsonObject` rejects several number shapes `JParser`'s
+    // own lenient character-class scan accepts as a well-formed top-level
+    // structural scan (a trailing decimal point, a leading zero). An element
+    // shaped like that, sitting before the element the predicate actually
+    // matches, must not make `removeArrayElements` throw -- it must be
+    // skipped exactly as `resolvePath`'s own `try?` decode already skips it
+    // when resolving a path, leaving its bytes completely untouched.
+
+    func test_removeArrayElements_lenientButUndecodableElementPrecedesMatch_doesNotThrowAndLeavesItUntouched() throws {
+        let content = "{\"items\":[1.,{\"own\":true},{\"own\":false}]}"
+        let expected = "{\"items\":[1.,{\"own\":false}]}"
+
+        let result = try JSONConfigDocumentEditor.removeArrayElements(
+            at: [.key("items")], in: Data(content.utf8), where: entryIsOwn
+        )
+
+        XCTAssertEqual(
+            String(decoding: try XCTUnwrap(result), as: UTF8.self), expected,
+            "an element JSONSerialization cannot decode (here, \"1.\") must be treated as non-matching " +
+            "rather than thrown on, and its bytes must survive untouched"
+        )
+    }
+
+    func test_removeArrayElements_leadingZeroUndecodableElementPrecedesMatch_doesNotThrow() throws {
+        let content = "{\"items\":[0123,{\"own\":true}]}"
+        let expected = "{\"items\":[0123]}"
+
+        let result = try JSONConfigDocumentEditor.removeArrayElements(
+            at: [.key("items")], in: Data(content.utf8), where: entryIsOwn
+        )
+
+        XCTAssertEqual(
+            String(decoding: try XCTUnwrap(result), as: UTF8.self), expected,
+            "a leading-zero element (also rejected by JSONSerialization, also accepted by JParser's lenient " +
+            "scan) must likewise be skipped rather than thrown on"
+        )
+    }
 }

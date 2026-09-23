@@ -608,7 +608,9 @@ private enum JSONEditor {
             var removedAny = false
             for (idx, elem) in arr.elements.enumerated() {
                 let elemBytes = Array(bytes[elem.value.range])
-                let decoded = try JSONSerialization.jsonObject(with: Data(elemBytes), options: [.fragmentsAllowed])
+                guard let decoded = try? JSONSerialization.jsonObject(
+                    with: Data(elemBytes), options: [.fragmentsAllowed]
+                ) else { continue }
                 if predicate(decoded) {
                     spliceRemoveElement(&bytes, array: arr, index: idx)
                     removedAny = true
