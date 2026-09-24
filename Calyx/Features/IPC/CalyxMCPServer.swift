@@ -8,6 +8,7 @@
 
 import Foundation
 import Network
+import Synchronization
 
 @MainActor
 final class CalyxMCPServer {
@@ -18,7 +19,14 @@ final class CalyxMCPServer {
 
     private(set) var isRunning: Bool = false
     private(set) var port: Int = 0
-    private(set) var token: String = ""
+    private(set) var token: String = "" {
+        didSet { sessionBearerToken.value = token }
+    }
+    /// `token`, readable off the main actor. The `/calyx-mcp` router keys
+    /// its session ids with it; `start` sets `token` before it binds the
+    /// listener, so the first request the listener accepts already sees
+    /// the token it was authenticated with.
+    let sessionBearerToken = MCPSessionBearerToken()
     let store = IPCStore()
     private(set) var appPeerID: UUID?
     private var peerRegistrationTask: Task<Void, Never>?
@@ -2414,5 +2422,18 @@ final class CalyxMCPServer {
             return nil
         }
         return name
+    }
+}
+
+// MARK: - Session bearer
+
+/// The server's bearer token, readable from any isolation domain.
+/// Written on the main actor whenever `CalyxMCPServer.token` changes.
+final class MCPSessionBearerToken: Sendable {
+    private let storage = Mutex("")
+
+    var value: String {
+        get { storage.withLock { $0 } }
+        set { storage.withLock { $0 = newValue } }
     }
 }

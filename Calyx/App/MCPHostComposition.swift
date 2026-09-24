@@ -11,17 +11,20 @@
 //
 //  Settings > MCP Servers is configured at launch whatever the AI Agent
 //  IPC state, so a config error is visible with IPC off. Only its model
-//  is configured; the Settings window is created when first opened. Connections and
-//  the router follow the IPC server: when it starts, `/calyx-mcp` gets the
-//  router and every enabled server connects; when it stops, `/calyx-mcp`
-//  answers 503 again and every connection is closed. These transitions,
-//  and the launch-time sweep of stale content rule lists, run one after
-//  another in the order they were requested.
+//  is configured; the Settings window is created when first opened.
+//  `/calyx-mcp` gets the router as soon as an enable is running, before
+//  that enable starts the listener, so no request the listener accepts is
+//  answered 503; the router's session key is the server's own token
+//  (`CalyxMCPServer.sessionBearerToken`), set before the listener binds.
+//  Connections follow the IPC server: when it starts, every enabled
+//  server connects; when it stops, `/calyx-mcp` answers 503 again and
+//  every connection is closed. These transitions, and the launch-time
+//  sweep of stale content rule lists, run one after another in the order
+//  they were requested.
 //
 
 import AppKit
 import GhosttyKit
-import Synchronization
 import os
 
 private let logger = Logger(subsystem: "com.calyx.terminal", category: "MCPApp")
@@ -43,7 +46,6 @@ final class MCPHostComposition {
     private let secretStore: any MCPSecretStore
     private let catalog: MCPLiveCatalogProvider
     private let settingsActions: MCPSupervisorSettingsActions
-    private let bearerToken: MCPSessionBearerToken
     private var isIPCRunning = false
     /// The last requested lifecycle step; each step waits for the one
     /// before it.
@@ -106,8 +108,7 @@ final class MCPHostComposition {
                 SurfacePropertyStore.shared.cwd(for: surfaceID).map { URL(fileURLWithPath: $0) }
             }
         )
-        let bearerToken = MCPSessionBearerToken()
-        self.bearerToken = bearerToken
+        let bearerToken = CalyxMCPServer.shared.sessionBearerToken
         self.router = MCPCalyxMCPRouter(
             coordinator: coordinator,
             registry: registry,
@@ -148,29 +149,41 @@ final class MCPHostComposition {
 
     // MARK: - Notifications (forwarded by AppDelegate)
 
-    /// `.calyxIPCStateDidChange`: acts when the IPC server has started or
-    /// stopped since the last call. The session token is re-read while it
-    /// runs, since a restart issues a new one.
+    /// `.calyxIPCStateDidChange`: `/calyx-mcp` has the router while the
+    /// IPC server runs or an enable is running, so it is in place before
+    /// the enable's work starts the listener (the chain announces a
+    /// running enable before that work runs). Connections follow the
+    /// server itself: every enabled server connects once it has started
+    /// and is disconnected once it has stopped.
     func ipcStateDidChange() {
         SettingsWindowController.mcpServerSettingsModel.refreshIPCEnabled()
         let server = CalyxMCPServer.shared
-        guard server.isRunning else {
-            guard isIPCRunning else { return }
-            isIPCRunning = false
-            server.setCalyxMCPRouter(nil)
-            let supervisor = self.supervisor
-            enqueue { await supervisor.disconnectAll() }
-            return
-        }
-        bearerToken.value = server.token
-        guard !isIPCRunning else { return }
-        isIPCRunning = true
-        server.setCalyxMCPRouter(router)
+        let installsRouter = Self.installsCalyxMCPRouter(
+            isServerRunning: server.isRunning,
+            runningOperation: IPCActivationChain.shared.runningOperation
+        )
+        server.setCalyxMCPRouter(installsRouter ? router : nil)
+        guard server.isRunning != isIPCRunning else { return }
+        isIPCRunning = server.isRunning
         let supervisor = self.supervisor
-        enqueue {
-            await supervisor.connectAll()
-            supervisor.startObservingRegistry()
+        if isIPCRunning {
+            enqueue {
+                await supervisor.connectAll()
+                supervisor.startObservingRegistry()
+            }
+        } else {
+            enqueue { await supervisor.disconnectAll() }
         }
+    }
+
+    /// Whether `/calyx-mcp` has the router: while the server runs, and
+    /// while an enable is running, since that enable's work starts the
+    /// listener. Otherwise `/calyx-mcp` answers 503.
+    static func installsCalyxMCPRouter(
+        isServerRunning: Bool,
+        runningOperation: IPCActivationChain.Operation?
+    ) -> Bool {
+        isServerRunning || runningOperation == .enabling
     }
 
     /// `.calyxMCPConnectionsDidChange`: Settings looks the connections up
@@ -205,20 +218,6 @@ final class MCPHostComposition {
             await previous?.value
             await step()
         }
-    }
-}
-
-// MARK: - Session token
-
-/// The IPC server's bearer token, which keys `/calyx-mcp` legacy session
-/// ids. Written on the main actor when the server starts; read by the
-/// router wherever it runs.
-final class MCPSessionBearerToken: Sendable {
-    private let storage = Mutex("")
-
-    var value: String {
-        get { storage.withLock { $0 } }
-        set { storage.withLock { $0 = newValue } }
     }
 }
 
