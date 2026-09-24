@@ -232,6 +232,24 @@ final class AgentHookPermissionResponseTests: XCTestCase {
         }
     }
 
+    /// `.allowedForView` is an MCP Apps-only decision (the "Always Allow
+    /// for This View" answer to an `.mcpApp`-sourced request) -- it can
+    /// never actually reach `AgentHookPermissionResponse.body(kind:decision:)`,
+    /// which only ever answers `.agentHook`/`.agentQuestion`-sourced
+    /// requests, but the switch must still handle it exhaustively. It is
+    /// mapped like `.expired`: nil for claude-code/codex (no vocabulary
+    /// for it, no output), the flat deny body for grok/pi.
+    func test_body_allowedForView_isTreatedLikeExpired() throws {
+        for kind in [AgentEntry.claudeCodeKind, AgentEntry.codexKind] {
+            XCTAssertNil(AgentHookPermissionResponse.body(kind: kind, decision: .allowedForView), "[\(kind)]")
+        }
+        for kind in [AgentEntry.grokKind, AgentEntry.piKind] {
+            let expiredBody = try XCTUnwrap(AgentHookPermissionResponse.body(kind: kind, decision: .expired))
+            let allowedForViewBody = try XCTUnwrap(AgentHookPermissionResponse.body(kind: kind, decision: .allowedForView))
+            XCTAssertEqual(allowedForViewBody, expiredBody, "[\(kind)] must byte-match .expired's own body")
+        }
+    }
+
     func test_body_grok_neverUsesTheClaudeCodeEnvelope() throws {
         for decision in [ApprovalDecision.allowed, .denied(.userRejected), .expired] {
             let data = try XCTUnwrap(
@@ -295,7 +313,7 @@ final class AgentHookPermissionResponseTests: XCTestCase {
             let expiredBody = try XCTUnwrap(AgentHookPermissionResponse.body(kind: kind, decision: .expired))
 
             let unexpressible: [ApprovalDecision] = [
-                .allowedWithPermissions(offer), .interrupted(.chatAboutQuestion), .answered(answers), .dismissed,
+                .allowedForView, .allowedWithPermissions(offer), .interrupted(.chatAboutQuestion), .answered(answers), .dismissed,
             ]
             for decision in unexpressible {
                 let body = try XCTUnwrap(AgentHookPermissionResponse.body(kind: kind, decision: decision), "kind=\(kind)")
@@ -319,7 +337,7 @@ final class AgentHookPermissionResponseTests: XCTestCase {
         let answers = makeAnswers()
 
         let unexpressible: [ApprovalDecision] = [
-            .allowedWithPermissions(offer), .interrupted(.chatAboutQuestion), .answered(answers), .dismissed,
+            .allowedForView, .allowedWithPermissions(offer), .interrupted(.chatAboutQuestion), .answered(answers), .dismissed,
         ]
         for decision in unexpressible {
             XCTAssertNil(AgentHookPermissionResponse.body(kind: AgentEntry.codexKind, decision: decision))
@@ -333,6 +351,7 @@ final class AgentHookPermissionResponseTests: XCTestCase {
         let offer = makeOffer(entry: ["type": "addDirectories", "directories": ["/tmp"]], label: "x")
 
         XCTAssertNil(AgentHookPermissionResponse.body(kind: unknownKind, decision: .allowed))
+        XCTAssertNil(AgentHookPermissionResponse.body(kind: unknownKind, decision: .allowedForView))
         XCTAssertNil(AgentHookPermissionResponse.body(kind: unknownKind, decision: .denied(.userRejected)))
         XCTAssertNil(AgentHookPermissionResponse.body(kind: unknownKind, decision: .expired))
         XCTAssertNil(AgentHookPermissionResponse.body(kind: unknownKind, decision: .allowedWithPermissions(offer)))

@@ -4,7 +4,8 @@
 //
 //  What the runtime answers to a view. Proxied requests go only to the
 //  view's own server session; while that server is not ready they fail
-//  with -32000.
+//  with -32000. `ui/open-link` and `ui/message` ask for consent in the
+//  approval panel (`requestConsent(viewID:state:kind:)`).
 //
 
 import AppKit
@@ -157,7 +158,7 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
         }
         if openLinkPolicy.requiresPrompt(viewID: viewID) {
             let generation = state.documentGeneration
-            let decision = await state.pane.promptForLink(url)
+            let decision = MCPAppOpenLinkPolicy.PromptDecision(await requestConsent(viewID: viewID, state: state, kind: .openLink(url)))
             // The document that asked unloaded (Reload) or the view was
             // removed while the prompt was up: nothing opens, nothing is allowed.
             guard isCurrentDocument(viewID: viewID, state: state, generation: generation) else {
@@ -204,20 +205,25 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
                 let formatted = try await MCPAppMessageFormatter.formatOffCallerActor(
                     content: blocks, imageDirectory: MCPAppMessageFormatter.imageDirectory
                 )
-                state.pane.showCopyOnly(text: formatted.pastedText)
+                offerCopy(of: formatted.pastedText, viewID: viewID, state: state)
             } catch {
                 return .failure(Self.serverError("The message could not be prepared: \(error)"))
             }
+            // The app is answered now; the copy offer waits for the user
+            // on its own.
             return .failure(Self.serverError("This view has no pane to send the message to."))
         case .send:
             return await deliver(blocks, route: route, surfaceID: state.surfaceID)
         case nil:
+            // One line: the panel would show each newline as `^J`.
             let preview = blocks.compactMap { block -> String? in
                 if case .text(let text) = block { return text }
                 return "[image]"
-            }.joined(separator: "\n")
+            }.joined(separator: "\n").components(separatedBy: .newlines).joined(separator: " ")
             let generation = state.documentGeneration
-            let decision = await state.pane.promptForMessage(preview: preview)
+            let decision = MCPAppMessageConsentGate.PromptDecision(
+                await requestConsent(viewID: viewID, state: state, kind: .sendMessage(preview: preview))
+            )
             // The document that asked unloaded (Reload, teardown) or the
             // view was removed while the prompt was up: nothing is sent,
             // nothing is approved.
@@ -230,6 +236,19 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
             case .dontSend:
                 return .success(Self.errorFlag)
             }
+        }
+    }
+
+    /// A pane-less view's `ui/message`: offers to copy `text` from the
+    /// approval panel ("Copy" / "Dismiss"). Copy puts it on the general
+    /// pasteboard; anything else copies nothing.
+    private func offerCopy(of text: String, viewID: UUID, state: ViewState) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let decision = await self.requestConsent(viewID: viewID, state: state, kind: .copyMessage(text: text))
+            guard decision == .allowed else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
         }
     }
 

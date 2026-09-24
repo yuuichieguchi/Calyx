@@ -12,7 +12,8 @@ import Foundation
 
 @MainActor
 final class MCPAppOpenLinkPolicy {
-    /// The user's choice in the open-link prompt.
+    /// The user's choice in the open-link prompt (the approval panel, see
+    /// `PromptDecision.init(_:)` in MCPAppConsentPresenter.swift).
     enum PromptDecision: Sendable, Equatable { case open, alwaysForThisView, cancel }
 
     private nonisolated static let allowedSchemes: Set<String> = ["http", "https", "mailto"]

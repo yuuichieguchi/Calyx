@@ -535,6 +535,8 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
             XCTFail("expected source .agentHook(...), got .mcpTool")
         case .agentQuestion:
             XCTFail("expected source .agentHook(...), got .agentQuestion")
+        case .mcpApp:
+            XCTFail("expected source .agentHook(...), got .mcpApp")
         }
 
         approvalInbox.decide(id: pendingRequest.id, .allowed)
@@ -884,7 +886,7 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         case .agentQuestion(let kind, let prompt):
             XCTAssertEqual(kind, AgentEntry.claudeCodeKind)
             XCTAssertEqual(prompt.questions.first?.text, "Which shell?")
-        case .agentHook, .mcpTool:
+        case .agentHook, .mcpTool, .mcpApp:
             XCTFail("expected source .agentQuestion(...)")
         }
 
@@ -1008,7 +1010,7 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         case .agentHook(let toolName, let kind, _, _):
             XCTAssertEqual(toolName, "AskUserQuestion")
             XCTAssertEqual(kind, AgentEntry.claudeCodeKind)
-        case .agentQuestion, .mcpTool:
+        case .agentQuestion, .mcpTool, .mcpApp:
             XCTFail("a decode failure must fall back to the generic .agentHook source, never .agentQuestion")
         }
 
@@ -1155,7 +1157,7 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
             XCTAssertEqual(kind, AgentEntry.codexKind)
             XCTAssertEqual(offers.permissionUpdates, [], "codex must never carry permission updates")
             XCTAssertFalse(offers.cliOwnsPersistence)
-        case .agentQuestion, .mcpTool:
+        case .agentQuestion, .mcpTool, .mcpApp:
             XCTFail("a codex-kind AskUserQuestion-shaped body must never be recognized as a question -- " +
                     "only claude-code decodes it")
         }

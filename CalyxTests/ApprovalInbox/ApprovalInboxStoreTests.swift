@@ -438,6 +438,31 @@ final class ApprovalInboxStoreTests: XCTestCase {
         XCTAssertEqual(result, .expired)
     }
 
+    /// `.allowedForView` (the "Always Allow for This View" decision on an
+    /// `.mcpApp`-sourced request) carries the same "the caller may already
+    /// be gone" hazard `.allowed`/`.allowedWithPermissions`/`.answered` do
+    /// -- a human really did grant something, so it must be demoted to
+    /// `.expired` on the same cancellation race, never silently delivered
+    /// to a Task that is already gone.
+    func test_awaitDecisionHonoringCancellation_allowedForViewRacingCancellation_demotedToExpired() async throws {
+        let store = ApprovalInboxStore()
+        let request = makeRequest()
+        store.submit(request)
+
+        let waiter = Task { @MainActor in
+            await store.awaitDecisionHonoringCancellation(id: request.id, timeoutMs: 5_000)
+        }
+        await yieldToScheduler()
+
+        store.decide(id: request.id, .allowedForView)
+        waiter.cancel()
+
+        let result = await waiter.value
+        XCTAssertEqual(result, .expired,
+                       "an .allowedForView decision racing a concurrent cancellation of the awaiting Task must be " +
+                       "demoted to .expired, exactly like the existing .allowed demotion")
+    }
+
     /// `.dismissed` grants nothing (unlike `.allowed`/`.allowedWithPermissions`/
     /// `.answered`), so `awaitDecisionHonoringCancellation` must pass it
     /// through unchanged even when the awaiting Task is concurrently

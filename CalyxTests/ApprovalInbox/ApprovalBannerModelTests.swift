@@ -1781,4 +1781,162 @@ final class ApprovalBannerModelTests: XCTestCase {
                        "alwaysAllow(id:) on an .agentQuestion request must never record Always-Allow memory")
     }
 
+    // MARK: - allowForView(id:) / alwaysAllow(id:) / dismiss(id:) for an .mcpApp-sourced request
+    //
+    // allowForView(id:) is the "Always Allow for This View" action for an
+    // .mcpApp request (openLink/sendMessage only -- copyMessage has no
+    // "for this view" concept, since a pane-less view has no pane to
+    // remember an allowance against). It decides .allowedForView and
+    // advances the cursor exactly like allow(id:)/deny(id:). alwaysAllow(id:)
+    // (the panel's OWN, separate global/pane-memory action) must never
+    // touch an .mcpApp request at all -- MCPAppOpenLinkPolicy/
+    // MCPAppMessageConsentGate own that memory, not ApprovalBannerModel/
+    // CockpitSettings.autoApproveEnabled. dismiss(id:) decides .dismissed
+    // and, unlike .mcpTool/.agentHook, never restores terminal focus --
+    // the runtime denies its own pending prompt, it does not hand
+    // anything back to a CLI waiting in the pane.
+
+    private func makeMcpAppRequest(
+        targetSurfaceID: UUID?, kind: MCPAppConsentKind, createdAt: Date = Date()
+    ) -> ApprovalRequest {
+        ApprovalRequest(
+            id: UUID(), source: .mcpApp(viewID: UUID(), title: "Notion", kind: kind),
+            targetSurfaceID: targetSurfaceID, payload: "payload", createdAt: createdAt
+        )
+    }
+
+    func test_allowForView_openLink_decidesAllowedForView_advancesCursor() async throws {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let url = URL(string: "https://example.com")!
+        let first = makeMcpAppRequest(targetSurfaceID: surfaceID, kind: .openLink(url), createdAt: Date(timeIntervalSince1970: 1_700_000_000))
+        let second = makeMcpAppRequest(targetSurfaceID: surfaceID, kind: .openLink(url), createdAt: Date(timeIntervalSince1970: 1_700_000_100))
+        store.submit(first)
+        store.submit(second)
+
+        let model = ApprovalBannerModel(store: store)
+        XCTAssertEqual(model.current?.id, first.id, "precondition: current is the oldest (first) request")
+
+        let waiter = Task { @MainActor in await store.awaitDecision(id: first.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.allowForView(id: first.id)
+
+        XCTAssertEqual(store.pending.map(\.id), [second.id], "allowForView(id:) must decide only the clicked request")
+        XCTAssertEqual(model.current?.id, second.id,
+                       "allowForView(id:) on the displayed request must advance the cursor to its successor, same as allow(id:)/deny(id:)")
+
+        let result = await waiter.value
+        XCTAssertEqual(result, .allowedForView)
+    }
+
+    func test_allowForView_sendMessage_decidesAllowedForView() async throws {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let request = makeMcpAppRequest(targetSurfaceID: surfaceID, kind: .sendMessage(preview: "hi"))
+        store.submit(request)
+        let model = ApprovalBannerModel(store: store)
+
+        let waiter = Task { @MainActor in await store.awaitDecision(id: request.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.allowForView(id: request.id)
+
+        XCTAssertTrue(store.pending.isEmpty)
+        let result = await waiter.value
+        XCTAssertEqual(result, .allowedForView)
+    }
+
+    func test_allowForView_copyMessage_isNoOp() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let request = makeMcpAppRequest(targetSurfaceID: surfaceID, kind: .copyMessage(text: "hi"))
+        store.submit(request)
+        let model = ApprovalBannerModel(store: store)
+
+        model.allowForView(id: request.id)
+
+        XCTAssertEqual(store.pending.map(\.id), [request.id],
+                       "allowForView(id:) must be a no-op for .copyMessage -- a pane-less view has no \"this view\" to remember an allowance against")
+    }
+
+    func test_allowForView_onMcpToolID_isNoOp() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let request = makeRequest(targetSurfaceID: surfaceID)
+        store.submit(request)
+        let model = ApprovalBannerModel(store: store)
+
+        model.allowForView(id: request.id)
+
+        XCTAssertEqual(store.pending.map(\.id), [request.id], "allowForView(id:) must never decide a non-.mcpApp request")
+    }
+
+    func test_allowForView_onAgentHookID_isNoOp() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let request = makeAgentHookRequest(targetSurfaceID: surfaceID)
+        store.submit(request)
+        let model = ApprovalBannerModel(store: store)
+
+        model.allowForView(id: request.id)
+
+        XCTAssertEqual(store.pending.map(\.id), [request.id], "allowForView(id:) must never decide a non-.mcpApp request")
+    }
+
+    func test_allowForView_onAgentQuestionID_isNoOp() {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let request = makeAgentQuestionRequest(targetSurfaceID: surfaceID)
+        store.submit(request)
+        let model = ApprovalBannerModel(store: store)
+
+        model.allowForView(id: request.id)
+
+        XCTAssertEqual(store.pending.map(\.id), [request.id], "allowForView(id:) must never decide a non-.mcpApp request")
+    }
+
+    func test_alwaysAllow_mcpAppSource_isNoOp_leavesRequestPending_neverTouchesAutoApprove() {
+        let suiteName = "com.calyx.tests.ApprovalBannerModelTests.alwaysAllowMcpAppIsNoOp"
+        CockpitSettings._testUseSuite(named: suiteName)
+        defer { CockpitSettings._testTeardownSuite(named: suiteName) }
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled, "precondition: the isolated suite starts with auto-approve off")
+
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let url = URL(string: "https://example.com")!
+        let request = makeMcpAppRequest(targetSurfaceID: surfaceID, kind: .openLink(url))
+        store.submit(request)
+        let model = ApprovalBannerModel(store: store)
+
+        model.alwaysAllow(id: request.id)
+
+        XCTAssertEqual(store.pending.map(\.id), [request.id],
+                       "alwaysAllow(id:) must never decide an .mcpApp request -- MCPAppOpenLinkPolicy owns that memory, not this action")
+        XCTAssertFalse(CockpitSettings.autoApproveEnabled,
+                       "alwaysAllow(id:) on an .mcpApp request must never flip the global Cockpit auto-approve toggle")
+    }
+
+    func test_dismiss_mcpAppSource_decidesDismissed_neverRestoresTerminalFocus() async throws {
+        let store = ApprovalInboxStore()
+        let surfaceID = UUID()
+        let url = URL(string: "https://example.com")!
+        let request = makeMcpAppRequest(targetSurfaceID: surfaceID, kind: .openLink(url))
+        store.submit(request)
+        let spy = RestoreFocusSpy()
+        let model = ApprovalBannerModel(store: store, restoreTerminalFocus: { spy.call($0) })
+
+        let waiter = Task { @MainActor in await store.awaitDecision(id: request.id, timeoutMs: 5_000) }
+        await yieldToScheduler()
+
+        model.dismiss(id: request.id)
+
+        XCTAssertTrue(store.pending.isEmpty, "dismiss(id:) must decide an .mcpApp-sourced request too")
+        XCTAssertEqual(spy.callCount, 0,
+                       "dismiss(id:) on an .mcpApp request must never restore terminal focus -- the WebView never held first responder")
+
+        let result = await waiter.value
+        XCTAssertEqual(result, .dismissed)
+    }
+
 }

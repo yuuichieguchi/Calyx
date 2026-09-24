@@ -5,7 +5,10 @@
 //  The WebKit side of MCP Apps. Mounts each view's web view (host page,
 //  sandboxed iframe, bridge in its own content world), keeps one card per
 //  store view in the pane's dock or a standalone panel, and answers the
-//  view's requests (see MCPAppWebViewRuntime+Requests.swift).
+//  view's requests (see MCPAppWebViewRuntime+Requests.swift). Consent
+//  prompts (`ui/open-link`, `ui/message`) show in the app-wide approval
+//  panel through `MCPAppRuntimeEnvironment.consentPresenter`, one
+//  pending request per view at most.
 //
 
 import AppKit
@@ -29,6 +32,9 @@ protocol MCPAppRuntimeEnvironment: AnyObject {
     func themeInputs() -> MCPAppThemeInputs
     /// Opens a `ui/open-link` URL the user allowed. True when it opened.
     func openLink(_ url: URL) -> Bool
+    /// Shows the consent prompts of `ui/open-link` and `ui/message` (the
+    /// approval panel) and returns the user's decision.
+    var consentPresenter: any MCPAppConsentPresenting { get }
 }
 
 @MainActor
@@ -36,6 +42,11 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
 
     /// `ui/resource-teardown` gets this long to answer.
     nonisolated static let teardownReplyWait: Duration = .seconds(2)
+
+    /// How long a consent prompt waits for the user before it resolves as
+    /// Cancel / Don't Send: one hour, the longest `ApprovalInboxStore`
+    /// allows.
+    nonisolated static let defaultConsentTimeoutMs = 3_600_000
 
     /// One mounted web view and the objects that guard it.
     final class Mounted {
@@ -72,6 +83,10 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         /// (`requestTeardown`, `unmount`). A prompt answered after it grew
         /// belongs to a document that is gone.
         var documentGeneration = 0
+        /// The view's consent request waiting in the approval panel, if
+        /// any. A new prompt for the view, an unloading document, and the
+        /// view's removal each expire it.
+        var pendingConsentRequestID: UUID?
 
         init(pane: MCPAppViewPane) {
             self.pane = pane
@@ -92,6 +107,8 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     let environment: any MCPAppRuntimeEnvironment
     let consentGate = MCPAppMessageConsentGate()
     let openLinkPolicy = MCPAppOpenLinkPolicy()
+    /// How long a consent prompt waits for the user; tests shorten it.
+    var consentTimeoutMs = defaultConsentTimeoutMs
     private(set) var views: [UUID: ViewState] = [:]
     /// Web views of views the store dropped, kept until `unmount`.
     private var retiringMounts: [UUID: Mounted] = [:]
@@ -316,7 +333,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         if let mounted = state.mounted {
             retiringMounts[viewID] = mounted
         }
-        state.pane.dismissPrompt()
+        expirePendingConsent(state)
         openLinkPolicy.viewWasRemoved(viewID: viewID)
         consentGate.viewWasRemoved(viewID: viewID)
         if let surfaceID = state.surfaceID {
@@ -342,11 +359,48 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     /// Denies the prompts of a document that is unloading: a pending
     /// `ui/message` fails with "Message sending denied" and a pending
     /// `ui/open-link` opens nothing. The view's "Always" grants stay;
-    /// `discard` forgets them.
+    /// `discard` forgets them. `documentGeneration` grows before the
+    /// request expires, so the handler, whenever it resumes, already sees
+    /// its document as gone.
     private func denyPendingPrompts(viewID: UUID) {
-        views[viewID]?.documentGeneration += 1
+        guard let state = views[viewID] else { return }
+        state.documentGeneration += 1
         consentGate.cancelPendingPrompt(viewID: viewID)
-        views[viewID]?.pane.denyWaitingPrompt()
+        expirePendingConsent(state)
+    }
+
+    /// Withdraws the view's consent request from the approval panel; its
+    /// handler resolves as Cancel / Don't Send.
+    private func expirePendingConsent(_ state: ViewState) {
+        guard let requestID = state.pendingConsentRequestID else { return }
+        state.pendingConsentRequestID = nil
+        environment.consentPresenter.expire(requestID: requestID)
+    }
+
+    /// Shows a consent prompt for the view in the approval panel and
+    /// waits for the user. A prompt the view already has pending is
+    /// expired first: a new prompt replaces it. The request targets the
+    /// view's pane (nil for a pane-less view) and is titled with the
+    /// server's display name. A view the store no longer has is closing:
+    /// nothing is asked and the prompt resolves `.expired` (Cancel /
+    /// Don't Send), the same answer its removal would give a pending one.
+    func requestConsent(viewID: UUID, state: ViewState, kind: MCPAppConsentKind) async -> ApprovalDecision {
+        expirePendingConsent(state)
+        guard let invocation = store?.invocation(forView: viewID) else { return .expired }
+        let request = ApprovalRequest(
+            id: UUID(),
+            source: .mcpApp(viewID: viewID, title: invocation.serverDisplayName, kind: kind),
+            targetSurfaceID: state.surfaceID,
+            payload: kind.displayText,
+            createdAt: Date()
+        )
+        state.pendingConsentRequestID = request.id
+        let decision = await environment.consentPresenter.requestConsent(request, timeoutMs: consentTimeoutMs)
+        // A later prompt of the view may have replaced this one meanwhile.
+        if state.pendingConsentRequestID == request.id {
+            state.pendingConsentRequestID = nil
+        }
+        return decision
     }
 
     /// True when `state` is still the view's card and no document of the
@@ -413,7 +467,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         // A docked card's size is the dock's card area. A card in a panel, or
         // in a dock not laid out yet (zero or negative card area), reports
         // the pane's own size. The reported height is the card's content
-        // area: the card below the header and any shown prompt.
+        // area: the card below the header.
         let cardSize = state.surfaceID.flatMap { docks[$0]?.dock.cardSize }
             .flatMap { $0.width > 0 && $0.height > 0 ? $0 : nil }
         let dimensions = MCPAppDockLayout.containerDimensions(

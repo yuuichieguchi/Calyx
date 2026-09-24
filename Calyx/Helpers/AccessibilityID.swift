@@ -154,12 +154,12 @@ enum AccessibilityID {
     /// label (queried while visually truncated to two lines); clicking
     /// it toggles `payloadExpanded`, the scrolling full payload shown
     /// below the body (`ExpandableBodyText`, shared by `.mcpTool`/
-    /// `.agentHook`'s payload and `.agentQuestion`'s question text).
+    /// `.agentHook`/`.mcpApp`'s payload and `.agentQuestion`'s question text).
     /// `optionsMenu` is an `NSMenu` pull-down -- its own items reach the
     /// accessibility tree as `NSMenuItem` titles, found by title text
     /// rather than identifier, the same way the queue preview menu's rows
     /// already are: every row that ever lands only in a `Menu` (a
-    /// `.mcpTool`/`.agentHook` choice row, a question option/"Other…"
+    /// `.mcpTool`/`.agentHook`/`.mcpApp` choice row, a question option/"Other…"
     /// row rendered through the Options menu rather than inline, "Add
     /// notes"/"Back"/"Chat about this") carries no identifier of its own
     /// for this reason, and is looked up by title in an XCUITest instead.
@@ -170,6 +170,11 @@ enum AccessibilityID {
     /// `optionsMenu` lists one row per `AgentHookOffers.permissionUpdates`
     /// element, Calyx's own pane-scoped "Always Allow ... in This Pane"
     /// only when the CLI sent no offer of its own, and "No" -- all by
+    /// title. `.mcpApp` (an MCP Apps view's consent prompt) uses
+    /// `allowButton` for its primary action -- "Open" for `ui/open-link`,
+    /// "Send" for `ui/message`, "Copy" for a pane-less view's message --
+    /// and its `optionsMenu` lists "Always Allow for This View" plus
+    /// "Cancel"/"Don't Send", or only "Dismiss" for the copy, all by
     /// title. `.agentQuestion` shows no primary action at all for a plain
     /// single-select click (an option click confirms immediately);
     /// "Next"/"Answer" (`answerButton`) appears only while a multi-select
@@ -248,9 +253,11 @@ enum AccessibilityID {
         static let submitAllButton = "calyx.diff.review.submitAllButton"
         static let discardAllButton = "calyx.diff.review.discardAllButton"
     }
-    /// MCP Apps views: the inline dock of a pane, each view's card, the
-    /// consent prompt shown inside the card, and the standalone panel of a
-    /// pane-less invocation (see Calyx/Features/MCPApps/).
+    /// MCP Apps views: the inline dock of a pane, each view's card, and
+    /// the standalone panel of a pane-less invocation (see
+    /// Calyx/Features/MCPApps/). A view's `ui/open-link`/`ui/message`
+    /// consent prompt is not in the card: it is the approval panel's
+    /// (`ApprovalBanner`).
     enum MCPApps {
         static func dock(_ surfaceID: UUID) -> String { "calyx.mcpApps.dock.\(surfaceID.uuidString)" }
         static func viewWeb(_ viewID: UUID) -> String { "calyx.mcpApps.view.\(viewID.uuidString).web" }
@@ -260,11 +267,6 @@ enum AccessibilityID {
         static func viewReloadButton(_ viewID: UUID) -> String { "calyx.mcpApps.view.\(viewID.uuidString).reloadButton" }
         static func standalonePanel(_ viewID: UUID) -> String { "calyx.mcpApps.standalonePanel.\(viewID.uuidString)" }
         static let dockSwitcher = "calyx.mcpApps.dock.switcher"
-        static let promptContainer = "calyx.mcpApps.prompt.container"
-        static let promptPrimaryButton = "calyx.mcpApps.prompt.primaryButton"
-        static let promptAllowForViewButton = "calyx.mcpApps.prompt.allowForViewButton"
-        static let promptCancelButton = "calyx.mcpApps.prompt.cancelButton"
-        static let promptCopyButton = "calyx.mcpApps.prompt.copyButton"
         static let elicitationContainer = "calyx.mcpApps.elicitation.container"
         static let elicitationAcceptButton = "calyx.mcpApps.elicitation.acceptButton"
         static let elicitationDeclineButton = "calyx.mcpApps.elicitation.declineButton"

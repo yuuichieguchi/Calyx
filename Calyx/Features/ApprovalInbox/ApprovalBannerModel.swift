@@ -3,7 +3,7 @@
 //
 // View-model behind the Cockpit approval banner, choosing which single
 // pending ApprovalRequest (if any) to show and forwarding Allow/Deny/
-// Always Allow/Dismiss to ApprovalInboxStore.decide(id:_:) /
+// Always Allow/Allow for View/Dismiss to ApprovalInboxStore.decide(id:_:) /
 // CockpitSettings.autoApproveEnabled / AgentHookApprovalMemory (see
 // alwaysAllow(id:)'s own doc comment for the .mcpTool vs .agentHook
 // source split, and dismiss(id:)'s own doc comment for why it, alone,
@@ -306,6 +306,34 @@ final class ApprovalBannerModel {
         store.decide(id: id, .allowedWithPermissions(offer))
     }
 
+    /// "Always Allow for This View" on an `.mcpApp` consent prompt
+    /// (`ApprovalBannerView`'s Options menu for an `.openLink`/
+    /// `.sendMessage` kind): advances the cursor exactly like
+    /// `allow(id:)`/`deny(id:)` and resolves `.allowedForView`. The
+    /// allowance itself is remembered by the runtime
+    /// (`MCPAppOpenLinkPolicy`/`MCPAppMessageConsentGate`), not here. A
+    /// no-op for every other source, and for a `.copyMessage` prompt --
+    /// a pane-less view has no "this view" allowance to remember.
+    func allowForView(id: UUID) {
+        guard isPendingMCPAppAllowingForView(id) else { return }
+        advanceCursor(pastDisplayed: id)
+        store.decide(id: id, .allowedForView)
+    }
+
+    /// Whether `id` currently names a pending `.mcpApp` request whose
+    /// kind offers "Always Allow for This View" (`.openLink`/
+    /// `.sendMessage`) -- `allowForView(id:)`'s own scoping guard.
+    private func isPendingMCPAppAllowingForView(_ id: UUID) -> Bool {
+        guard let request = store.pending.first(where: { $0.id == id }) else { return false }
+        guard case .mcpApp(_, _, let kind) = request.source else { return false }
+        switch kind {
+        case .openLink, .sendMessage:
+            return true
+        case .copyMessage:
+            return false
+        }
+    }
+
     /// Whether `id` currently names a pending `.agentHook` request -- the
     /// scoping guard `allowWithPermissions(id:offer:)` uses: it never
     /// applies to `.mcpTool` (no CLI hook behind it) or `.agentQuestion`
@@ -432,6 +460,12 @@ final class ApprovalBannerModel {
     /// available once the request itself is gone from `store.pending`. A
     /// stale `id` is a safe no-op either way, same as every other action
     /// here.
+    ///
+    /// For an `.mcpApp` consent prompt, × is Cancel/Don't Send: advance
+    /// and decide `.dismissed` (which grants nothing), but NEVER restore
+    /// terminal focus -- the prompt came from a web view, nothing waits in
+    /// the pane, and moving first responder there would take it away from
+    /// the view the human was using.
     func dismiss(id: UUID) {
         guard let request = store.pending.first(where: { $0.id == id }), request.isDismissible else { return }
         switch request.source {
@@ -441,6 +475,9 @@ final class ApprovalBannerModel {
             advanceCursor(pastDisplayed: id)
             store.decide(id: id, .dismissed)
             restoreTerminalFocus(request.targetSurfaceID)
+        case .mcpApp:
+            advanceCursor(pastDisplayed: id)
+            store.decide(id: id, .dismissed)
         }
     }
 
@@ -468,6 +505,12 @@ final class ApprovalBannerModel {
     /// window). An agent-hook request always carries a target surface
     /// (the endpoint that submits it 400s otherwise), but this
     /// guard-lets and bails gracefully rather than assuming so.
+    ///
+    /// For an `.agentQuestion`- or `.mcpApp`-sourced request: a no-op.
+    /// A question is answered only through `answer(id:answers:)`/
+    /// `chatAboutQuestion(id:)`; an MCP Apps consent prompt's own
+    /// "always" is `allowForView(id:)`, remembered per view by the
+    /// runtime, and must never turn on the global auto-approve.
     ///
     /// Either way, a no-op (no setting change, no memory recorded, no
     /// drain) if `id` is no longer pending -- a stale click must never
@@ -517,6 +560,13 @@ final class ApprovalBannerModel {
             // `allow(id:)`'s own doc comment on why `.agentQuestion`
             // requests only ever resolve through `answer(id:answers:)`/
             // `chatAboutQuestion(id:)`.
+            return
+
+        case .mcpApp:
+            // An MCP Apps consent prompt's own "always" is per view and
+            // lives in the runtime (`allowForView(id:)`); flipping the
+            // global Cockpit auto-approve here would grant every future
+            // `.mcpTool` call instead.
             return
         }
     }

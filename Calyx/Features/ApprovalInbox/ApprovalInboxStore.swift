@@ -154,24 +154,26 @@ final class ApprovalInboxStore {
 
     /// Security-critical wrapper around `awaitDecision(id:timeoutMs:)`
     /// that itself performs the caller obligation `awaitDecision`'s own
-    /// doc comment documents: an `.allowed`/`.allowedWithPermissions`/
-    /// `.answered` result that raced a concurrent cancellation of this
+    /// doc comment documents: an `.allowed`/`.allowedForView`/
+    /// `.allowedWithPermissions`/`.answered` result that raced a
+    /// concurrent cancellation of this
     /// call's own Task is demoted to `.expired` here, rather than left to
     /// every individual caller to re-check `Task.isCancelled` on its own.
-    /// Centralizes that re-check in exactly one place -- both
-    /// `MCPCockpitBridge.gate` and `CalyxMCPServer.routeApprovalRequest`
-    /// call this instead of duplicating it. Each of these three carries
-    /// the same "the caller may already be gone" hazard: every one is a
+    /// Centralizes that re-check in exactly one place --
+    /// `MCPCockpitBridge.gate`, `CalyxMCPServer.routeApprovalRequest` and
+    /// `ApprovalInboxConsentPresenter.requestConsent(_:timeoutMs:)` call
+    /// this instead of duplicating it. Each of these four carries the
+    /// same "the caller may already be gone" hazard: every one is a
     /// decision a human actually made that GRANTS something (a plain
-    /// allow, the CLI's own always-allow choice, or an answered
-    /// question), as opposed to `.denied`/`.interrupted`/`.expired`/
+    /// allow, an MCP Apps view's "Always Allow for This View", the CLI's
+    /// own always-allow choice, or an answered question), as opposed to `.denied`/`.interrupted`/`.expired`/
     /// `.dismissed`, which pass through unchanged -- none of those four
     /// grants anything, so there is nothing for a vanished caller to
     /// leave un-acted-on.
     func awaitDecisionHonoringCancellation(id: UUID, timeoutMs: Int) async -> ApprovalDecision {
         let decision = await awaitDecision(id: id, timeoutMs: timeoutMs)
         switch decision {
-        case .allowed, .allowedWithPermissions, .answered:
+        case .allowed, .allowedForView, .allowedWithPermissions, .answered:
             guard Task.isCancelled else { return decision }
             return .expired
         case .denied, .interrupted, .expired, .dismissed:

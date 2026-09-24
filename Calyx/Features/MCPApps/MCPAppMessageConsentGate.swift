@@ -12,7 +12,8 @@ import Foundation
 
 @MainActor
 final class MCPAppMessageConsentGate {
-    /// The user's choice in the dock prompt.
+    /// The user's choice in the consent prompt (the approval panel, see
+    /// `PromptDecision.init(_:)` in MCPAppConsentPresenter.swift).
     enum PromptDecision: Sendable, Equatable { case send, alwaysForThisView, dontSend }
     enum PromptOutcome: Sendable, Equatable { case send, dontSend }
     enum BeginOutcome: Sendable, Equatable { case noPaneCopyOnly, send }

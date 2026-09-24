@@ -15,6 +15,12 @@
 //    (AgentEntry.displayName(forKind:)) with the tool name;
 //    displayPayload is the source's own summary, NOT
 //    ApprovalRequest.payload
+//  - .mcpApp: displayToolName is "<title> · Open Link"/"Send Message"/
+//    "Copy Message" depending on MCPAppConsentKind; displayPayload is the
+//    URL string / the (already newline-folded) preview / a fixed
+//    "the app wants to send a message, but this window has no pane"
+//    sentence for copyMessage; prefersWideApprovalPanel is always false;
+//    isDismissible is always true
 //  - both helpers return RAW strings -- hostile control/bidi characters
 //    in an agent-hook summary must survive unescaped, since escaping for
 //    display is ControlCharacterDisplay's job, done later in the view
@@ -210,6 +216,82 @@ final class ApprovalRequestDisplayTests: XCTestCase {
 
         XCTAssertFalse(request.prefersWideApprovalPanel,
                        "a zero-option question has nothing to list inline regardless of multiSelect")
+    }
+
+    // MARK: - .mcpApp
+    //
+    // title is what MCPAppWebViewRuntime resolves as the invocation's
+    // serverDisplayName (or the snapshot's own title when there is
+    // none) -- an opaque string as far as ApprovalRequest itself is
+    // concerned, so these fixtures just pick "Notion".
+
+    func test_displayToolName_mcpApp_openLink_isTitleAndOpenLink() {
+        let url = URL(string: "https://example.com/doc")!
+        let request = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .openLink(url)))
+
+        XCTAssertEqual(request.displayToolName, "Notion · Open Link")
+    }
+
+    func test_displayToolName_mcpApp_sendMessage_isTitleAndSendMessage() {
+        let request = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .sendMessage(preview: "hello")))
+
+        XCTAssertEqual(request.displayToolName, "Notion · Send Message")
+    }
+
+    func test_displayToolName_mcpApp_copyMessage_isTitleAndCopyMessage() {
+        let request = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .copyMessage(text: "hello")))
+
+        XCTAssertEqual(request.displayToolName, "Notion · Copy Message")
+    }
+
+    func test_displayPayload_mcpApp_openLink_isTheURLString() {
+        let url = URL(string: "https://example.com/doc?x=1&y=2")!
+        let request = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .openLink(url)))
+
+        XCTAssertEqual(request.displayPayload, url.absoluteString)
+    }
+
+    func test_displayPayload_mcpApp_sendMessage_isThePreviewVerbatim() {
+        let request = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .sendMessage(preview: "already folded to one line")))
+
+        XCTAssertEqual(request.displayPayload, "already folded to one line",
+                       "displayPayload for .sendMessage is the (already newline-folded) preview, unchanged")
+    }
+
+    func test_displayPayload_mcpApp_copyMessage_explainsThereIsNoPaneAndCarriesTheText() {
+        let request = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .copyMessage(text: "hello there")))
+
+        XCTAssertEqual(
+            request.displayPayload,
+            "The app wants to send a message, but this window has no pane. Copy it instead: hello there"
+        )
+    }
+
+    func test_prefersWideApprovalPanel_mcpApp_isAlwaysFalse() {
+        let openLink = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .openLink(URL(string: "https://example.com")!)))
+        let sendMessage = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .sendMessage(preview: "hi")))
+        let copyMessage = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .copyMessage(text: "hi")))
+
+        XCTAssertFalse(openLink.prefersWideApprovalPanel)
+        XCTAssertFalse(sendMessage.prefersWideApprovalPanel)
+        XCTAssertFalse(copyMessage.prefersWideApprovalPanel)
+    }
+
+    func test_isDismissible_mcpApp_isAlwaysTrue() {
+        let openLink = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .openLink(URL(string: "https://example.com")!)))
+        let sendMessage = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .sendMessage(preview: "hi")))
+        let copyMessage = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .copyMessage(text: "hi")))
+
+        XCTAssertTrue(openLink.isDismissible)
+        XCTAssertTrue(sendMessage.isDismissible)
+        XCTAssertTrue(copyMessage.isDismissible)
+    }
+
+    func test_previewLine_mcpApp_combinesDisplayToolNameAndCompactedPayload() {
+        let url = URL(string: "https://example.com/doc")!
+        let request = makeRequest(source: .mcpApp(viewID: UUID(), title: "Notion", kind: .openLink(url)))
+
+        XCTAssertEqual(request.previewLine, "Notion · Open Link: https://example.com/doc")
     }
 
     // MARK: - isDismissible

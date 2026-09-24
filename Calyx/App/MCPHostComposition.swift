@@ -253,14 +253,17 @@ final class MCPSupervisorSettingsActions: MCPServerSettingsActions {
 
 /// What the WebKit runtime needs from the app: pane lookups through
 /// `AppDelegate`, herdr and agent state, Cockpit input delivery, the
-/// theme inputs, and `NSWorkspace` for `ui/open-link`.
+/// theme inputs, `NSWorkspace` for `ui/open-link`, and the app-wide
+/// approval panel (`ApprovalInboxStore.shared`) for consent prompts.
 @MainActor
 final class AppMCPAppRuntimeEnvironment: MCPAppRuntimeEnvironment {
     private let appDelegate: AppDelegate
     let cockpitInputDelivery: any MCPAppInputDelivering
+    let consentPresenter: any MCPAppConsentPresenting
 
     init(appDelegate: AppDelegate) {
         self.appDelegate = appDelegate
+        self.consentPresenter = ApprovalInboxConsentPresenter(store: .shared)
         self.cockpitInputDelivery = MCPAppCockpitInputDelivery(
             access: LiveCockpitAppAccess(),
             isAgentPane: { AgentRegistry.shared.entries[$0] != nil }
