@@ -251,13 +251,13 @@ final class MCPAppMessageDeliveryTests: XCTestCase {
     }
 
     @MainActor
-    func test_consentGate_viewTeardown_clearsAlwaysApproval() {
+    func test_consentGate_viewWasRemoved_clearsAlwaysApproval() {
         let gate = MCPAppMessageConsentGate()
         let viewID = UUID()
         gate.recordAlways(viewID: viewID)
         XCTAssertFalse(gate.requiresPrompt(viewID: viewID))
 
-        _ = gate.viewDidTeardown(viewID: viewID)
+        gate.viewWasRemoved(viewID: viewID)
 
         XCTAssertTrue(gate.requiresPrompt(viewID: viewID),
             "\"Always\" must last only as long as the view -- a fresh view (even reusing the same tool) starts unapproved")
@@ -268,23 +268,29 @@ final class MCPAppMessageDeliveryTests: XCTestCase {
     // there is no separate begin-pending seam.
 
     @MainActor
-    func test_consentGate_pendingPrompt_viewTeardown_resolvesMinus32000Outcome() {
+    func test_consentGate_pendingPrompt_viewWasRemoved_endsThePendingRequest() {
         let gate = MCPAppMessageConsentGate()
         let viewID = UUID()
         _ = gate.beginRequest(viewID: viewID, hasPane: true)
 
-        let outcome = gate.viewDidTeardown(viewID: viewID)
+        gate.viewWasRemoved(viewID: viewID)
 
-        XCTAssertEqual(outcome, .viewTornDown)
         XCTAssertFalse(gate.isPending(viewID: viewID))
     }
 
     @MainActor
-    func test_consentGate_teardown_withNoPendingPrompt_returnsNil() {
+    func test_consentGate_cancelPendingPrompt_endsThePendingRequest_andKeepsAlwaysApproval() {
         let gate = MCPAppMessageConsentGate()
-        let viewID = UUID()
+        let pendingViewID = UUID()
+        let approvedViewID = UUID()
+        _ = gate.beginRequest(viewID: pendingViewID, hasPane: true)
+        gate.recordAlways(viewID: approvedViewID)
 
-        XCTAssertNil(gate.viewDidTeardown(viewID: viewID))
+        gate.cancelPendingPrompt(viewID: pendingViewID)
+        gate.cancelPendingPrompt(viewID: approvedViewID)
+
+        XCTAssertFalse(gate.isPending(viewID: pendingViewID))
+        XCTAssertFalse(gate.requiresPrompt(viewID: approvedViewID), "a document unloading (Reload) keeps the view's approval")
     }
 
     @MainActor

@@ -252,8 +252,8 @@ final class MCPSupervisorSettingsActions: MCPServerSettingsActions {
 // MARK: - Runtime environment
 
 /// What the WebKit runtime needs from the app: pane lookups through
-/// `AppDelegate`, herdr and agent state, Cockpit input delivery, and the
-/// theme inputs.
+/// `AppDelegate`, herdr and agent state, Cockpit input delivery, the
+/// theme inputs, and `NSWorkspace` for `ui/open-link`.
 @MainActor
 final class AppMCPAppRuntimeEnvironment: MCPAppRuntimeEnvironment {
     private let appDelegate: AppDelegate
@@ -281,6 +281,9 @@ final class AppMCPAppRuntimeEnvironment: MCPAppRuntimeEnvironment {
 
     func themeInputs() -> MCPAppThemeInputs {
         MCPAppThemeInputsReader.read(config: GhosttyAppController.shared.configManager, defaults: .standard)
+    }
+    func openLink(_ url: URL) -> Bool {
+        NSWorkspace.shared.open(url)
     }
 }
 

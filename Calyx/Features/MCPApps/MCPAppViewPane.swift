@@ -39,6 +39,7 @@ final class MCPAppViewPane: NSView {
     private let borderLayerWidth: CGFloat
     private(set) weak var webView: WKWebView?
     private var promptContinuation: CheckedContinuation<MCPAppMessageConsentGate.PromptDecision, Never>?
+    private weak var promptText: MCPAppPromptTextView?
 
     init(viewID: UUID, prefersBorder: Bool?) {
         self.viewID = viewID
@@ -80,6 +81,7 @@ final class MCPAppViewPane: NSView {
     override func setFrameSize(_ newSize: NSSize) {
         let changed = newSize != frame.size
         super.setFrameSize(newSize)
+        promptText?.wrapWidth = promptTextWidth
         if changed { onEnvironmentChange?() }
     }
 
@@ -141,7 +143,8 @@ final class MCPAppViewPane: NSView {
     // MARK: - Prompts
 
     /// Asks whether to send a `ui/message`. Resolves as `.dontSend` if the
-    /// prompt is dismissed because the view goes away.
+    /// prompt is dismissed because the view goes away or its document
+    /// unloads.
     func promptForMessage(preview: String) async -> MCPAppMessageConsentGate.PromptDecision {
         resolvePrompt(.dontSend)
         return await withCheckedContinuation { continuation in
@@ -157,20 +160,27 @@ final class MCPAppViewPane: NSView {
         }
     }
 
-    /// Asks whether to open a link. True for Open.
-    func promptForLink(_ url: URL) async -> Bool {
+    /// Asks whether to open a link: a lead line, then the whole link in the
+    /// prompt's text view. Resolves as `.cancel` if the prompt is dismissed
+    /// because the view goes away or its document unloads.
+    func promptForLink(_ url: URL) async -> MCPAppOpenLinkPolicy.PromptDecision {
         resolvePrompt(.dontSend)
         let decision = await withCheckedContinuation { continuation in
             promptContinuation = continuation
             showPrompt(
-                message: "The app wants to open \(url.absoluteString)",
+                message: "The app wants to open this link:\n\(url.absoluteString)",
                 buttons: [
                     ("Open", AccessibilityID.MCPApps.promptPrimaryButton, { [weak self] in self?.resolvePrompt(.send) }),
+                    ("Always Allow for This View", AccessibilityID.MCPApps.promptAllowForViewButton, { [weak self] in self?.resolvePrompt(.alwaysForThisView) }),
                     ("Cancel", AccessibilityID.MCPApps.promptCancelButton, { [weak self] in self?.resolvePrompt(.dontSend) }),
                 ]
             )
         }
-        return decision == .send
+        switch decision {
+        case .send: return .open
+        case .alwaysForThisView: return .alwaysForThisView
+        case .dontSend: return .cancel
+        }
     }
 
     /// A pane-less `ui/message`: nothing to send to, only Copy.
@@ -187,6 +197,12 @@ final class MCPAppViewPane: NSView {
                 ("Dismiss", AccessibilityID.MCPApps.promptCancelButton, { [weak self] in self?.hidePrompt() }),
             ]
         )
+    }
+
+    /// Resolves a waiting Send or Open prompt as `.dontSend` and hides it.
+    /// A copy-only prompt, which waits for nothing, stays.
+    func denyWaitingPrompt() {
+        resolvePrompt(.dontSend)
     }
 
     /// Dismisses any prompt; a waiting one resolves as `.dontSend`.
@@ -287,45 +303,22 @@ final class MCPAppViewPane: NSView {
         onEnvironmentChange?()
     }
 
-    /// Adds the prompt's text, whole: a read-only, selectable text view that
-    /// scrolls once it is taller than `maxPromptTextHeight`. The scroll view
-    /// joins `promptArea` before its constraints are activated, because a
-    /// constraint between views with no common ancestor raises.
+    /// Adds the prompt's text, whole, in an `MCPAppPromptTextView` wrapping
+    /// at the prompt area's inner width. The scroll view joins `promptArea`
+    /// before its constraint is activated, because a constraint between
+    /// views with no common ancestor raises.
     private func addPromptText(_ message: String) {
-        let insets = promptArea.edgeInsets.left + promptArea.edgeInsets.right
-        let textView = NSTextView(usingTextLayoutManager: false)
-        textView.frame = NSRect(x: 0, y: 0, width: max(bounds.width - insets, 120), height: 0)
-        textView.string = message
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.drawsBackground = false
-        textView.font = .systemFont(ofSize: NSFont.systemFontSize)
-        textView.textContainerInset = .zero
-        textView.textContainer?.lineFragmentPadding = 0
-        textView.textContainer?.widthTracksTextView = true
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]
-
-        let scrollView = NSScrollView()
-        scrollView.documentView = textView
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-
-        var textHeight: CGFloat = 0
-        if let layoutManager = textView.layoutManager, let container = textView.textContainer {
-            layoutManager.ensureLayout(for: container)
-            textHeight = ceil(layoutManager.usedRect(for: container).height)
-        }
+        let scrollView = MCPAppPromptTextView(text: message, maxHeight: Self.maxPromptTextHeight)
+        scrollView.wrapWidth = promptTextWidth
         promptArea.addArrangedSubview(scrollView)
-        NSLayoutConstraint.activate([
-            scrollView.widthAnchor.constraint(equalTo: promptArea.widthAnchor, constant: -insets),
-            scrollView.heightAnchor.constraint(equalToConstant: min(max(textHeight, 1), Self.maxPromptTextHeight)),
-        ])
+        scrollView.widthAnchor.constraint(equalTo: promptArea.widthAnchor, constant: -promptInsets).isActive = true
+        promptText = scrollView
     }
+
+    private var promptInsets: CGFloat { promptArea.edgeInsets.left + promptArea.edgeInsets.right }
+
+    /// The prompt text's width: the card's width less the prompt's insets.
+    private var promptTextWidth: CGFloat { max(bounds.width - promptInsets, 0) }
 
     private func hidePrompt() {
         guard !promptArea.isHidden else { return }
@@ -383,6 +376,88 @@ final class MCPAppViewPane: NSView {
         default: return false
         }
     }
+}
+
+/// A prompt's text: a read-only, selectable text view that wraps at
+/// `wrapWidth` and scrolls once it is taller than `maxHeight`.
+///
+/// The intrinsic height is the text's height laid out at `wrapWidth`, capped
+/// at `maxHeight`. It is measured with its own TextKit 1 objects, so it is
+/// correct before the scroll view is laid out: the card reports the prompt's
+/// height to the view (host context) as soon as the prompt shows. Above
+/// `maxHeight` a vertical scroller may narrow the text, which only makes it
+/// taller, so the capped height stays `maxHeight`.
+///
+/// The clip view is flipped, so the text stays anchored at its first line
+/// when it grows taller (an unflipped clip view keeps its bounds origin at
+/// the document's bottom edge). The text view starts at zero size like the
+/// clip view, so its width autoresizes to the clip view's width.
+@MainActor
+final class MCPAppPromptTextView: NSScrollView {
+    private let textView = NSTextView(usingTextLayoutManager: false)
+    private let maxHeight: CGFloat
+
+    /// The width the text wraps at: the scroll view's width once laid out.
+    var wrapWidth: CGFloat = 0 {
+        didSet {
+            if wrapWidth != oldValue { invalidateIntrinsicContentSize() }
+        }
+    }
+
+    init(text: String, maxHeight: CGFloat) {
+        self.maxHeight = maxHeight
+        super.init(frame: .zero)
+        contentView = MCPAppFlippedClipView()
+        hasVerticalScroller = true
+        hasHorizontalScroller = false
+        autohidesScrollers = true
+        drawsBackground = false
+        borderType = .noBorder
+        translatesAutoresizingMaskIntoConstraints = false
+
+        textView.string = text
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = Self.font
+        textView.textContainerInset = .zero
+        textView.minSize = .zero
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        documentView = textView
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: min(max(Self.textHeight(textView.string, width: wrapWidth), 1), maxHeight))
+    }
+
+    private static let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+
+    /// `text`'s height laid out at `width` with the text view's font and
+    /// zero line fragment padding.
+    private static func textHeight(_ text: String, width: CGFloat) -> CGFloat {
+        let storage = NSTextStorage(string: text, attributes: [.font: font])
+        let layoutManager = NSLayoutManager()
+        let container = NSTextContainer(size: NSSize(width: max(width, 0), height: CGFloat.greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        layoutManager.addTextContainer(container)
+        storage.addLayoutManager(layoutManager)
+        layoutManager.ensureLayout(for: container)
+        return ceil(layoutManager.usedRect(for: container).height)
+    }
+}
+
+/// A clip view whose origin is its top-left corner.
+@MainActor
+private final class MCPAppFlippedClipView: NSClipView {
+    override var isFlipped: Bool { true }
 }
 
 /// A push button running a closure.

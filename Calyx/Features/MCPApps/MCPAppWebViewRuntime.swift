@@ -27,6 +27,8 @@ protocol MCPAppRuntimeEnvironment: AnyObject {
     var cockpitInputDelivery: any MCPAppInputDelivering { get }
     /// Calyx's theme and the ghostty colors and font, for the style variables.
     func themeInputs() -> MCPAppThemeInputs
+    /// Opens a `ui/open-link` URL the user allowed. True when it opened.
+    func openLink(_ url: URL) -> Bool
 }
 
 @MainActor
@@ -66,6 +68,10 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         var lastHostContext: [String: AnyCodable] = [:]
         var pipWindow: MCPAppPiPWindow?
         var panel: MCPAppStandalonePanel?
+        /// Grows by one each time a document of the view starts unloading
+        /// (`requestTeardown`, `unmount`). A prompt answered after it grew
+        /// belongs to a document that is gone.
+        var documentGeneration = 0
 
         init(pane: MCPAppViewPane) {
             self.pane = pane
@@ -85,6 +91,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     }
     let environment: any MCPAppRuntimeEnvironment
     let consentGate = MCPAppMessageConsentGate()
+    let openLinkPolicy = MCPAppOpenLinkPolicy()
     private(set) var views: [UUID: ViewState] = [:]
     /// Web views of views the store dropped, kept until `unmount`.
     private var retiringMounts: [UUID: Mounted] = [:]
@@ -159,7 +166,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     /// Sends `ui/resource-teardown` to a view that initialized (the host
     /// sends nothing before `initialized`) and waits up to 2 seconds.
     func requestTeardown(viewID: UUID) async {
-        resolvePendingConsent(viewID: viewID)
+        denyPendingPrompts(viewID: viewID)
         guard let bridge = mounted(viewID)?.bridge, bridge.hasReceivedInitialized else { return }
         let request = JSONRPCMessage.request(id: .string("teardown"), method: "ui/resource-teardown", params: [:])
         let wait = Self.teardownReplyWait
@@ -181,7 +188,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     }
 
     func unmount(viewID: UUID) {
-        resolvePendingConsent(viewID: viewID)
+        denyPendingPrompts(viewID: viewID)
         let mounted: Mounted
         if let state = views[viewID], let shown = state.mounted {
             state.mounted = nil
@@ -300,13 +307,18 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     }
 
     /// Drops the card of a view the store no longer has. A web view still
-    /// mounted is kept for `requestTeardown` and `unmount`.
+    /// mounted is kept for `requestTeardown` and `unmount`. The only place
+    /// that forgets the view's "Always" grants for `ui/open-link` and
+    /// `ui/message`: every removal from the store reaches it through
+    /// `syncWithStore`, and a Reload does not.
     private func discard(viewID: UUID) {
         guard let state = views.removeValue(forKey: viewID) else { return }
         if let mounted = state.mounted {
             retiringMounts[viewID] = mounted
         }
         state.pane.dismissPrompt()
+        openLinkPolicy.viewWasRemoved(viewID: viewID)
+        consentGate.viewWasRemoved(viewID: viewID)
         if let surfaceID = state.surfaceID {
             if state.displayMode == "fullscreen" {
                 docks[surfaceID]?.container?.setFullscreen(false, forLeaf: surfaceID)
@@ -327,10 +339,21 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         }
     }
 
-    private func resolvePendingConsent(viewID: UUID) {
-        if consentGate.viewDidTeardown(viewID: viewID) != nil {
-            views[viewID]?.pane.dismissPrompt()
-        }
+    /// Denies the prompts of a document that is unloading: a pending
+    /// `ui/message` fails with "Message sending denied" and a pending
+    /// `ui/open-link` opens nothing. The view's "Always" grants stay;
+    /// `discard` forgets them.
+    private func denyPendingPrompts(viewID: UUID) {
+        views[viewID]?.documentGeneration += 1
+        consentGate.cancelPendingPrompt(viewID: viewID)
+        views[viewID]?.pane.denyWaitingPrompt()
+    }
+
+    /// True when `state` is still the view's card and no document of the
+    /// view started unloading since `generation` was read: a prompt's
+    /// answer still belongs to the document that asked.
+    func isCurrentDocument(viewID: UUID, state: ViewState, generation: Int) -> Bool {
+        views[viewID] === state && state.documentGeneration == generation
     }
 
     // MARK: - Display modes and host context

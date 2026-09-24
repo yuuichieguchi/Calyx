@@ -3,8 +3,10 @@
 //  CalyxTests
 //
 //  Pure policy for the ui/* request table (plan §9): ui/open-link accepts
-//  only http, https, mailto; sampling/createMessage is never declared, so
-//  every request for it is -32601; a view's tools/call is gated on the
+//  only http, https, mailto, and prompts for every link until the user
+//  allows the view's links, which lasts until the view is removed;
+//  sampling/createMessage is never declared, so every request for it is
+//  -32601; a view's tools/call is gated on the
 //  tool's declared visibility (absent visibility defaults to
 //  ["model","app"], so it's callable unless a server explicitly narrows
 //  it to "model" only); ui/request-display-mode follows the MCP Apps
@@ -21,6 +23,37 @@ import XCTest
 @testable import Calyx
 
 final class MCPAppViewRequestPolicyTests: XCTestCase {
+
+    // MARK: - ui/open-link per-view allowance
+
+    @MainActor
+    func test_openLinkAllowance_everyViewPromptsByDefault() {
+        let policy = MCPAppOpenLinkPolicy()
+        XCTAssertTrue(policy.requiresPrompt(viewID: UUID()))
+    }
+
+    @MainActor
+    func test_openLinkAllowance_alwaysForOneView_skipsItsPromptOnly() {
+        let policy = MCPAppOpenLinkPolicy()
+        let allowed = UUID()
+        let other = UUID()
+
+        policy.recordAlways(viewID: allowed)
+
+        XCTAssertFalse(policy.requiresPrompt(viewID: allowed))
+        XCTAssertTrue(policy.requiresPrompt(viewID: other))
+    }
+
+    @MainActor
+    func test_openLinkAllowance_viewWasRemoved_forgetsIt() {
+        let policy = MCPAppOpenLinkPolicy()
+        let viewID = UUID()
+        policy.recordAlways(viewID: viewID)
+
+        policy.viewWasRemoved(viewID: viewID)
+
+        XCTAssertTrue(policy.requiresPrompt(viewID: viewID))
+    }
 
     // MARK: - ui/open-link scheme allowlist
 
