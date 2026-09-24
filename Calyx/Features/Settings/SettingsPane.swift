@@ -20,7 +20,7 @@ enum SettingsPane: CaseIterable {
         case .appearance: return "Appearance"
         case .sessions: return "Sessions"
         case .agents: return "Agents"
-        case .mcpServers: return "MCP Servers"
+        case .mcpServers: return "MCP Apps"
         case .lsp: return "LSP"
         }
     }

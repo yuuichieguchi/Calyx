@@ -516,6 +516,35 @@ final class MCPUpstreamConnectionTests: XCTestCase {
         }
     }
 
+    /// A child that exits while `initialize` is in flight: the failure
+    /// is one readable sentence built from the exit status, and carries
+    /// the stderr the child wrote.
+    func test_childExitsDuringHandshake_entersFailedWithExitSentenceAndStderrTail() async throws {
+        let factory = TransportFactory()
+        let connection = makeConnection(factory: factory, clock: ManualMCPClock())
+
+        Task { await connection.start() }
+        try await waitUntil { await factory.issued.count == 1 }
+        let transport = await factory.transports[0]
+        try await waitUntil { await transport.sentMessages().count >= 1 }
+        let stderr = "python3: can't open file '/tmp/server.py': [Errno 2] No such file or directory\n"
+        await transport.simulateCrash(
+            reason: "child exited with status 2",
+            exit: .exited(2),
+            stderrTail: Data(stderr.utf8)
+        )
+
+        try await waitUntil {
+            if case .failed = await connection.state() { return true }
+            return false
+        }
+        guard case .failed(let failure) = await connection.state() else {
+            return XCTFail("expected .failed")
+        }
+        XCTAssertEqual(failure.reason, "The server exited with status 2 during the handshake.")
+        XCTAssertEqual(failure.stderrTail, stderr)
+    }
+
     // MARK: - ready -> restarting on unsolicited close; in-flight calls fail, never retried
 
     func test_unsolicitedClose_whileCallInFlight_failsWithTransportClosedReason_andEntersRestarting() async throws {

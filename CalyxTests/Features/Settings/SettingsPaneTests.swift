@@ -71,7 +71,7 @@ final class SettingsPaneTests: XCTestCase {
         XCTAssertEqual(SettingsPane.appearance.title, "Appearance")
         XCTAssertEqual(SettingsPane.sessions.title, "Sessions")
         XCTAssertEqual(SettingsPane.agents.title, "Agents")
-        XCTAssertEqual(SettingsPane.mcpServers.title, "MCP Servers")
+        XCTAssertEqual(SettingsPane.mcpServers.title, "MCP Apps")
         XCTAssertEqual(SettingsPane.lsp.title, "LSP")
     }
 

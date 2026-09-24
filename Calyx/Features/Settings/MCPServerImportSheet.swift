@@ -47,8 +47,8 @@ struct MCPServerImportPreviewItem: Equatable {
 struct MCPServerImportSheet: View {
     let model: MCPServerSettingsModel
     let existingAliases: Set<String>
-
-    @Environment(\.dismiss) private var dismiss
+    /// Ends the sheet's presentation; the presenter supplies it.
+    let close: @MainActor () -> Void
 
     @State private var text = ""
     @State private var imported: [MCPImportedServer] = []
@@ -94,7 +94,7 @@ struct MCPServerImportSheet: View {
             }
             HStack {
                 Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
+                Button("Cancel", role: .cancel) { close() }
                     .keyboardShortcut(.cancelAction)
                 Button("Import", action: confirm)
                     .keyboardShortcut(.defaultAction)
@@ -189,7 +189,7 @@ struct MCPServerImportSheet: View {
         Task {
             do {
                 _ = try await model.importServers(servers, conflictPolicy: policy)
-                dismiss()
+                close()
             } catch {
                 importError = MCPServerSettingsModel.describe(error)
                 isImporting = false

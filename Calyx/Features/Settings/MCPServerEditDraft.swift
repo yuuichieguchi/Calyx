@@ -109,3 +109,119 @@ enum MCPServerDraftConversion {
         }
     }
 }
+
+/// The add sheet's alias while creating a server: it follows the alias
+/// derived from the name until the user edits the alias field, then keeps
+/// what the user typed.
+struct MCPServerAliasFieldState: Equatable {
+    private(set) var alias = ""
+    private(set) var followsName = true
+
+    /// The name changed. While following, the alias becomes the one
+    /// derived from `name`, or empty when nothing can be derived.
+    mutating func nameDidChange(_ name: String) {
+        guard followsName else { return }
+        alias = MCPServerAliasDeriver.derive(fromDisplayName: name) ?? ""
+    }
+
+    /// The user typed into the alias field. A write of the value the
+    /// field already holds is not an edit.
+    mutating func userDidEdit(_ newAlias: String) {
+        guard newAlias != alias else { return }
+        alias = newAlias
+        followsName = false
+    }
+}
+
+/// The stdio Arguments field: one line of shell-style words.
+enum MCPServerArgumentSplitter {
+
+    enum SplitError: Error, Equatable {
+        case unterminatedQuote(Character)
+        case trailingBackslash
+    }
+
+    /// Splits `text` into arguments the way a POSIX shell splits words,
+    /// without expansions: spaces, tabs and newlines separate arguments;
+    /// single quotes keep everything up to the next single quote; double
+    /// quotes keep everything up to the next unescaped double quote, where
+    /// a backslash escapes only `"` and `\`; outside quotes a backslash
+    /// keeps the next character, and a backslash before a newline joins
+    /// the lines. `''` and `""` are empty arguments.
+    static func split(_ text: String) throws(SplitError) -> [String] {
+        var arguments: [String] = []
+        var current = ""
+        var inWord = false
+        var characters = text.makeIterator()
+        while let character = characters.next() {
+            switch character {
+            case " ", "\t", "\n", "\r", "\r\n":
+                if inWord {
+                    arguments.append(current)
+                    current = ""
+                    inWord = false
+                }
+            case "'":
+                inWord = true
+                var closed = false
+                while let quoted = characters.next() {
+                    if quoted == "'" {
+                        closed = true
+                        break
+                    }
+                    current.append(quoted)
+                }
+                guard closed else { throw SplitError.unterminatedQuote("'") }
+            case "\"":
+                inWord = true
+                var closed = false
+                while let quoted = characters.next() {
+                    if quoted == "\"" {
+                        closed = true
+                        break
+                    }
+                    if quoted == "\\" {
+                        guard let escaped = characters.next() else { throw SplitError.unterminatedQuote("\"") }
+                        if escaped != "\"" && escaped != "\\" {
+                            current.append("\\")
+                        }
+                        current.append(escaped)
+                    } else {
+                        current.append(quoted)
+                    }
+                }
+                guard closed else { throw SplitError.unterminatedQuote("\"") }
+            case "\\":
+                guard let escaped = characters.next() else { throw SplitError.trailingBackslash }
+                if escaped == "\n" || escaped == "\r\n" {
+                    continue
+                }
+                inWord = true
+                current.append(escaped)
+            default:
+                inWord = true
+                current.append(character)
+            }
+        }
+        if inWord {
+            arguments.append(current)
+        }
+        return arguments
+    }
+
+    /// The Arguments field text for `arguments`, which `split` turns back
+    /// into the same arguments. An argument made only of characters with
+    /// no meaning to `split` is written as is; any other is single-quoted,
+    /// with each single quote written as `'\''`.
+    static func join(_ arguments: [String]) -> String {
+        arguments.map(quote).joined(separator: " ")
+    }
+
+    private static func quote(_ argument: String) -> String {
+        let special: Set<Character> = [" ", "\t", "\n", "\r", "\r\n", "'", "\"", "\\"]
+        guard !argument.isEmpty, !argument.contains(where: special.contains) else {
+            return "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }
+        return argument
+    }
+}

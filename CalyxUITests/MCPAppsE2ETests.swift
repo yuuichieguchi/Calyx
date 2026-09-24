@@ -53,7 +53,7 @@
 //   `calyx.settings.mcpServers.editor.{nameField,aliasField,
 //   transportPicker,commandField,argsField,saveButton}`,
 //   `calyx.settings.mcpServers.import.{textView,preview,confirmButton}`.
-//   Settings toolbar item title: "MCP Servers" (looked up by label, no
+//   Settings toolbar item title: "MCP Apps" (looked up by label, no
 //   identifier -- mirrors SettingsWindowE2ETests's own established
 //   toolbar-button-by-label idiom, see that file's header for why).
 // - Settings row status text and view state-label text are asserted by
@@ -476,7 +476,7 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
         menuAction("Calyx", item: "Settings…")
     }
 
-    /// Opens Settings and selects the "MCP Servers" toolbar pane
+    /// Opens Settings and selects the "MCP Apps" toolbar pane
     /// (looked up by label -- no accessibility identifier exists on any
     /// Settings toolbar button in this codebase, see
     /// SettingsWindowE2ETests's own header), returning the Settings
@@ -486,8 +486,8 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
         openSettingsViaMenu()
         let settingsWindow = app.windows.firstMatch
         XCTAssertTrue(waitFor(settingsWindow, timeout: 10), "the Settings window never appeared")
-        let toolbarButton = settingsWindow.toolbars.buttons["MCP Servers"]
-        XCTAssertTrue(waitFor(toolbarButton, timeout: 10), "the Settings toolbar never showed an \"MCP Servers\" item")
+        let toolbarButton = settingsWindow.toolbars.buttons["MCP Apps"]
+        XCTAssertTrue(waitFor(toolbarButton, timeout: 10), "the Settings toolbar never showed an \"MCP Apps\" item")
         toolbarButton.click()
         return settingsWindow
     }
@@ -897,9 +897,12 @@ final class MCPAppsSettingsE2ETests: MCPAppsE2ETestCaseBase {
         nameField.click()
         nameField.typeText("E2E Manual Server")
 
+        // The alias field already holds the alias derived from the name;
+        // replace it.
         let aliasField = app.textFields["calyx.settings.mcpServers.editor.aliasField"]
         XCTAssertTrue(waitFor(aliasField, timeout: 5))
         aliasField.click()
+        aliasField.typeKey("a", modifierFlags: .command)
         aliasField.typeText("manual")
 
         let commandField = app.textFields["calyx.settings.mcpServers.editor.commandField"]

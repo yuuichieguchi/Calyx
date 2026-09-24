@@ -3,10 +3,10 @@
 //  Calyx
 //
 //  Add and edit sheet of Settings > MCP Servers. stdio: command, arguments
-//  (one per line), env vars with masked values, working directory. HTTP:
+//  (shell-style words), env vars with masked values, working directory. HTTP:
 //  URL, headers with masked values, the legacy HTTP+SSE hint, the fixed
 //  OAuth redirect port, and an optional pre-registered OAuth client. The
-//  alias is entered only when adding.
+//  alias is entered only when adding, and follows the name until edited.
 //
 
 import SwiftUI
@@ -47,11 +47,11 @@ struct MCPServerEditorSheet: View {
     let mode: Mode
     /// Aliases of the registered servers when the sheet opened.
     let existingAliases: Set<String>
-
-    @Environment(\.dismiss) private var dismiss
+    /// Ends the sheet's presentation; the presenter supplies it.
+    let close: @MainActor () -> Void
 
     @State private var displayName = ""
-    @State private var alias = ""
+    @State private var aliasField = MCPServerAliasFieldState()
     @State private var transportKind: TransportKind = .stdio
     @State private var command = ""
     @State private var argsText = ""
@@ -67,17 +67,18 @@ struct MCPServerEditorSheet: View {
     @State private var saveError: String?
     @State private var isSaving = false
 
-    init(model: MCPServerSettingsModel, mode: Mode, existingAliases: Set<String>) {
+    init(model: MCPServerSettingsModel, mode: Mode, existingAliases: Set<String>, close: @escaping @MainActor () -> Void) {
         self.model = model
         self.mode = mode
         self.existingAliases = existingAliases
+        self.close = close
         guard case .edit(_, let draft) = mode else { return }
         _displayName = State(initialValue: draft.displayName)
         switch draft.transport {
         case .stdio(let command, let args, let env, let cwd):
             _transportKind = State(initialValue: .stdio)
             _command = State(initialValue: command)
-            _argsText = State(initialValue: args.joined(separator: "\n"))
+            _argsText = State(initialValue: MCPServerArgumentSplitter.join(args))
             _env = State(initialValue: Self.namedValues(env))
             _cwd = State(initialValue: cwd ?? "")
         case .http(let url, let headers, let hint, let useFixedPort):
@@ -127,10 +128,16 @@ struct MCPServerEditorSheet: View {
         Section {
             TextField("Name", text: $displayName)
                 .accessibilityIdentifier(AccessibilityID.MCPServersSettings.editorNameField)
+                .onChange(of: displayName) { _, name in
+                    aliasField.nameDidChange(name)
+                }
             switch mode {
             case .create:
-                TextField("Alias", text: $alias, prompt: Text(aliasSuggestion))
-                    .accessibilityIdentifier(AccessibilityID.MCPServersSettings.editorAliasField)
+                TextField("Alias", text: Binding(
+                    get: { aliasField.alias },
+                    set: { aliasField.userDidEdit($0) }
+                ))
+                .accessibilityIdentifier(AccessibilityID.MCPServersSettings.editorAliasField)
             case .edit(let config, _):
                 LabeledContent("Alias", value: config.alias.rawValue)
             }
@@ -153,9 +160,14 @@ struct MCPServerEditorSheet: View {
         Section("Command") {
             TextField("Command", text: $command)
                 .accessibilityIdentifier(AccessibilityID.MCPServersSettings.editorCommandField)
-            TextField("Arguments", text: $argsText, prompt: Text("One per line"), axis: .vertical)
-                .lineLimit(1...6)
-                .accessibilityIdentifier(AccessibilityID.MCPServersSettings.editorArgsField)
+            // The second text of a grouped form row's label is shown under
+            // the label as its description.
+            TextField(text: $argsText, axis: .vertical) {
+                Text("Arguments")
+                Text("Separate with spaces; quote values that contain spaces.")
+            }
+            .lineLimit(1...6)
+            .accessibilityIdentifier(AccessibilityID.MCPServersSettings.editorArgsField)
             TextField("Working directory", text: $cwd, prompt: Text("Optional"))
         }
     }
@@ -221,7 +233,7 @@ struct MCPServerEditorSheet: View {
             }
             HStack {
                 Spacer()
-                Button("Cancel", role: .cancel) { dismiss() }
+                Button("Cancel", role: .cancel) { close() }
                     .keyboardShortcut(.cancelAction)
                 Button("Save", action: save)
                     .keyboardShortcut(.defaultAction)
@@ -233,10 +245,6 @@ struct MCPServerEditorSheet: View {
 
     // MARK: - Validation and saving
 
-    private var aliasSuggestion: String {
-        MCPServerAliasDeriver.derive(fromDisplayName: displayName) ?? "Alias"
-    }
-
     private var trimmedDisplayName: String {
         displayName.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -247,6 +255,7 @@ struct MCPServerEditorSheet: View {
             return "Enter a name."
         }
         if case .create = mode {
+            let alias = aliasField.alias
             guard MCPServerAlias(rawValue: alias) != nil else {
                 return "Enter an alias: a lowercase letter followed by up to 9 lowercase letters or digits."
             }
@@ -258,6 +267,11 @@ struct MCPServerEditorSheet: View {
         case .stdio:
             if command.trimmingCharacters(in: .whitespaces).isEmpty {
                 return "Enter a command."
+            }
+            do throws(MCPServerArgumentSplitter.SplitError) {
+                _ = try MCPServerArgumentSplitter.split(argsText)
+            } catch {
+                return Self.argumentsProblem(error)
             }
             if let message = Self.namedValuesProblem(env, noun: "environment variable") {
                 return message
@@ -277,13 +291,13 @@ struct MCPServerEditorSheet: View {
         return nil
     }
 
-    private var transportDraft: MCPServerTransportConfigDraft {
+    private func transportDraft() throws(MCPServerArgumentSplitter.SplitError) -> MCPServerTransportConfigDraft {
         switch transportKind {
         case .stdio:
             let trimmedCwd = cwd.trimmingCharacters(in: .whitespaces)
             return .stdio(
                 command: command.trimmingCharacters(in: .whitespaces),
-                args: argsText.split(separator: "\n", omittingEmptySubsequences: true).map(String.init),
+                args: try MCPServerArgumentSplitter.split(argsText),
                 env: Self.dictionary(env),
                 cwd: trimmedCwd.isEmpty ? nil : trimmedCwd
             )
@@ -315,10 +329,17 @@ struct MCPServerEditorSheet: View {
 
     private func save() {
         saveError = nil
+        let transport: MCPServerTransportConfigDraft
+        do {
+            transport = try transportDraft()
+        } catch {
+            saveError = Self.argumentsProblem(error)
+            return
+        }
         isSaving = true
-        let transport = transportDraft
         let auth = authDraft
         let name = trimmedDisplayName
+        let alias = aliasField.alias
         Task {
             do {
                 switch mode {
@@ -327,7 +348,7 @@ struct MCPServerEditorSheet: View {
                 case .edit(let config, _):
                     try await model.update(config, with: MCPServerEditDraft(displayName: name, transport: transport, authDraft: auth))
                 }
-                dismiss()
+                close()
             } catch {
                 saveError = MCPServerSettingsModel.describe(error)
                 isSaving = false
@@ -341,6 +362,16 @@ struct MCPServerEditorSheet: View {
 
     private static func dictionary(_ values: [NamedValue]) -> [String: String] {
         Dictionary(uniqueKeysWithValues: values.map { ($0.name.trimmingCharacters(in: .whitespaces), $0.value) })
+    }
+
+    /// Why the Arguments text cannot be split.
+    private static func argumentsProblem(_ error: MCPServerArgumentSplitter.SplitError) -> String {
+        switch error {
+        case .unterminatedQuote(let quote):
+            return "Close the \(quote) quote in Arguments."
+        case .trailingBackslash:
+            return "Arguments end with a backslash; escape it as \\\\ or remove it."
+        }
     }
 
     /// An empty or repeated name.

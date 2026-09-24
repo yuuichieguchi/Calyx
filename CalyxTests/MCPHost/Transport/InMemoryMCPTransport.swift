@@ -13,11 +13,11 @@
 //  it to," so it is a separate test API (simulateCrash(reason:)) rather
 //  than reusing close().
 //
-//  Per the API contract section 2.4, simulateCrash takes only a reason
-//  string; the closed(reason:exit:stderrTail:) it yields always carries
-//  exit: nil, stderrTail: nil. Exit-status and stderr-tail detail is
-//  exercised at the StdioMCPTransport layer instead, via the byte
-//  transport it wraps.
+//  simulateCrash yields closed(reason:exit:stderrTail:) with exit: nil,
+//  stderrTail: nil unless a test passes them, so a connection-level test
+//  can stand in for a child that exited with a status and wrote stderr.
+//  How StdioMCPTransport obtains them is exercised at that layer, via the
+//  byte transport it wraps.
 //
 
 import Foundation
@@ -92,10 +92,14 @@ actor InMemoryMCPTransport: MCPMessageTransport {
     /// then marks the transport closed so a subsequent send is dropped.
     /// Distinct from close(), which is the graceful, caller-initiated
     /// path and must never be observed as a crash.
-    func simulateCrash(reason: String = "child exited") async {
+    func simulateCrash(
+        reason: String = "child exited",
+        exit: MCPTransportExitInfo? = nil,
+        stderrTail: Data? = nil
+    ) async {
         guard !isClosed else { return }
         isClosed = true
-        continuation.yield(.closed(reason: reason, exit: nil, stderrTail: nil))
+        continuation.yield(.closed(reason: reason, exit: exit, stderrTail: stderrTail))
         continuation.finish()
     }
 

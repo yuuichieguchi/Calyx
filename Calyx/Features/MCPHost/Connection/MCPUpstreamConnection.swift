@@ -61,6 +61,7 @@ actor MCPUpstreamConnection: MCPUpstreamConnecting {
     /// An unsolicited transport loss reported on `serverEvents`.
     private struct TransportLoss {
         let reason: String
+        let exit: MCPTransportExitInfo?
         let stderrTail: String?
     }
 
@@ -295,7 +296,10 @@ actor MCPUpstreamConnection: MCPUpstreamConnecting {
             guard !Task.isCancelled else { return }
             crashCount += 1
             if crashCount >= configuration.maxCrashesBeforeFailed {
-                transition(to: .failed(MCPConnectionFailure(reason: loss.reason, stderrTail: loss.stderrTail)))
+                transition(to: .failed(MCPConnectionFailure(
+                    reason: MCPConnectionFailureText.connectionLost(reason: loss.reason, exit: loss.exit),
+                    stderrTail: loss.stderrTail
+                )))
                 return
             }
             let delay = min(configuration.backoffCapSeconds, pow(2, Double(crashCount - 1)))
@@ -324,14 +328,28 @@ actor MCPUpstreamConnection: MCPUpstreamConnecting {
             return session
         } catch {
             guard !Task.isCancelled else { return nil }
+            var loss: TransportLoss?
             if let session = self.session {
+                // Read before `end` closes the transport: a closed
+                // transport no longer reports how the child ended.
+                if MCPConnectionFailureText.transportWasLost(error) {
+                    loss = await transportLoss(of: session)
+                }
                 await end(session)
                 guard !Task.isCancelled else { return nil }
             }
             if Self.isUnauthorized(error) {
                 transition(to: .needsAuthorization)
             } else {
-                transition(to: .failed(MCPConnectionFailure(reason: String(describing: error), stderrTail: nil)))
+                transition(to: .failed(MCPConnectionFailure(
+                    reason: MCPConnectionFailureText.connectFailure(
+                        error,
+                        exit: loss?.exit,
+                        requestTimeout: configuration.client.requestTimeout,
+                        handshakeOrder: handshakeOrder
+                    ),
+                    stderrTail: loss?.stderrTail
+                )))
             }
             return nil
         }
@@ -387,13 +405,30 @@ actor MCPUpstreamConnection: MCPUpstreamConnecting {
                         return nil
                     }
                 }
-            case .closed(let reason, _, let stderrTail):
+            case .closed(let reason, let exit, let stderrTail):
                 guard !Task.isCancelled else { return nil }
                 return TransportLoss(
                     reason: reason,
+                    exit: exit,
                     stderrTail: stderrTail.map { String(decoding: $0, as: UTF8.self) }
                 )
             }
+        }
+        return nil
+    }
+
+    /// The loss the client reported on `serverEvents` for a session whose
+    /// transport was lost before `.ready`. The client has already failed
+    /// the handshake with `.transportClosed`, so `serverEvents` ends right
+    /// after the loss (or without one, when the transport was closed).
+    private func transportLoss(of session: Session) async -> TransportLoss? {
+        for await event in session.client.serverEvents {
+            guard case .closed(let reason, let exit, let stderrTail) = event else { continue }
+            return TransportLoss(
+                reason: reason,
+                exit: exit,
+                stderrTail: stderrTail.map { String(decoding: $0, as: UTF8.self) }
+            )
         }
         return nil
     }
