@@ -159,9 +159,12 @@ enum MCPOAuthFormEncoding {
 
 /// The failure type shared by the whole Auth module.
 enum MCPOAuthFlowError: Error, Sendable, Equatable {
-    /// No stored tokens, a refresh rejected with `invalid_grant`, or a client
-    /// registration that needs a client id from the user.
+    /// No stored tokens, or a refresh rejected with `invalid_grant`.
     case needsAuthorization
+    /// The authorization server has no `registration_endpoint`, does not
+    /// support client ID metadata documents, and no pre-registered client
+    /// ID is configured, so sign-in needs a client ID from the user.
+    case clientRegistrationUnavailable(issuer: String)
     /// The loopback redirect listener was cancelled.
     case cancelled
     case portBusy(Int)

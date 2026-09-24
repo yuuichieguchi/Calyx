@@ -82,4 +82,62 @@ final class MCPConnectionFailureTextTests: XCTestCase {
         ))
         XCTAssertTrue(MCPConnectionFailureText.transportWasLost(MCPClientProtocolError.transportClosed(reason: "x")))
     }
+
+    // MARK: - Sign-in failures
+
+    func test_signInFailure_clientRegistrationUnavailable_namesTheIssuerAndTheClientIDField() {
+        XCTAssertEqual(
+            MCPConnectionFailureText.signInFailure(.clientRegistrationUnavailable(issuer: "https://github.com/login/oauth")),
+            "https://github.com/login/oauth does not support automatic client registration. "
+                + "Enter the client ID of an OAuth app registered with it in Edit."
+        )
+    }
+
+    func test_signInFailure_everyCase_isASentence() {
+        let cases: [(MCPOAuthFlowError, String)] = [
+            (.needsAuthorization, "Sign in is required."),
+            (.cancelled, "Sign in was cancelled."),
+            (.portBusy(33418), "Port 33418 is in use."),
+            (.pkceUnsupported, "The authorization server does not support PKCE with S256."),
+            (.issuerMismatch, "The sign-in response did not come from the expected authorization server."),
+            (.stateMismatch, "The sign-in response does not match the request Calyx sent."),
+            (.discoveryFailed("protected resource metadata names no authorization server"),
+             "The authorization server could not be found: protected resource metadata names no authorization server."),
+            (.registrationFailed("registration endpoint returned HTTP 400"),
+             "Client registration failed: registration endpoint returned HTTP 400."),
+            (.authorizationFailed(error: "access_denied", description: nil),
+             "The authorization server returned access_denied."),
+            (.authorizationFailed(error: "access_denied", description: "The user denied access."),
+             "The authorization server returned access_denied: The user denied access."),
+            (.tokenEndpointFailed(error: "invalid_client", description: nil),
+             "The token endpoint returned invalid_client."),
+            (.tokenEndpointFailed(error: "invalid_client", description: "Client authentication failed"),
+             "The token endpoint returned invalid_client: Client authentication failed."),
+            (.storageFailed("keychain locked"), "The sign-in credentials could not be saved: keychain locked."),
+        ]
+        for (error, expected) in cases {
+            XCTAssertEqual(MCPConnectionFailureText.signInFailure(error), expected, "\(error)")
+        }
+    }
+
+    func test_connectFailure_oauthFlowError_isTheSignInSentence() {
+        XCTAssertEqual(
+            connectFailure(MCPOAuthFlowError.tokenEndpointFailed(error: "invalid_client", description: nil)),
+            "The token endpoint returned invalid_client."
+        )
+    }
+
+    // MARK: - Supervisor failures
+
+    func test_supervisorFailure_everyCase_isASentence() {
+        let cases: [(MCPUpstreamSupervisorError, String)] = [
+            (.unknownServer(MCPServerID()), "The server is no longer configured."),
+            (.notHTTPServer(MCPServerID()), "Only HTTP servers can sign in."),
+            (.invalidURL("not a url"), "\"not a url\" is not a valid URL."),
+            (.missingSecret(name: "API_KEY"), "No stored value for API_KEY."),
+        ]
+        for (error, expected) in cases {
+            XCTAssertEqual(MCPConnectionFailureText.supervisorFailure(error), expected, "\(error)")
+        }
+    }
 }
