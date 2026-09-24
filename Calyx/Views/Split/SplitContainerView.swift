@@ -59,8 +59,8 @@ class SplitContainerView: NSView {
     private var fullscreenLeafID: UUID?
     /// Dock widths set by dragging a dock divider, by leaf. A leaf without
     /// an entry gets `MCPAppDockLayout.defaultDockWidth`. Kept while the
-    /// dock is parked or hidden and across `updateRegistry`; dropped when
-    /// the dock is detached or replaced.
+    /// dock is parked and across `updateRegistry`; dropped when the dock is
+    /// detached or replaced.
     private var dockWidths: [UUID: CGFloat] = [:]
     var onDeferredLayoutComplete: (() -> Void)?
     var onActiveLeafChange: ((UUID) -> Void)?
@@ -244,31 +244,16 @@ class SplitContainerView: NSView {
 
     // MARK: - MCP Apps docks
 
-    /// The terminal cell width in points, from the surface's cell size.
-    private func cellWidth(of surfaceView: SurfaceView) -> CGFloat {
-        surfaceView.convertFromBacking(surfaceView.cachedCellSize).width
-    }
-
     /// Lays out a leaf that has a dock: terminal on the left, the dock
-    /// divider, the dock on the right. The divider is placed after the
-    /// wrapper and the dock are in the container, so a newly created
-    /// divider sits above both and keeps its whole hit area. A leaf too
-    /// narrow for both minimums (no `MCPAppDockLayout.dockWidthRange`)
-    /// gives the terminal the whole leaf and hides the dock with its frame
-    /// left as it is; no divider is placed, so this pass reaps it. The
-    /// stored width is kept, and the dock shows again when the leaf is
-    /// wide enough.
-    private func layoutDockedLeaf(_ leafID: UUID, wrapper: SurfaceScrollView, dock: NSView, cellWidth: CGFloat, in rect: CGRect) {
-        guard let range = MCPAppDockLayout.dockWidthRange(leafWidth: rect.width, cellWidth: cellWidth) else {
-            wrapper.frame = rect
-            if wrapper.superview !== self {
-                addSubview(wrapper)
-            }
-            dock.isHidden = true
-            return
-        }
+    /// divider, the dock on the right, at every leaf width. The dock width
+    /// is the stored (or default) width clamped by
+    /// `MCPAppDockLayout.clampedDockWidth` for the leaf's current width,
+    /// the same bounds a split pane divider has. The divider is placed
+    /// after the wrapper and the dock are in the container, so a newly
+    /// created divider sits above both and keeps its whole hit area.
+    private func layoutDockedLeaf(_ leafID: UUID, wrapper: SurfaceScrollView, dock: NSView, in rect: CGRect) {
         let dockWidth = dockWidths[leafID] ?? MCPAppDockLayout.defaultDockWidth(leafWidth: rect.width)
-        let split = MCPAppDockLayout.split(leafRect: rect, dockWidth: dockWidth, in: range)
+        let split = MCPAppDockLayout.split(leafRect: rect, dockWidth: dockWidth)
         wrapper.frame = split.terminalRect
         dock.frame = split.dockRect
         dock.isHidden = false
@@ -281,11 +266,11 @@ class SplitContainerView: NSView {
         let divider = placeDividerView(
             key: .dock(leafID: leafID), direction: .horizontal, frame: split.dividerRect, containingRect: rect
         )
-        // Rebound every pass so the drag uses the leaf's current rect and width range.
+        // Rebound every pass so the drag uses the leaf's current rect.
         divider.onTargetRatioChange = { [weak self] ratio in
             guard let self else { return }
             let requested = MCPAppDockLayout.dockWidth(forDividerRatio: ratio, leafWidth: rect.width)
-            self.dockWidths[leafID] = MCPAppDockLayout.clamp(requested, to: range)
+            self.dockWidths[leafID] = MCPAppDockLayout.clampedDockWidth(requested, leafWidth: rect.width)
             self.dockPreferredWidthDidChange()
         }
     }
@@ -370,7 +355,7 @@ class SplitContainerView: NSView {
                 surfaceView.focusHost = self
                 wrapper.autoresizingMask = []
                 if let dock = docks[id] {
-                    layoutDockedLeaf(id, wrapper: wrapper, dock: dock, cellWidth: cellWidth(of: surfaceView), in: rect)
+                    layoutDockedLeaf(id, wrapper: wrapper, dock: dock, in: rect)
                 } else {
                     wrapper.frame = rect
                     if wrapper.superview !== self {

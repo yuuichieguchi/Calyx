@@ -20,10 +20,10 @@
 //  terminal with a split divider between them. The default dock width is
 //  40% of the leaf width; dragging the divider sets the leaf's dock width,
 //  which is kept through re-layouts, tab switches, parking and view
-//  changes, and dropped when the dock is detached. A drag is clamped to
-//  at least `MCPAppDockLayout.minDockWidth`; a leaf too narrow for both
-//  the dock and terminal minimums hides the dock (no divider) until it
-//  grows (K61).
+//  changes, and dropped when the dock is detached. The dock is bounded
+//  like a split pane (K67): for a leaf width W each side keeps at least
+//  max(50pt, 0.1 * W) (0.1 * W when W < 2 * 50 + 1), and the dock shows at
+//  every leaf width.
 //
 
 import AppKit
@@ -323,7 +323,7 @@ final class SplitContainerViewDockTests: XCTestCase {
         XCTAssertEqual(wrapper.frame, CGRect(x: 0, y: 0, width: 599, height: 600))
     }
 
-    func test_draggingTheDockDivider_isHonoredUpToTheTerminalMinimum() throws {
+    func test_draggingTheDockDivider_isHonoredUntilTheTerminalKeepsTenPercent() throws {
         let fixture = makeFixture()
         let leafID = UUID()
         registerLeaf(leafID, in: fixture.registry)
@@ -332,14 +332,14 @@ final class SplitContainerViewDockTests: XCTestCase {
         fixture.container.attachDock(dock, toLeaf: leafID)
         let divider = try dockDivider(in: fixture, leafID: leafID)
 
-        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 121, y: 300))
-        XCTAssertEqual(dock.frame.minX, 121, accuracy: 0.01)
-        XCTAssertEqual(dock.frame.width, 679, accuracy: 0.01, "the terminal keeps exactly its 120pt minimum")
+        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 81, y: 300))
+        XCTAssertEqual(dock.frame.minX, 81, accuracy: 0.01)
+        XCTAssertEqual(dock.frame.width, 719, accuracy: 0.01, "the terminal keeps exactly 0.1 * 800")
 
-        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 50, y: 300))
-        XCTAssertEqual(dock.frame.width, 679, accuracy: 0.01, "a drag past the terminal minimum stops there")
+        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 20, y: 300))
+        XCTAssertEqual(dock.frame.width, 719, accuracy: 0.01, "a drag past the limit stops there")
         let wrapper = try XCTUnwrap(wrapper(for: leafID, in: fixture))
-        XCTAssertEqual(wrapper.frame.width, 120, accuracy: 0.01)
+        XCTAssertEqual(wrapper.frame.width, 80, accuracy: 0.01)
     }
 
     func test_draggedWidth_persistsAcrossTreeChangesAndContainerResizes() throws {
@@ -369,17 +369,17 @@ final class SplitContainerViewDockTests: XCTestCase {
         fixture.container.updateLayout(tree: singleLeafTree(leafID))
         let dock = NSView()
         fixture.container.attachDock(dock, toLeaf: leafID)
-        try dockDivider(in: fixture, leafID: leafID)._testSimulateDrag(toSuperviewPoint: NSPoint(x: 500, y: 300))
-        XCTAssertEqual(dock.frame.width, 300, accuracy: 0.01)
+        try dockDivider(in: fixture, leafID: leafID)._testSimulateDrag(toSuperviewPoint: NSPoint(x: 100, y: 300))
+        XCTAssertEqual(dock.frame.width, 700, accuracy: 0.01)
 
         fixture.container.setFrameSize(NSSize(width: 400, height: 600))
-        XCTAssertEqual(dock.frame.width, 279, accuracy: 0.01, "capped so the terminal keeps 120pt: 400 - 1 - 120")
+        XCTAssertEqual(dock.frame.width, 349, accuracy: 0.01, "capped so the terminal keeps 50pt: 400 - 1 - 50")
 
         fixture.container.setFrameSize(NSSize(width: 800, height: 600))
-        XCTAssertEqual(dock.frame.width, 300, accuracy: 0.01, "the dragged width returns")
+        XCTAssertEqual(dock.frame.width, 700, accuracy: 0.01, "the dragged width returns")
     }
 
-    func test_draggingTheDockDividerPastTheLeafsRightEdge_keepsTheDockMinimum() throws {
+    func test_draggingTheDockDividerPastTheLeafsRightEdge_keepsTheLowerLimit() throws {
         let fixture = makeFixture()
         let leafID = UUID()
         registerLeaf(leafID, in: fixture.registry)
@@ -391,37 +391,103 @@ final class SplitContainerViewDockTests: XCTestCase {
         divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 900, y: 300))
 
         XCTAssertFalse(dock.isHidden)
-        XCTAssertEqual(dock.frame, CGRect(x: 800 - MCPAppDockLayout.minDockWidth, y: 0, width: MCPAppDockLayout.minDockWidth, height: 600))
+        XCTAssertEqual(dock.frame, CGRect(x: 720, y: 0, width: 80, height: 600), "0.1 * 800")
         XCTAssertNoThrow(try dockDivider(in: fixture, leafID: leafID), "the divider stays between the terminal and the dock")
 
         fixture.container.setFrameSize(NSSize(width: 1000, height: 600))
-        XCTAssertEqual(dock.frame.width, MCPAppDockLayout.minDockWidth, accuracy: 0.01, "the stored width is the dock minimum")
+        XCTAssertEqual(dock.frame.width, 100, accuracy: 0.01, "the stored 80pt is raised to 0.1 * 1000")
     }
 
-    func test_leafTooNarrowForBothMinimums_hidesTheDock_andTheDockReturnsWhenTheLeafGrows() throws {
+    // MARK: - Bounded like a split pane (K67)
+
+    func test_dockStaysVisible_afterASplitNarrowsTheLeafTo400pt() throws {
         let fixture = makeFixture()
-        let leafID = UUID()
-        registerLeaf(leafID, in: fixture.registry)
-        fixture.container.updateLayout(tree: singleLeafTree(leafID))
+        let leafA = UUID()
+        let leafB = UUID()
+        registerLeaf(leafA, in: fixture.registry)
+        registerLeaf(leafB, in: fixture.registry)
+        fixture.container.updateLayout(tree: singleLeafTree(leafA))
         let dock = NSView()
-        fixture.container.attachDock(dock, toLeaf: leafID)
-        try dockDivider(in: fixture, leafID: leafID)._testSimulateDrag(toSuperviewPoint: NSPoint(x: 500, y: 300))
-        XCTAssertEqual(dock.frame.width, 300, accuracy: 0.01, "precondition: a dragged width")
+        fixture.container.attachDock(dock, toLeaf: leafA)
 
-        // 120 terminal + 1 divider + 120 dock = 241 > 200.
-        fixture.container.setFrameSize(NSSize(width: 200, height: 600))
-
-        XCTAssertTrue(dock.isHidden, "the dock is not shown")
-        let wrapper = try XCTUnwrap(wrapper(for: leafID, in: fixture))
-        XCTAssertEqual(wrapper.frame, CGRect(x: 0, y: 0, width: 200, height: 600), "the terminal takes the whole leaf")
-        XCTAssertTrue(fixture.container.subviews.compactMap { $0 as? SplitDividerView }.isEmpty, "no dock divider")
-        XCTAssertEqual(fixture.container.dockView(forLeaf: leafID), dock, "the dock is kept")
-
-        fixture.container.setFrameSize(NSSize(width: 800, height: 600))
+        // pane_split direction right: leaf A becomes the left 399.5pt.
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: nil))
 
         XCTAssertFalse(dock.isHidden)
+        XCTAssertEqual(dock.frame.width, 399.5 * 0.4, accuracy: 0.01)
+        XCTAssertEqual(dock.frame.maxX, 399.5, accuracy: 0.01)
+        XCTAssertNoThrow(try dockDivider(in: fixture, leafID: leafA), "the divider stays")
+    }
+
+    func test_dockStaysVisible_afterASplitNarrowsTheLeafTo200pt() throws {
+        let fixture = makeFixture()
+        let leafA = UUID()
+        let leafB = UUID()
+        registerLeaf(leafA, in: fixture.registry)
+        registerLeaf(leafB, in: fixture.registry)
+        fixture.container.updateLayout(tree: singleLeafTree(leafA))
+        let dock = NSView()
+        fixture.container.attachDock(dock, toLeaf: leafA)
+        try dockDivider(in: fixture, leafID: leafA)._testSimulateDrag(toSuperviewPoint: NSPoint(x: 500, y: 300))
+        XCTAssertEqual(dock.frame.width, 300, accuracy: 0.01, "precondition: a dragged width")
+
+        // A 400pt container split in two: leaf A is the left 199.5pt.
+        fixture.container.setFrameSize(NSSize(width: 400, height: 600))
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: nil))
+
+        XCTAssertFalse(dock.isHidden)
+        let wrapper = try XCTUnwrap(wrapper(for: leafA, in: fixture))
+        XCTAssertEqual(dock.frame.width, 199.5 - 1 - 50, accuracy: 0.01, "the dragged 300pt is capped so the terminal keeps 50pt")
+        XCTAssertEqual(wrapper.frame.width, 50, accuracy: 0.01)
+        XCTAssertEqual(dock.frame.maxX, 199.5, accuracy: 0.01)
+        XCTAssertNoThrow(try dockDivider(in: fixture, leafID: leafA), "the divider stays")
+
+        fixture.container.setFrameSize(NSSize(width: 800, height: 600))
+        fixture.container.updateLayout(tree: singleLeafTree(leafA))
         XCTAssertEqual(dock.frame, CGRect(x: 500, y: 0, width: 300, height: 600), "the dragged width returns")
-        XCTAssertNoThrow(try dockDivider(in: fixture, leafID: leafID))
+    }
+
+    func test_dragLimitsInASplitLeaf_areTheSplitPaneLimits() throws {
+        let fixture = makeFixture()
+        let leafA = UUID()
+        let leafB = UUID()
+        registerLeaf(leafA, in: fixture.registry)
+        registerLeaf(leafB, in: fixture.registry)
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: nil))
+        let dock = NSView()
+        fixture.container.attachDock(dock, toLeaf: leafA)
+        let divider = try dockDivider(in: fixture, leafID: leafA)
+        let wrapper = try XCTUnwrap(wrapper(for: leafA, in: fixture))
+
+        // Leaf A is 399.5pt: each side keeps max(50, 39.95) = 50pt.
+        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 0, y: 300))
+        XCTAssertEqual(wrapper.frame.width, 50, accuracy: 0.01)
+        XCTAssertEqual(dock.frame.width, 399.5 - 1 - 50, accuracy: 0.01)
+
+        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 600, y: 300))
+        XCTAssertEqual(dock.frame.width, 50, accuracy: 0.01)
+        XCTAssertEqual(dock.frame.maxX, 399.5, accuracy: 0.01)
+        XCTAssertFalse(dock.isHidden)
+    }
+
+    func test_unzoomingAnotherLeaf_restoresTheDockInTheSplitLeaf() throws {
+        let fixture = makeFixture()
+        let leafA = UUID()
+        let leafB = UUID()
+        registerLeaf(leafA, in: fixture.registry)
+        registerLeaf(leafB, in: fixture.registry)
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: nil))
+        let dock = NSView()
+        fixture.container.attachDock(dock, toLeaf: leafA)
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: leafB))
+        XCTAssertTrue(dock.isHidden, "precondition: hidden while leaf B is zoomed")
+
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: nil))
+
+        XCTAssertFalse(dock.isHidden)
+        XCTAssertEqual(dock.frame.width, 399.5 * 0.4, accuracy: 0.01)
+        XCTAssertEqual(dock.frame.maxX, 399.5, accuracy: 0.01)
+        XCTAssertNoThrow(try dockDivider(in: fixture, leafID: leafA), "the divider stays")
     }
 
     func test_draggedWidth_persistsAcrossATabSwitch() throws {

@@ -3,12 +3,13 @@
 //  CalyxTests
 //
 //  MCPAppDockLayout is the pure geometry behind inline placement
-//  (contract v2 §11.10, K55, K61): the dock sits to the right of the
-//  terminal, separated by a 1pt divider. Its default width is 40% of the
-//  leaf width; a requested width is clamped to [minDockWidth (120pt),
-//  what leaves the terminal max(120pt, 40 columns)]. A leaf too narrow
-//  for both minimums gets no split (the dock is hidden). `mode` is a
-//  String, not an enum (§11.10 signature).
+//  (contract v2 §11.10, K55, K67): the dock sits to the right of the
+//  terminal, separated by a 1pt divider, and is bounded like a split pane.
+//  Its default width is 40% of the leaf width. For a leaf width W, each
+//  side keeps at least m = max(50pt, 0.1 * W) when W >= 2 * 50 + 1, and
+//  m = 0.1 * W below that; a requested dock width is clamped to
+//  [m, W - 1 - m]. Every leaf width gets a split (the dock is never
+//  hidden). `mode` is a String, not an enum (§11.10 signature).
 //
 //  containerDimensions per mode (§11.10, K60). contentTopInset is the
 //  card's height above its content area (the header, and the prompt while
@@ -31,18 +32,18 @@ final class MCPAppDockLayoutTests: XCTestCase {
 
     // MARK: - Side by side
 
-    func test_split_placesTheTerminalLeft_theDividerBetween_andTheDockRight() throws {
+    func test_split_placesTheTerminalLeft_theDividerBetween_andTheDockRight() {
         let leaf = CGRect(x: 10, y: 20, width: 800, height: 600)
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 320, cellWidth: 8))
+        let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 320)
 
         XCTAssertEqual(result.terminalRect, CGRect(x: 10, y: 20, width: 479, height: 600))
         XCTAssertEqual(result.dividerRect, CGRect(x: 489, y: 20, width: 1, height: 600))
         XCTAssertEqual(result.dockRect, CGRect(x: 490, y: 20, width: 320, height: 600))
     }
 
-    func test_split_terminalDividerAndDock_partitionTheLeafWidthExactly() throws {
+    func test_split_terminalDividerAndDock_partitionTheLeafWidthExactly() {
         let leaf = CGRect(x: 0, y: 0, width: 640, height: 300)
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 200, cellWidth: 7))
+        let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 200)
 
         XCTAssertEqual(result.terminalRect.width + result.dividerRect.width + result.dockRect.width, leaf.width, accuracy: 0.01)
         XCTAssertEqual(result.terminalRect.maxX, result.dividerRect.minX)
@@ -54,9 +55,9 @@ final class MCPAppDockLayoutTests: XCTestCase {
         }
     }
 
-    func test_split_requestWithinTheCaps_isHonoredExactly() throws {
+    func test_split_requestWithinTheLimits_isHonoredExactly() {
         let leaf = CGRect(x: 0, y: 0, width: 800, height: 600)
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 250, cellWidth: 8))
+        let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 250)
 
         XCTAssertEqual(result.dockRect.width, 250, accuracy: 0.01)
     }
@@ -68,83 +69,124 @@ final class MCPAppDockLayoutTests: XCTestCase {
         XCTAssertEqual(MCPAppDockLayout.defaultDockWidth(leafWidth: 1000), 400, accuracy: 0.01)
     }
 
-    // MARK: - Caps
-
-    func test_wideRequest_isHonoredUpToTheTerminalMinimum() throws {
+    func test_defaultDockWidth_isWithinTheSplitLimits_andIsHonored() {
         let leaf = CGRect(x: 0, y: 0, width: 800, height: 600)
-        // 40 columns * 1pt = 40pt, so the 120pt minimum is the only cap.
-        let upToTheMinimum = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 679, cellWidth: 1))
-        XCTAssertEqual(upToTheMinimum.dockRect.width, 679, accuracy: 0.01, "800 - 1 divider - 120 terminal")
-        XCTAssertEqual(upToTheMinimum.terminalRect.width, 120, accuracy: 0.01)
+        let result = MCPAppDockLayout.split(
+            leafRect: leaf, dockWidth: MCPAppDockLayout.defaultDockWidth(leafWidth: leaf.width)
+        )
 
-        let beyondTheMinimum = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 790, cellWidth: 1))
-        XCTAssertEqual(beyondTheMinimum.dockRect.width, 679, accuracy: 0.01)
+        XCTAssertEqual(result.dockRect, CGRect(x: 480, y: 0, width: 320, height: 600))
+        XCTAssertEqual(result.terminalRect, CGRect(x: 0, y: 0, width: 479, height: 600))
     }
 
-    func test_terminal_keepsAtLeast40Columns_whenColumnsAreWiderThanThePointMinimum() throws {
+    // MARK: - Split limits (SplitData.clampRatio [0.1, 0.9] and minSize 50)
+
+    func test_wideRequest_stopsWhereTheTerminalKeepsTenPercent() {
         let leaf = CGRect(x: 0, y: 0, width: 800, height: 600)
-        // 40 columns * 12pt = 480pt, wider than the 120pt minimum.
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 700, cellWidth: 12))
+        // m = max(50, 0.1 * 800) = 80; the dock is at most 800 - 1 - 80.
+        let upToTheLimit = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 719)
+        XCTAssertEqual(upToTheLimit.dockRect.width, 719, accuracy: 0.01)
+        XCTAssertEqual(upToTheLimit.terminalRect.width, 80, accuracy: 0.01)
 
-        XCTAssertEqual(result.terminalRect.width, 480, accuracy: 0.01)
-        XCTAssertEqual(result.dockRect.width, 319, accuracy: 0.01, "800 - 480 terminal - 1 divider")
+        let beyondTheLimit = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 790)
+        XCTAssertEqual(beyondTheLimit.dockRect.width, 719, accuracy: 0.01)
+        XCTAssertEqual(beyondTheLimit.terminalRect.width, 80, accuracy: 0.01)
     }
 
-    func test_terminal_keepsAtLeast120pt_whenColumnsAreNarrowerThanThePointMinimum() throws {
-        let leaf = CGRect(x: 0, y: 0, width: 260, height: 600)
-        // 40 columns * 2pt = 80pt, narrower than the 120pt minimum.
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 200, cellWidth: 2))
-
-        XCTAssertEqual(result.terminalRect.width, 120, accuracy: 0.01)
-        XCTAssertEqual(result.dockRect.width, 139, accuracy: 0.01, "260 - 120 terminal - 1 divider")
-    }
-
-    // MARK: - Dock minimum
-
-    func test_minDockWidth_is120pt() {
-        XCTAssertEqual(MCPAppDockLayout.minDockWidth, 120)
-    }
-
-    func test_narrowRequest_isRaisedToTheDockMinimum() throws {
+    func test_narrowRequest_isRaisedToTenPercentOfTheLeaf() {
         let leaf = CGRect(x: 0, y: 0, width: 800, height: 600)
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 40, cellWidth: 8))
+        let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 40)
 
-        XCTAssertEqual(result.dockRect.width, MCPAppDockLayout.minDockWidth)
-        XCTAssertEqual(result.terminalRect.width, 800 - 1 - MCPAppDockLayout.minDockWidth)
+        XCTAssertEqual(result.dockRect.width, 80, accuracy: 0.01)
+        XCTAssertEqual(result.terminalRect.width, 719, accuracy: 0.01)
     }
 
-    func test_negativeRequest_givesTheDockMinimum() throws {
+    func test_bothSidesKeep50pt_whenTenPercentIsLess() {
+        let leaf = CGRect(x: 0, y: 0, width: 400, height: 600)
+        // m = max(50, 40) = 50.
+        let narrow = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 10)
+        XCTAssertEqual(narrow.dockRect.width, 50, accuracy: 0.01)
+        XCTAssertEqual(narrow.terminalRect.width, 349, accuracy: 0.01)
+
+        let wide = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 390)
+        XCTAssertEqual(wide.dockRect.width, 349, accuracy: 0.01)
+        XCTAssertEqual(wide.terminalRect.width, 50, accuracy: 0.01)
+    }
+
+    func test_negativeRequest_givesTheLowerLimit() {
         let leaf = CGRect(x: 0, y: 0, width: 800, height: 600)
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: -50, cellWidth: 8))
+        let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: -50)
 
-        XCTAssertEqual(result.dockRect.width, MCPAppDockLayout.minDockWidth)
-        XCTAssertEqual(result.terminalRect.width, 679)
+        XCTAssertEqual(result.dockRect.width, 80, accuracy: 0.01)
+        XCTAssertEqual(result.terminalRect.width, 719, accuracy: 0.01)
     }
 
-    func test_split_isNil_whenTheLeafCannotHoldBothMinimums() {
-        // 120 terminal + 1 divider + 120 dock = 241.
-        let tooNarrow = CGRect(x: 0, y: 0, width: 240, height: 600)
-        XCTAssertNil(MCPAppDockLayout.split(leafRect: tooNarrow, dockWidth: 100, cellWidth: 2))
-        XCTAssertNil(MCPAppDockLayout.split(leafRect: CGRect(x: 0, y: 0, width: 100, height: 600), dockWidth: 40, cellWidth: 8))
-        // 40 columns * 12pt = 480pt terminal minimum.
-        XCTAssertNil(MCPAppDockLayout.split(leafRect: CGRect(x: 0, y: 0, width: 600, height: 600), dockWidth: 200, cellWidth: 12))
-    }
-
-    func test_split_showsTheDock_whenTheLeafHoldsExactlyBothMinimums() throws {
-        let leaf = CGRect(x: 0, y: 0, width: 241, height: 600)
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 500, cellWidth: 2))
-
-        XCTAssertEqual(result.terminalRect.width, 120)
-        XCTAssertEqual(result.dockRect.width, 120)
-    }
-
-    func test_dockWidthRequestPastTheLeafsRightEdge_isHeldAtTheDockMinimum() throws {
+    func test_dockWidthRequestPastTheLeafsRightEdge_isHeldAtTheLowerLimit() {
         let leaf = CGRect(x: 0, y: 0, width: 800, height: 600)
         let requested = MCPAppDockLayout.dockWidth(forDividerRatio: 1.2, leafWidth: leaf.width)
-        let result = try XCTUnwrap(MCPAppDockLayout.split(leafRect: leaf, dockWidth: requested, cellWidth: 8))
+        let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: requested)
 
-        XCTAssertEqual(result.dockRect.width, MCPAppDockLayout.minDockWidth)
+        XCTAssertEqual(result.dockRect.width, 80, accuracy: 0.01)
         XCTAssertEqual(result.dockRect.maxX, leaf.maxX)
+    }
+
+    func test_clampedDockWidth_matchesTheSplit() {
+        XCTAssertEqual(MCPAppDockLayout.clampedDockWidth(900, leafWidth: 800), 719, accuracy: 0.01)
+        XCTAssertEqual(MCPAppDockLayout.clampedDockWidth(-10, leafWidth: 800), 80, accuracy: 0.01)
+        XCTAssertEqual(MCPAppDockLayout.clampedDockWidth(300, leafWidth: 800), 300, accuracy: 0.01)
+        XCTAssertEqual(MCPAppDockLayout.clampedDockWidth(300, leafWidth: 200), 149, accuracy: 0.01)
+    }
+
+    // MARK: - Narrow leaves keep the dock
+
+    func test_200ptLeaf_stillShowsADock() {
+        let leaf = CGRect(x: 0, y: 0, width: 200, height: 600)
+        let result = MCPAppDockLayout.split(
+            leafRect: leaf, dockWidth: MCPAppDockLayout.defaultDockWidth(leafWidth: leaf.width)
+        )
+
+        XCTAssertEqual(result.dockRect, CGRect(x: 120, y: 0, width: 80, height: 600))
+        XCTAssertEqual(result.dividerRect, CGRect(x: 119, y: 0, width: 1, height: 600))
+        XCTAssertEqual(result.terminalRect, CGRect(x: 0, y: 0, width: 119, height: 600))
+        // m = 50: the dock is limited to [50, 149].
+        XCTAssertEqual(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 300).dockRect.width, 149, accuracy: 0.01)
+        XCTAssertEqual(MCPAppDockLayout.split(leafRect: leaf, dockWidth: 10).dockRect.width, 50, accuracy: 0.01)
+    }
+
+    func test_101ptLeaf_isTheNarrowestWithThe50ptFloor() {
+        let leaf = CGRect(x: 0, y: 0, width: 101, height: 600)
+        let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 10)
+
+        XCTAssertEqual(result.dockRect.width, 50, accuracy: 0.01)
+        XCTAssertEqual(result.terminalRect.width, 50, accuracy: 0.01)
+    }
+
+    func test_60ptLeaf_splitsProportionally_withoutThe50ptFloor() {
+        let leaf = CGRect(x: 0, y: 0, width: 60, height: 600)
+        // Narrower than 2 * 50 + 1: m = 0.1 * 60 = 6, the dock is limited to [6, 53].
+        let byDefault = MCPAppDockLayout.split(
+            leafRect: leaf, dockWidth: MCPAppDockLayout.defaultDockWidth(leafWidth: leaf.width)
+        )
+        XCTAssertEqual(byDefault.dockRect.width, 24, accuracy: 0.01)
+        XCTAssertEqual(byDefault.terminalRect.width, 35, accuracy: 0.01)
+        XCTAssertEqual(byDefault.dividerRect.width, 1)
+
+        let wide = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 60)
+        XCTAssertEqual(wide.dockRect.width, 53, accuracy: 0.01)
+        XCTAssertEqual(wide.terminalRect.width, 6, accuracy: 0.01)
+
+        let narrow = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 0)
+        XCTAssertEqual(narrow.dockRect.width, 6, accuracy: 0.01)
+        XCTAssertEqual(narrow.terminalRect.width, 53, accuracy: 0.01)
+    }
+
+    func test_splitPartsNeverHaveANegativeWidth_inALeafNarrowerThanTheDivider() {
+        let leaf = CGRect(x: 0, y: 0, width: 1, height: 600)
+        let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 5)
+
+        for rect in [result.terminalRect, result.dividerRect, result.dockRect] {
+            XCTAssertGreaterThanOrEqual(rect.width, 0)
+        }
     }
 
     // MARK: - Divider drag

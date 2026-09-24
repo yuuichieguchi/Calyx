@@ -14,15 +14,18 @@ import Foundation
 enum MCPAppDockLayout {
     /// A dock nobody has dragged is this share of its leaf's width.
     static let defaultDockShare: CGFloat = 0.4
-    /// The terminal keeps at least this many points, or `minTerminalColumns` columns if that is wider.
-    static let minTerminalWidth: CGFloat = 120
-    static let minTerminalColumns: CGFloat = 40
     /// The visible width of the divider between the terminal and the dock
     /// (the split divider's width).
     static let dividerThickness: CGFloat = 1
     static let defaultBorderWidth: CGFloat = 1
-    /// A shown dock is at least this wide.
-    static let minDockWidth: CGFloat = 120
+    /// Each side keeps at least this many points when the leaf has room
+    /// for it on both sides of the divider. The same value as the
+    /// `minSize: 50` that `CalyxWindowController` passes to the split
+    /// tree's ratio setters.
+    static let minSideWidth: CGFloat = 50
+    /// Each side keeps at least this share of the leaf's width. The lower
+    /// bound of `SplitData.clampRatio` ([0.1, 0.9]).
+    static let minSideShare: CGFloat = 0.1
 
     struct SplitResult: Sendable, Equatable {
         let terminalRect: CGRect
@@ -35,40 +38,37 @@ enum MCPAppDockLayout {
         leafWidth * defaultDockShare
     }
 
-    /// The dock widths a leaf can show: from `minDockWidth` to what leaves
-    /// the terminal max(120pt, 40 columns). Nil when the leaf is too
-    /// narrow for both minimums and the divider.
-    static func dockWidthRange(leafWidth: CGFloat, cellWidth: CGFloat) -> ClosedRange<CGFloat>? {
-        let terminalMinimum = max(minTerminalWidth, minTerminalColumns * cellWidth)
-        let maxDock = leafWidth - dividerThickness - terminalMinimum
-        guard maxDock >= minDockWidth else { return nil }
-        return minDockWidth...maxDock
-    }
-
-    /// `dockWidth` clamped to `range`.
-    static func clamp(_ dockWidth: CGFloat, to range: ClosedRange<CGFloat>) -> CGFloat {
-        min(max(dockWidth, range.lowerBound), range.upperBound)
+    /// `dockWidth` clamped the way a split pane's divider is clamped. Each
+    /// side of the divider keeps at least max(`minSideWidth`,
+    /// `minSideShare` * leaf width) when the leaf is at least
+    /// 2 * `minSideWidth` + `dividerThickness` wide, and
+    /// `minSideShare` * leaf width when it is narrower. When the width left
+    /// after the divider cannot hold both side minimums (a leaf narrower
+    /// than 1.25 pt), the dock gets the side minimum capped to that width
+    /// and the terminal the rest, so no part has a negative width.
+    static func clampedDockWidth(_ dockWidth: CGFloat, leafWidth: CGFloat) -> CGFloat {
+        let sides = max(0, leafWidth - dividerThickness)
+        let proportional = minSideShare * leafWidth
+        let sideMinimum = leafWidth >= 2 * minSideWidth + dividerThickness
+            ? max(minSideWidth, proportional)
+            : proportional
+        let lower = min(sideMinimum, sides)
+        let upper = max(lower, sides - sideMinimum)
+        return min(max(dockWidth, lower), upper)
     }
 
     /// Terminal on the left, divider, dock on the right, each the leaf's
-    /// full height. The dock gets `dockWidth` clamped to the leaf's
-    /// `dockWidthRange`. Nil when the leaf is too narrow for a dock: the
-    /// dock is hidden and the terminal takes the whole leaf.
-    static func split(leafRect: CGRect, dockWidth: CGFloat, cellWidth: CGFloat) -> SplitResult? {
-        guard let range = dockWidthRange(leafWidth: leafRect.width, cellWidth: cellWidth) else { return nil }
-        return split(leafRect: leafRect, dockWidth: dockWidth, in: range)
-    }
-
-    /// The split for a leaf whose `dockWidthRange` is `range`: the dock
-    /// gets `dockWidth` clamped to `range`.
-    static func split(leafRect: CGRect, dockWidth: CGFloat, in range: ClosedRange<CGFloat>) -> SplitResult {
-        let dock = clamp(dockWidth, to: range)
-        let terminal = leafRect.width - dividerThickness - dock
+    /// full height. The dock gets `clampedDockWidth(dockWidth, leafWidth:)`
+    /// and the terminal the rest after the divider. Every leaf width gets
+    /// a split.
+    static func split(leafRect: CGRect, dockWidth: CGFloat) -> SplitResult {
+        let dock = clampedDockWidth(dockWidth, leafWidth: leafRect.width)
+        let terminal = max(0, leafRect.width - dividerThickness) - dock
         let dividerX = leafRect.minX + terminal
         return SplitResult(
             terminalRect: CGRect(x: leafRect.minX, y: leafRect.minY, width: terminal, height: leafRect.height),
             dividerRect: CGRect(x: dividerX, y: leafRect.minY, width: dividerThickness, height: leafRect.height),
-            dockRect: CGRect(x: leafRect.maxX - dock, y: leafRect.minY, width: dock, height: leafRect.height)
+            dockRect: CGRect(x: dividerX + dividerThickness, y: leafRect.minY, width: dock, height: leafRect.height)
         )
     }
 
@@ -76,7 +76,7 @@ enum MCPAppDockLayout {
     /// under the cursor. `ratio` is the cursor's position across the leaf,
     /// as `SplitDividerView` reports it, and is not limited to 0...1 (a
     /// cursor past the leaf's right edge gives a negative width), so the
-    /// result goes through `clamp(_:to:)`.
+    /// result goes through `clampedDockWidth(_:leafWidth:)`.
     static func dockWidth(forDividerRatio ratio: Double, leafWidth: CGFloat) -> CGFloat {
         leafWidth * (1 - CGFloat(ratio))
     }
