@@ -259,13 +259,7 @@ struct MCPCalyxMCPRouter: Sendable {
         case "prompts/list":
             return .buffered(modernResult(id: id, cacheable: true, ["prompts": AnyCodable([AnyCodable]())]))
         case "resources/read":
-            return .buffered(await readResource(id: id, params: params) { result in
-                var decorated = result
-                for (key, value) in Self.cacheableFields where decorated[key] == nil {
-                    decorated[key] = value
-                }
-                return Self.addingServerInfo(to: decorated)
-            })
+            return .buffered(await readResource(id: id, params: params) { Self.modernDecorated($0, cacheable: true) })
         case "subscriptions/listen":
             let filter = params["notifications"]?.objectValue ?? [:]
             let ack = MCPCalyxMCPWire.sseFrame(MCPCalyxMCPWire.notificationMessage(
@@ -285,7 +279,7 @@ struct MCPCalyxMCPRouter: Sendable {
                 id: id, params: params, meta: meta, paneContext: paneContext,
                 clientName: clientName, clientDeclaredUI: clientDeclaredUI,
                 sessionNonce: nil, isLegacy: false, allowStream: true, modelContextProvider: modelContextProvider,
-                decorate: { Self.addingServerInfo(to: $0) }
+                decorate: { Self.modernDecorated($0, cacheable: false) }
             )
         default:
             return .buffered(MCPCalyxMCPWire.jsonResponse(
@@ -322,8 +316,14 @@ struct MCPCalyxMCPRouter: Sendable {
         return nil
     }
 
-    private static let cacheableFields: [String: AnyCodable] = [
+    /// Carried by every modern result (schema 2026-07-28 lists
+    /// `resultType` in `Result.required`).
+    private static let completeFields: [String: AnyCodable] = [
         "resultType": AnyCodable("complete"),
+    ]
+
+    /// Carried additionally by cacheable (list/discover/read) results.
+    private static let cachingHints: [String: AnyCodable] = [
         "ttlMs": AnyCodable(0),
         "cacheScope": AnyCodable("private"),
     ]
@@ -343,14 +343,22 @@ struct MCPCalyxMCPRouter: Sendable {
         return decorated
     }
 
-    private func modernResult(id: JSONRPCId, cacheable: Bool, _ result: [String: AnyCodable]) -> HTTPResponse {
+    /// The single modern-generation decoration every successful result
+    /// passes through: `resultType`, the caching hints when `cacheable`,
+    /// and serverInfo. Fields the result already carries are kept.
+    private static func modernDecorated(_ result: [String: AnyCodable], cacheable: Bool) -> [String: AnyCodable] {
         var decorated = result
+        decorated.merge(completeFields) { current, _ in current }
         if cacheable {
-            decorated.merge(Self.cacheableFields) { current, _ in current }
+            decorated.merge(cachingHints) { current, _ in current }
         }
-        return MCPCalyxMCPWire.jsonResponse(
+        return addingServerInfo(to: decorated)
+    }
+
+    private func modernResult(id: JSONRPCId, cacheable: Bool, _ result: [String: AnyCodable]) -> HTTPResponse {
+        MCPCalyxMCPWire.jsonResponse(
             statusCode: 200,
-            message: MCPCalyxMCPWire.resultMessage(id: id, result: Self.addingServerInfo(to: decorated))
+            message: MCPCalyxMCPWire.resultMessage(id: id, result: Self.modernDecorated(result, cacheable: cacheable))
         )
     }
 

@@ -436,6 +436,76 @@ final class MCPCalyxMCPRouterTests: XCTestCase {
         }
     }
 
+    // MARK: - resultType on tools/call results (contract 10.6; schema 2026-07-28 `CallToolResult.required`)
+
+    /// The `result` object of the JSON-RPC response frame among `text`'s
+    /// SSE `data:` lines.
+    private static func sseResult(_ text: String) throws -> [String: Any] {
+        for line in text.split(separator: "\n") where line.hasPrefix("data: ") {
+            let json = try JSONSerialization.jsonObject(with: Data(line.dropFirst("data: ".count).utf8)) as? [String: Any]
+            if let result = json?["result"] as? [String: Any] { return result }
+        }
+        return try XCTUnwrap(nil as [String: Any]?, "no SSE data frame carried a result: \(text)")
+    }
+
+    private func bufferedResult(_ routed: RoutedResponse) throws -> [String: Any] {
+        let resp = try buffered(routed)
+        let json = try JSONSerialization.jsonObject(with: try XCTUnwrap(resp.body)) as? [String: Any]
+        return try XCTUnwrap(json?["result"] as? [String: Any])
+    }
+
+    private func proxiedWeatherRouter(progress: MCPProgressUpdate? = nil) async throws -> MCPCalyxMCPRouter {
+        let serverID = MCPServerID(rawValue: UUID())
+        let connection = FakeUpstreamConnection(serverID: serverID, initialState: readyState(), initialTools: [try tool("get_weather")])
+        if let progress { await connection.enqueueProgress(progress) }
+        await connection.enqueueToolCallOutcome(.result(MCPCallToolResult(raw: ["content": AnyCodable([]), "isError": AnyCodable(false)])))
+        let catalog = FakeCatalogProviding(resolvedTools: [
+            "srv-get_weather": resolvedTool(exportedName: "srv-get_weather", serverID: serverID, upstreamToolName: "get_weather", definition: try tool("get_weather")),
+        ])
+        return MCPCalyxMCPRouterTestSupport.makeMinimalRouter(
+            catalog: catalog, connections: FakeConnectionLookup([serverID: connection]), bearerToken: { [testToken] in testToken }
+        )
+    }
+
+    func test_modernToolsCall_bufferedResult_isComplete() async throws {
+        let router = try await proxiedWeatherRouter()
+        let routed = await router.routeCalyxMCP(
+            request: modernRequest(method: "tools/call", name: "srv-get_weather", params: ["arguments": [:] as [String: Any]]),
+            paneContext: MCPPaneResolutionContext(surfaceID: nil, clientName: nil, herdrPaneRef: nil)
+        )
+        let result = try bufferedResult(routed)
+        XCTAssertEqual(result["resultType"] as? String, "complete",
+                       "a modern client rejects a tools/call result without resultType")
+        XCTAssertEqual(result["isError"] as? Bool, false)
+    }
+
+    func test_modernToolsCall_streamedFinalResult_isComplete() async throws {
+        let router = try await proxiedWeatherRouter(progress: MCPProgressUpdate(progress: 1, total: 2, message: "halfway"))
+        let routed = await router.routeCalyxMCP(
+            request: modernRequest(
+                method: "tools/call", name: "srv-get_weather", params: ["arguments": [:] as [String: Any]], progressToken: "progress-1"
+            ),
+            paneContext: MCPPaneResolutionContext(surfaceID: nil, clientName: nil, herdrPaneRef: nil)
+        )
+        guard case .stream(_, let body) = routed else {
+            return XCTFail("a tools/call whose upstream delivers progress must be answered as an SSE stream, got \(routed)")
+        }
+        let result = try Self.sseResult(await Self.drain(body))
+        XCTAssertEqual(result["resultType"] as? String, "complete",
+                       "the SSE final response frame is a tools/call result too and needs resultType")
+    }
+
+    func test_legacyToolsCall_result_hasNoResultType() async throws {
+        let router = try await proxiedWeatherRouter()
+        let routed = await router.routeCalyxMCP(
+            request: legacyRequest(method: "tools/call", params: ["name": "srv-get_weather", "arguments": [:] as [String: Any]]),
+            paneContext: MCPPaneResolutionContext(surfaceID: nil, clientName: nil, herdrPaneRef: nil)
+        )
+        let result = try bufferedResult(routed)
+        XCTAssertNil(result["resultType"], "resultType is a 2026-07-28 field; the legacy generation's result stays as before")
+        XCTAssertEqual(result["isError"] as? Bool, false)
+    }
+
     // MARK: - Rule 13: modern tools/call cancellation when the request stream's consumer stops
 
     func test_modernToolsCall_consumerStopsConsuming_cancelsTheRouteTask() async throws {

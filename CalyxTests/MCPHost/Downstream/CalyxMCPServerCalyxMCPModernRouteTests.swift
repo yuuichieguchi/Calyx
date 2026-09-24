@@ -323,4 +323,28 @@ final class CalyxMCPServerCalyxMCPModernRouteTests: XCTestCase {
         let supported = try XCTUnwrap(result["supportedVersions"] as? [String])
         XCTAssertEqual(supported, supportedVersions)
     }
+
+    // MARK: - resultType on every result (contract 10.6; schema 2026-07-28 `Result.required`)
+
+    func test_toolsCall_appContext_result_isComplete() async throws {
+        let req = modernRequest(method: "tools/call", name: "app_context", params: ["arguments": [:] as [String: Any]])
+        let resp = await server.route(request: req)
+        XCTAssertEqual(resp.statusCode, 200)
+        let result = try result(resp)
+
+        XCTAssertEqual(result["resultType"] as? String, "complete",
+                       "schema 2026-07-28 lists resultType in CallToolResult.required; a modern client rejects its absence")
+        let meta = try XCTUnwrap(result["_meta"] as? [String: Any])
+        XCTAssertNotNil(meta["io.modelcontextprotocol/serverInfo"])
+    }
+
+    func test_ping_result_isComplete() async throws {
+        let req = modernRequest(method: "ping")
+        let resp = await server.route(request: req)
+        XCTAssertEqual(resp.statusCode, 200)
+        let result = try result(resp)
+
+        XCTAssertEqual(result["resultType"] as? String, "complete",
+                       "schema 2026-07-28 lists resultType in Result.required, so even ping's empty result carries it")
+    }
 }
