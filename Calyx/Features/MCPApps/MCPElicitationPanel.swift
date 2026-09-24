@@ -173,12 +173,32 @@ final class MCPElicitationField: Identifiable {
             kind = .unsupported(type: type ?? "untyped")
         }
         // The schema's `default`, when it has one, prefills the field.
-        text = defaultValue?.stringValue
-            ?? defaultValue?.intValue.map { String($0) }
-            ?? defaultValue?.doubleValue.map { String($0) }
-            ?? ""
-        isOn = defaultValue?.boolValue == true
-        choice = defaultValue?.stringValue
+        let prefill = Self.prefill(from: defaultValue)
+        text = prefill.text
+        isOn = prefill.isOn
+        choice = prefill.choice
+    }
+
+    /// Converts a schema `default` into the initial `text`, `isOn`, and
+    /// `choice`, resolving the default in a single pass of `if let` checks
+    /// instead of a chain of `??` operators.
+    private static func prefill(
+        from defaultValue: AnyCodable?
+    ) -> (text: String, isOn: Bool, choice: String?) {
+        guard let defaultValue else { return ("", false, nil) }
+        if let string = defaultValue.stringValue {
+            return (string, false, string)
+        }
+        if let int = defaultValue.intValue {
+            return (String(int), false, nil)
+        }
+        if let double = defaultValue.doubleValue {
+            return (String(double), false, nil)
+        }
+        if let bool = defaultValue.boolValue {
+            return ("", bool, nil)
+        }
+        return ("", false, nil)
     }
 
     /// The field's JSON value; nil when empty or not parseable.
