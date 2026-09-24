@@ -6,7 +6,8 @@
 //  detached through the container it was attached to, fullscreen follows
 //  the view to a remapped leaf, closing the picture-in-picture window
 //  returns the view inline, a host request to a mounted view fails when
-//  its WebContent process ends or its caller is cancelled, and a mount
+//  its WebContent process ends or its caller is cancelled, a pending
+//  `ui/message` fails with -32000 when the pane's agent ends, and a mount
 //  that finishes after the store dropped the view builds no web view.
 //
 
@@ -18,7 +19,8 @@ import XCTest
 @MainActor
 private final class FakeRuntimeEnvironment: MCPAppRuntimeEnvironment {
     var containers: [UUID: SplitContainerView] = [:]
-    let cockpitInputDelivery: any MCPAppInputDelivering = UnusedInputDelivery()
+    let recordingDelivery = RecordingInputDelivery()
+    var cockpitInputDelivery: any MCPAppInputDelivering { recordingDelivery }
 
     func splitContainer(owningSurface surfaceID: UUID) -> SplitContainerView? { containers[surfaceID] }
     func herdrPaneRef(forSurface surfaceID: UUID) -> HerdrPaneRef? { nil }
@@ -26,9 +28,13 @@ private final class FakeRuntimeEnvironment: MCPAppRuntimeEnvironment {
     func themeInputs() -> MCPAppThemeInputs { MCPAppThemeInputsReader.defaultInputs }
 }
 
+/// Records every message delivered to a pane.
 @MainActor
-private final class UnusedInputDelivery: MCPAppInputDelivering {
-    func deliverUserMessage(_ text: String, to surfaceID: UUID) async throws {}
+private final class RecordingInputDelivery: MCPAppInputDelivering {
+    private(set) var deliveredTexts: [String] = []
+    func deliverUserMessage(_ text: String, to surfaceID: UUID) async throws {
+        deliveredTexts.append(text)
+    }
 }
 
 @MainActor
@@ -245,6 +251,34 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         try await waitUntil(timeout: 1, "the cancelled call returns") { box.value != nil }
         XCTAssertEqual(box.value?.raw["isError"]?.boolValue, true)
         await harness.store.close(viewID: viewID)
+    }
+
+    // MARK: - K52: the calling agent's exit ends a pending ui/message
+
+    func test_conversationEnded_failsAPendingMessagePromptWithMinus32000_andDeliversNothing() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
+        let box = Box<Result<AnyCodable, JSONRPCError>>()
+        Task { @MainActor in
+            box.value = await harness.runtime.bridge(bridge, didReceiveRequest: "ui/message", params: [
+                "role": AnyCodable("user"),
+                "content": AnyCodable([AnyCodable(["type": AnyCodable("text"), "text": AnyCodable("hello")])]),
+            ])
+        }
+        try await waitUntil("the consent prompt is pending") { harness.runtime.consentGate.isPending(viewID: viewID) }
+
+        NotificationCenter.default.post(name: .calyxAgentConversationEnded, object: nil, userInfo: ["surfaceID": surfaceID])
+
+        try await waitUntil("the message request ends") { box.value != nil }
+        guard case .failure(let error)? = box.value else {
+            return XCTFail("expected the message request to fail, got \(String(describing: box.value))")
+        }
+        XCTAssertEqual(error.code, -32000)
+        XCTAssertEqual(error.message, "Message sending denied")
+        XCTAssertTrue(harness.environment.recordingDelivery.deliveredTexts.isEmpty, "nothing reaches the pane")
+        try await waitUntil("the view is removed") { harness.store.snapshot(viewID: viewID) == nil }
     }
 
     // MARK: - Finding 1: a mount the store no longer wants builds nothing

@@ -113,7 +113,7 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
     private var order: [UUID] = []
     private var disconnectedServers: Set<MCPServerID> = []
     private var nextRequestNumber = 0
-    private var surfaceObserver: SurfaceDestroyedObserver?
+    private var paneObserver: PaneNotificationObserver?
     /// The running load of each view's resource started by
     /// `uiToolInvocationDidStart`.
     private var resourceLoads: [UUID: Task<Void, Never>] = [:]
@@ -122,13 +122,17 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         self.paneResolver = paneResolver
         self.runtime = runtime
         self.appToolRegistry = appToolRegistry
-        let observer = SurfaceDestroyedObserver()
+        let observer = PaneNotificationObserver()
         observer.store = self
         NotificationCenter.default.addObserver(
-            observer, selector: #selector(SurfaceDestroyedObserver.handleSurfaceDestroyed(_:)),
+            observer, selector: #selector(PaneNotificationObserver.handleSurfaceDestroyed(_:)),
             name: .calyxSurfaceDestroyed, object: nil
         )
-        surfaceObserver = observer
+        NotificationCenter.default.addObserver(
+            observer, selector: #selector(PaneNotificationObserver.handleAgentConversationEnded(_:)),
+            name: .calyxAgentConversationEnded, object: nil
+        )
+        paneObserver = observer
     }
 
     // MARK: - MCPAppViewHosting
@@ -420,6 +424,24 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         }
     }
 
+    // MARK: - .calyxAgentConversationEnded
+
+    /// A view belongs to the conversation that called it, which is the
+    /// agent process of its pane. When that agent ends, each of the pane's
+    /// views goes through `remove(viewID:)` in creation order: a mounted
+    /// view gets `ui/resource-teardown` and is unmounted, then leaves the
+    /// table. The pane itself still exists. `Task.immediate` starts the
+    /// first removal before the notification post returns.
+    fileprivate func conversationEnded(_ surfaceID: UUID) {
+        let viewIDs = order.filter { records[$0]?.surfaceID == surfaceID }
+        guard !viewIDs.isEmpty else { return }
+        Task.immediate { @MainActor [weak self] in
+            for viewID in viewIDs {
+                await self?.remove(viewID: viewID)
+            }
+        }
+    }
+
     // MARK: - Private
 
     private func loadResource(viewID: UUID) async {
@@ -682,14 +704,20 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
     }
 }
 
-/// Receives `.calyxSurfaceDestroyed` on the posting thread, the way
-/// `SurfacePropertyStore` does, and forwards it to the store.
+/// Receives `.calyxSurfaceDestroyed` and `.calyxAgentConversationEnded`
+/// on the posting thread, the way `SurfacePropertyStore` does, and
+/// forwards them to the store.
 @MainActor
-private final class SurfaceDestroyedObserver: NSObject {
+private final class PaneNotificationObserver: NSObject {
     weak var store: MCPAppHostStore?
 
     @objc func handleSurfaceDestroyed(_ notification: Notification) {
         guard let surfaceID = notification.userInfo?["surfaceID"] as? UUID else { return }
         store?.surfaceDestroyed(surfaceID)
+    }
+
+    @objc func handleAgentConversationEnded(_ notification: Notification) {
+        guard let surfaceID = notification.userInfo?["surfaceID"] as? UUID else { return }
+        store?.conversationEnded(surfaceID)
     }
 }

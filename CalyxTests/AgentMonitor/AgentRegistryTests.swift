@@ -3538,3 +3538,140 @@ final class AgentRegistryTests: XCTestCase {
         XCTAssertTrue(registry.entries.isEmpty)
     }
 }
+
+// MARK: - .calyxAgentConversationEnded
+
+/// Records the surface IDs `.calyxAgentConversationEnded` carries for one
+/// registry. The selector observer runs on the posting thread, before
+/// `post` returns.
+@MainActor
+private final class ConversationEndedRecorder: NSObject {
+    private(set) var surfaceIDs: [UUID] = []
+    private let registry: AgentRegistry
+
+    init(registry: AgentRegistry) {
+        self.registry = registry
+        super.init()
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(conversationEnded(_:)), name: .calyxAgentConversationEnded, object: registry
+        )
+    }
+
+    @objc private func conversationEnded(_ notification: Notification) {
+        guard let surfaceID = notification.userInfo?["surfaceID"] as? UUID else { return }
+        surfaceIDs.append(surfaceID)
+    }
+}
+
+/// The registry posts `.calyxAgentConversationEnded` when a pane's row
+/// enters `.done`: the agent process of that pane ended.
+@MainActor
+final class AgentRegistryConversationEndedTests: XCTestCase {
+
+    private func event(_ name: String, sessionID: String = "session-1") -> AgentEvent {
+        AgentEvent(hookEventName: name, sessionID: sessionID, cwd: "/Users/dev/project", message: nil)
+    }
+
+    func test_sessionEnd_ofALiveRow_postsOnceWithTheSurface() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("UserPromptSubmit"), surfaceID: surfaceID)
+        XCTAssertTrue(recorder.surfaceIDs.isEmpty, "a live row posts nothing")
+
+        registry.handleHookEvent(event("SessionEnd"), surfaceID: surfaceID)
+
+        XCTAssertEqual(recorder.surfaceIDs, [surfaceID])
+    }
+
+    func test_sessionEnd_forASurfaceWithNoRow_posts() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+
+        registry.handleHookEvent(event("SessionEnd"), surfaceID: surfaceID)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .done, "precondition: SessionEnd creates a done row")
+        XCTAssertEqual(recorder.surfaceIDs, [surfaceID])
+    }
+
+    func test_secondSessionEnd_ofADoneRow_doesNotPostAgain() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("SessionEnd"), surfaceID: surfaceID)
+
+        registry.handleHookEvent(event("SessionEnd"), surfaceID: surfaceID)
+
+        XCTAssertEqual(recorder.surfaceIDs, [surfaceID])
+    }
+
+    func test_stop_settlesIdle_andDoesNotPost() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("UserPromptSubmit"), surfaceID: surfaceID)
+
+        registry.handleHookEvent(event("Stop"), surfaceID: surfaceID)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .idle)
+        XCTAssertTrue(recorder.surfaceIDs.isEmpty)
+    }
+
+    func test_paneCommandFinished_settlingAnMCPConnectionRow_posts() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleMCPConnection(surfaceID: surfaceID, kind: AgentEntry.codexKind)
+
+        XCTAssertTrue(registry.handlePaneCommandFinished(surfaceID: surfaceID, exitCode: 0))
+
+        XCTAssertEqual(recorder.surfaceIDs, [surfaceID])
+    }
+
+    func test_paneCommandFinished_suspended_doesNotPost() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID)
+
+        XCTAssertFalse(registry.handlePaneCommandFinished(surfaceID: surfaceID, exitCode: 0, suspended: true))
+
+        XCTAssertTrue(recorder.surfaceIDs.isEmpty)
+    }
+
+    func test_surfaceDestroyed_andReset_doNotPost() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let destroyedSurfaceID = UUID()
+        let resetSurfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart"), surfaceID: destroyedSurfaceID)
+        registry.handleHookEvent(event("SessionStart", sessionID: "session-2"), surfaceID: resetSurfaceID)
+
+        registry.handleSurfaceDestroyed(surfaceID: destroyedSurfaceID)
+        registry.reset()
+
+        XCTAssertTrue(registry.entries.isEmpty, "precondition: both rows are gone")
+        XCTAssertTrue(recorder.surfaceIDs.isEmpty)
+    }
+
+    func test_titleHeuristicRowRetirement_doesNotPost() {
+        let registry = AgentRegistry()
+        registry.markServerStarted()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working)
+        XCTAssertEqual(registry.entries[surfaceID]?.source, .titleHeuristic, "precondition: an inferred row")
+
+        for _ in 0..<10 where registry.entries[surfaceID] != nil {
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil)
+        }
+
+        XCTAssertNil(registry.entries[surfaceID], "precondition: the miss streak retired the row")
+        XCTAssertTrue(recorder.surfaceIDs.isEmpty)
+        registry.reset()
+    }
+}

@@ -845,6 +845,62 @@ final class MCPAppHostStoreTests: XCTestCase {
         try await waitUntil("the destroyed pane's view is unmounted") { runtime.unmountedViewIDs == [viewID] }
     }
 
+    // MARK: - K52: a view ends with the conversation that called it
+
+    private func postConversationEnded(_ surfaceID: UUID) {
+        NotificationCenter.default.post(name: .calyxAgentConversationEnded, object: nil, userInfo: ["surfaceID": surfaceID])
+    }
+
+    func test_conversationEnded_tearsDownAndRemovesEveryViewOfThatPane() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let first = try await startLiveView(store, surfaceID: surfaceID)
+        let session = FakeMCPAppServerSession(readResourceResult: .failure(FakeSessionError(message: "unreadable")))
+        let unmountedCard = try invocation(serverID: session.serverID, surfaceID: surfaceID)
+        await startAndLoad(store, unmountedCard, session: session)
+        let second = try await startLiveView(store, surfaceID: surfaceID)
+        XCTAssertEqual(store.snapshots(forSurface: surfaceID).map(\.viewID), [first, unmountedCard.id.rawValue, second],
+                       "precondition: two live views and a card without a web view")
+
+        postConversationEnded(surfaceID)
+
+        try await waitUntil("the pane's views are removed") { !store.hasActiveView(forSurface: surfaceID) }
+        XCTAssertEqual(runtime.teardownRequestedViewIDs, [first, second], "each mounted view gets ui/resource-teardown")
+        XCTAssertEqual(runtime.unmountedViewIDs, [first, second])
+        XCTAssertNil(store.snapshot(viewID: unmountedCard.id.rawValue))
+    }
+
+    func test_conversationEnded_leavesOtherPanesAndStandaloneViewsUntouched() async throws {
+        let surfaceID = UUID()
+        let otherSurfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let ended = try await startLiveView(store, surfaceID: surfaceID)
+        let other = try await startLiveView(store, surfaceID: otherSurfaceID)
+        let standalone = try await startLiveView(store, surfaceID: nil)
+
+        postConversationEnded(surfaceID)
+
+        try await waitUntil("the ended pane's view is removed") { store.snapshot(viewID: ended) == nil }
+        XCTAssertEqual(store.snapshot(viewID: other)?.status, .live)
+        XCTAssertEqual(store.snapshot(viewID: standalone)?.status, .live)
+        XCTAssertEqual(runtime.teardownRequestedViewIDs, [ended])
+        XCTAssertEqual(runtime.unmountedViewIDs, [ended])
+    }
+
+    func test_conversationEnded_unregistersTheViewsAppTools() async throws {
+        let surfaceID = UUID()
+        let appToolRegistry = FakeAppToolRegistry()
+        let (store, _) = makeCoupled(appToolRegistry: appToolRegistry)
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+        store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("pick")])], viewID: viewID)
+        XCTAssertFalse(appToolRegistry.appTools(forSurface: surfaceID).isEmpty, "precondition: the pane's agent sees the tool")
+
+        postConversationEnded(surfaceID)
+
+        try await waitUntil("the view is removed") { store.snapshot(viewID: viewID) == nil }
+        XCTAssertTrue(appToolRegistry.appTools(forSurface: surfaceID).isEmpty)
+    }
+
     func test_callAppTool_awaitingAViewThatIsClosed_returnsIsError() async throws {
         let surfaceID = UUID()
         let (store, runtime) = makeCoupled()

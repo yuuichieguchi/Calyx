@@ -210,8 +210,10 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
                 return "[image]"
             }.joined(separator: "\n")
             let decision = await state.pane.promptForMessage(preview: preview)
+            // No pending request is left to decide (the view's teardown
+            // clears it): nothing is sent.
             guard consentGate.isPending(viewID: viewID) else {
-                return .failure(Self.serverError("The view was closed before the message was sent."))
+                return .failure(Self.serverError("Message sending denied"))
             }
             switch consentGate.resolvePendingPrompt(viewID: viewID, decision: decision) {
             case .send:
