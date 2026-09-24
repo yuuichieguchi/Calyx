@@ -102,7 +102,13 @@ struct GitChangesView: View {
 
     private var sectionList: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
+            // Not lazy on purpose: a lazy stack wrapped around the commit
+            // list's `LazyVStack` mis-estimates its height, so the scroll
+            // view's content height keeps changing and the scrollbar jumps.
+            // Collapsed sections build only their header, so eager layout
+            // costs one header per repo; laziness belongs only to the commit
+            // list, which grows without bound.
+            VStack(alignment: .leading, spacing: 0) {
                 ForEach(state.sections) { section in
                     GitRepoSectionView(
                         data: section,
