@@ -215,6 +215,34 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         try await waitUntil("the dock leaves the container") { container.dockView(forLeaf: surfaceID) == nil }
     }
 
+    /// The order of closing a pane: the leaf leaves the tree first (the
+    /// container parks its dock), then the surface is destroyed. The
+    /// parked dock is forgotten: it is out of the view hierarchy, and a
+    /// leaf with the same ID back in the tree gets no dock and no dock
+    /// divider.
+    func test_viewOfADestroyedSurface_whoseLeafAlreadyLeftTheTree_forgetsTheParkedDock() async throws {
+        let harness = makeHarness()
+        let closing = UUID()
+        let sibling = UUID()
+        let (container, _) = makeContainer(leaves: [closing, sibling])
+        harness.environment.containers[closing] = container
+        _ = try await startCardOnlyView(harness, surfaceID: closing)
+        let dock = try XCTUnwrap(container.dockView(forLeaf: closing), "precondition: the view is docked under its pane")
+
+        container.updateLayout(tree: tree([sibling]))
+        XCTAssertNil(dock.superview, "precondition: the dock of a leaf out of the tree is parked")
+
+        harness.environment.containers[closing] = nil
+        NotificationCenter.default.post(name: .calyxSurfaceDestroyed, object: nil, userInfo: ["surfaceID": closing])
+        try await waitUntil("the runtime drops the view") { harness.runtime.views.isEmpty }
+
+        XCTAssertNil(dock.superview)
+        container.updateLayout(tree: tree([closing, sibling]))
+        XCTAssertNil(container.dockView(forLeaf: closing), "a dock forgotten by the container is not put back")
+        XCTAssertFalse(container.subviews.contains { $0 is MCPAppDockView })
+        XCTAssertEqual(container.subviews.filter { $0 is SplitDividerView }.count, 1, "only the split divider; no dock divider")
+    }
+
     // MARK: - Finding 10: fullscreen follows the view to a remapped leaf
 
     func test_remap_keepsAFullscreenViewFullscreenOnTheNewLeaf() async throws {

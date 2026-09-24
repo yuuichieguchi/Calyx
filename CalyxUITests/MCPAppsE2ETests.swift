@@ -77,7 +77,10 @@
 //   ghostty's own default (`ghostty/src/config/Config.zig`, "Toggle
 //   zoom a split"): Cmd+Shift+Return. Calyx's own config never
 //   overrides it (`grep -rn "toggle_split_zoom" Calyx/` at the time
-//   this suite was written found no override).
+//   this suite was written found no override). The binding is on the
+//   physical Return key, so the suite types `XCUIKeyboardKey.return`
+//   ("\r"); `.enter` is "\u{3}", the keypad Enter key (ghostty's
+//   `numpad_enter`), which matches no binding.
 // - Plain Cmd+W closes the FOCUSED PANE, not the whole tab
 //   (`CalyxUITestCase.swift`'s own `closeTabViaMenu()` doc comment,
 //   confirming a prior shortcut move already landed).
@@ -781,11 +784,11 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
         // this file's header) below targets that new pane, not the
         // original one carrying the dock.
         Thread.sleep(forTimeInterval: 1)
-        app.typeKey(.enter, modifierFlags: [.command, .shift])
+        app.typeKey(.return, modifierFlags: [.command, .shift])
 
         waitForNonExistence(dock, timeout: 15)
 
-        app.typeKey(.enter, modifierFlags: [.command, .shift])
+        app.typeKey(.return, modifierFlags: [.command, .shift])
 
         XCTAssertTrue(waitFor(dock, timeout: 15), "the dock must reappear once the zoomed sibling pane is unzoomed")
     }
@@ -812,12 +815,20 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
         let dock = dockElement(surfaceID: surfaceID)
         XCTAssertTrue(waitFor(dock, timeout: 20), "the dock never appeared for the in-flight slow_tool call")
 
-        // The original pane sits on the LEFT half after a "right" split;
-        // click into it to focus it (no accessibility identifier exists
-        // on a pane/surface view in this codebase) before closing it
-        // with plain Cmd+W (closes the FOCUSED PANE, see this file's
-        // header).
-        app.windows.firstMatch.coordinate(withNormalizedOffset: CGVector(dx: 0.25, dy: 0.5)).click()
+        // `pane_split` focuses the new (right) pane, so the original
+        // pane is clicked to focus it before plain Cmd+W (closes the
+        // FOCUSED PANE, see this file's header). A pane/surface view has
+        // no accessibility identifier, so the click is placed relative
+        // to the original pane's dock: the dock sits at the right of that
+        // pane's terminal, and a point 25 pt left of the dock's left edge
+        // is inside that terminal (the dock divider's hit area reaches
+        // 4 pt left of the dock; the terminal keeps at least 50 pt). A
+        // point relative to the window does not work: the sidebar
+        // (220 pt by default) covers the left of the 800 pt window, and
+        // 25% of its width (200 pt) is inside the sidebar.
+        dock.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5))
+            .withOffset(CGVector(dx: -25, dy: 0))
+            .click()
         Thread.sleep(forTimeInterval: 0.5)
         app.typeKey("w", modifierFlags: .command)
 
