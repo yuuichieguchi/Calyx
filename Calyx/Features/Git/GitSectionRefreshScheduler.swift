@@ -18,6 +18,7 @@ final class GitSectionRefreshScheduler {
     private let fetch: Fetch
     private var runs: [String: Task<Void, Never>] = [:]
     private var pending: [String: GitSectionFetchScope] = [:]
+    private var running: [String: GitSectionFetchScope] = [:]
 
     init(fetch: @escaping Fetch) {
         self.fetch = fetch
@@ -40,20 +41,35 @@ final class GitSectionRefreshScheduler {
                 // await between them, so a request made from the main actor
                 // either lands in this loop or starts a new one.
                 guard let next = self.pending.removeValue(forKey: repoID) else {
+                    self.running.removeValue(forKey: repoID)
                     self.runs.removeValue(forKey: repoID)
                     return
                 }
+                self.running[repoID] = next
                 await self.fetch(repoID, next)
+                // A cancelled run no longer owns this section's slots:
+                // `cancelAll` already cleared them, and a run started since
+                // then may have filled them again.
+                guard !Task.isCancelled else { return }
+                self.running.removeValue(forKey: repoID)
             }
         }
         runs[repoID] = task
         return task
     }
 
+    /// Whether a load-more page is queued or in flight for this section, so
+    /// another request would only add a page nobody asked for.
+    func isLoadingMoreCommits(repoID: String) -> Bool {
+        pending[repoID]?.loadsMoreCommits == true
+            || running[repoID]?.loadsMoreCommits == true
+    }
+
     /// Cancels every section's work and forgets what was queued, for when
     /// the sidebar showing it is no longer on screen.
     func cancelAll() {
         pending.removeAll()
+        running.removeAll()
         for task in runs.values {
             task.cancel()
         }

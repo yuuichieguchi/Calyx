@@ -190,4 +190,109 @@ struct GitSectionRefreshSchedulerTests {
         #expect(scheduler.schedule(repoID: "A", scope: GitSectionFetchScope()) == nil)
         #expect(recorder.started.isEmpty)
     }
+
+    // MARK: - isLoadingMoreCommits
+
+    @Test func test_isLoadingMoreCommits_isFalseBeforeAnythingIsScheduled() {
+        let recorder = FetchRecorder()
+        let gate = FetchGate()
+        let scheduler = makeScheduler(recorder: recorder, gate: gate)
+
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == false)
+    }
+
+    @Test func test_isLoadingMoreCommits_isTrueWhileAPageIsInFlightAndFalseAfter() async throws {
+        let recorder = FetchRecorder()
+        let gate = FetchGate()
+        let scheduler = makeScheduler(recorder: recorder, gate: gate)
+
+        let run = scheduler.schedule(repoID: "A", scope: .moreCommits)
+        try await waitUntil { recorder.startedScopes(for: "A").count == 1 }
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == true)
+        #expect(scheduler.isLoadingMoreCommits(repoID: "B") == false)
+
+        gate.open()
+        await run?.value
+
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == false)
+    }
+
+    @Test func test_isLoadingMoreCommits_isTrueWhileAPageIsQueuedBehindARefresh() async throws {
+        let recorder = FetchRecorder()
+        let gate = FetchGate()
+        let scheduler = makeScheduler(recorder: recorder, gate: gate)
+
+        let run = scheduler.schedule(repoID: "A", scope: .statusAndLog)
+        try await waitUntil { recorder.startedScopes(for: "A").count == 1 }
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == false)
+
+        scheduler.schedule(repoID: "A", scope: .moreCommits)
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == true)
+
+        gate.open()
+        await run?.value
+
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == false)
+    }
+
+    @Test func test_isLoadingMoreCommits_isFalseForARunningLogFetch() async throws {
+        let recorder = FetchRecorder()
+        let gate = FetchGate()
+        let scheduler = makeScheduler(recorder: recorder, gate: gate)
+
+        let run = scheduler.schedule(repoID: "A", scope: .log)
+        try await waitUntil { recorder.startedScopes(for: "A").count == 1 }
+
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == false)
+
+        gate.open()
+        await run?.value
+    }
+
+    @Test func test_isLoadingMoreCommits_isFalseAfterCancelAllWithAPageInFlight() async throws {
+        let recorder = FetchRecorder()
+        let gate = FetchGate()
+        let scheduler = makeScheduler(recorder: recorder, gate: gate)
+
+        let run = scheduler.schedule(repoID: "A", scope: .moreCommits)
+        try await waitUntil { recorder.startedScopes(for: "A").count == 1 }
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == true)
+
+        scheduler.cancelAll()
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == false)
+
+        gate.open()
+        await run?.value
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == false)
+    }
+
+    @Test func test_isLoadingMoreCommits_aCancelledRunFinishingLaterKeepsANewerPageInFlight() async throws {
+        let recorder = FetchRecorder()
+        let firstGate = FetchGate()
+        let secondGate = FetchGate()
+        var gates = [firstGate, secondGate]
+        let scheduler = GitSectionRefreshScheduler { repoID, scope in
+            let gate = gates.removeFirst()
+            recorder.begin(repoID, scope)
+            await gate.wait()
+            recorder.end(repoID, scope, wasCancelled: Task.isCancelled)
+        }
+
+        let cancelledRun = scheduler.schedule(repoID: "A", scope: .moreCommits)
+        try await waitUntil { recorder.startedScopes(for: "A").count == 1 }
+        scheduler.cancelAll()
+
+        // The sidebar comes back and asks for a page while the abandoned
+        // fetch is still unwinding.
+        let newerRun = scheduler.schedule(repoID: "A", scope: .moreCommits)
+        try await waitUntil { recorder.startedScopes(for: "A").count == 2 }
+
+        firstGate.open()
+        await cancelledRun?.value
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == true)
+
+        secondGate.open()
+        await newerRun?.value
+        #expect(scheduler.isLoadingMoreCommits(repoID: "A") == false)
+    }
 }

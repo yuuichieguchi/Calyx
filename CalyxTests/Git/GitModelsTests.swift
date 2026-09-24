@@ -365,6 +365,54 @@ struct GitModelsTests {
         #expect(everySection == ["/repos/alpha", "/repos/beta", "/repos/gamma"])
     }
 
+    // MARK: - Commit list prefetching
+
+    @Test func commitPageSizeExceedsThePrefetchThreshold() {
+        // An appended page moves the trigger `commitPageSize -
+        // commitPrefetchThreshold` rows down. Without a positive gap the
+        // trigger lands on a row that is already realized, never appears
+        // again, and paging stalls.
+        #expect(GitRepoChanges.commitPageSize > GitRepoChanges.commitPrefetchThreshold)
+    }
+
+    @Test func commitPrefetchTriggerIndexIsNilForAnEmptyList() {
+        #expect(GitRepoChanges.commitPrefetchTriggerIndex(commitCount: 0) == nil)
+    }
+
+    @Test func commitPrefetchTriggerIndexClampsToTheFirstRowWhenFewerRowsThanTheThreshold() {
+        // With fewer commits loaded than the threshold, the very first row
+        // is the only one that can still request the next page in time.
+        #expect(
+            GitRepoChanges.commitPrefetchTriggerIndex(commitCount: 5, threshold: 12) == 0
+        )
+    }
+
+    @Test func commitPrefetchTriggerIndexAtExactlyTheThreshold() {
+        #expect(
+            GitRepoChanges.commitPrefetchTriggerIndex(commitCount: 12, threshold: 12) == 0
+        )
+    }
+
+    @Test func commitPrefetchTriggerIndexOneRowPastTheThreshold() {
+        #expect(
+            GitRepoChanges.commitPrefetchTriggerIndex(commitCount: 13, threshold: 12) == 1
+        )
+    }
+
+    @Test func commitPrefetchTriggerIndexForALargeList() {
+        #expect(
+            GitRepoChanges.commitPrefetchTriggerIndex(commitCount: 100, threshold: 12) == 88
+        )
+    }
+
+    @Test func commitPrefetchTriggerIndexWithAThresholdOfOneIsTheLastRow() {
+        #expect(
+            GitRepoChanges.commitPrefetchTriggerIndex(commitCount: 100, threshold: 1) == 99
+        )
+    }
+
+    // MARK: - Discovery refresh scope merging
+
     @Test func discoveryRefreshScopeMergeKeepsTheWiderRequest() {
         // A background event superseding a manual refresh must not narrow
         // it into a run that fetches nothing.

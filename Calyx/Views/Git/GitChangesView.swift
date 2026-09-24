@@ -102,7 +102,13 @@ struct GitChangesView: View {
 
     private var sectionList: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 0) {
+            // Not lazy on purpose: a lazy stack wrapped around the commit
+            // list's `LazyVStack` mis-estimates its height, so the scroll
+            // view's content height keeps changing and the scrollbar jumps.
+            // Collapsed sections build only their header, so eager layout
+            // costs one header per repo; laziness belongs only to the commit
+            // list, which grows without bound.
+            VStack(alignment: .leading, spacing: 0) {
                 ForEach(state.sections) { section in
                     GitRepoSectionView(
                         data: section,
@@ -473,6 +479,20 @@ private struct GitRepoChangesBody: View {
 
     // MARK: - Commit Graph
 
+    /// The row `commitPrefetchThreshold` from the end asks for the next
+    /// page, so it arrives before the user reaches the bottom. Appending a
+    /// page of `commitPageSize` rows moves the trigger
+    /// `commitPageSize - commitPrefetchThreshold` rows down, onto a row not
+    /// realized yet, so it fires once per page. A short final page can
+    /// leave the trigger on a realized row; that is harmless because no
+    /// more pages exist. A repeat appearance of the trigger row is ignored
+    /// by the controller while a page is queued or in flight, and the
+    /// end-of-list fallback covers a trigger row that was already realized.
+    private var prefetchTriggerCommitID: String? {
+        GitRepoChanges.commitPrefetchTriggerIndex(commitCount: commits.count)
+            .map { commits[$0].id }
+    }
+
     @ViewBuilder
     private var commitGraphSection: some View {
         if !commits.isEmpty {
@@ -496,8 +516,16 @@ private struct GitRepoChangesBody: View {
                             onFileSelected: { file in onCommitFileSelected?(file) }
                         )
                         .accessibilityIdentifier(AccessibilityID.Git.commitRow(commit.shortHash))
+                        .onAppear {
+                            if commit.id == prefetchTriggerCommitID {
+                                onLoadMore?()
+                            }
+                        }
                     }
-
+                    // The row trigger can miss when a refresh shifts the list
+                    // under an already-realized row, so reaching the end still
+                    // asks for a page; the controller ignores the duplicate
+                    // while a page is queued or in flight.
                     Color.clear
                         .frame(height: 1)
                         .onAppear { onLoadMore?() }
