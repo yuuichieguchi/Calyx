@@ -10,8 +10,10 @@
 //  exchange, saving the result through `credentials`.
 //
 //    enum MCPOAuthFlowError: Error, Sendable, Equatable {
-//        case needsAuthorization, cancelled, portBusy(Int), pkceUnsupported,
-//             issuerMismatch, stateMismatch, discoveryFailed(String), registrationFailed(String)
+//        case needsAuthorization, clientRegistrationUnavailable(issuer: String), cancelled, portBusy(Int),
+//             pkceUnsupported, issuerMismatch, stateMismatch, discoveryFailed(String), registrationFailed(String),
+//             authorizationFailed(error: String, description: String?),
+//             tokenEndpointFailed(error: String, description: String?), storageFailed(String)
 //    }
 //    protocol MCPOAuthCredentialStoring: Sendable {
 //        func tokens(for serverID: MCPServerID) async throws -> MCPOAuthTokenSet?
@@ -206,9 +208,9 @@ final class MCPOAuthFlowTests: XCTestCase {
         XCTAssertEqual(params["redirect_uri"]?.removingPercentEncoding, redirectURI, "the redirect_uri sent to the token endpoint must match the one used in the authorization URL")
     }
 
-    // MARK: - .needsUserInput registration outcome surfaces as MCPOAuthFlowError.needsAuthorization
+    // MARK: - .needsUserInput registration outcome surfaces as MCPOAuthFlowError.clientRegistrationUnavailable
 
-    func test_authorize_registrationNeedsUserInput_throwsNeedsAuthorization_withoutOpeningBrowser() async throws {
+    func test_authorize_registrationNeedsUserInput_throwsClientRegistrationUnavailableWithTheIssuer_withoutOpeningBrowser() async throws {
         enqueuePRM()
         enqueueASMetadata()
 
@@ -224,9 +226,9 @@ final class MCPOAuthFlowTests: XCTestCase {
                 clientAuthentication: .none,
                 scopeOverride: nil
             )
-            XCTFail("expected needsAuthorization")
+            XCTFail("expected clientRegistrationUnavailable")
         } catch let error as MCPOAuthFlowError {
-            XCTAssertEqual(error, .needsAuthorization)
+            XCTAssertEqual(error, .clientRegistrationUnavailable(issuer: "https://auth.example.com"))
         }
 
         let openedCount = await browser.openedURLCount()

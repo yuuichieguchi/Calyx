@@ -415,6 +415,10 @@ final class MCPServerSettingsModel {
             case .fileUnavailable(let path):
                 return "\(path) is unavailable, so changes cannot be saved."
             }
+        case let error as MCPOAuthFlowError:
+            return MCPConnectionFailureText.signInFailure(error)
+        case let error as MCPUpstreamSupervisorError:
+            return MCPConnectionFailureText.supervisorFailure(error)
         case let error as MCPServersJSONImportError:
             switch error {
             case .parseError(let line, let column, let message):

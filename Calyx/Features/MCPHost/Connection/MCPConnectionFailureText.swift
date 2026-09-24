@@ -5,7 +5,8 @@
 //  The one-sentence `MCPConnectionFailure.reason` Settings shows for a
 //  server that could not connect or kept crashing. Built from the error
 //  the connection attempt threw and, when the transport was lost, how the
-//  child process ended.
+//  child process ended. Also the sentence Settings shows under a row when
+//  signing in to a server failed.
 //
 
 import Foundation
@@ -44,6 +45,8 @@ enum MCPConnectionFailureText {
                 ?? "The connection closed during the handshake."
         case let urlError as URLError:
             return "Could not reach the server: \(urlError.localizedDescription)"
+        case let oauthError as MCPOAuthFlowError:
+            return signInFailure(oauthError)
         default:
             return "The server could not be started: \(describe(error))"
         }
@@ -71,7 +74,59 @@ enum MCPConnectionFailureText {
         }
     }
 
+    /// Why signing in to a server failed.
+    static func signInFailure(_ error: MCPOAuthFlowError) -> String {
+        switch error {
+        case .needsAuthorization:
+            return "Sign in is required."
+        case .clientRegistrationUnavailable(let issuer):
+            return "\(issuer) does not support automatic client registration. "
+                + "Enter the client ID of an OAuth app registered with it in Edit."
+        case .cancelled:
+            return "Sign in was cancelled."
+        case .portBusy(let port):
+            return "Port \(port) is in use."
+        case .pkceUnsupported:
+            return "The authorization server does not support PKCE with S256."
+        case .issuerMismatch:
+            return "The sign-in response did not come from the expected authorization server."
+        case .stateMismatch:
+            return "The sign-in response does not match the request Calyx sent."
+        case .discoveryFailed(let detail):
+            return terminated("The authorization server could not be found: \(detail)")
+        case .registrationFailed(let detail):
+            return terminated("Client registration failed: \(detail)")
+        case .authorizationFailed(let code, let description):
+            return terminated("The authorization server returned \(code)" + (description.map { ": \($0)" } ?? ""))
+        case .tokenEndpointFailed(let code, let description):
+            return terminated("The token endpoint returned \(code)" + (description.map { ": \($0)" } ?? ""))
+        case .storageFailed(let detail):
+            return terminated("The sign-in credentials could not be saved: \(detail)")
+        }
+    }
+
+    /// Why a server action of the upstream supervisor failed.
+    static func supervisorFailure(_ error: MCPUpstreamSupervisorError) -> String {
+        switch error {
+        case .unknownServer:
+            return "The server is no longer configured."
+        case .notHTTPServer:
+            return "Only HTTP servers can sign in."
+        case .invalidURL(let url):
+            return "\"\(url)\" is not a valid URL."
+        case .missingSecret(let name):
+            return "No stored value for \(name)."
+        }
+    }
+
     // MARK: - Private
+
+    /// `text` ending with one period. A detail from a server can already
+    /// end with sentence punctuation.
+    private static func terminated(_ text: String) -> String {
+        guard let last = text.last, !".!?".contains(last) else { return text }
+        return text + "."
+    }
 
     private static func isTransportClosed(_ error: MCPClientProtocolError) -> Bool {
         if case .transportClosed = error { return true }

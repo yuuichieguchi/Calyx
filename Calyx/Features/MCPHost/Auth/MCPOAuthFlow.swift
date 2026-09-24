@@ -224,7 +224,7 @@ actor MCPOAuthFlow {
         case .preRegistered(let clientID), .cimd(let clientID), .dynamicallyRegistered(let clientID):
             return clientID
         case .needsUserInput:
-            throw MCPOAuthFlowError.needsAuthorization
+            throw MCPOAuthFlowError.clientRegistrationUnavailable(issuer: serverMetadata.issuer)
         }
     }
 
