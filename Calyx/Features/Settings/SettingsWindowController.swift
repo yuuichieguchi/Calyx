@@ -1,5 +1,6 @@
 import AppKit
 import OSLog
+import SwiftUI
 
 private let logger = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "com.calyx.terminal",
@@ -22,6 +23,13 @@ class SettingsWindowController: NSWindowController {
     private let agentIPCSwitch = NSSwitch()
     private let agentIPCRefreshButton = NSButton(title: "Refresh", target: nil, action: nil)
     private let agentIPCStatusLabel = NSTextField(wrappingLabelWithString: "")
+    /// State behind the MCP Servers pane, shared by every instance and
+    /// held by the type so the composition root configures it at launch
+    /// without creating the Settings window. Empty until
+    /// `configureMCPServers(_:)`.
+    static let mcpServerSettingsModel = MCPServerSettingsModel()
+
+    var mcpServerSettingsModel: MCPServerSettingsModel { Self.mcpServerSettingsModel }
 
     private let tabViewController = SettingsTabViewController()
 
@@ -54,6 +62,8 @@ class SettingsWindowController: NSWindowController {
 
         super.init(window: window)
 
+        // IPC may have changed while no Settings window existed to observe it.
+        mcpServerSettingsModel.refreshIPCEnabled()
         setupContent()
 
         // Settings is AppKit, so @Observable does not drive it. Chain
@@ -153,6 +163,11 @@ class SettingsWindowController: NSWindowController {
                 title: "Agent Hook Approval",
                 subtitle: "Routes Claude Code and Codex permission prompts, all always-approve Grok tool calls, and every pi tool call to the Calyx approval banner. Off = agents decide alone, and pi, which has no prompt of its own, just runs the call."
             )
+        case .mcpServers:
+            return SectionHeading(
+                title: "MCP Servers",
+                subtitle: "Calyx connects to these servers and offers their tools, and the apps some tools show, to agents over AI Agent IPC."
+            )
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .glassOpacityCells, .themeColorWell, .themeColorHex, .lspRequireConfirmation,
@@ -221,6 +236,8 @@ class SettingsWindowController: NSWindowController {
             return commandTrackingRow()
         case .agentHookApproval:
             return agentHookApprovalRow()
+        case .mcpServers:
+            return mcpServersRow()
         case .openSessionBrowserButton:
             return sessionBrowserButtonRow()
         case .openConfigFileFooter:
@@ -440,6 +457,22 @@ class SettingsWindowController: NSWindowController {
         return controlRow(label: "Show agent tool prompts in the approval banner", control: toggleSwitch)
     }
 
+    /// The whole MCP Servers pane below its heading: a SwiftUI view over
+    /// `mcpServerSettingsModel`, sized to its content at the pane's width.
+    private func mcpServersRow() -> NSView {
+        let hostingView = NSHostingView(rootView: MCPServersSettingsView(model: mcpServerSettingsModel))
+        hostingView.sizingOptions = [.intrinsicContentSize]
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        hostingView.widthAnchor.constraint(equalToConstant: Self.paneWidth - 2 * Self.paneContentInset).isActive = true
+        return hostingView
+    }
+
+    /// Gives the MCP Servers pane its registry, connections, catalog,
+    /// secret store and actions. Does not create the Settings window.
+    static func configureMCPServers(_ dependencies: MCPServerSettingsModel.Dependencies) {
+        mcpServerSettingsModel.configure(dependencies)
+    }
+
     private func sessionBrowserButtonRow() -> NSView {
         let openBrowserButton = NSButton(
             title: "Open Session Browser", target: self, action: #selector(openSessionBrowser(_:))
@@ -646,6 +679,7 @@ class SettingsWindowController: NSWindowController {
         let enabled = sender.state == .on
         IPCSettings.enabled = enabled
         updateAgentIPCRow()
+        mcpServerSettingsModel.refreshIPCEnabled()
         guard LaunchEnvironmentPolicy.mayPerformAgentIPCActivation() else { return }
         Task {
             if enabled {
@@ -742,6 +776,7 @@ class SettingsWindowController: NSWindowController {
 
     @objc private func agentIPCStateDidChange(_ notification: Notification) {
         updateAgentIPCRow()
+        mcpServerSettingsModel.refreshIPCEnabled()
     }
 
     @objc private func openSessionBrowser(_ sender: Any?) {

@@ -703,6 +703,7 @@ private struct TabRowItemView: View {
                         .font(.system(size: 12.5, weight: isActive ? .semibold : .medium, design: .rounded))
                 }
                 Spacer()
+                MCPAppActivityDot(tabID: tab.id)
                 if tab.unreadNotifications > 0 {
                     UnreadCountBadge(count: tab.unreadNotifications)
                 }

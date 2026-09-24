@@ -204,6 +204,15 @@ targets:
     platform: macOS
     sources:
       - path: CalyxTests
+        excludes:
+          - "Fixtures/**"
+      # Loaded at runtime from the source tree via #filePath (see
+      # MCPSchemaConformanceTests.swift), not from bundle resources: two
+      # schema.json fixtures share a basename in different version
+      # subdirectories, which Xcode's flat Copy Bundle Resources phase
+      # cannot both place at the bundle root.
+      - path: CalyxTests/Fixtures
+        buildPhase: none
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES

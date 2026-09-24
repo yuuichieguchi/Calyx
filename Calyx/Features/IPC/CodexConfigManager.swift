@@ -25,6 +25,8 @@ struct CodexConfigManager: Sendable {
     // MARK: - Private
 
     private static let tableEditor = TOMLTableConfigDocumentEditor(tablePath: "mcp_servers.calyx-ipc")
+    /// The `/calyx-mcp` table, beside `calyx-ipc`.
+    private static let calyxMCPTableEditor = TOMLTableConfigDocumentEditor(tablePath: "mcp_servers.calyx-mcp")
 
     // MARK: - Public API
 
@@ -59,6 +61,15 @@ struct CodexConfigManager: Sendable {
         env_http_headers = { "X-Calyx-Surface-ID" = "CALYX_SURFACE_ID", "X-Calyx-Session-ID" = "CALYX_SESSION_ID" }
         """
 
+        // Same host, port and headers as calyx-ipc, plus the herdr pane and
+        // socket headers `/calyx-mcp` resolves a herdr pane by. Codex omits
+        // an env header whose variable is unset.
+        let calyxMCPBody = """
+        url = "http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)"
+        http_headers = { "Authorization" = "Bearer \(token)", "X-Calyx-Agent-Kind" = "\(AgentEntry.codexKind)" }
+        env_http_headers = { "X-Calyx-Surface-ID" = "CALYX_SURFACE_ID", "X-Calyx-Session-ID" = "CALYX_SESSION_ID", "X-Calyx-Herdr-Pane-ID" = "HERDR_PANE_ID", "X-Calyx-Herdr-Socket-Path" = "HERDR_SOCKET_PATH" }
+        """
+
         // 0600: this table carries the bearer token. ~/.codex/config.toml
         // is shared with CodexHooksConfigManager's hooks block, which
         // carries no token and therefore leaves the file's mode alone
@@ -66,7 +77,8 @@ struct CodexConfigManager: Sendable {
         // manager's write actually contains the secret is the one that
         // enforces the mode.
         try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
-            try tableEditor.setTable(body: body, in: current)
+            let withIPC = try tableEditor.setTable(body: body, in: current)
+            return try calyxMCPTableEditor.setTable(body: calyxMCPBody, in: withIPC)
         }
     }
 
@@ -77,7 +89,8 @@ struct CodexConfigManager: Sendable {
         // user's file already has rather than forcing 0600 (that mode
         // belongs to enableIPC, which writes the token).
         try ConfigFileUtils.withExclusiveConfig(path: path) { current in
-            try tableEditor.removeTable(in: current)
+            let withoutIPC = try tableEditor.removeTable(in: current)
+            return try calyxMCPTableEditor.removeTable(in: withoutIPC)
         }
     }
 

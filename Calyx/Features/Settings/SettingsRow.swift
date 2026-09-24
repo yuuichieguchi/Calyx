@@ -28,6 +28,7 @@ enum SettingsRow: String, CaseIterable {
     case cockpitAutoApprove
     case commandTracking
     case agentHookApproval
+    case mcpServers
     case openSessionBrowserButton
     case openConfigFileFooter
 
@@ -42,6 +43,8 @@ enum SettingsRow: String, CaseIterable {
             return .sessions
         case .agentIPC, .agentResume, .agentResumeAutoExecute, .cockpitAutoApprove, .commandTracking, .agentHookApproval:
             return .agents
+        case .mcpServers:
+            return .mcpServers
         }
     }
 }

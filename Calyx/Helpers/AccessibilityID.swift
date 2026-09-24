@@ -248,4 +248,55 @@ enum AccessibilityID {
         static let submitAllButton = "calyx.diff.review.submitAllButton"
         static let discardAllButton = "calyx.diff.review.discardAllButton"
     }
+    /// MCP Apps views: the inline dock of a pane, each view's card, the
+    /// consent prompt shown inside the card, and the standalone panel of a
+    /// pane-less invocation (see Calyx/Features/MCPApps/).
+    enum MCPApps {
+        static func dock(_ surfaceID: UUID) -> String { "calyx.mcpApps.dock.\(surfaceID.uuidString)" }
+        static func viewWeb(_ viewID: UUID) -> String { "calyx.mcpApps.view.\(viewID.uuidString).web" }
+        static func viewHeader(_ viewID: UUID) -> String { "calyx.mcpApps.view.\(viewID.uuidString).header" }
+        static func viewStateLabel(_ viewID: UUID) -> String { "calyx.mcpApps.view.\(viewID.uuidString).stateLabel" }
+        static func viewCloseButton(_ viewID: UUID) -> String { "calyx.mcpApps.view.\(viewID.uuidString).closeButton" }
+        static func viewReloadButton(_ viewID: UUID) -> String { "calyx.mcpApps.view.\(viewID.uuidString).reloadButton" }
+        static func standalonePanel(_ viewID: UUID) -> String { "calyx.mcpApps.standalonePanel.\(viewID.uuidString)" }
+        static let dockSwitcher = "calyx.mcpApps.dock.switcher"
+        static let promptContainer = "calyx.mcpApps.prompt.container"
+        static let promptPrimaryButton = "calyx.mcpApps.prompt.primaryButton"
+        static let promptAllowForViewButton = "calyx.mcpApps.prompt.allowForViewButton"
+        static let promptCancelButton = "calyx.mcpApps.prompt.cancelButton"
+        static let promptCopyButton = "calyx.mcpApps.prompt.copyButton"
+        static let elicitationContainer = "calyx.mcpApps.elicitation.container"
+        static let elicitationAcceptButton = "calyx.mcpApps.elicitation.acceptButton"
+        static let elicitationDeclineButton = "calyx.mcpApps.elicitation.declineButton"
+        static let signInContainer = "calyx.mcpApps.signIn.container"
+        static let signInButton = "calyx.mcpApps.signIn.button"
+        static func tabActivityIndicator(_ tabID: UUID) -> String { "calyx.mcpApps.tabActivity.\(tabID.uuidString)" }
+    }
+    /// Settings > MCP Servers. Row identifiers use
+    /// `MCPServerID.rawValue.uuidString`.
+    enum MCPServersSettings {
+        static let list = "calyx.settings.mcpServers.list"
+        static let emptyState = "calyx.settings.mcpServers.emptyState"
+        static let ipcDisabledBanner = "calyx.settings.mcpServers.ipcDisabledBanner"
+        static let configErrorBanner = "calyx.settings.mcpServers.configErrorBanner"
+        static let addButton = "calyx.settings.mcpServers.addButton"
+        static let importButton = "calyx.settings.mcpServers.importButton"
+        static func rowStatus(_ serverID: UUID) -> String { "calyx.settings.mcpServers.row.\(serverID.uuidString).status" }
+        static func rowEnabledSwitch(_ serverID: UUID) -> String { "calyx.settings.mcpServers.row.\(serverID.uuidString).enabledSwitch" }
+        static func rowEditButton(_ serverID: UUID) -> String { "calyx.settings.mcpServers.row.\(serverID.uuidString).editButton" }
+        static func rowRetryButton(_ serverID: UUID) -> String { "calyx.settings.mcpServers.row.\(serverID.uuidString).retryButton" }
+        static func rowRemoveButton(_ serverID: UUID) -> String { "calyx.settings.mcpServers.row.\(serverID.uuidString).removeButton" }
+        static func rowSignInButton(_ serverID: UUID) -> String { "calyx.settings.mcpServers.row.\(serverID.uuidString).signInButton" }
+        static func rowCancelSignInButton(_ serverID: UUID) -> String { "calyx.settings.mcpServers.row.\(serverID.uuidString).cancelSignInButton" }
+        static func rowSignOutButton(_ serverID: UUID) -> String { "calyx.settings.mcpServers.row.\(serverID.uuidString).signOutButton" }
+        static let editorNameField = "calyx.settings.mcpServers.editor.nameField"
+        static let editorAliasField = "calyx.settings.mcpServers.editor.aliasField"
+        static let editorTransportPicker = "calyx.settings.mcpServers.editor.transportPicker"
+        static let editorCommandField = "calyx.settings.mcpServers.editor.commandField"
+        static let editorArgsField = "calyx.settings.mcpServers.editor.argsField"
+        static let editorSaveButton = "calyx.settings.mcpServers.editor.saveButton"
+        static let importTextView = "calyx.settings.mcpServers.import.textView"
+        static let importPreview = "calyx.settings.mcpServers.import.preview"
+        static let importConfirmButton = "calyx.settings.mcpServers.import.confirmButton"
+    }
 }

@@ -85,6 +85,10 @@ enum GroupCloseMode {
 class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private(set) var windowSession: WindowSession
     private var splitContainerView: SplitContainerView?
+
+    /// The window's split container. One container shows whichever tab is
+    /// active; MCP App docks park and reattach as leaves leave and return.
+    var splitContainer: SplitContainerView? { splitContainerView }
     private var hostingView: NSHostingView<MainContentView>?
     private var wasOccluded = false
     /// Not `private`: `SessionCommandPaletteTests` reads
@@ -3992,6 +3996,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         tab.sessionRefs = tab.sessionRefs.remappingKeys(mapping)
         SessionSurfaceMap.shared.replaceSurface(old: oldSurfaceID, new: newSurfaceID)
         CommandLogStore.shared.remapSurface(old: oldSurfaceID, new: newSurfaceID)
+        // Before `destroySurface`: the store tears down the views of a
+        // destroyed surface, and these now belong to the new one.
+        (NSApp.delegate as? AppDelegate)?.mcpHostComposition?.store.remapSurface(old: oldSurfaceID, new: newSurfaceID)
 
         reconnectingSurfaceIDs.insert(oldSurfaceID)
         tab.registry.destroySurface(oldSurfaceID)

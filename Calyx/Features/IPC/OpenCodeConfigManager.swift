@@ -36,6 +36,8 @@ struct OpenCodeConfigManager: Sendable {
 
     private static let mcpKey = "mcp"
     private static let calyxIPCKey = "calyx-ipc"
+    /// The `/calyx-mcp` entry, beside `calyx-ipc`.
+    private static let calyxMCPKey = "calyx-mcp"
 
     /// Relative filename (including leading slash) for `opencode.json` under the OpenCode config dir.
     private static let openCodeJSONFilename = "/opencode.json"
@@ -193,14 +195,30 @@ struct OpenCodeConfigManager: Sendable {
         // comment -- without it this entry's bytes are not stable across
         // process launches, defeating withExclusiveConfig's no-write check.
         let entryData = try JSONSerialization.data(withJSONObject: calyxEntry, options: [.sortedKeys])
+        // Same host, port and identity headers as calyx-ipc, plus the herdr
+        // pane and socket headers `/calyx-mcp` resolves a herdr pane by.
+        let calyxMCPEntry: [String: Any] = [
+            "type": "remote",
+            "url": "http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)",
+            "headers": [
+                "Authorization": "Bearer \(token)",
+                "X-Calyx-Surface-ID": "{env:CALYX_SURFACE_ID}",
+                "X-Calyx-Session-ID": "{env:CALYX_SESSION_ID}",
+                "X-Calyx-Agent-Kind": AgentEntry.openCodeKind,
+                "X-Calyx-Herdr-Pane-ID": "{env:HERDR_PANE_ID}",
+                "X-Calyx-Herdr-Socket-Path": "{env:HERDR_SOCKET_PATH}",
+            ]
+        ]
+        let calyxMCPEntryData = try JSONSerialization.data(withJSONObject: calyxMCPEntry, options: [.sortedKeys])
 
         do {
-            // 0600: this entry carries the bearer token.
+            // 0600: these entries carry the bearer token.
             try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
                 // A 0-byte file (a pre-created empty file) is treated the same
                 // as an absent one: `JSONConfigDocumentEditor` already starts
                 // a fresh `{}` for both `nil` and empty input.
-                try JSONConfigDocumentEditor.setValue(entryData, at: [mcpKey, calyxIPCKey], in: current)
+                let withIPC = try JSONConfigDocumentEditor.setValue(entryData, at: [mcpKey, calyxIPCKey], in: current)
+                return try JSONConfigDocumentEditor.setValue(calyxMCPEntryData, at: [mcpKey, calyxMCPKey], in: withIPC)
             }
         } catch ConfigFileError.invalidJSON {
             // Preserve this manager's own public error type for a
@@ -221,7 +239,8 @@ struct OpenCodeConfigManager: Sendable {
                 // A 0-byte file has nothing to remove and is left exactly as it
                 // was: `JSONConfigDocumentEditor.removeValue` passes empty
                 // input straight through unchanged.
-                try JSONConfigDocumentEditor.removeValue(at: [mcpKey, calyxIPCKey], in: current)
+                let withoutIPC = try JSONConfigDocumentEditor.removeValue(at: [mcpKey, calyxIPCKey], in: current)
+                return try JSONConfigDocumentEditor.removeValue(at: [mcpKey, calyxMCPKey], in: withoutIPC)
             }
         } catch ConfigFileError.invalidJSON {
             throw OpenCodeConfigError.invalidJSON

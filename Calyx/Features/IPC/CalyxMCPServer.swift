@@ -177,6 +177,32 @@ final class CalyxMCPServer {
     /// `approvalTimeoutMs`.
     var approvalRequestTimeoutMs: Int = ApprovalHookTiming.serverTimeoutMs
 
+    // MARK: - /calyx-mcp
+
+    /// The router `/calyx-mcp` dispatches to. Every `/calyx-mcp` request
+    /// is answered 503 while it is nil.
+    private var calyxMCPRouter: MCPCalyxMCPRouter?
+
+    /// Consulted by `/calyx-mcp`'s herdr-first pane resolution. Defaults
+    /// to the shared singleton; tests inject an isolated instance, same
+    /// rationale as `agentRegistry`/`sessionSurfaceMap`.
+    var herdrPaneRegistry: HerdrPaneRegistry = .shared
+
+    /// What `app_context` reads. Nil until a view host is attached, in
+    /// which case no pane has a live view.
+    var calyxMCPModelContextProvider: (any MCPAppModelContextProviding)?
+
+    /// The herdr socket a pane is looked up under when its
+    /// `X-Calyx-Herdr-Socket-Path` is empty (`HERDR_SOCKET_PATH` unset):
+    /// herdr's default session socket. Test-overridable.
+    var herdrDefaultSocketPath: () -> String? = { HerdrConfigPaths.defaultRootDirectory + "/herdr.sock" }
+
+    /// Installs the router `/calyx-mcp` dispatches to; nil makes every
+    /// `/calyx-mcp` request 503 again.
+    func setCalyxMCPRouter(_ router: MCPCalyxMCPRouter?) {
+        calyxMCPRouter = router
+    }
+
     /// Lazily constructed, cached `MCPCockpitBridge` that Cockpit tool
     /// calls dispatch through -- same `lazy` caveat as
     /// `lazyCommandLogBridge`: only built on first actual Cockpit-tool
@@ -266,6 +292,12 @@ final class CalyxMCPServer {
             return await routeCommandEvent(request: request)
         case ("POST", Self.approvalRequestPath):
             return await routeApprovalRequest(request: request)
+        case ("POST", HTTPParser.calyxMCPPath):
+            return await routeCalyxMCP(request: request)
+        case ("GET", HTTPParser.calyxMCPPath):
+            return await Self.collect(await routeCalyxMCPStream(request: request))
+        case ("DELETE", HTTPParser.calyxMCPPath):
+            return await routeCalyxMCPDelete(request: request)
         default:
             return HTTPParser.response(statusCode: 404, body: nil)
         }
@@ -784,6 +816,170 @@ final class CalyxMCPServer {
         )
     }
 
+    // MARK: - /calyx-mcp routes
+
+    /// Like `route(request:)`, but a `/calyx-mcp` POST or GET may answer
+    /// with a stream. The stream finishes once `lifetime` (the caller's
+    /// handle on the connection) completes; a stream that finishes, or is
+    /// no longer consumed, cancels whatever it was producing.
+    func routeStreaming(request: HTTPRequest, lifetime: Task<Void, Never>) async -> RoutedResponse {
+        let routed: RoutedResponse
+        switch (request.method, request.path) {
+        case ("POST", HTTPParser.calyxMCPPath):
+            routed = await routeCalyxMCPPost(request: request)
+        case ("GET", HTTPParser.calyxMCPPath):
+            routed = await routeCalyxMCPStream(request: request)
+        default:
+            return .buffered(await route(request: request))
+        }
+        guard case .stream(let head, let body) = routed else { return routed }
+        return .stream(head: head, body: Self.bounded(body, by: lifetime))
+    }
+
+    private func routeCalyxMCP(request: HTTPRequest) async -> HTTPResponse {
+        await Self.collect(await routeCalyxMCPPost(request: request))
+    }
+
+    private func routeCalyxMCPPost(request: HTTPRequest) async -> RoutedResponse {
+        if let rejection = calyxMCPRejection(for: request) {
+            return .buffered(rejection)
+        }
+        guard let router = calyxMCPRouter else {
+            return .buffered(HTTPParser.response(statusCode: 503, body: nil))
+        }
+        return await router.routeCalyxMCP(
+            request: request,
+            paneContext: calyxMCPPaneContext(from: request.headers),
+            modelContextProvider: calyxMCPModelContextProvider
+        )
+    }
+
+    private func routeCalyxMCPStream(request: HTTPRequest) async -> RoutedResponse {
+        if let rejection = calyxMCPRejection(for: request) {
+            return .buffered(rejection)
+        }
+        guard let router = calyxMCPRouter else {
+            return .buffered(HTTPParser.response(statusCode: 503, body: nil))
+        }
+        return await router.routeCalyxMCPStream(request: request)
+    }
+
+    private func routeCalyxMCPDelete(request: HTTPRequest) async -> HTTPResponse {
+        if let rejection = calyxMCPRejection(for: request) {
+            return rejection
+        }
+        guard let router = calyxMCPRouter else {
+            return HTTPParser.response(statusCode: 503, body: nil)
+        }
+        return await router.routeCalyxMCPDelete(request: request)
+    }
+
+    /// The checks every `/calyx-mcp` request passes before its router: a
+    /// present `Origin` must be loopback (403), then the bearer token (401).
+    /// A request without `Origin` is not rejected for it.
+    private func calyxMCPRejection(for request: HTTPRequest) -> HTTPResponse? {
+        if let origin = header(named: "Origin", in: request.headers), !Self.isLoopbackOrigin(origin) {
+            return HTTPParser.response(statusCode: 403, body: nil)
+        }
+        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+            return HTTPParser.response(statusCode: 401, body: nil)
+        }
+        return nil
+    }
+
+    private static func isLoopbackOrigin(_ origin: String) -> Bool {
+        guard let host = URLComponents(string: origin)?.host?.lowercased() else { return false }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
+    }
+
+    /// Pane resolution for `/calyx-mcp`: a non-empty
+    /// `X-Calyx-Herdr-Pane-ID` is final, resolved or not; otherwise the
+    /// session and surface headers resolve exactly as for `/mcp`
+    /// (`resolveSurfaceID`). An empty or whitespace-only herdr pane id is
+    /// the unset-variable expansion outside herdr and counts as absent.
+    private func calyxMCPPaneContext(from headers: [String: String]) -> MCPPaneResolutionContext {
+        if let ref = resolveHerdrPaneRef(from: headers) {
+            return MCPPaneResolutionContext(
+                surfaceID: herdrPaneRegistry.surfaceID(forPaneID: ref.paneID, socketPath: ref.socketPath),
+                clientName: nil,
+                herdrPaneRef: ref
+            )
+        }
+        if herdrPaneID(from: headers) != nil {
+            // A herdr pane with no socket to look it up under.
+            return MCPPaneResolutionContext(surfaceID: nil, clientName: nil, herdrPaneRef: nil)
+        }
+        return MCPPaneResolutionContext(surfaceID: resolveSurfaceID(from: headers), clientName: nil, herdrPaneRef: nil)
+    }
+
+    /// The herdr pane the request names. The socket is
+    /// `X-Calyx-Herdr-Socket-Path` when non-empty, else
+    /// `herdrDefaultSocketPath()`. Nil without a non-empty pane id or
+    /// without a socket.
+    private func resolveHerdrPaneRef(from headers: [String: String]) -> HerdrPaneRef? {
+        guard let paneID = herdrPaneID(from: headers) else { return nil }
+        let explicitSocket = header(named: "X-Calyx-Herdr-Socket-Path", in: headers)?
+            .trimmingCharacters(in: .whitespaces)
+        let socketPath: String?
+        if let explicitSocket, !explicitSocket.isEmpty {
+            socketPath = explicitSocket
+        } else {
+            socketPath = herdrDefaultSocketPath()
+        }
+        guard let socketPath else { return nil }
+        return HerdrPaneRef(socketPath: socketPath, paneID: paneID)
+    }
+
+    private func herdrPaneID(from headers: [String: String]) -> String? {
+        guard let paneID = header(named: "X-Calyx-Herdr-Pane-ID", in: headers)?
+            .trimmingCharacters(in: .whitespaces), !paneID.isEmpty else {
+            return nil
+        }
+        return paneID
+    }
+
+    /// A buffered response for `route(request:)`: a stream is read to its
+    /// end and returned as one body.
+    private static func collect(_ routed: RoutedResponse) async -> HTTPResponse {
+        switch routed {
+        case .buffered(let response):
+            return response
+        case .stream(let head, let body):
+            var data = Data()
+            for await chunk in body {
+                data.append(chunk)
+            }
+            let base = HTTPParser.response(statusCode: head.statusCode, body: data)
+            return HTTPResponse(
+                statusCode: base.statusCode,
+                statusMessage: base.statusMessage,
+                headers: base.headers.merging(head.headers) { _, streamed in streamed },
+                body: data
+            )
+        }
+    }
+
+    /// `body`, finished once `lifetime` completes.
+    private static func bounded(_ body: AsyncStream<Data>, by lifetime: Task<Void, Never>) -> AsyncStream<Data> {
+        AsyncStream { continuation in
+            let forward = Task {
+                for await chunk in body {
+                    continuation.yield(chunk)
+                }
+                continuation.finish()
+            }
+            let watch = Task {
+                await lifetime.value
+                forward.cancel()
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in
+                forward.cancel()
+                watch.cancel()
+            }
+        }
+    }
+
     /// Case-insensitive `Authorization: Bearer <token>` extraction, shared
     /// by both `/mcp` and `/agent-event`. Built on `header(named:in:)` so
     /// the case-insensitive lookup itself exists in exactly one place.
@@ -918,13 +1114,14 @@ final class CalyxMCPServer {
 
         // Phase 1: canonical linear scan over `preferredPort..<preferredPort+10`.
         // If a port in that window is free we bind it and publish the port
-        // the listener actually resolved to (see `bindListener(onPort:)`) —
-        // which matches the requested port for the common non-zero case,
+        // the listener actually resolved to (see
+        // `LoopbackListenerBinder.bindListener(onPort:logLabel:)`), which
+        // matches the requested port for the common non-zero case,
         // preserving the "well-known port" UX, but can differ when
         // `preferredPort` is `0` and the kernel silently assigns an
         // ephemeral slot instead of literally binding port `0` (see
-        // `bindKernelAssignedListener`'s doc comment for why that can
-        // happen even on this, the canonical-scan, path).
+        // `LoopbackListenerBinder.bindKernelAssignedListener`'s doc comment
+        // for why that can happen even on this, the canonical-scan, path).
         //
         // `NWListener(using:)` does NOT actually validate the bind — it only
         // checks parameter shape. The kernel-level bind happens later during
@@ -936,7 +1133,7 @@ final class CalyxMCPServer {
         // never accepts connections.
         for portOffset in 0..<10 {
             let tryPort = preferredPort + portOffset
-            guard let (nl, resolvedPort) = await bindListener(onPort: tryPort) else {
+            guard let (nl, resolvedPort) = await LoopbackListenerBinder.bindListener(onPort: tryPort, logLabel: Self.listenerLogLabel) else {
                 lastError = NSError(
                     domain: "CalyxMCPServer",
                     code: 3,
@@ -976,236 +1173,29 @@ final class CalyxMCPServer {
         )
     }
 
-    /// Attempt to bind an `NWListener` on `127.0.0.1:<port>`. Returns the
-    /// started listener together with the port it actually resolved to
-    /// once ready, or `nil` if the bind fails (e.g. EADDRINUSE), does not
-    /// become ready within 1s, or reaches `.ready` without a resolvable
-    /// non-zero port.
-    ///
-    /// The resolved port is read back from `nl.port?.rawValue` rather than
-    /// trusted to equal `tryPort` because `requiredLocalEndpoint` with a
-    /// literal port of `0` is not rejected by Network framework on every
-    /// host (see `bindKernelAssignedListener`'s doc
-    /// comment): on hosts where it isn't rejected, this very function can
-    /// reach `.ready` with the kernel having silently picked an ephemeral
-    /// port for `tryPort == 0`, and the only way to learn which port that
-    /// is is to ask the listener itself. A `nil`/`0` readback here is
-    /// treated as a bind failure (cancel + `nil`) so a caller can never
-    /// record port `0` as if it were a successful bind.
-    ///
-    /// Note: the listener's queue is intentionally a dedicated background
-    /// queue rather than `.main`. `startListenerAndWaitForReady` suspends
-    /// on a `CheckedContinuation` instead of blocking a thread, so
-    /// `@MainActor` stays free to run other work while a bind is in
-    /// flight; the listener's own callbacks still run on their dedicated
-    /// queue so the state handler never has to hop onto `@MainActor`
-    /// itself. Once the listener is ready we reassign
-    /// `newConnectionHandler` so connections route back into `@MainActor`
-    /// via `Task { @MainActor in ... }`.
-    private func bindListener(onPort tryPort: Int) async -> (NWListener, Int)? {
-        let params = NWParameters.tcp
-        let nwPort = NWEndpoint.Port(integerLiteral: UInt16(tryPort))
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(
-            host: .ipv4(.loopback),
-            port: nwPort
-        )
-        guard let nl = try? NWListener(using: params) else { return nil }
-        guard let ready = await startListenerAndWaitForReady(nl) else { return nil }
-        guard let resolvedPort = ready.port?.rawValue, resolvedPort != 0 else {
-            ready.cancel()
-            return nil
-        }
-        return (ready, Int(resolvedPort))
-    }
-
-    /// Fallback bind path used when the canonical scan (Phase 1 in
-    /// `start()`) exhausts `preferredPort..<preferredPort+10` without
-    /// finding a free port. Asks the kernel for a free ephemeral loopback
-    /// port via a throwaway BSD socket, then binds an `NWListener` to
-    /// that resolved port with `requiredLocalEndpoint`. Returns the
-    /// started listener and the port the kernel actually picked, or
-    /// `nil` if every attempt fails.
-    ///
-    /// Implementation note: this path resolves a concrete port via a BSD
-    /// socket before ever touching `NWListener`, rather than binding
-    /// `requiredLocalEndpoint` with a literal port of `0` directly, on
-    /// the assumption that Network framework rejects a literal-`0`
-    /// `requiredLocalEndpoint` at `start()` time
-    /// (`nw_path_create_evaluator_for_listener failed`). That rejection
-    /// is environment-dependent,
-    /// not universal: on hosts where it does *not* reject the bind, a
-    /// literal-`0` `requiredLocalEndpoint` reaches `.ready` directly,
-    /// with the kernel silently choosing the ephemeral port during
-    /// Phase 1's canonical scan itself (`bindListener(onPort:)`) —
-    /// which is exactly why `bindListener(onPort:)` reads back
-    /// `nl.port?.rawValue` after `.ready` instead of trusting the
-    /// requested port. This fallback remains in place for hosts where
-    /// the literal-`0` bind genuinely is rejected and the canonical
-    /// scan's `tryPort == 0` iteration fails outright.
+    /// Asks the kernel for a free ephemeral loopback port and binds an
+    /// `NWListener` to it. See
+    /// `LoopbackListenerBinder.bindKernelAssignedListener(logLabel:)`.
     ///
     /// `internal` (not `private`) so `CalyxMCPServerTests` can exercise
     /// it directly via `@testable import` without needing to exhaust
     /// the whole canonical scan range first just to reach this path.
     func bindKernelAssignedListener() async -> (NWListener, Int)? {
-        // Strategy: use the BSD socket API to ask the kernel for a free
-        // ephemeral port on 127.0.0.1, then probe that exact port via
-        // `requiredLocalEndpoint` with the resolved port number — see
-        // this function's doc comment for why a literal port `0` isn't
-        // handed to `NWListener` directly. The BSD socket is closed
-        // before NWListener binds; the race window is sub-millisecond
-        // and the test exercises a host where the pre-bound ports are
-        // deliberately outside this range.
-        //
-        // Try up to a handful of kernel-assigned ports — if one happens
-        // to lose the close→bind race we ask the kernel for another.
-        for attempt in 0..<5 {
-            guard let probedPort = askKernelForFreeLoopbackPort() else {
-                NSLog("[CalyxMCPServer] BSD fallback attempt \(attempt): kernel did not return a port")
-                continue
-            }
-
-            let params = NWParameters.tcp
-            let nwPort = NWEndpoint.Port(integerLiteral: UInt16(probedPort))
-            params.requiredLocalEndpoint = NWEndpoint.hostPort(
-                host: .ipv4(.loopback),
-                port: nwPort
-            )
-            guard let nl = try? NWListener(using: params) else { continue }
-            guard let ready = await startListenerAndWaitForReady(nl) else { continue }
-
-            // Symmetric with `bindListener(onPort:)`: read the port the
-            // listener itself actually resolved to, rather than
-            // trusting `probedPort` (the pre-bind BSD-socket probe) to
-            // still be accurate. No observed real-world divergence
-            // between the two today — the BSD socket is closed before
-            // `NWListener` binds, and the race window between them is
-            // sub-millisecond — but nothing structurally guarantees
-            // they can never differ, and recording an unverified
-            // pre-bind guess here would silently reopen the exact class
-            // of bug `bindListener(onPort:)` was fixed to close: a
-            // caller trusting a port number the listener never
-            // confirmed it actually bound.
-            guard let boundPort = ready.port?.rawValue, boundPort != 0 else {
-                ready.cancel()
-                continue
-            }
-            if Int(boundPort) != probedPort {
-                NSLog("[CalyxMCPServer] BSD fallback probed port \(probedPort) but the listener resolved to \(boundPort); recording the resolved port")
-            }
-            return (ready, Int(boundPort))
-        }
-        return nil
+        await LoopbackListenerBinder.bindKernelAssignedListener(logLabel: Self.listenerLogLabel)
     }
 
-    /// Ask the kernel for a free ephemeral port on `127.0.0.1` by
-    /// binding a throwaway BSD socket to `127.0.0.1:0`, reading the
-    /// assigned port via `getsockname`, then closing the socket. The
-    /// returned port is the kernel's choice from the ephemeral range —
-    /// use it as the desired port for an `NWListener` bind.
+    /// Ask the kernel for a free ephemeral port on `127.0.0.1`. See
+    /// `LoopbackListenerBinder.askKernelForFreeLoopbackPort()`.
     ///
     /// `internal` (not `private`) so `CalyxMCPServerTests` can call this
     /// directly via `@testable import` instead of maintaining its own
     /// duplicate copy of the same BSD-socket probe.
     func askKernelForFreeLoopbackPort() -> Int? {
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = 0
-        addr.sin_addr.s_addr = UInt32(0x7F000001).bigEndian  // 127.0.0.1
-        addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-
-        let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-
-        var reuse: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
-
-        let bindResult = withUnsafePointer(to: &addr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-                Darwin.bind(fd, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-            }
-        }
-        guard bindResult == 0 else { return nil }
-
-        var boundAddr = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let nameResult = withUnsafeMutablePointer(to: &boundAddr) { ptr -> Int32 in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-                getsockname(fd, saPtr, &len)
-            }
-        }
-        guard nameResult == 0 else { return nil }
-        let resolvedPort = Int(UInt16(bigEndian: boundAddr.sin_port))
-        return resolvedPort != 0 ? resolvedPort : nil
+        LoopbackListenerBinder.askKernelForFreeLoopbackPort()
     }
 
-    /// 1s is generous: a successful loopback bind reaches `.ready` in
-    /// sub-millisecond on a healthy host; bind failures are reported
-    /// essentially synchronously from the kernel. We cap so a wedged
-    /// listener never blocks `start()` indefinitely.
-    private static let listenerReadyTimeout: TimeInterval = 1.0
-
-    /// Shared helper: start `nl` on a dedicated background queue and
-    /// suspend until it reaches `.ready` (success) or `.failed` /
-    /// `.cancelled` / timeout (failure). Returns the listener on
-    /// success, `nil` on failure.
-    ///
-    /// `stateUpdateHandler` can fire `.ready` and later still fire
-    /// `.failed`/`.cancelled` on this SAME listener (a later `.cancel()`
-    /// on the failure path in `bindListener(onPort:)` drives `.cancelled`
-    /// into this same closure) — a `CheckedContinuation` resumed twice
-    /// traps, so every arm below (the state handler's three cases and the
-    /// timeout) routes through one `IPCListenerReadyGuard`, constructed
-    /// before `nl.start(queue:)` so no resume can race its construction.
-    /// The state handler and the timeout's `asyncAfter` both run on the
-    /// same serial `listenerQueue`, so the guard needs no lock beyond its
-    /// own plain `Bool`.
-    private func startListenerAndWaitForReady(_ nl: NWListener) async -> NWListener? {
-        let listenerQueue = DispatchQueue(
-            label: "CalyxMCPServer.listenerProbe"
-        )
-        let guardian = IPCListenerReadyGuard()
-
-        let didSucceed = await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
-            nl.stateUpdateHandler = { state in
-                switch state {
-                case .ready:
-                    guardian.resumeOnce { continuation.resume(returning: true) }
-                case .failed(let err):
-                    NSLog("[CalyxMCPServer] probe listener failed: \(err)")
-                    guardian.resumeOnce { continuation.resume(returning: false) }
-                case .cancelled:
-                    guardian.resumeOnce { continuation.resume(returning: false) }
-                default:
-                    break
-                }
-            }
-            // NWListener fails its `start()` with EINVAL when no
-            // `newConnectionHandler` is set before `start()` is invoked.
-            // Install a no-op placeholder here purely to satisfy the
-            // start-time invariant; `finishStart` reassigns the real
-            // production handler after the probe completes successfully.
-            // Without this placeholder every bind in the canonical
-            // 41830-41839 scan fails with `POSIXErrorCode(rawValue: 22)`
-            // and `start()` ends up in the kernel-assigned fallback path
-            // unconditionally — which used to throw outright before the
-            // fallback existed, breaking previously-passing tests.
-            nl.newConnectionHandler = { connection in
-                connection.cancel()
-            }
-            nl.start(queue: listenerQueue)
-
-            listenerQueue.asyncAfter(deadline: .now() + Self.listenerReadyTimeout) {
-                guardian.resumeOnce { continuation.resume(returning: false) }
-            }
-        }
-
-        if !didSucceed {
-            nl.cancel()
-            return nil
-        }
-        return nl
-    }
+    /// Prefix of the binder's log lines and its probe queue label.
+    private static let listenerLogLabel = "CalyxMCPServer"
 
     /// Common tail of every successful bind path. Installs the
     /// production `newConnectionHandler`, records bookkeeping state
@@ -1447,6 +1437,11 @@ final class CalyxMCPServer {
         var data = Data()
         var requiredTotal: Int?
         var didRespond = false
+        /// The body cap of the request being received, decided from its
+        /// header block (`requestBodyLimit(forHeaderString:)`).
+        var bodyLimit = HTTPParser.maxBodySize
+        /// True from a streamed response's head until its last chunk.
+        var isStreaming = false
     }
 
     private func handleConnection(_ connection: NWConnection) {
@@ -1536,7 +1531,10 @@ final class CalyxMCPServer {
                     // against the byte count it already computed then.
                     state = accumulator.data.count >= requiredTotal ? .complete : .incomplete
                 } else {
-                    let (resolvedState, resolvedTotal) = HTTPParser.completeness(of: accumulator.data)
+                    let (resolvedState, resolvedTotal) = HTTPParser.completeness(of: accumulator.data) { headerString in
+                        accumulator.bodyLimit = self.requestBodyLimit(forHeaderString: headerString)
+                        return accumulator.bodyLimit
+                    }
                     accumulator.requiredTotal = resolvedTotal
                     state = resolvedState
                 }
@@ -1585,7 +1583,11 @@ final class CalyxMCPServer {
     /// guarantees only the first call gets to respond.
     private func finishRequest(connection: NWConnection, buffer: Data, accumulator: ReceiveAccumulator) async {
         do {
-            let httpRequest = try HTTPParser.parse(buffer)
+            let httpRequest = try HTTPParser.parse(buffer, maxBodySize: accumulator.bodyLimit)
+            if httpRequest.path == HTTPParser.calyxMCPPath {
+                await serveCalyxMCP(connection: connection, request: httpRequest, accumulator: accumulator)
+                return
+            }
             let httpResponse = await self.dispatchRoute(connection: connection, request: httpRequest, accumulator: accumulator)
             self.sendHTTPResponse(connection: connection, httpResponse: httpResponse, accumulator: accumulator)
         } catch let error as HTTPParseError {
@@ -1653,28 +1655,98 @@ final class CalyxMCPServer {
             await self.route(request: request)
         }
 
-        armApprovalRequestConnectionDropSentinel(connection: connection, routeTask: routeTask, accumulator: accumulator)
+        armConnectionDropSentinel(
+            connection: connection,
+            isSettled: { accumulator.didRespond },
+            onDrop: { routeTask.cancel() }
+        )
 
         return await routeTask.value
     }
 
+    /// Serves a `/calyx-mcp` request, whose response may be a stream. The
+    /// connection-drop sentinel `dispatchRoute` arms for
+    /// `/approval-request` watches this request too, for as long as its
+    /// response is pending or streaming: a drop cancels the route's Task
+    /// and ends `lifetime`, which finishes the stream and cancels whatever
+    /// was producing it. A stream is written with chunked transfer
+    /// encoding, one chunk per element, then the connection is closed.
+    private func serveCalyxMCP(connection: NWConnection, request: HTTPRequest, accumulator: ReceiveAccumulator) async {
+        let lifetime = Task<Void, Never> {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3600))
+            }
+        }
+        let routeTask = Task { @MainActor in
+            await self.routeStreaming(request: request, lifetime: lifetime)
+        }
+        armConnectionDropSentinel(
+            connection: connection,
+            isSettled: { accumulator.didRespond && !accumulator.isStreaming },
+            onDrop: {
+                routeTask.cancel()
+                lifetime.cancel()
+            }
+        )
+
+        switch await routeTask.value {
+        case .buffered(let response):
+            lifetime.cancel()
+            sendHTTPResponse(connection: connection, httpResponse: response, accumulator: accumulator)
+        case .stream(let head, let body):
+            guard !accumulator.didRespond else {
+                lifetime.cancel()
+                return
+            }
+            accumulator.didRespond = true
+            accumulator.isStreaming = true
+            connection.send(content: HTTPParser.serializeStreamHead(head), completion: .idempotent)
+            for await chunk in body {
+                connection.send(content: HTTPParser.encodeChunk(chunk), completion: .idempotent)
+            }
+            lifetime.cancel()
+            accumulator.isStreaming = false
+            connection.send(content: HTTPParser.lastChunk, completion: .contentProcessed { _ in
+                connection.cancel()
+            })
+        }
+    }
+
+    /// The body cap of the request whose header block is `headerString`:
+    /// 32 MiB for `/calyx-mcp` carrying this server's bearer token, 1 MiB
+    /// otherwise, so the larger cap is never available before
+    /// authentication.
+    private func requestBodyLimit(forHeaderString headerString: String) -> Int {
+        let token = self.token
+        return HTTPParser.bodyLimit(forHeaderString: headerString) { authorization in
+            guard !token.isEmpty, let authorization, authorization.hasPrefix("Bearer ") else { return false }
+            return String(authorization.dropFirst(7)) == token
+        }
+    }
+
     /// The sentinel receive `dispatchRoute` arms for `/approval-request`
-    /// — see that method's own doc comment for the full rationale. Kept
-    /// as its own recursive method (mirroring `receiveUntilComplete`'s
-    /// shape) rather than inline in `dispatchRoute`, so the re-arm-on-
-    /// non-terminal-data step reads as a plain recursive call instead of
-    /// a nested closure capturing itself.
-    private func armApprovalRequestConnectionDropSentinel(
-        connection: NWConnection, routeTask: Task<HTTPResponse, Never>, accumulator: ReceiveAccumulator
+    /// and `serveCalyxMCP` for `/calyx-mcp` — see `dispatchRoute`'s own
+    /// doc comment for the full rationale. `isSettled` says whether the
+    /// response is already complete, in which case a completing receive
+    /// (including the one `sendHTTPResponse`'s own `connection.cancel()`
+    /// completes) is a no-op; otherwise a terminal receive calls `onDrop`.
+    /// Kept as its own recursive method (mirroring `receiveUntilComplete`'s
+    /// shape) rather than inline, so the re-arm-on-non-terminal-data step
+    /// reads as a plain recursive call instead of a nested closure
+    /// capturing itself.
+    private func armConnectionDropSentinel(
+        connection: NWConnection,
+        isSettled: @escaping @MainActor () -> Bool,
+        onDrop: @escaping @MainActor () -> Void
     ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: HTTPParser.maxHeaderSize + HTTPParser.maxBodySize) { [weak self] _, _, isComplete, error in
             Task { @MainActor in
-                guard let self, !accumulator.didRespond else { return }
+                guard let self, !isSettled() else { return }
                 guard isComplete || error != nil else {
-                    self.armApprovalRequestConnectionDropSentinel(connection: connection, routeTask: routeTask, accumulator: accumulator)
+                    self.armConnectionDropSentinel(connection: connection, isSettled: isSettled, onDrop: onDrop)
                     return
                 }
-                routeTask.cancel()
+                onDrop()
             }
         }
     }

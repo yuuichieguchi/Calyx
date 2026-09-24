@@ -848,4 +848,39 @@ final class CodexConfigManagerTests: XCTestCase {
         }
         // Note: some errors are acceptable (contention), but the file must not be corrupted
     }
+
+    // MARK: - calyx-mcp table
+
+    // enableIPC must also own a second table, [mcp_servers.calyx-mcp],
+    // sharing calyx-ipc's host/port but the /calyx-mcp path, carrying the
+    // same env_http_headers mapping plus the two herdr headers.
+    func test_enableIPC_alsoWritesCalyxMCPTable() throws {
+        try CodexConfigManager.enableIPC(port: 41830, token: "abc123", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertTrue(content.contains("[mcp_servers.calyx-mcp]"),
+                      "enableIPC must also write a [mcp_servers.calyx-mcp] table")
+        XCTAssertTrue(content.contains("url = \"http://127.0.0.1:41830/calyx-mcp\""),
+                      "calyx-mcp must share calyx-ipc's host/port but use the /calyx-mcp path")
+        XCTAssertTrue(content.contains("\"Authorization\" = \"Bearer abc123\""))
+        XCTAssertTrue(content.contains("\"X-Calyx-Agent-Kind\" = \"codex\""))
+        XCTAssertTrue(content.contains("\"X-Calyx-Herdr-Pane-ID\" = \"HERDR_PANE_ID\""),
+                      "calyx-mcp's env_http_headers mapping must additionally map the herdr pane header")
+        XCTAssertTrue(content.contains("\"X-Calyx-Herdr-Socket-Path\" = \"HERDR_SOCKET_PATH\""),
+                      "calyx-mcp's env_http_headers mapping must additionally map the herdr socket-path header")
+    }
+
+    func test_disableIPC_removesBothCalyxIPCAndCalyxMCPTables() throws {
+        // Seeded with an unrelated sibling table so this file exercises
+        // ordinary table removal, not whatever "file became entirely
+        // Calyx's own" edge case an enable-from-nothing cycle would hit.
+        writeConfig("[other]\nx = 1\n")
+        try CodexConfigManager.enableIPC(port: 41830, token: "abc123", configPath: configPath)
+        try CodexConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc]"))
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-mcp]"),
+                       "disableIPC must also remove [mcp_servers.calyx-mcp]")
+    }
 }

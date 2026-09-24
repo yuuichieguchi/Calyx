@@ -45,6 +45,14 @@ class SplitContainerView: NSView {
         _ direction: SplitDirection,
         _ splitRect: CGRect
     ) -> Void)?
+    /// MCP Apps docks by leaf. A dock shares its leaf's rect with the
+    /// terminal wrapper and outlives tab switches (`updateRegistry`).
+    private var docks: [UUID: NSView] = [:]
+    /// Docks whose leaf left the tree: detached but kept, and put back
+    /// when the leaf returns.
+    private var parkedDocks: [UUID: NSView] = [:]
+    /// The leaf whose dock covers the whole container.
+    private var fullscreenLeafID: UUID?
     var onDeferredLayoutComplete: (() -> Void)?
     var onActiveLeafChange: ((UUID) -> Void)?
 
@@ -72,6 +80,7 @@ class SplitContainerView: NSView {
         scrollWrappers.removeAll()
         dividerCache.removeAll()
         dividersUsedThisPass.removeAll()
+        // Docks stay in `docks`; the next layout puts them back or parks them.
         subviews.forEach { $0.removeFromSuperview() }
         activeLeafID = nil
         needsLayout = true
@@ -93,6 +102,8 @@ class SplitContainerView: NSView {
             subviews.forEach { $0.removeFromSuperview() }
             scrollWrappers.removeAll()
             dividerCache.removeAll()
+            parkedDocks.merge(docks) { _, new in new }
+            docks.removeAll()
             activeLeafID = nil
             applyActiveDimming()
             return
@@ -166,7 +177,23 @@ class SplitContainerView: NSView {
         guard let root = currentTree.root else { return }
 
         dividersUsedThisPass.removeAll()
-        if let zoomID = currentTree.effectiveZoomedLeafID {
+        restoreParkedDocks()
+        if let fullscreenID = fullscreenLeafID, currentTree.allLeafIDs().contains(fullscreenID) {
+            // Fullscreen: the leaf's dock covers the container. Wrappers
+            // are hidden with their frames left as they are, so leaving
+            // fullscreen needs no geometry recovery (a zero frame would
+            // also kill the Metal drawable).
+            for (_, wrapper) in scrollWrappers {
+                wrapper.isHidden = true
+            }
+            for (id, dock) in docks {
+                dock.isHidden = id != fullscreenID
+                if id == fullscreenID {
+                    dock.frame = bounds
+                    if dock.superview !== self { addSubview(dock) }
+                }
+            }
+        } else if let zoomID = currentTree.effectiveZoomedLeafID {
             // Zoomed: lay out ONLY the zoomed leaf, at the container's
             // full bounds, and hide every other wrapper. Hiding the
             // `SurfaceScrollView` WRAPPER (not the `SurfaceView` inside
@@ -191,6 +218,10 @@ class SplitContainerView: NSView {
             for (id, wrapper) in scrollWrappers {
                 wrapper.isHidden = (id != zoomID)
             }
+            // Another leaf's dock hides with its terminal; it is not destroyed.
+            for (id, dock) in docks where id != zoomID {
+                dock.isHidden = true
+            }
         } else {
             layoutNode(root, in: bounds)
             for (_, wrapper) in scrollWrappers {
@@ -198,7 +229,51 @@ class SplitContainerView: NSView {
             }
         }
         removeOrphanedSurfaces()
+        parkDocksOutsideTree()
         reapUnusedDividers()
+    }
+
+    // MARK: - MCP Apps docks
+
+    /// The terminal row height in points, from the surface's cell size.
+    private func rowHeight(of surfaceView: SurfaceView) -> CGFloat {
+        surfaceView.convertFromBacking(surfaceView.cachedCellSize).height
+    }
+
+    /// The height a dock asks for through its intrinsic content size. A
+    /// dock that states none gets no inline space.
+    private func preferredHeight(of dock: NSView) -> CGFloat {
+        let height = dock.intrinsicContentSize.height
+        return height == NSView.noIntrinsicMetric ? 0 : height
+    }
+
+    /// Puts parked docks back when their leaf is in the tree again.
+    private func restoreParkedDocks() {
+        let leafIDs = Set(currentTree.allLeafIDs())
+        for (id, dock) in parkedDocks where leafIDs.contains(id) {
+            docks[id] = dock
+            parkedDocks.removeValue(forKey: id)
+        }
+    }
+
+    /// Detaches (but keeps) the docks of leaves that left the tree.
+    private func parkDocksOutsideTree() {
+        let leafIDs = Set(currentTree.allLeafIDs())
+        for (id, dock) in docks where !leafIDs.contains(id) {
+            dock.removeFromSuperview()
+            parkedDocks[id] = dock
+            docks.removeValue(forKey: id)
+        }
+        if let fullscreenID = fullscreenLeafID, !leafIDs.contains(fullscreenID) {
+            fullscreenLeafID = nil
+        }
+    }
+
+    /// Lays the tree out again, for dock changes that do not change the tree.
+    private func relayoutForDocks() {
+        guard bounds.width > 0 && bounds.height > 0, currentTree.root != nil else { return }
+        applyLayout()
+        applyActiveDimming()
     }
 
     // MARK: - Active Pane Dimming
@@ -253,10 +328,22 @@ class SplitContainerView: NSView {
                     scrollWrappers[id] = wrapper
                 }
                 surfaceView.focusHost = self
-                wrapper.frame = rect
                 wrapper.autoresizingMask = []
+                if let dock = docks[id] {
+                    let split = MCPAppDockLayout.split(
+                        leafRect: rect, dockHeight: preferredHeight(of: dock), rowHeight: rowHeight(of: surfaceView)
+                    )
+                    wrapper.frame = split.terminalRect
+                    dock.frame = split.dockRect
+                    dock.isHidden = false
+                } else {
+                    wrapper.frame = rect
+                }
                 if wrapper.superview !== self {
                     addSubview(wrapper)
+                }
+                if let dock = docks[id], dock.superview !== self {
+                    addSubview(dock, positioned: .above, relativeTo: wrapper)
                 }
             }
 
@@ -428,5 +515,58 @@ extension SplitContainerView: SurfaceFocusHost {
         activeLeafID = id
         applyActiveDimming()
         onActiveLeafChange?(id)
+    }
+}
+
+// MARK: - MCP Apps dock placement
+
+extension SplitContainerView {
+    /// Shows `dockView` under the leaf's terminal. Attaching the same view
+    /// again is harmless; a different view replaces the leaf's dock.
+    func attachDock(_ dockView: NSView, toLeaf leafID: UUID) {
+        if let existing = docks[leafID], existing !== dockView {
+            existing.removeFromSuperview()
+        }
+        parkedDocks.removeValue(forKey: leafID)
+        docks[leafID] = dockView
+        relayoutForDocks()
+    }
+
+    /// The leaf's attached dock. Nil while the leaf is out of the tree.
+    func dockView(forLeaf leafID: UUID) -> NSView? {
+        docks[leafID]
+    }
+
+    /// Fullscreen hides the terminal wrappers without zeroing their frames
+    /// and gives the leaf's dock the whole container.
+    func setFullscreen(_ isFullscreen: Bool, forLeaf leafID: UUID) {
+        if isFullscreen {
+            fullscreenLeafID = leafID
+        } else if fullscreenLeafID == leafID {
+            fullscreenLeafID = nil
+        }
+        relayoutForDocks()
+    }
+
+    /// Removes the leaf's dock for good (the view it showed was closed).
+    func detachDock(fromLeaf leafID: UUID) {
+        docks.removeValue(forKey: leafID)?.removeFromSuperview()
+        parkedDocks.removeValue(forKey: leafID)
+        if fullscreenLeafID == leafID { fullscreenLeafID = nil }
+        relayoutForDocks()
+    }
+
+    /// A dock's preferred height changed.
+    func dockPreferredHeightDidChange() {
+        relayoutForDocks()
+    }
+
+    /// The leaf's whole rect (terminal plus dock) while it is laid out.
+    func leafRect(forLeaf leafID: UUID) -> CGRect? {
+        guard let wrapper = scrollWrappers[leafID], wrapper.superview === self else { return nil }
+        guard let dock = docks[leafID], dock.superview === self, !dock.isHidden, fullscreenLeafID != leafID else {
+            return wrapper.frame
+        }
+        return wrapper.frame.union(dock.frame)
     }
 }

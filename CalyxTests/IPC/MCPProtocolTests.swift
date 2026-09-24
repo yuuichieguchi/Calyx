@@ -54,9 +54,9 @@ final class MCPProtocolTests: XCTestCase {
         XCTAssertNotNil(response.result,
                         "Initialize response must contain a result")
 
-        // Assert — decode result as MCPInitializeResult
+        // Assert — decode result as CalyxIPCInitializeResult
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
 
         XCTAssertEqual(initResult.protocolVersion, "2024-11-05",
                        "Protocol version must be 2024-11-05")
@@ -79,26 +79,26 @@ final class MCPProtocolTests: XCTestCase {
 
     func test_initializeResult_instructions_codable_roundtrip() throws {
         // Non-nil case
-        let withInstructions = MCPInitializeResult(
+        let withInstructions = CalyxIPCInitializeResult(
             protocolVersion: "2024-11-05",
             capabilities: MCPCapabilities(tools: MCPToolsCapability(listChanged: false)),
-            serverInfo: MCPServerInfo(name: "test", version: "1.0.0"),
+            serverInfo: CalyxIPCServerInfo(name: "test", version: "1.0.0"),
             instructions: "Test instructions"
         )
         let data1 = try jsonEncoder.encode(withInstructions)
-        let decoded1 = try jsonDecoder.decode(MCPInitializeResult.self, from: data1)
+        let decoded1 = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: data1)
         XCTAssertEqual(decoded1.instructions, "Test instructions",
                        "instructions must survive encode/decode roundtrip")
 
         // Nil case
-        let withoutInstructions = MCPInitializeResult(
+        let withoutInstructions = CalyxIPCInitializeResult(
             protocolVersion: "2024-11-05",
             capabilities: MCPCapabilities(tools: MCPToolsCapability(listChanged: false)),
-            serverInfo: MCPServerInfo(name: "test", version: "1.0.0"),
+            serverInfo: CalyxIPCServerInfo(name: "test", version: "1.0.0"),
             instructions: nil
         )
         let data2 = try jsonEncoder.encode(withoutInstructions)
-        let decoded2 = try jsonDecoder.decode(MCPInitializeResult.self, from: data2)
+        let decoded2 = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: data2)
         XCTAssertNil(decoded2.instructions,
                      "nil instructions must remain nil after roundtrip")
     }
@@ -134,7 +134,7 @@ final class MCPProtocolTests: XCTestCase {
     func test_instructions_withPeerID_doesNotInstructImmediateRegisterPeerCall() throws {
         let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: UUID())
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertFalse(
@@ -152,7 +152,7 @@ final class MCPProtocolTests: XCTestCase {
 
         let response = MCPRouter.buildInitializeResponse(id: id, peerID: peerID)
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
         let instructions = try XCTUnwrap(initResult.instructions)
 
         // "Your peer_id is: <uuid>" must still appear (existing contract, unchanged).
@@ -178,7 +178,7 @@ final class MCPProtocolTests: XCTestCase {
     func test_instructions_withoutPeerID_retainsImmediateRegisterPeerInstruction() throws {
         let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertTrue(
@@ -253,7 +253,7 @@ final class MCPProtocolTests: XCTestCase {
     func test_instructions_withoutPeerID_doesNotMentionAck() throws {
         let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertNil(
@@ -266,7 +266,7 @@ final class MCPProtocolTests: XCTestCase {
     func test_instructions_withPeerID_doesNotMentionAck() throws {
         let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: UUID())
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertNil(
@@ -285,7 +285,7 @@ final class MCPProtocolTests: XCTestCase {
     func test_instructions_withoutPeerID_doesNotMentionBrowserTools() throws {
         let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertFalse(
@@ -299,7 +299,7 @@ final class MCPProtocolTests: XCTestCase {
     func test_instructions_withPeerID_doesNotMentionBrowserTools() throws {
         let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: UUID())
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertFalse(
@@ -344,7 +344,7 @@ final class MCPProtocolTests: XCTestCase {
         for (peerID, variant) in [(UUID?.none, "peerID: nil"), (UUID?.some(UUID()), "peerID: UUID()")] {
             let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: peerID)
             let resultData = try jsonEncoder.encode(response.result!)
-            let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+            let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
             let instructions = try XCTUnwrap(initResult.instructions)
 
             let prefixes = try extractPrefixes(from: instructions, variant: variant)
@@ -365,7 +365,7 @@ final class MCPProtocolTests: XCTestCase {
         // reply flow around re-reading) a message it already retrieved.
         let response = MCPRouter.buildInitializeResponse(id: .int(1), peerID: nil)
         let resultData = try jsonEncoder.encode(response.result!)
-        let initResult = try jsonDecoder.decode(MCPInitializeResult.self, from: resultData)
+        let initResult = try jsonDecoder.decode(CalyxIPCInitializeResult.self, from: resultData)
         let instructions = try XCTUnwrap(initResult.instructions)
 
         XCTAssertTrue(instructions.contains("receive_messages"),

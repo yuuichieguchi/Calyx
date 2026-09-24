@@ -287,6 +287,61 @@ final class ClaudeConfigManagerTests: XCTestCase {
                        "add it too, not just X-Calyx-Surface-ID")
     }
 
+    // MARK: - calyx-mcp entry
+
+    // enableIPC must also own a second entry, calyx-mcp, pointing at the
+    // same host/port but the /calyx-mcp path, so re-published MCP-Apps
+    // tools land under a separately-approvable entry from calyx-ipc (see
+    // .claude/plans/zesty-conjuring-dream.md, 決定事項). It carries the
+    // same identity headers as calyx-ipc plus the two herdr headers.
+    func test_enableIPC_alsoWritesCalyxMCPEntry() throws {
+        try ClaudeConfigManager.enableIPC(port: 41830, token: "abc123", configPath: configPath)
+
+        let dict = try readConfigDict()
+        let mcpServers = dict["mcpServers"] as? [String: Any]
+        let calyxMCP = mcpServers?["calyx-mcp"] as? [String: Any]
+        XCTAssertNotNil(calyxMCP, "enableIPC must also write a calyx-mcp entry")
+        XCTAssertEqual(calyxMCP?["type"] as? String, "http")
+        XCTAssertEqual(calyxMCP?["url"] as? String, "http://127.0.0.1:41830/calyx-mcp",
+                       "calyx-mcp must share calyx-ipc's host/port but use the /calyx-mcp path")
+
+        let headers = calyxMCP?["headers"] as? [String: String]
+        XCTAssertEqual(headers?["Authorization"], "Bearer abc123")
+        XCTAssertEqual(headers?["X-Calyx-Surface-ID"], "${CALYX_SURFACE_ID:-}")
+        XCTAssertEqual(headers?["X-Calyx-Session-ID"], "${CALYX_SESSION_ID:-}")
+        XCTAssertEqual(headers?["X-Calyx-Herdr-Pane-ID"], "${HERDR_PANE_ID:-}",
+                       "calyx-mcp must additionally carry the herdr pane header, sourced from HERDR_PANE_ID")
+        XCTAssertEqual(headers?["X-Calyx-Herdr-Socket-Path"], "${HERDR_SOCKET_PATH:-}",
+                       "calyx-mcp must additionally carry the herdr socket-path header, sourced from " +
+                       "HERDR_SOCKET_PATH (unset -> empty default, matching HERDR_SOCKET_PATH's own " +
+                       "opt-in nature)")
+        XCTAssertEqual(headers?.count, 5,
+                       "calyx-mcp headers must contain exactly Authorization, X-Calyx-Surface-ID, " +
+                       "X-Calyx-Session-ID, X-Calyx-Herdr-Pane-ID, X-Calyx-Herdr-Socket-Path")
+
+        // calyx-ipc must be completely unaffected by calyx-mcp's addition.
+        let calyxIPC = mcpServers?["calyx-ipc"] as? [String: Any]
+        XCTAssertEqual(calyxIPC?["url"] as? String, "http://127.0.0.1:41830/mcp")
+        XCTAssertEqual((calyxIPC?["headers"] as? [String: String])?.count, 3,
+                       "calyx-ipc's own header set must not gain the herdr headers")
+    }
+
+    func test_disableIPC_removesBothCalyxIPCAndCalyxMCPEntries() throws {
+        // Seeded with an unrelated sibling key so mcpServers never becomes
+        // solely Calyx's own region -- an enable-from-nothing then
+        // disable would otherwise hit the JSON editor's "whole file
+        // became Calyx's own region" cascade-delete path, which this
+        // test has no reason to exercise.
+        writeConfig("{\n  \"otherKey\": \"value\"\n}\n")
+        try ClaudeConfigManager.enableIPC(port: 41830, token: "abc123", configPath: configPath)
+        try ClaudeConfigManager.disableIPC(configPath: configPath)
+
+        let dict = try readConfigDict()
+        let mcpServers = dict["mcpServers"] as? [String: Any]
+        XCTAssertNil(mcpServers?["calyx-ipc"], "disableIPC must remove calyx-ipc")
+        XCTAssertNil(mcpServers?["calyx-mcp"], "disableIPC must also remove calyx-mcp")
+    }
+
     // MARK: - disableIPC
 
     func test_disableIPC_removesCalyxEntry() throws {

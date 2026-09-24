@@ -17,6 +17,9 @@
 //       child-owning state lives inside a reference-typed
 //       `ProcessHandle` whose `deinit` unconditionally kills any
 //       still-running child.
+//    5. The `MCPByteTransport` conformance adds an explicit `spawn()`,
+//       `waitForExit()` (served by `ExitMonitor`, which outlives
+//       `close()`), and `closeGracefully(stdinGrace:termGrace:)`.
 //
 //  Concurrency notes:
 //    - `Process` / `Pipe` / `FileHandle` are not `Sendable`. They are
@@ -134,6 +137,101 @@ actor StdioLSPTransport: LSPTransport {
         }
     }
 
+    /// Records how the child exited. Holds the `Process` independently
+    /// of `handle` so `waitForExit()` still answers after `close()` has
+    /// dropped the handle and detached the termination handler. A single
+    /// background `waitUntilExit()` serves every waiter; it starts on the
+    /// first wait, not at spawn. Thread-safe via `NSLock`.
+    private final class ExitMonitor: @unchecked Sendable {
+        private let lock = NSLock()
+        private var process: Process?
+        private var isWatching = false
+        private var result: MCPTransportExitInfo?
+        private var exitWaiters: [CheckedContinuation<MCPTransportExitInfo, Never>] = []
+        private var timedWaiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+
+        /// Registers the spawned process. Starts watching if a waiter
+        /// arrived before the spawn.
+        func attach(_ process: Process) {
+            lock.lock()
+            self.process = process
+            let hasWaiters = !exitWaiters.isEmpty || !timedWaiters.isEmpty
+            let shouldWatch = hasWaiters && !isWatching
+            if shouldWatch { isWatching = true }
+            lock.unlock()
+            if shouldWatch { watch(process) }
+        }
+
+        /// Suspends until the child has exited.
+        func wait() async -> MCPTransportExitInfo {
+            await withCheckedContinuation { (cont: CheckedContinuation<MCPTransportExitInfo, Never>) in
+                lock.lock()
+                if let result {
+                    lock.unlock()
+                    cont.resume(returning: result)
+                    return
+                }
+                exitWaiters.append(cont)
+                let toWatch = claimWatchLocked()
+                lock.unlock()
+                if let toWatch { watch(toWatch) }
+            }
+        }
+
+        /// Suspends until the child has exited or `timeout` elapsed.
+        /// Returns true when the child has exited.
+        func wait(timeout: TimeInterval) async -> Bool {
+            let id = UUID()
+            return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                lock.lock()
+                if result != nil {
+                    lock.unlock()
+                    cont.resume(returning: true)
+                    return
+                }
+                timedWaiters[id] = cont
+                let toWatch = claimWatchLocked()
+                lock.unlock()
+                if let toWatch { watch(toWatch) }
+                DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+                    self.expire(id)
+                }
+            }
+        }
+
+        // Caller holds `lock`.
+        private func claimWatchLocked() -> Process? {
+            guard let process, !isWatching else { return nil }
+            isWatching = true
+            return process
+        }
+
+        private func expire(_ id: UUID) {
+            lock.lock()
+            let waiter = timedWaiters.removeValue(forKey: id)
+            lock.unlock()
+            waiter?.resume(returning: false)
+        }
+
+        private func watch(_ process: Process) {
+            DispatchQueue.global(qos: .utility).async {
+                process.waitUntilExit()
+                let info: MCPTransportExitInfo = process.terminationReason == .uncaughtSignal
+                    ? .signaled(process.terminationStatus)
+                    : .exited(process.terminationStatus)
+                self.lock.lock()
+                self.result = info
+                let exitWaiters = self.exitWaiters
+                let timedWaiters = self.timedWaiters
+                self.exitWaiters = []
+                self.timedWaiters = [:]
+                self.lock.unlock()
+                for waiter in exitWaiters { waiter.resume(returning: info) }
+                for waiter in timedWaiters.values { waiter.resume(returning: true) }
+            }
+        }
+    }
+
     /// Cap of the stderr ring buffer in bytes. The contract documented
     /// by `recentStderr()` is "<= 64KB tail".
     private static let stderrCapacityBytes = 64 * 1024
@@ -170,6 +268,7 @@ actor StdioLSPTransport: LSPTransport {
     private var handle: ProcessHandle?
     private var isClosed = false
     private let stderrRing = StderrRing(capacity: StdioLSPTransport.stderrCapacityBytes)
+    private let exitMonitor = ExitMonitor()
 
     /// Inbound bytes stream + its continuation.
     nonisolated let incoming: AsyncStream<Data>
@@ -340,6 +439,7 @@ actor StdioLSPTransport: LSPTransport {
         }
 
         try process.run()
+        exitMonitor.attach(process)
 
         // Make stdin writes non-blocking. The pipe's write end is a
         // separate fd from whatever the child reads on, so setting
@@ -416,5 +516,58 @@ actor StdioLSPTransport: LSPTransport {
                 }
             }
         }
+    }
+}
+
+// MARK: - MCPByteTransport
+
+extension StdioLSPTransport: MCPByteTransport {
+
+    /// Spawns the child now instead of on the first `send`. Idempotent.
+    /// Throws `LSPClientError.transportClosed` once the transport is
+    /// closed.
+    func spawn() async throws {
+        if isClosed {
+            throw LSPClientError.transportClosed
+        }
+        _ = try ensureSpawned()
+    }
+
+    /// Suspends until the child has exited. Answers after `close()` and
+    /// `closeGracefully` too.
+    func waitForExit() async -> MCPTransportExitInfo {
+        await exitMonitor.wait()
+    }
+
+    /// Closes stdin, waits up to `stdinGrace` for the child to exit, then
+    /// sends SIGTERM and waits up to `termGrace`, then sends SIGKILL.
+    /// Returns as soon as the child has exited. Finishes `incoming`.
+    /// Idempotent, and a no-op after `close()`.
+    func closeGracefully(stdinGrace: TimeInterval, termGrace: TimeInterval) async {
+        guard !isClosed else { return }
+        isClosed = true
+
+        if let h = handle {
+            try? h.stdinPipe.fileHandleForWriting.close()
+            if await !exitMonitor.wait(timeout: stdinGrace) {
+                if h.process.isRunning {
+                    h.process.terminate()
+                }
+                if await !exitMonitor.wait(timeout: termGrace) {
+                    let pid = h.process.processIdentifier
+                    if pid > 0 {
+                        _ = kill(pid, SIGKILL)
+                    }
+                }
+            }
+
+            h.stdoutPipe.fileHandleForReading.readabilityHandler = nil
+            h.stderrPipe.fileHandleForReading.readabilityHandler = nil
+            h.process.terminationHandler = nil
+            try? h.stdoutPipe.fileHandleForReading.close()
+            try? h.stderrPipe.fileHandleForReading.close()
+        }
+        handle = nil
+        continuation.finish()
     }
 }

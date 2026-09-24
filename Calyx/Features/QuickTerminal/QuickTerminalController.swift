@@ -41,6 +41,21 @@ class QuickTerminalController: NSObject, NSWindowDelegate {
 
     // MARK: - Public API
 
+    /// Whether `surfaceID` is the Quick Terminal's pane.
+    func ownsSurface(_ surfaceID: UUID) -> Bool {
+        tab?.registry.allIDs.contains(surfaceID) == true
+    }
+
+    /// The Quick Terminal's split container, when it shows `surfaceID`.
+    func splitContainer(owningSurface surfaceID: UUID) -> SplitContainerView? {
+        ownsSurface(surfaceID) ? splitContainerView : nil
+    }
+
+    /// The Quick Terminal's window, when it shows `surfaceID`.
+    func window(owningSurface surfaceID: UUID) -> NSWindow? {
+        ownsSurface(surfaceID) ? quickWindow : nil
+    }
+
     func toggle() {
         if visible {
             animateOut()

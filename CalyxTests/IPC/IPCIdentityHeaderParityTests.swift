@@ -178,4 +178,76 @@ final class IPCIdentityHeaderParityTests: XCTestCase {
                       "CalyxMCPServer.resolveSurfaceID cannot identify a pane inside a persistent " +
                       "calyx-session")
     }
+
+    // MARK: - calyx-mcp: herdr header parity
+    //
+    // calyx-mcp's pane resolution additionally needs the herdr pane and
+    // socket-path headers (see CalyxMCPServer's herdr-first pane
+    // resolution and HerdrPaneRegistry) alongside calyx-ipc's own two
+    // identity headers. A manager dropping either herdr header from
+    // calyx-mcp is only caught here.
+
+    func test_claudeConfigManager_enableIPC_calyxMCP_emitsHerdrHeaders() throws {
+        try ClaudeConfigManager.enableIPC(port: port, token: token, configPath: claudeConfigPath)
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: claudeConfigPath))
+        let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let mcpServers = parsed?["mcpServers"] as? [String: Any]
+        let calyxMCP = mcpServers?["calyx-mcp"] as? [String: Any]
+        let headers = calyxMCP?["headers"] as? [String: String]
+
+        XCTAssertEqual(headers?["X-Calyx-Herdr-Pane-ID"], "${HERDR_PANE_ID:-}",
+                       "ClaudeConfigManager: calyx-mcp headers are missing X-Calyx-Herdr-Pane-ID")
+        XCTAssertEqual(headers?["X-Calyx-Herdr-Socket-Path"], "${HERDR_SOCKET_PATH:-}",
+                       "ClaudeConfigManager: calyx-mcp headers are missing X-Calyx-Herdr-Socket-Path")
+    }
+
+    func test_codexConfigManager_enableIPC_calyxMCP_emitsHerdrHeaders() throws {
+        try CodexConfigManager.enableIPC(port: port, token: token, configPath: codexConfigPath)
+
+        let content = try String(contentsOfFile: codexConfigPath, encoding: .utf8)
+
+        XCTAssertTrue(content.contains(#""X-Calyx-Herdr-Pane-ID" = "HERDR_PANE_ID""#),
+                      "CodexConfigManager: calyx-mcp's env_http_headers is missing the X-Calyx-Herdr-Pane-ID mapping")
+        XCTAssertTrue(content.contains(#""X-Calyx-Herdr-Socket-Path" = "HERDR_SOCKET_PATH""#),
+                      "CodexConfigManager: calyx-mcp's env_http_headers is missing the X-Calyx-Herdr-Socket-Path mapping")
+    }
+
+    func test_grokConfigManager_enableIPC_calyxMCP_emitsHerdrHeaders() throws {
+        try GrokConfigManager.enableIPC(port: port, token: token, configPath: grokConfigPath)
+
+        let content = try String(contentsOfFile: grokConfigPath, encoding: .utf8)
+
+        XCTAssertTrue(content.contains("X-Calyx-Herdr-Pane-ID = \"${HERDR_PANE_ID:-}\""),
+                      "GrokConfigManager: calyx-mcp headers are missing X-Calyx-Herdr-Pane-ID")
+        XCTAssertTrue(content.contains("X-Calyx-Herdr-Socket-Path = \"${HERDR_SOCKET_PATH:-}\""),
+                      "GrokConfigManager: calyx-mcp headers are missing X-Calyx-Herdr-Socket-Path")
+    }
+
+    func test_openCodeConfigManager_enableIPC_calyxMCP_emitsHerdrHeaders() throws {
+        try OpenCodeConfigManager.enableIPC(port: port, token: token, configDir: openCodeConfigDir)
+
+        let jsonPath = openCodeConfigDir + "/opencode.json"
+        let data = try Data(contentsOf: URL(fileURLWithPath: jsonPath))
+        let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let mcp = parsed?["mcp"] as? [String: Any]
+        let calyxMCP = mcp?["calyx-mcp"] as? [String: Any]
+        let headers = calyxMCP?["headers"] as? [String: String]
+
+        XCTAssertEqual(headers?["X-Calyx-Herdr-Pane-ID"], "{env:HERDR_PANE_ID}",
+                       "OpenCodeConfigManager: calyx-mcp headers are missing X-Calyx-Herdr-Pane-ID")
+        XCTAssertEqual(headers?["X-Calyx-Herdr-Socket-Path"], "{env:HERDR_SOCKET_PATH}",
+                       "OpenCodeConfigManager: calyx-mcp headers are missing X-Calyx-Herdr-Socket-Path")
+    }
+
+    func test_hermesConfigManager_enableIPC_calyxMCP_emitsHerdrHeaders() throws {
+        try HermesConfigManager.enableIPC(port: port, token: token, configPath: hermesConfigPath)
+
+        let content = try String(contentsOfFile: hermesConfigPath, encoding: .utf8)
+
+        XCTAssertTrue(content.contains("X-Calyx-Herdr-Pane-ID: \"${HERDR_PANE_ID}\""),
+                      "HermesConfigManager: calyx-mcp entry is missing X-Calyx-Herdr-Pane-ID")
+        XCTAssertTrue(content.contains("X-Calyx-Herdr-Socket-Path: \"${HERDR_SOCKET_PATH}\""),
+                      "HermesConfigManager: calyx-mcp entry is missing X-Calyx-Herdr-Socket-Path")
+    }
 }

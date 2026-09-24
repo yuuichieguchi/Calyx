@@ -150,6 +150,60 @@ struct AnyCodable: @unchecked Sendable, Codable, Equatable {
     }
 }
 
+// MARK: - AnyCodable Read Accessors
+
+extension AnyCodable {
+
+    /// The JSON `null` value.
+    static let null = AnyCodable(storage: .null)
+
+    private init(storage: Storage) {
+        self.storage = storage
+    }
+
+    /// Each accessor returns a value only for its own storage case; no
+    /// cross-type coercion (an `.int` is never a `Bool`, a `.double` is
+    /// never an `Int`).
+    var stringValue: String? {
+        guard case .string(let v) = storage else { return nil }
+        return v
+    }
+
+    var intValue: Int? {
+        guard case .int(let v) = storage else { return nil }
+        return v
+    }
+
+    var doubleValue: Double? {
+        guard case .double(let v) = storage else { return nil }
+        return v
+    }
+
+    var boolValue: Bool? {
+        guard case .bool(let v) = storage else { return nil }
+        return v
+    }
+
+    var arrayValue: [AnyCodable]? {
+        guard case .array(let v) = storage else { return nil }
+        return v
+    }
+
+    var objectValue: [String: AnyCodable]? {
+        guard case .dictionary(let v) = storage else { return nil }
+        return v
+    }
+
+    var isNull: Bool {
+        storage == .null
+    }
+
+    /// Member lookup on an object value. Nil for non-object storage or a missing key.
+    subscript(key: String) -> AnyCodable? {
+        objectValue?[key]
+    }
+}
+
 // MARK: - JSON-RPC Base Types
 
 /// JSON-RPC id — either an integer or a string.
@@ -194,10 +248,15 @@ struct JSONRPCRequest: Sendable, Codable {
 }
 
 /// JSON-RPC 2.0 error object.
-struct JSONRPCError: Sendable, Codable {
+struct JSONRPCError: Sendable, Codable, Equatable {
     let code: Int
     let message: String
+    /// Error-specific payload. Omitted from the encoded JSON when nil.
+    let data: AnyCodable?
 }
+
+/// Lets a JSON-RPC error be the failure of a `Result` or be thrown.
+extension JSONRPCError: Error {}
 
 /// JSON-RPC 2.0 response.
 struct JSONRPCResponse: Sendable, Codable {

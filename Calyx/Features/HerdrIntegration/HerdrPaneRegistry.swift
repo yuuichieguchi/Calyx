@@ -57,7 +57,10 @@
 // HerdrPaneRef is Equatable but deliberately NOT Hashable (see that
 // file's own header) and this file must not modify HerdrPaneRef.swift,
 // so the reverse (socketPath, paneID) -> surfaceID map is keyed by a
-// composite string rather than the ref itself -- a NUL byte joiner
+// composite string rather than the ref itself, its socket path
+// canonicalized (standardized() + resolvingSymlinksInPath()) so a lookup
+// by a differently spelled path to the same socket still matches -- a NUL
+// byte joiner
 // (socket paths and pane ids are both plain text that cannot contain
 // one) rather than a plain colon, since paneID already contains one
 // ("wB:p1").
@@ -206,8 +209,16 @@ final class HerdrPaneRegistry: NSObject {
         paneKey(socketPath: ref.socketPath, paneID: ref.paneID)
     }
 
+    /// The socket path is canonicalized first (`standardized` and
+    /// `resolvingSymlinksInPath`), so spellings of the same socket that
+    /// differ by a trailing slash, a doubled separator, or a symlinked
+    /// component key the same pane.
     private static func paneKey(socketPath: String, paneID: String) -> String {
-        "\(socketPath)\u{0}\(paneID)"
+        "\(canonicalSocketPath(socketPath))\u{0}\(paneID)"
+    }
+
+    private static func canonicalSocketPath(_ socketPath: String) -> String {
+        URL(fileURLWithPath: socketPath).standardized.resolvingSymlinksInPath().path
     }
 
     #if DEBUG

@@ -11,10 +11,10 @@ import Foundation
 // MARK: - MCP Types
 
 /// Result of the MCP `initialize` method.
-struct MCPInitializeResult: Sendable, Codable {
+struct CalyxIPCInitializeResult: Sendable, Codable {
     let protocolVersion: String
     let capabilities: MCPCapabilities
-    let serverInfo: MCPServerInfo
+    let serverInfo: CalyxIPCServerInfo
     let instructions: String?
 }
 
@@ -29,7 +29,7 @@ struct MCPToolsCapability: Sendable, Codable {
 }
 
 /// MCP server information.
-struct MCPServerInfo: Sendable, Codable {
+struct CalyxIPCServerInfo: Sendable, Codable {
     let name: String
     let version: String
 }
@@ -290,12 +290,12 @@ struct MCPRouter: Sendable {
     static func buildInitializeResponse(id: JSONRPCId, peerID: UUID? = nil) -> JSONRPCResponse {
         let fullInstructions = peerID.map(alreadyRegisteredInstructions(peerID:)) ?? instructions
 
-        let initResult = MCPInitializeResult(
+        let initResult = CalyxIPCInitializeResult(
             protocolVersion: "2024-11-05",
             capabilities: MCPCapabilities(
                 tools: MCPToolsCapability(listChanged: false)
             ),
-            serverInfo: MCPServerInfo(name: "calyx-ipc", version: "1.0.0"),
+            serverInfo: CalyxIPCServerInfo(name: "calyx-ipc", version: "1.0.0"),
             instructions: fullInstructions
         )
 
@@ -329,7 +329,7 @@ struct MCPRouter: Sendable {
             jsonrpc: "2.0",
             id: id,
             result: nil,
-            error: JSONRPCError(code: code, message: message)
+            error: JSONRPCError(code: code, message: message, data: nil)
         )
     }
 
