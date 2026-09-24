@@ -43,6 +43,9 @@ enum PiExtensionManager: Sendable {
     //      permission prompt of its own, so this gate is the only thing
     //      that can stop one.
     //   3. One dispatcher tool exposes Calyx's IPC tools to the model.
+    //   4. A second dispatcher, calyx_mcp, exposes the tools of the MCP
+    //      servers configured in Calyx (the /calyx-mcp endpoint). It is
+    //      the only thing registered inside a herdr pane or outside Calyx.
     //
     // agent-endpoint.json (port and token) is cached by mtime and
     // re-parsed only when the file changes, so a Calyx restart or a token
@@ -64,14 +67,7 @@ enum PiExtensionManager: Sendable {
       // Ghostty surface changes, so it is preferred over the launch-time
       // surface UUID.
       const calyxPaneID = process.env.CALYX_SESSION_ID || process.env.CALYX_SURFACE_ID;
-      // A pi inside a herdr pane is already mirrored into Calyx by herdr
-      // itself, and a pi started outside Calyx has no server to answer
-      // its gate. Register nothing at all in either case: a live gate
-      // with nobody behind it would block on a server nobody is running.
       const herdrPaneID = process.env.HERDR_PANE_ID;
-      if (!calyxPaneID || herdrPaneID) {
-        return;
-      }
 
       // CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController
       // alongside CALYX_SURFACE_ID, scoped to wherever this Calyx process
@@ -91,6 +87,86 @@ enum PiExtensionManager: Sendable {
         cachedEndpoint = endpoint;
         cachedEndpointMtimeMs = stats.mtimeMs;
         return endpoint;
+      }
+
+      // The tools of the MCP servers configured in Calyx, reached through
+      // /calyx-mcp without a session. The herdr headers let Calyx find
+      // the herdr pane; the pane headers find an ordinary one.
+      async function callCalyxMCP(method, params, signal) {
+        const endpoint = await loadEndpoint();
+        const response = await fetch(`http://127.0.0.1:${endpoint.port}/calyx-mcp`, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${endpoint.token}`,
+            "X-Calyx-Surface-ID": calyxPaneID ?? "",
+            "X-Calyx-Agent-Kind": "pi",
+            "X-Calyx-Herdr-Pane-ID": herdrPaneID ?? "",
+            "X-Calyx-Herdr-Socket-Path": process.env.HERDR_SOCKET_PATH ?? "",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+          },
+          body: JSON.stringify({ jsonrpc: "2.0", id: "calyx-pi", method, params }),
+          signal,
+        });
+        const answer = await response.json();
+        if (answer.error) {
+          throw new Error(answer.error.message);
+        }
+        return answer.result;
+      }
+
+      // Every failure becomes an error result: an unreachable Calyx must
+      // never throw out of the tool.
+      function registerCalyxMCP(pi) {
+        pi.registerTool({
+          name: "calyx_mcp",
+          label: "Calyx MCP",
+          description:
+            "Bridge to the MCP servers configured in Calyx. Pass tool: 'list' to enumerate their " +
+            "tools, then call one by name with its own arguments in args.",
+          promptSnippet: "Reach the MCP servers configured in Calyx",
+          parameters: {
+            type: "object",
+            properties: {
+              tool: {
+                type: "string",
+                description: "Name of the tool to run, or 'list' to enumerate them",
+              },
+              args: {
+                type: "object",
+                description: "Arguments for that tool",
+              },
+            },
+            required: ["tool"],
+            additionalProperties: false,
+          },
+          async execute(toolCallId, params, signal, onUpdate, ctx) {
+            try {
+              const result = params.tool === "list"
+                ? await callCalyxMCP("tools/list", {}, signal)
+                : await callCalyxMCP("tools/call", { name: params.tool, arguments: params.args ?? {} }, signal);
+              return {
+                content: [{ type: "text", text: JSON.stringify(result) }],
+                details: {},
+              };
+            } catch (error) {
+              return {
+                content: [{ type: "text", text: `Calyx MCP is unavailable: ${error}` }],
+                details: {},
+              };
+            }
+          },
+        });
+      }
+
+      // A pi inside a herdr pane is already mirrored into Calyx by herdr
+      // itself, and a pi started outside Calyx has no server to answer
+      // its gate. Only the calyx_mcp dispatcher is registered in either
+      // case: a live gate with nobody behind it would block on a server
+      // nobody is running.
+      if (!calyxPaneID || herdrPaneID) {
+        registerCalyxMCP(pi);
+        return;
       }
 
       function calyxHeaders(endpoint) {
@@ -232,6 +308,8 @@ enum PiExtensionManager: Sendable {
           };
         },
       });
+
+      registerCalyxMCP(pi);
     }
     """
 

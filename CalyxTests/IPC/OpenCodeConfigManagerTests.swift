@@ -210,7 +210,7 @@ final class OpenCodeConfigManagerTests: XCTestCase {
         // Then: calyx-ipc is REPLACED with new values (not duplicated, not merged)
         let dict = try readOpenCodeDict()
         let mcp = dict["mcp"] as? [String: Any]
-        XCTAssertEqual(mcp?.count, 1, "There should be only one entry under mcp (no duplicates)")
+        XCTAssertEqual(mcp?.count, 2, "There should be only calyx-ipc and calyx-mcp under mcp (no duplicates)")
 
         let calyxIPC = mcp?["calyx-ipc"] as? [String: Any]
         XCTAssertEqual(calyxIPC?["url"] as? String, "http://127.0.0.1:55555/mcp",
@@ -944,5 +944,37 @@ final class OpenCodeConfigManagerTests: XCTestCase {
                                      "AGENTS.md should contain at most one managed block after concurrent access")
         }
         // Note: some errors are acceptable under contention, but files must not be corrupted.
+    }
+
+    // MARK: - calyx-mcp entry
+
+    // enableIPC must also own a second entry, mcp.calyx-mcp, sharing
+    // calyx-ipc's host/port but the /calyx-mcp path, with the same
+    // {env:VAR} headers plus the two herdr headers.
+    func test_enableIPC_alsoWritesCalyxMCPEntry() throws {
+        try OpenCodeConfigManager.enableIPC(port: 41830, token: "abc123", configDir: configDir)
+
+        let dict = try readOpenCodeDict()
+        let mcp = dict["mcp"] as? [String: Any]
+        let calyxMCP = mcp?["calyx-mcp"] as? [String: Any]
+        XCTAssertNotNil(calyxMCP, "enableIPC must also write a mcp.calyx-mcp entry")
+        let headers = calyxMCP?["headers"] as? [String: String]
+        XCTAssertEqual(headers?["X-Calyx-Herdr-Pane-ID"], "{env:HERDR_PANE_ID}",
+                       "calyx-mcp headers must additionally carry the herdr pane header")
+        XCTAssertEqual(headers?["X-Calyx-Herdr-Socket-Path"], "{env:HERDR_SOCKET_PATH}",
+                       "calyx-mcp headers must additionally carry the herdr socket-path header")
+    }
+
+    func test_disableIPC_removesBothCalyxIPCAndCalyxMCPEntries() throws {
+        // Seeded with an unrelated sibling key, same rationale as the
+        // other four managers' equivalent tests above.
+        writeOpenCodeJSON("{\n  \"theme\": \"dark\"\n}\n")
+        try OpenCodeConfigManager.enableIPC(port: 41830, token: "abc123", configDir: configDir)
+        try OpenCodeConfigManager.disableIPC(configDir: configDir)
+
+        let dict = try readOpenCodeDict()
+        let mcp = dict["mcp"] as? [String: Any]
+        XCTAssertNil(mcp?["calyx-ipc"])
+        XCTAssertNil(mcp?["calyx-mcp"], "disableIPC must also remove mcp.calyx-mcp")
     }
 }

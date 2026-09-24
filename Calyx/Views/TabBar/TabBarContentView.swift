@@ -448,6 +448,8 @@ private struct TabItemButton: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
+                MCPAppActivityDot(tabID: tab.id)
+
                 if tab.unreadNotifications > 0 {
                     UnreadCountBadge(count: tab.unreadNotifications)
                 }

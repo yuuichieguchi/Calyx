@@ -47,6 +47,21 @@ struct HTTPResponse: Sendable {
     }
 }
 
+// MARK: - Streaming Responses
+
+/// The status line and headers of a response whose body is streamed.
+struct HTTPResponseHead: Sendable {
+    let statusCode: Int
+    let headers: [String: String]
+}
+
+/// A route's answer: a complete response, or a head followed by body
+/// chunks sent with chunked transfer encoding until the stream finishes.
+enum RoutedResponse: Sendable {
+    case buffered(HTTPResponse)
+    case stream(head: HTTPResponseHead, body: AsyncStream<Data>)
+}
+
 // MARK: - HTTPParseError
 
 enum HTTPParseError: Error, Equatable {
@@ -63,12 +78,16 @@ struct HTTPParser {
 
     static let maxHeaderSize: Int = 8 * 1024      // 8KB
     static let maxBodySize: Int = 1 * 1024 * 1024  // 1MB
+    /// Body cap of an authenticated `/calyx-mcp` request, which carries
+    /// re-published tool arguments and results.
+    static let maxCalyxMCPBodySize: Int = 32 * 1024 * 1024  // 32MB
+    static let calyxMCPPath = "/calyx-mcp"
 
     private static let headerTerminator = Data("\r\n\r\n".utf8)
 
     // MARK: - Parse
 
-    static func parse(_ data: Data) throws -> HTTPRequest {
+    static func parse(_ data: Data, maxBodySize: Int = HTTPParser.maxBodySize) throws -> HTTPRequest {
         // Find the header/body separator "\r\n\r\n"
         guard let separatorRange = data.range(of: headerTerminator) else {
             if data.count > maxHeaderSize {
@@ -252,7 +271,13 @@ struct HTTPParser {
     /// stayed under some looser combined cap, but that `parse(_:)`
     /// would then still reject as `.bodyTooLarge`, is exactly the kind
     /// of gate/parse threshold mismatch this avoids).
-    static func completeness(of buffer: Data) -> (state: Completeness, requiredTotal: Int?) {
+    ///
+    /// `bodyLimit` receives the decoded header block (request line
+    /// included) and returns the body cap for that request.
+    static func completeness(
+        of buffer: Data,
+        bodyLimit: (String) -> Int = { _ in HTTPParser.maxBodySize }
+    ) -> (state: Completeness, requiredTotal: Int?) {
         guard let separatorRange = buffer.range(of: headerTerminator) else {
             let state: Completeness = buffer.count > maxHeaderSize ? .tooLarge : .incomplete
             return (state, nil)
@@ -288,7 +313,7 @@ struct HTTPParser {
             return (.complete, headerLength)
         }
 
-        if parsedContentLength > maxBodySize {
+        if parsedContentLength > bodyLimit(headerString) {
             return (.tooLarge, nil)
         }
 
@@ -296,6 +321,55 @@ struct HTTPParser {
         let state: Completeness = buffer.count >= requiredTotal ? .complete : .incomplete
         return (state, requiredTotal)
     }
+
+    // MARK: - Per-Path Body Cap
+
+    /// The body cap for the request whose header block is `headerString`:
+    /// `maxCalyxMCPBodySize` for `/calyx-mcp` when `isAuthorized` accepts
+    /// its `Authorization` value, `maxBodySize` for every other request.
+    static func bodyLimit(forHeaderString headerString: String, isAuthorized: (String?) -> Bool) -> Int {
+        let lines = headerString.components(separatedBy: "\r\n")
+        guard let requestLine = lines.first else { return maxBodySize }
+        let parts = requestLine.split(separator: " ", maxSplits: 2)
+        guard parts.count >= 2, parts[1] == calyxMCPPath else { return maxBodySize }
+        var authorization: String?
+        for line in lines.dropFirst() {
+            guard let colonIndex = line.firstIndex(of: ":") else { continue }
+            guard line[line.startIndex..<colonIndex].caseInsensitiveCompare("Authorization") == .orderedSame else { continue }
+            authorization = line[line.index(after: colonIndex)...].trimmingCharacters(in: .whitespaces)
+            break
+        }
+        return isAuthorized(authorization) ? maxCalyxMCPBodySize : maxBodySize
+    }
+
+    // MARK: - Chunked Transfer Encoding
+
+    /// The status line and headers of a streamed response, with
+    /// `Transfer-Encoding: chunked` and `Connection: close`.
+    static func serializeStreamHead(_ head: HTTPResponseHead) -> Data {
+        var result = "HTTP/1.1 \(head.statusCode) \(statusMessage(for: head.statusCode))\r\n"
+        var headers = head.headers.filter { $0.key.caseInsensitiveCompare("Content-Length") != .orderedSame }
+        headers["Transfer-Encoding"] = "chunked"
+        headers["Connection"] = "close"
+        for (key, value) in headers {
+            result += "\(key): \(value)\r\n"
+        }
+        result += "\r\n"
+        return Data(result.utf8)
+    }
+
+    /// One chunk: hex size, CRLF, bytes, CRLF. Empty data yields nothing,
+    /// since a zero-size chunk ends the body.
+    static func encodeChunk(_ data: Data) -> Data {
+        guard !data.isEmpty else { return Data() }
+        var chunk = Data((String(data.count, radix: 16) + "\r\n").utf8)
+        chunk.append(data)
+        chunk.append(Data("\r\n".utf8))
+        return chunk
+    }
+
+    /// The zero-size chunk that ends a chunked body.
+    static let lastChunk = Data("0\r\n\r\n".utf8)
 
     // MARK: - Response Builders
 
@@ -338,13 +412,16 @@ struct HTTPParser {
         switch code {
         case 200: "OK"
         case 201: "Created"
+        case 202: "Accepted"
         case 204: "No Content"
         case 400: "Bad Request"
         case 401: "Unauthorized"
         case 403: "Forbidden"
         case 404: "Not Found"
         case 405: "Method Not Allowed"
+        case 406: "Not Acceptable"
         case 408: "Request Timeout"
+        case 409: "Conflict"
         case 413: "Payload Too Large"
         case 500: "Internal Server Error"
         case 503: "Service Unavailable"

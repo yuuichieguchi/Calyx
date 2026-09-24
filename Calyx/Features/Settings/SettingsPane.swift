@@ -12,6 +12,7 @@ enum SettingsPane: CaseIterable {
     case appearance
     case sessions
     case agents
+    case mcpServers
     case lsp
 
     var title: String {
@@ -19,6 +20,7 @@ enum SettingsPane: CaseIterable {
         case .appearance: return "Appearance"
         case .sessions: return "Sessions"
         case .agents: return "Agents"
+        case .mcpServers: return "MCP Apps"
         case .lsp: return "LSP"
         }
     }
@@ -31,6 +33,7 @@ enum SettingsPane: CaseIterable {
         case .appearance: return "paintbrush"
         case .sessions: return "terminal"
         case .agents: return "sparkles"
+        case .mcpServers: return "server.rack"
         case .lsp: return "gearshape.2"
         }
     }

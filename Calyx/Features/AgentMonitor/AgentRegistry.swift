@@ -597,6 +597,17 @@ final class AgentRegistry {
     /// excluded: `.idle` is still a live row, and that downgrade is
     /// Calyx's own inference about a row it hasn't heard from, not a
     /// report that the agent finished.
+    ///
+    /// A row that enters `.done` here (from a live state or from no row)
+    /// also posts `.calyxAgentConversationEnded` for `surfaceID`, after
+    /// the row is written. `.done` is written only by a hook-reported
+    /// `SessionEnd` and by the pane-exit settles, so the post means the
+    /// pane's conversation ended: the agent process exited or the session
+    /// was cleared. Claude Code sends `SessionEnd` with `reason: "clear"`
+    /// on `/clear` and keeps running; that also posts. A `.remove` posts
+    /// nothing: the resolver's only `.remove` retires an inferred
+    /// `.titleHeuristic` row. `handleSurfaceDestroyed` and `reset()` do
+    /// not pass through here and post nothing either.
     private func apply(_ r: AgentResolution, surfaceID: UUID) {
         let newEvidence = r.evidence.isEmpty ? nil : r.evidence
         if evidence[surfaceID] != newEvidence { evidence[surfaceID] = newEvidence }
@@ -607,9 +618,15 @@ final class AgentRegistry {
         case .keep:
             break
         case .write(let row):
+            let previousState = entries[surfaceID]?.state
             if entries[surfaceID] != row { entries[surfaceID] = row }
             if row.state == .done || r.retiresChildren {
                 subagentRegistry.handleSurfaceDestroyed(parentSurfaceID: surfaceID)
+            }
+            if row.state == .done, previousState != .done {
+                NotificationCenter.default.post(
+                    name: .calyxAgentConversationEnded, object: self, userInfo: ["surfaceID": surfaceID]
+                )
             }
         case .remove:
             if entries[surfaceID] != nil { entries.removeValue(forKey: surfaceID) }
@@ -924,6 +941,13 @@ extension Notification.Name {
     /// Posted by `SurfaceRegistry.destroySurface` when a pane is torn down.
     /// `userInfo["surfaceID"]` carries the destroyed surface's `UUID`.
     static let calyxSurfaceDestroyed = Notification.Name("com.calyx.agentMonitor.surfaceDestroyed")
+
+    /// Posted by `AgentRegistry` when a pane's row enters `.done`: the
+    /// pane's conversation ended, because the agent process exited or the
+    /// session was cleared (Claude Code's `/clear` sends `SessionEnd` and
+    /// the process keeps running). `object` is the registry;
+    /// `userInfo["surfaceID"]` carries the pane's surface `UUID`.
+    static let calyxAgentConversationEnded = Notification.Name("com.calyx.agentMonitor.agentConversationEnded")
 
     /// Posted when an Agents sidebar row is clicked. `userInfo["surfaceID"]`
     /// carries the `UUID` of the surface to focus.

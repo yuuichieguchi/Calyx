@@ -39,6 +39,10 @@
 //  cockpitAutoApprove/commandTracking each were before it (see this
 //  repo's own history on this file).
 //
+//  MCP APPS HOST: a new MCP Servers pane follows Agents (plan section 11,
+//  contract v2 section 13), holding a single `mcpServers` row that hosts
+//  the whole pane.
+//
 //  ICON COVERAGE (user-reported defect): the Settings
 //  toolbar's tabStyle (.toolbar, SettingsWindowController.setupContent())
 //  renders a degenerate fat header with sunk text when a tab item has no
@@ -57,16 +61,17 @@ final class SettingsPaneTests: XCTestCase {
 
     // MARK: - Pane identity, order, titles
 
-    func test_settingsPane_orderIsAppearanceThenSessionsThenAgentsThenLSP() {
-        XCTAssertEqual(SettingsPane.allCases, [.appearance, .sessions, .agents, .lsp],
+    func test_settingsPane_orderIsAppearanceThenSessionsThenAgentsThenMCPServersThenLSP() {
+        XCTAssertEqual(SettingsPane.allCases, [.appearance, .sessions, .agents, .mcpServers, .lsp],
                        "Pane order must match the user's requested restructure order -- Agents sits right " +
-                       "after Sessions, since its rows moved out of that pane")
+                       "after Sessions, since its rows moved out of that pane, and MCP Servers right after Agents")
     }
 
     func test_settingsPane_titles() {
         XCTAssertEqual(SettingsPane.appearance.title, "Appearance")
         XCTAssertEqual(SettingsPane.sessions.title, "Sessions")
         XCTAssertEqual(SettingsPane.agents.title, "Agents")
+        XCTAssertEqual(SettingsPane.mcpServers.title, "MCP Apps")
         XCTAssertEqual(SettingsPane.lsp.title, "LSP")
     }
 
@@ -94,6 +99,7 @@ final class SettingsPaneTests: XCTestCase {
         ("cockpitAutoApprove", .agents),
         ("commandTracking", .agents),
         ("agentHookApproval", .agents),
+        ("mcpServers", .mcpServers),
         ("openSessionBrowserButton", .sessions),
         ("openConfigFileFooter", .appearance),
     ]
@@ -122,6 +128,7 @@ final class SettingsPaneTests: XCTestCase {
         XCTAssertEqual(SettingsPane.appearance.icon, "paintbrush")
         XCTAssertEqual(SettingsPane.sessions.icon, "terminal")
         XCTAssertEqual(SettingsPane.agents.icon, "sparkles")
+        XCTAssertEqual(SettingsPane.mcpServers.icon, "server.rack")
         XCTAssertEqual(SettingsPane.lsp.icon, "gearshape.2")
     }
 

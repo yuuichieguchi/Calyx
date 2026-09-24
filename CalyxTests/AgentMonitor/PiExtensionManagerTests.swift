@@ -20,13 +20,16 @@
 //    (and throws when an existing file cannot be deleted); isInstalled
 //    reflects install state; a symlinked destination is followed to its
 //    real file and the link itself survives both operations
-//  - scriptBody invariants: the `pi` agent-kind header, the pane
-//    identity and herdr guards firing before anything is registered, the
+//  - scriptBody invariants: the `pi` agent-kind header, the herdr branch
+//    (registers only the `calyx_mcp` dispatcher, nothing else) and the
+//    pane-identity guard (registers nothing at all) each firing before
+//    the lifecycle handlers and the original `calyx` dispatcher, the
 //    five pi lifecycle events mapped onto the canonical hook event
 //    vocabulary, the canonical snake_case state ping, the approval
 //    request's PermissionRequest envelope and its timeout derived from
-//    ApprovalHookTiming, the single `calyx` dispatcher tool, the block
-//    path taken only on an explicit deny, the session id read from
+//    ApprovalHookTiming, the two dispatcher tools (`calyx` for
+//    calyx-ipc, `calyx_mcp` for /calyx-mcp), the block path taken only
+//    on an explicit deny, the session id read from
 //    sessionManager.getSessionId(), and the mtime-cached endpoint read
 //    through node:fs/promises
 //  - AgentToolPaths.piConfigDirectory points at pi's agent root
@@ -210,35 +213,84 @@ final class PiExtensionManagerTests: XCTestCase {
                              "the row to a surface")
     }
 
-    func test_scriptBody_guardsOnPaneIdentityAndHerdrBeforeRegisteringAnything() {
+    // Anchored on the guard CONDITION itself (`!calyxPaneID`), not on the
+    // `calyxPaneID` declaration line: inside herdr the herdr branch (its
+    // own dispatcher registration and `return`) sits BEFORE this guard in
+    // the script (see the herdr test below), so the first
+    // `pi.on(`/`pi.registerTool(` call in the WHOLE script is no longer a
+    // reliable anchor for "nothing registered before the identity check".
+    // What must still hold is narrower and still real: the ORIGINAL
+    // lifecycle handler (`pi.on(`) and the original `"calyx"` dispatcher
+    // (exact `name:"calyx"`, never matching the longer `name:"calyx_mcp"`)
+    // must never be registered before this guard's own `return`.
+    func test_scriptBody_guardsOnPaneIdentityBeforeRegisteringLifecycleAndTheCalyxDispatcher() {
         assertScriptContains("process.env.CALYX_SESSION_ID||process.env.CALYX_SURFACE_ID",
                              "A persistent pane's CALYX_SESSION_ID stays stable across surface changes, " +
                              "so it is preferred over the launch-time surface UUID. The || fallback also " +
                              "treats an empty string as absent, which ?? would not")
+        assertScriptContains("!calyxPaneID",
+                             "scriptBody must guard on the absence of a resolved pane identity")
+
+        let code = scriptCode
+        guard let guardConditionRange = code.range(of: "!calyxPaneID") else {
+            XCTFail("scriptBody must read !calyxPaneID as its no-pane-identity guard condition")
+            return
+        }
+        guard let guardReturn = code.range(of: "return", range: guardConditionRange.upperBound..<code.endIndex) else {
+            XCTFail("The pane-identity guard must return")
+            return
+        }
+        let firstLifecycleOrCalyxDispatcherRegistration = [
+            code.range(of: "pi.on("),
+            code.range(of: "name:\"calyx\""),
+        ].compactMap { $0?.lowerBound }.min()
+        guard let firstLifecycleOrCalyxDispatcherRegistration else {
+            XCTFail("scriptBody must register at least one pi.on() handler and the \"calyx\" dispatcher")
+            return
+        }
+        XCTAssertTrue(guardReturn.upperBound <= firstLifecycleOrCalyxDispatcherRegistration,
+                      "The no-pane-identity guard must return BEFORE the first pi.on() lifecycle handler " +
+                      "or the \"calyx\" dispatcher registers. Registering first and checking later would " +
+                      "leave a pi started outside Calyx carrying a live approval gate that blocks on a " +
+                      "server nobody is running")
+    }
+
+    // Inside herdr, the pane's own lifecycle/approval-gate identity is
+    // already mirrored into Calyx by herdr itself, so only the calyx_mcp
+    // dispatcher (the new /calyx-mcp bridge, guarded to fail open when
+    // Calyx is unreachable) is registered there -- no pi.on() lifecycle
+    // handler, no approval gate, and not the original "calyx" dispatcher
+    // either.
+    func test_scriptBody_insideHerdr_registersOnlyTheCalyxMCPDispatcher() {
         assertScriptContains("process.env.HERDR_PANE_ID",
-                             "A pi running inside a herdr pane is mirrored into Calyx by herdr itself, " +
-                             "so this extension must stay out of the way there")
+                             "A pi running inside a herdr pane is mirrored into Calyx by herdr itself, so " +
+                             "only the calyx_mcp dispatcher registers there")
 
         let code = scriptCode
         guard let herdrRange = code.range(of: "HERDR_PANE_ID") else {
             XCTFail("scriptBody must read HERDR_PANE_ID")
             return
         }
-        guard let guardReturn = code.range(of: "return", range: herdrRange.upperBound..<code.endIndex) else {
-            XCTFail("The herdr guard must return")
+        guard let herdrDispatcherRegistration = code.range(
+            of: "name:\"calyx_mcp\"", range: herdrRange.upperBound..<code.endIndex
+        ) else {
+            XCTFail("Inside herdr, scriptBody must register the calyx_mcp dispatcher")
             return
         }
-        let firstRegistration = [code.range(of: "pi.on("), code.range(of: "pi.registerTool(")]
-            .compactMap { $0?.lowerBound }
-            .min()
-        guard let firstRegistration else {
-            XCTFail("scriptBody must register at least one handler or tool")
+        guard let herdrGuardReturn = code.range(
+            of: "return", range: herdrDispatcherRegistration.upperBound..<code.endIndex
+        ) else {
+            XCTFail("The herdr branch must return after registering only the calyx_mcp dispatcher")
             return
         }
-        XCTAssertTrue(guardReturn.upperBound <= firstRegistration,
-                      "The guard must return BEFORE the first pi.on()/pi.registerTool() call. Registering " +
-                      "first and checking later would leave a pi started outside Calyx carrying a live " +
-                      "approval gate that blocks on a server nobody is running")
+        let anyOtherRegistrationInHerdrBranch = [
+            code.range(of: "pi.on(", range: herdrRange.upperBound..<herdrGuardReturn.lowerBound),
+            code.range(of: "name:\"calyx\"", range: herdrRange.upperBound..<herdrGuardReturn.lowerBound),
+        ].compactMap { $0 }
+        XCTAssertTrue(anyOtherRegistrationInHerdrBranch.isEmpty,
+                      "The herdr branch must register nothing but the calyx_mcp dispatcher before " +
+                      "returning -- no lifecycle pi.on() handler, no approval gate, and not the " +
+                      "original \"calyx\" dispatcher")
     }
 
     func test_scriptBody_mapsPiLifecycleEventsToCanonicalHookEventNames() {
@@ -353,11 +405,18 @@ final class PiExtensionManagerTests: XCTestCase {
                       "can take that branch")
     }
 
-    func test_scriptBody_registersASingleCalyxDispatcherTool() {
-        XCTAssertEqual(occurrences(of: "pi.registerTool("), 1,
-                       "One dispatcher, not one tool per Calyx IPC tool. Registering all of them " +
-                       "individually puts every name and description into pi's system prompt on every " +
-                       "turn")
+    // Exactly 2, counted across the WHOLE script: the herdr branch and
+    // the non-herdr branch both register calyx_mcp, so a literal
+    // `pi.registerTool({name:"calyx_mcp",...})` call site inlined into
+    // both branches would make this 3. A single `registerCalyxMCP(pi)`
+    // helper function, called once from each branch, is what keeps this
+    // at 2 while still registering calyx_mcp inside herdr.
+    func test_scriptBody_registersExactlyTwoDispatcherTools() {
+        XCTAssertEqual(occurrences(of: "pi.registerTool("), 2,
+                       "Two dispatchers: the original \"calyx\" (calyx-ipc) bridge, and the new " +
+                       "\"calyx_mcp\" (/calyx-mcp) bridge. Registering every re-published tool " +
+                       "individually would put each one's name and description into pi's system prompt " +
+                       "on every turn")
         assertScriptContains("name:\"calyx\"",
                              "The dispatcher's name is what the model calls")
         assertScriptContains("required:[\"tool\"]",
@@ -366,6 +425,43 @@ final class PiExtensionManagerTests: XCTestCase {
                              "extension at all")
         assertScriptContains("args:{",
                              "The dispatched tool's own arguments ride in args")
+    }
+
+    // MARK: - calyx_mcp dispatcher (/calyx-mcp bridge)
+
+    func test_scriptBody_calyxMCPDispatcher_bridgesTheCalyxMCPEndpoint() {
+        assertScriptContains("name:\"calyx_mcp\"",
+                             "The second dispatcher's name is what the model calls to reach the " +
+                             "re-published MCP-Apps tools")
+        assertScriptContains("/calyx-mcp",
+                             "The calyx_mcp dispatcher must bridge the /calyx-mcp path, not /mcp")
+    }
+
+    func test_scriptBody_calyxMCPDispatcher_sendsHerdrHeaders() {
+        assertScript("X-Calyx-Herdr-Pane-ID", appearsNear: "/calyx-mcp",
+                     "The calyx_mcp dispatcher must identify its herdr pane so CalyxMCPServer's " +
+                     "herdr-first pane resolution can bind it to a surface")
+        assertScript("X-Calyx-Herdr-Socket-Path", appearsNear: "/calyx-mcp",
+                     "The calyx_mcp dispatcher must also send the herdr socket-path header")
+        assertScriptContains("HERDR_PANE_ID",
+                             "The herdr pane header's value is read from process.env.HERDR_PANE_ID")
+    }
+
+    // The dispatcher must fail open: an unreachable Calyx (or an
+    // endpoint file that doesn't exist yet) must never throw all the way
+    // out to pi and block the model's tool call -- same fail-open
+    // contract as postState/callCalyx's own try/catch above.
+    func test_scriptBody_calyxMCPDispatcher_failsOpenWhenEndpointUnreachable() {
+        let code = scriptCode
+        guard let dispatcherRange = code.range(of: "name:\"calyx_mcp\"") else {
+            XCTFail("scriptBody must register the calyx_mcp dispatcher")
+            return
+        }
+        let windowEnd = code.index(dispatcherRange.upperBound, offsetBy: 1200, limitedBy: code.endIndex) ?? code.endIndex
+        XCTAssertTrue(code[dispatcherRange.upperBound..<windowEnd].contains("catch"),
+                      "The calyx_mcp dispatcher's execute body must catch a failed fetch/endpoint-read " +
+                      "rather than letting it throw uncaught, so an unreachable Calyx fails open instead " +
+                      "of blocking the tool call")
     }
 
     func test_scriptBody_declaresDispatcherParametersAsPlainJSONSchema() {

@@ -14,6 +14,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     private var windowControllers: [CalyxWindowController] = []
     private var pendingURLs: [URL] = []
     private var quickTerminalController: QuickTerminalController?
+    /// The MCP Apps host (`MCPHostComposition.swift`). Built in
+    /// `applicationDidFinishLaunching`, so nil in the unit-test host.
+    private(set) var mcpHostComposition: MCPHostComposition?
 
     /// Tracks the window the user is working in app-wide -- see
     /// `CurrentWindowTracker.swift`'s own file header for the full
@@ -61,6 +64,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// if no open window does.
     func windowController(owningSurface id: UUID) -> CalyxWindowController? {
         windowControllers.first { $0.windowSession.groups.tabAndGroup(owningSurface: id) != nil }
+    }
+
+    /// The split container that shows `surfaceID`'s leaf: its window's
+    /// container, or the Quick Terminal's.
+    func splitContainer(owningSurface surfaceID: UUID) -> SplitContainerView? {
+        if let controller = windowController(owningSurface: surfaceID) {
+            return controller.splitContainer
+        }
+        return quickTerminalController?.splitContainer(owningSurface: surfaceID)
+    }
+
+    /// The window that shows `surfaceID`: its main window, or the Quick
+    /// Terminal's.
+    func window(showingSurface surfaceID: UUID) -> NSWindow? {
+        if let controller = windowController(owningSurface: surfaceID) {
+            return controller.window
+        }
+        return quickTerminalController?.window(owningSurface: surfaceID)
     }
 
     /// Restores terminal focus after an approval decision resolves (or a
@@ -1113,6 +1134,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // before this launch's herdr connection is even established).
         HerdrPaneRegistry.shared.setBridgeObserver(herdrAgentMirror)
         startHerdrIntegration()
+        // Before `resyncAgentHooksIfInstalled()`, so the IPC start it may
+        // trigger reaches the MCP host.
+        startMCPHost()
         resyncAgentHooksIfInstalled()
 
         browserTabBroker.appDelegate = self
@@ -1466,6 +1490,43 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     @objc private func handleApprovalInboxChangedForPanel(_ notification: Notification) {
         guard !isApplicationTerminating else { return }
         approvalPanelController.render()
+    }
+
+    // MARK: - MCP Apps host
+
+    /// Builds the MCP Apps host, configures Settings > MCP Servers, and
+    /// follows the IPC server, the supervisor's connections, the views and
+    /// the ghostty config.
+    private func startMCPHost() {
+        let composition = MCPHostComposition(appDelegate: self)
+        mcpHostComposition = composition
+        let center = NotificationCenter.default
+        center.addObserver(self, selector: #selector(handleIPCStateDidChangeForMCPHost(_:)), name: .calyxIPCStateDidChange, object: nil)
+        center.addObserver(self, selector: #selector(handleMCPConnectionsDidChange(_:)), name: .calyxMCPConnectionsDidChange, object: nil)
+        center.addObserver(self, selector: #selector(handleMCPAppViewsChanged(_:)), name: .calyxMCPAppViewsChanged, object: nil)
+        center.addObserver(self, selector: #selector(handleGhosttyConfigChangeForMCPHost(_:)), name: .ghosttyConfigChange, object: nil)
+        composition.start()
+        composition.ipcStateDidChange()
+    }
+
+    @objc private func handleIPCStateDidChangeForMCPHost(_ notification: Notification) {
+        mcpHostComposition?.ipcStateDidChange()
+    }
+
+    @objc private func handleMCPConnectionsDidChange(_ notification: Notification) {
+        mcpHostComposition?.connectionsDidChange()
+    }
+
+    @objc private func handleMCPAppViewsChanged(_ notification: Notification) {
+        mcpHostComposition?.appViewsDidChange()
+    }
+
+    /// App-level config changes only (`object == nil`): theme presets and
+    /// glass opacity reload the app config, and the theme inputs read the
+    /// app config.
+    @objc private func handleGhosttyConfigChangeForMCPHost(_ notification: Notification) {
+        guard notification.object == nil else { return }
+        mcpHostComposition?.hostEnvironmentDidChange()
     }
 
     #if DEBUG
@@ -4411,4 +4472,21 @@ extension Notification.Name {
     /// it deferred while the gate was up; see
     /// `drainDeferredReconnectEvents()`.
     static let calyxConfirmingQuitDidEnd = Notification.Name("com.calyx.session.confirmingQuitDidEnd")
+}
+
+// MARK: - MCPPaneResolving
+
+extension AppDelegate: MCPPaneResolving {
+    /// The window and tab that hold `surfaceID`, or the Quick Terminal.
+    func paneHost(owningSurface surfaceID: UUID) -> MCPPaneHost? {
+        for controller in windowControllers {
+            if let owner = controller.windowSession.groups.tabAndGroup(owningSurface: surfaceID) {
+                return .window(windowID: controller.windowSession.id, tabID: owner.tab.id)
+            }
+        }
+        if quickTerminalController?.ownsSurface(surfaceID) == true {
+            return .quickTerminal
+        }
+        return nil
+    }
 }

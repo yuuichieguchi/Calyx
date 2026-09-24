@@ -11,17 +11,19 @@ private let logger = Logger(subsystem: "com.calyx.terminal", category: "SplitCon
 @MainActor
 class SplitContainerView: NSView {
 
-    /// Composite cache key that uniquely identifies a single split node in
-    /// the current tree. Built from the leftmost leaves of BOTH children
-    /// plus direction, because in a binary tree two distinct splits cannot
-    /// share both children's leftmost leaves AND direction. This avoids the
-    /// Bug A collision in trees like `V(H(A, C), B)` where the outer V and
-    /// the inner H would otherwise both compute `firstLeafID(first) == A`
-    /// and clobber each other in a UUID-only cache.
-    private struct DividerKey: Hashable {
-        let firstChildFirstLeafID: UUID
-        let secondChildFirstLeafID: UUID
-        let direction: SplitDirection
+    /// Cache key that uniquely identifies one divider in the current layout.
+    ///
+    /// `.split` identifies a split node by the leftmost leaves of BOTH
+    /// children plus direction, because in a binary tree two distinct splits
+    /// cannot share both children's leftmost leaves AND direction. This
+    /// avoids the Bug A collision in trees like `V(H(A, C), B)` where the
+    /// outer V and the inner H would otherwise both compute
+    /// `firstLeafID(first) == A` and clobber each other in a UUID-only cache.
+    ///
+    /// `.dock` is the divider between a leaf's terminal and its MCP Apps dock.
+    private enum DividerKey: Hashable {
+        case split(firstChildFirstLeafID: UUID, secondChildFirstLeafID: UUID, direction: SplitDirection)
+        case dock(leafID: UUID)
     }
 
     private var registry: SurfaceRegistry
@@ -45,6 +47,21 @@ class SplitContainerView: NSView {
         _ direction: SplitDirection,
         _ splitRect: CGRect
     ) -> Void)?
+    /// MCP Apps docks by leaf. A dock shares its leaf's rect with the
+    /// terminal wrapper and outlives tab switches (`updateRegistry`).
+    private var docks: [UUID: NSView] = [:]
+    /// Docks whose leaf left the tree: detached but kept, and put back
+    /// when the leaf returns.
+    private var parkedDocks: [UUID: NSView] = [:]
+    /// The leaf whose dock covers the whole container. Kept while the leaf
+    /// is out of the tree; cleared by `setFullscreen(false, ...)` and
+    /// `detachDock(fromLeaf:)`.
+    private var fullscreenLeafID: UUID?
+    /// Dock widths set by dragging a dock divider, by leaf. A leaf without
+    /// an entry gets `MCPAppDockLayout.defaultDockWidth`. Kept while the
+    /// dock is parked and across `updateRegistry`; dropped when the dock is
+    /// detached or replaced.
+    private var dockWidths: [UUID: CGFloat] = [:]
     var onDeferredLayoutComplete: (() -> Void)?
     var onActiveLeafChange: ((UUID) -> Void)?
 
@@ -72,6 +89,7 @@ class SplitContainerView: NSView {
         scrollWrappers.removeAll()
         dividerCache.removeAll()
         dividersUsedThisPass.removeAll()
+        // Docks stay in `docks`; the next layout puts them back or parks them.
         subviews.forEach { $0.removeFromSuperview() }
         activeLeafID = nil
         needsLayout = true
@@ -93,6 +111,8 @@ class SplitContainerView: NSView {
             subviews.forEach { $0.removeFromSuperview() }
             scrollWrappers.removeAll()
             dividerCache.removeAll()
+            parkedDocks.merge(docks) { _, new in new }
+            docks.removeAll()
             activeLeafID = nil
             applyActiveDimming()
             return
@@ -166,7 +186,23 @@ class SplitContainerView: NSView {
         guard let root = currentTree.root else { return }
 
         dividersUsedThisPass.removeAll()
-        if let zoomID = currentTree.effectiveZoomedLeafID {
+        restoreParkedDocks()
+        if let fullscreenID = fullscreenLeafID, currentTree.allLeafIDs().contains(fullscreenID) {
+            // Fullscreen: the leaf's dock covers the container. Wrappers
+            // are hidden with their frames left as they are, so leaving
+            // fullscreen needs no geometry recovery (a zero frame would
+            // also kill the Metal drawable).
+            for (_, wrapper) in scrollWrappers {
+                wrapper.isHidden = true
+            }
+            for (id, dock) in docks {
+                dock.isHidden = id != fullscreenID
+                if id == fullscreenID {
+                    dock.frame = bounds
+                    if dock.superview !== self { addSubview(dock) }
+                }
+            }
+        } else if let zoomID = currentTree.effectiveZoomedLeafID {
             // Zoomed: lay out ONLY the zoomed leaf, at the container's
             // full bounds, and hide every other wrapper. Hiding the
             // `SurfaceScrollView` WRAPPER (not the `SurfaceView` inside
@@ -191,6 +227,10 @@ class SplitContainerView: NSView {
             for (id, wrapper) in scrollWrappers {
                 wrapper.isHidden = (id != zoomID)
             }
+            // Another leaf's dock hides with its terminal; it is not destroyed.
+            for (id, dock) in docks where id != zoomID {
+                dock.isHidden = true
+            }
         } else {
             layoutNode(root, in: bounds)
             for (_, wrapper) in scrollWrappers {
@@ -198,7 +238,67 @@ class SplitContainerView: NSView {
             }
         }
         removeOrphanedSurfaces()
+        parkDocksOutsideTree()
         reapUnusedDividers()
+    }
+
+    // MARK: - MCP Apps docks
+
+    /// Lays out a leaf that has a dock: terminal on the left, the dock
+    /// divider, the dock on the right, at every leaf width. The dock width
+    /// is the stored (or default) width clamped by
+    /// `MCPAppDockLayout.clampedDockWidth` for the leaf's current width,
+    /// the same bounds a split pane divider has. The divider is placed
+    /// after the wrapper and the dock are in the container, so a newly
+    /// created divider sits above both and keeps its whole hit area.
+    private func layoutDockedLeaf(_ leafID: UUID, wrapper: SurfaceScrollView, dock: NSView, in rect: CGRect) {
+        let dockWidth = dockWidths[leafID] ?? MCPAppDockLayout.defaultDockWidth(leafWidth: rect.width)
+        let split = MCPAppDockLayout.split(leafRect: rect, dockWidth: dockWidth)
+        wrapper.frame = split.terminalRect
+        dock.frame = split.dockRect
+        dock.isHidden = false
+        if wrapper.superview !== self {
+            addSubview(wrapper)
+        }
+        if dock.superview !== self {
+            addSubview(dock, positioned: .above, relativeTo: wrapper)
+        }
+        let divider = placeDividerView(
+            key: .dock(leafID: leafID), direction: .horizontal, frame: split.dividerRect, containingRect: rect
+        )
+        // Rebound every pass so the drag uses the leaf's current rect.
+        divider.onTargetRatioChange = { [weak self] ratio in
+            guard let self else { return }
+            let requested = MCPAppDockLayout.dockWidth(forDividerRatio: ratio, leafWidth: rect.width)
+            self.dockWidths[leafID] = MCPAppDockLayout.clampedDockWidth(requested, leafWidth: rect.width)
+            self.dockPreferredWidthDidChange()
+        }
+    }
+
+    /// Puts parked docks back when their leaf is in the tree again.
+    private func restoreParkedDocks() {
+        let leafIDs = Set(currentTree.allLeafIDs())
+        for (id, dock) in parkedDocks where leafIDs.contains(id) {
+            docks[id] = dock
+            parkedDocks.removeValue(forKey: id)
+        }
+    }
+
+    /// Detaches (but keeps) the docks of leaves that left the tree.
+    private func parkDocksOutsideTree() {
+        let leafIDs = Set(currentTree.allLeafIDs())
+        for (id, dock) in docks where !leafIDs.contains(id) {
+            dock.removeFromSuperview()
+            parkedDocks[id] = dock
+            docks.removeValue(forKey: id)
+        }
+    }
+
+    /// Lays the tree out again, for dock changes that do not change the tree.
+    private func relayoutForDocks() {
+        guard bounds.width > 0 && bounds.height > 0, currentTree.root != nil else { return }
+        applyLayout()
+        applyActiveDimming()
     }
 
     // MARK: - Active Pane Dimming
@@ -253,10 +353,14 @@ class SplitContainerView: NSView {
                     scrollWrappers[id] = wrapper
                 }
                 surfaceView.focusHost = self
-                wrapper.frame = rect
                 wrapper.autoresizingMask = []
-                if wrapper.superview !== self {
-                    addSubview(wrapper)
+                if let dock = docks[id] {
+                    layoutDockedLeaf(id, wrapper: wrapper, dock: dock, in: rect)
+                } else {
+                    wrapper.frame = rect
+                    if wrapper.superview !== self {
+                        addSubview(wrapper)
+                    }
                 }
             }
 
@@ -323,8 +427,37 @@ class SplitContainerView: NSView {
         splitData: SplitData,
         splitRect: CGRect
     ) {
+        guard let firstChildID = SplitTree.firstLeafID(of: splitData.first),
+              let secondChildID = SplitTree.firstLeafID(of: splitData.second) else { return }
+
+        let divider = placeDividerView(
+            key: .split(firstChildFirstLeafID: firstChildID, secondChildFirstLeafID: secondChildID, direction: direction),
+            direction: direction,
+            frame: frame,
+            containingRect: splitRect
+        )
+
+        // Rebind the callback every pass so it captures the latest splitData
+        // shape (ratio/children may have changed even if the cache key didn't)
+        // AND the latest splitRect (resizing the container moves nested splits).
+        divider.onTargetRatioChange = { [weak self] targetRatio in
+            guard let self else { return }
+            self.onTargetRatioChange?(firstChildID, secondChildID, targetRatio, direction, splitRect)
+        }
+    }
+
+    /// Places the cached divider for `key` (creating it on first use) over
+    /// the visible `frame` with the expanded hit area, and marks it used in
+    /// this pass. `containingRect` is the rect the divider's drag ratio is
+    /// measured across.
+    private func placeDividerView(
+        key: DividerKey,
+        direction: SplitDirection,
+        frame: CGRect,
+        containingRect: CGRect
+    ) -> SplitDividerView {
         // Expand hit area around the visible divider
-        let hitExpansion: CGFloat = 3
+        let hitExpansion = MCPAppDockLayout.dividerHitExpansion
         let hitFrame: CGRect
         switch direction {
         case .horizontal:
@@ -342,15 +475,6 @@ class SplitContainerView: NSView {
                 height: frame.height + hitExpansion * 2
             )
         }
-
-        guard let firstChildID = SplitTree.firstLeafID(of: splitData.first),
-              let secondChildID = SplitTree.firstLeafID(of: splitData.second) else { return }
-
-        let key = DividerKey(
-            firstChildFirstLeafID: firstChildID,
-            secondChildFirstLeafID: secondChildID,
-            direction: direction
-        )
 
         let divider: SplitDividerView
         if let existing = dividerCache[key] {
@@ -371,17 +495,10 @@ class SplitContainerView: NSView {
         // Keep the divider in sync with the sub-rect it lives in so drag
         // math is computed relative to that rect, not the whole container
         // (Bug C).
-        divider.containingRect = splitRect
-
-        // Rebind the callback every pass so it captures the latest splitData
-        // shape (ratio/children may have changed even if the cache key didn't)
-        // AND the latest splitRect (resizing the container moves nested splits).
-        divider.onTargetRatioChange = { [weak self] targetRatio in
-            guard let self else { return }
-            self.onTargetRatioChange?(firstChildID, secondChildID, targetRatio, direction, splitRect)
-        }
+        divider.containingRect = containingRect
 
         dividersUsedThisPass.insert(key)
+        return divider
     }
 
     private func reapUnusedDividers() {
@@ -428,5 +545,53 @@ extension SplitContainerView: SurfaceFocusHost {
         activeLeafID = id
         applyActiveDimming()
         onActiveLeafChange?(id)
+    }
+}
+
+// MARK: - MCP Apps dock placement
+
+extension SplitContainerView {
+    /// Shows `dockView` to the right of the leaf's terminal. Attaching the
+    /// same view again is harmless; a different view replaces the leaf's
+    /// dock and starts at the default width.
+    func attachDock(_ dockView: NSView, toLeaf leafID: UUID) {
+        if let existing = docks[leafID] ?? parkedDocks[leafID], existing !== dockView {
+            existing.removeFromSuperview()
+            dockWidths.removeValue(forKey: leafID)
+        }
+        parkedDocks.removeValue(forKey: leafID)
+        docks[leafID] = dockView
+        relayoutForDocks()
+    }
+
+    /// The leaf's attached dock. Nil while the leaf is out of the tree.
+    func dockView(forLeaf leafID: UUID) -> NSView? {
+        docks[leafID]
+    }
+
+    /// Fullscreen hides the terminal wrappers without zeroing their frames
+    /// and gives the leaf's dock the whole container.
+    func setFullscreen(_ isFullscreen: Bool, forLeaf leafID: UUID) {
+        if isFullscreen {
+            fullscreenLeafID = leafID
+        } else if fullscreenLeafID == leafID {
+            fullscreenLeafID = nil
+        }
+        relayoutForDocks()
+    }
+
+    /// Removes the leaf's dock for good (the view it showed was closed).
+    func detachDock(fromLeaf leafID: UUID) {
+        docks.removeValue(forKey: leafID)?.removeFromSuperview()
+        parkedDocks.removeValue(forKey: leafID)
+        dockWidths.removeValue(forKey: leafID)
+        if fullscreenLeafID == leafID { fullscreenLeafID = nil }
+        relayoutForDocks()
+    }
+
+    /// A leaf's dock width changed (a dock divider drag): lays the docks
+    /// out again.
+    func dockPreferredWidthDidChange() {
+        relayoutForDocks()
     }
 }

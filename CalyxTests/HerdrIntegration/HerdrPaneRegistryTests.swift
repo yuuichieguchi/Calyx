@@ -403,4 +403,75 @@ final class HerdrPaneRegistryTests: XCTestCase {
             "registration itself must still succeed normally even after the bridge observer has deallocated"
         )
     }
+
+    // MARK: - Socket path key canonicalization (calyx-mcp herdr-first pane resolution)
+    //
+    // `/calyx-mcp`'s herdr-first pane resolution (plan §4) looks a pane
+    // up by (X-Calyx-Herdr-Socket-Path header value, X-Calyx-Herdr-Pane-ID
+    // header value). The header value and the value herdr itself used at
+    // register() time need not be byte-identical (a trailing slash, a
+    // double slash, or a symlinked path component) even though they name
+    // the same socket -- so both register and lookup must canonicalize
+    // the socket path (standardized() + resolvingSymlinksInPath()) before
+    // keying on it.
+
+    func test_surfaceIDForPaneID_trailingSlashInLookupSocketPath_stillResolves() {
+        let registry = HerdrPaneRegistry()
+        let surfaceID = UUID()
+        registry.register(
+            surfaceID: surfaceID,
+            ref: HerdrPaneRef(socketPath: "/Users/dev/.config/herdr/herdr.sock", paneID: "wB:p1")
+        )
+
+        let resolved = registry.surfaceID(forPaneID: "wB:p1", socketPath: "/Users/dev/.config/herdr/herdr.sock/")
+        XCTAssertEqual(
+            resolved, surfaceID,
+            "a lookup socket path differing only by a trailing slash must resolve to the same surface " +
+            "registered under the canonical form"
+        )
+    }
+
+    func test_surfaceIDForPaneID_doubleSlashInLookupSocketPath_stillResolves() {
+        let registry = HerdrPaneRegistry()
+        let surfaceID = UUID()
+        registry.register(
+            surfaceID: surfaceID,
+            ref: HerdrPaneRef(socketPath: "/Users/dev/.config/herdr/herdr.sock", paneID: "wB:p1")
+        )
+
+        let resolved = registry.surfaceID(forPaneID: "wB:p1", socketPath: "/Users/dev//.config/herdr/herdr.sock")
+        XCTAssertEqual(
+            resolved, surfaceID,
+            "a lookup socket path differing only by a doubled path separator must resolve to the same " +
+            "registered surface"
+        )
+    }
+
+    func test_register_thenLookupWithCanonicallyEquivalentButDifferentlySpelledPath_singleControllerInvariantHolds() {
+        // register() itself must canonicalize too: registering the SAME
+        // pane twice, once under each spelling, must be treated as the
+        // SAME (socketPath, paneID) key -- the second register replaces
+        // the first rather than the single-controller eviction picking a
+        // seemingly-different key.
+        let registry = HerdrPaneRegistry()
+        let firstSurfaceID = UUID()
+        let secondSurfaceID = UUID()
+
+        registry.register(
+            surfaceID: firstSurfaceID,
+            ref: HerdrPaneRef(socketPath: "/Users/dev/.config/herdr/herdr.sock", paneID: "wB:p1")
+        )
+        registry.register(
+            surfaceID: secondSurfaceID,
+            ref: HerdrPaneRef(socketPath: "/Users/dev/.config/herdr/herdr.sock/", paneID: "wB:p1")
+        )
+
+        XCTAssertFalse(
+            registry.isBridgeSurface(firstSurfaceID),
+            "registering the same pane under a canonically-equivalent but differently-spelled socket path " +
+            "must evict the first surface (single-controller invariant), not create two independent entries"
+        )
+        XCTAssertTrue(registry.isBridgeSurface(secondSurfaceID))
+        XCTAssertEqual(registry.surfaceID(forPaneID: "wB:p1", socketPath: "/Users/dev/.config/herdr/herdr.sock"), secondSurfaceID)
+    }
 }

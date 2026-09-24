@@ -1168,6 +1168,15 @@ final class ConfigEditingContractTests: XCTestCase {
             "      X-Calyx-Surface-ID: \"${CALYX_SURFACE_ID}\"\n" +
             "      X-Calyx-Session-ID: \"${CALYX_SESSION_ID}\"\n" +
             "      X-Calyx-Agent-Kind: \"hermes\"\n" +
+            "  calyx-mcp:\n" +
+            "    url: \"http://127.0.0.1:41830/calyx-mcp\"\n" +
+            "    headers:\n" +
+            "      Authorization: \"Bearer t\"\n" +
+            "      X-Calyx-Surface-ID: \"${CALYX_SURFACE_ID}\"\n" +
+            "      X-Calyx-Session-ID: \"${CALYX_SESSION_ID}\"\n" +
+            "      X-Calyx-Agent-Kind: \"hermes\"\n" +
+            "      X-Calyx-Herdr-Pane-ID: \"${HERDR_PANE_ID}\"\n" +
+            "      X-Calyx-Herdr-Socket-Path: \"${HERDR_SOCKET_PATH}\"\n" +
             "  # END CALYX IPC\n" +
             "other: 1\n"
         let expected = expectedLF.replacingOccurrences(of: "\n", with: "\r\n")
@@ -2094,6 +2103,15 @@ final class ConfigEditingContractTests: XCTestCase {
             "            X-Calyx-Surface-ID: \"${CALYX_SURFACE_ID}\"\n" +
             "            X-Calyx-Session-ID: \"${CALYX_SESSION_ID}\"\n" +
             "            X-Calyx-Agent-Kind: \"hermes\"\n" +
+            "    calyx-mcp:\n" +
+            "        url: \"http://127.0.0.1:2/calyx-mcp\"\n" +
+            "        headers:\n" +
+            "            Authorization: \"Bearer second\"\n" +
+            "            X-Calyx-Surface-ID: \"${CALYX_SURFACE_ID}\"\n" +
+            "            X-Calyx-Session-ID: \"${CALYX_SESSION_ID}\"\n" +
+            "            X-Calyx-Agent-Kind: \"hermes\"\n" +
+            "            X-Calyx-Herdr-Pane-ID: \"${HERDR_PANE_ID}\"\n" +
+            "            X-Calyx-Herdr-Socket-Path: \"${HERDR_SOCKET_PATH}\"\n" +
             "    # END CALYX IPC\n"
         let finalData = try Data(contentsOf: URL(fileURLWithPath: configPath))
         XCTAssertEqual(
@@ -2245,5 +2263,110 @@ final class ConfigEditingContractTests: XCTestCase {
                 "exactly as it found it, not force it back to 0600"
             )
         }
+    }
+
+    // MARK: - calyx-mcp: detection predicate agrees with disable-remove
+
+    /// Each manager's `isIPCEnabled` detection predicate is keyed on the
+    /// calyx-ipc entry alone (unchanged by this feature). This pins that
+    /// `disableIPC` removes calyx-mcp in exact lockstep with calyx-ipc --
+    /// `isIPCEnabled` never disagrees with what a fresh `enableIPC` +
+    /// `disableIPC` cycle actually leaves behind for EITHER entry, across
+    /// every manager that now owns a calyx-mcp entry.
+    func test_calyxMCPEntry_disableIPC_agreesWithIsIPCEnabled_acrossAllManagers() throws {
+        struct Descriptor {
+            let managerName: String
+            let relativePath: String
+            /// Unrelated sibling content seeded before enable, so
+            /// disable's removal never has to cross the "file became
+            /// entirely Calyx's own region" cascade-delete boundary --
+            /// this test has no reason to exercise that separate edge
+            /// case (already covered by `jsonBoundaryChecks()` /
+            /// `markerAbsentBecomesPresentButEmptyChecks()` above).
+            let seedContent: String
+            let enable: (String) throws -> Void
+            let disable: (String) throws -> Void
+            let isIPCEnabled: (String) -> Bool
+            let containsCalyxMCP: (String) -> Bool
+        }
+
+        let descriptors: [Descriptor] = [
+            Descriptor(
+                managerName: "ClaudeConfigManager",
+                relativePath: "claude.json",
+                seedContent: "{\n  \"otherKey\": \"value\"\n}\n",
+                enable: { path in try ClaudeConfigManager.enableIPC(port: 41830, token: "t", configPath: path) },
+                disable: { path in try ClaudeConfigManager.disableIPC(configPath: path) },
+                isIPCEnabled: { path in ClaudeConfigManager.isIPCEnabled(configPath: path) },
+                containsCalyxMCP: { content in content.contains("calyx-mcp") }
+            ),
+            Descriptor(
+                managerName: "CodexConfigManager",
+                relativePath: "config.toml",
+                seedContent: "[other]\nx = 1\n",
+                enable: { path in try CodexConfigManager.enableIPC(port: 41830, token: "t", configPath: path) },
+                disable: { path in try CodexConfigManager.disableIPC(configPath: path) },
+                isIPCEnabled: { path in CodexConfigManager.isIPCEnabled(configPath: path) },
+                containsCalyxMCP: { content in content.contains("[mcp_servers.calyx-mcp]") }
+            ),
+            Descriptor(
+                managerName: "GrokConfigManager",
+                relativePath: "config.toml",
+                seedContent: "[other]\nx = 1\n",
+                enable: { path in try GrokConfigManager.enableIPC(port: 41830, token: "t", configPath: path) },
+                disable: { path in try GrokConfigManager.disableIPC(configPath: path) },
+                isIPCEnabled: { path in GrokConfigManager.isIPCEnabled(configPath: path) },
+                containsCalyxMCP: { content in content.contains("[mcp_servers.calyx-mcp") }
+            ),
+            Descriptor(
+                managerName: "HermesConfigManager",
+                relativePath: "config.yaml",
+                seedContent: "other: 1\n",
+                enable: { path in try HermesConfigManager.enableIPC(port: 41830, token: "t", configPath: path) },
+                disable: { path in try HermesConfigManager.disableIPC(configPath: path) },
+                isIPCEnabled: { path in HermesConfigManager.isIPCEnabled(configPath: path) },
+                containsCalyxMCP: { content in content.contains("calyx-mcp:") }
+            ),
+        ]
+
+        for descriptor in descriptors {
+            let root = tempDir + "/" + UUID().uuidString
+            try FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+            let path = root + "/" + descriptor.relativePath
+
+            XCTAssertFalse(descriptor.isIPCEnabled(path), "\(descriptor.managerName): absent file must report disabled")
+            try Data(descriptor.seedContent.utf8).write(to: URL(fileURLWithPath: path))
+
+            try descriptor.enable(path)
+            XCTAssertTrue(descriptor.isIPCEnabled(path), "\(descriptor.managerName): isIPCEnabled must be true after enable")
+            let afterEnable = try String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)
+            XCTAssertTrue(
+                descriptor.containsCalyxMCP(afterEnable),
+                "\(descriptor.managerName): precondition -- enable must have written calyx-mcp"
+            )
+
+            try descriptor.disable(path)
+            XCTAssertFalse(descriptor.isIPCEnabled(path), "\(descriptor.managerName): isIPCEnabled must be false after disable")
+            let afterDisable = try String(contentsOf: URL(fileURLWithPath: path), encoding: .utf8)
+            XCTAssertFalse(
+                descriptor.containsCalyxMCP(afterDisable),
+                "\(descriptor.managerName): disable must remove calyx-mcp in lockstep with calyx-ipc, " +
+                "exactly when isIPCEnabled flips to false"
+            )
+        }
+
+        // OpenCodeConfigManager: separate config-directory shape.
+        let openCodeRoot = tempDir + "/" + UUID().uuidString
+        try FileManager.default.createDirectory(atPath: openCodeRoot, withIntermediateDirectories: true)
+        XCTAssertFalse(OpenCodeConfigManager.isIPCEnabled(configDir: openCodeRoot))
+        try Data("{\n  \"theme\": \"dark\"\n}\n".utf8).write(to: URL(fileURLWithPath: openCodeRoot + "/opencode.json"))
+        try OpenCodeConfigManager.enableIPC(port: 41830, token: "t", configDir: openCodeRoot)
+        XCTAssertTrue(OpenCodeConfigManager.isIPCEnabled(configDir: openCodeRoot))
+        let openCodeJSON = try String(contentsOfFile: openCodeRoot + "/opencode.json", encoding: .utf8)
+        XCTAssertTrue(openCodeJSON.contains("calyx-mcp"), "OpenCodeConfigManager: precondition -- enable must write calyx-mcp")
+        try OpenCodeConfigManager.disableIPC(configDir: openCodeRoot)
+        XCTAssertFalse(OpenCodeConfigManager.isIPCEnabled(configDir: openCodeRoot))
+        let openCodeJSONAfter = try String(contentsOfFile: openCodeRoot + "/opencode.json", encoding: .utf8)
+        XCTAssertFalse(openCodeJSONAfter.contains("calyx-mcp"), "OpenCodeConfigManager: disable must remove calyx-mcp")
     }
 }

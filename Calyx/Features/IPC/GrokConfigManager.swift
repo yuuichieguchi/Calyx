@@ -32,6 +32,8 @@ struct GrokConfigManager: Sendable {
     // MARK: - Private
 
     private static let tableEditor = TOMLTableConfigDocumentEditor(tablePath: "mcp_servers.calyx-ipc")
+    /// The `/calyx-mcp` table, beside `calyx-ipc`.
+    private static let calyxMCPTableEditor = TOMLTableConfigDocumentEditor(tablePath: "mcp_servers.calyx-mcp")
 
     // MARK: - Public API
 
@@ -68,9 +70,24 @@ struct GrokConfigManager: Sendable {
         X-Calyx-Surface-ID = "${CALYX_SURFACE_ID:-}"
         """
 
-        // 0600: this table's headers sub-table carries the bearer token.
+        // Same host, port and headers as calyx-ipc, plus the herdr pane and
+        // socket headers `/calyx-mcp` resolves a herdr pane by.
+        let calyxMCPBody = """
+        url = "http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)"
+
+        [mcp_servers.calyx-mcp.headers]
+        Authorization = "Bearer \(token)"
+        X-Calyx-Agent-Kind = "\(AgentEntry.grokKind)"
+        X-Calyx-Session-ID = "${CALYX_SESSION_ID:-}"
+        X-Calyx-Surface-ID = "${CALYX_SURFACE_ID:-}"
+        X-Calyx-Herdr-Pane-ID = "${HERDR_PANE_ID:-}"
+        X-Calyx-Herdr-Socket-Path = "${HERDR_SOCKET_PATH:-}"
+        """
+
+        // 0600: both tables' headers sub-tables carry the bearer token.
         try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
-            try tableEditor.setTable(body: body, in: current)
+            let withIPC = try tableEditor.setTable(body: body, in: current)
+            return try calyxMCPTableEditor.setTable(body: calyxMCPBody, in: withIPC)
         }
     }
 
@@ -85,7 +102,8 @@ struct GrokConfigManager: Sendable {
         // user's file already has rather than forcing 0600 (that mode
         // belongs to enableIPC, which writes the token).
         try ConfigFileUtils.withExclusiveConfig(path: path) { current in
-            try tableEditor.removeTable(in: current)
+            let withoutIPC = try tableEditor.removeTable(in: current)
+            return try calyxMCPTableEditor.removeTable(in: withoutIPC)
         }
     }
 

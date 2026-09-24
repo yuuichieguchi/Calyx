@@ -347,4 +347,37 @@ final class GrokConfigManagerTests: XCTestCase {
         let attributes = try FileManager.default.attributesOfItem(atPath: configPath)
         XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSymbolicLink)
     }
+
+    // MARK: - calyx-mcp table
+
+    // enableIPC must also own a second table, [mcp_servers.calyx-mcp],
+    // sharing calyx-ipc's host/port but the /calyx-mcp path, with the
+    // same headers sub-table plus the two herdr headers.
+    func test_enableIPC_alsoWritesCalyxMCPTable() throws {
+        try GrokConfigManager.enableIPC(port: 41830, token: dummyToken, configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertTrue(content.contains("[mcp_servers.calyx-mcp.headers]"),
+                      "enableIPC must also write a [mcp_servers.calyx-mcp.headers] table")
+        XCTAssertTrue(content.contains("url = \"http://127.0.0.1:41830/calyx-mcp\""),
+                      "calyx-mcp must share calyx-ipc's host/port but use the /calyx-mcp path")
+        XCTAssertTrue(content.contains("Authorization = \"Bearer \(dummyToken)\""))
+        XCTAssertTrue(content.contains("X-Calyx-Herdr-Pane-ID = \"${HERDR_PANE_ID:-}\""),
+                      "calyx-mcp headers must additionally carry the herdr pane header")
+        XCTAssertTrue(content.contains("X-Calyx-Herdr-Socket-Path = \"${HERDR_SOCKET_PATH:-}\""),
+                      "calyx-mcp headers must additionally carry the herdr socket-path header")
+    }
+
+    func test_disableIPC_removesBothCalyxIPCAndCalyxMCPTables() throws {
+        // Seeded with an unrelated sibling table, same rationale as the
+        // Codex counterpart above.
+        writeConfig("[other]\nx = 1\n")
+        try GrokConfigManager.enableIPC(port: 41830, token: dummyToken, configPath: configPath)
+        try GrokConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-ipc"))
+        XCTAssertFalse(content.contains("[mcp_servers.calyx-mcp"),
+                       "disableIPC must also remove every [mcp_servers.calyx-mcp*] table")
+    }
 }

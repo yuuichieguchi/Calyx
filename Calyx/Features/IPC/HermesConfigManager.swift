@@ -13,7 +13,7 @@
 //   - Case A: file has no top-level `mcp_servers:` key — the managed block
 //     is appended at EOF and contains its own `mcp_servers:` parent.
 //   - Case B: file already has a top-level `mcp_servers:` key — only the
-//     `calyx-ipc:` child entry is inserted under it, with comment markers
+//     `calyx-ipc:` and `calyx-mcp:` child entries are inserted under it, with comment markers
 //     and the entry indented to the learned child indent.
 //
 // Hermes registers no hooks: a Hermes Agents row is
@@ -97,6 +97,9 @@ struct HermesConfigManager: Sendable {
         let url = "http://127.0.0.1:\(port)/mcp"
         let authorization = "Bearer \(token)"
         let urlScalar = try yamlDoubleQuotedScalar(url)
+        let calyxMCPURLScalar = try yamlDoubleQuotedScalar("http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)")
+        let herdrPaneIDScalar = try yamlDoubleQuotedScalar("${HERDR_PANE_ID}")
+        let herdrSocketPathScalar = try yamlDoubleQuotedScalar("${HERDR_SOCKET_PATH}")
         let authScalar = try yamlDoubleQuotedScalar(authorization)
         let surfaceIDScalar = try yamlDoubleQuotedScalar("${CALYX_SURFACE_ID}")
         let sessionIDScalar = try yamlDoubleQuotedScalar("${CALYX_SESSION_ID}")
@@ -112,10 +115,13 @@ struct HermesConfigManager: Sendable {
                 let body = managedBlockBody(
                     caseBUnit: nil,
                     urlScalar: urlScalar,
+                    calyxMCPURLScalar: calyxMCPURLScalar,
                     authScalar: authScalar,
                     surfaceIDScalar: surfaceIDScalar,
                     sessionIDScalar: sessionIDScalar,
-                    agentKindScalar: agentKindScalar
+                    agentKindScalar: agentKindScalar,
+                    herdrPaneIDScalar: herdrPaneIDScalar,
+                    herdrSocketPathScalar: herdrSocketPathScalar
                 )
                 let replaced = try markerEditor.replaceBlock(body: body, in: current) { original, beginIndex in
                     original.leadingSpaceCount(original.lines[beginIndex]) == 0
@@ -133,10 +139,13 @@ struct HermesConfigManager: Sendable {
             let body = managedBlockBody(
                 caseBUnit: unit,
                 urlScalar: urlScalar,
+                calyxMCPURLScalar: calyxMCPURLScalar,
                 authScalar: authScalar,
                 surfaceIDScalar: surfaceIDScalar,
                 sessionIDScalar: sessionIDScalar,
-                agentKindScalar: agentKindScalar
+                agentKindScalar: agentKindScalar,
+                herdrPaneIDScalar: herdrPaneIDScalar,
+                herdrSocketPathScalar: herdrSocketPathScalar
             )
             let replaced = try markerEditor.replaceBlock(body: body, in: current) { original, beginIndex in
                 isCaseBChildPlacement(beginLine: beginIndex, unit: unit, in: original)
@@ -203,13 +212,20 @@ struct HermesConfigManager: Sendable {
     /// (relative `unit`) land one level deeper, and so on, matching the
     /// existing document's own indent convention throughout instead of
     /// only at the first level.
+    ///
+    /// The body holds two sibling entries: `calyx-ipc:` (`/mcp`) and
+    /// `calyx-mcp:` (`/calyx-mcp`), the latter with the herdr pane and
+    /// socket headers `/calyx-mcp` resolves a herdr pane by.
     private static func managedBlockBody(
         caseBUnit: Int?,
         urlScalar: String,
+        calyxMCPURLScalar: String,
         authScalar: String,
         surfaceIDScalar: String,
         sessionIDScalar: String,
-        agentKindScalar: String
+        agentKindScalar: String,
+        herdrPaneIDScalar: String,
+        herdrSocketPathScalar: String
     ) -> String {
         guard let unit = caseBUnit else {
             return """
@@ -221,6 +237,15 @@ struct HermesConfigManager: Sendable {
                   X-Calyx-Surface-ID: \(surfaceIDScalar)
                   X-Calyx-Session-ID: \(sessionIDScalar)
                   X-Calyx-Agent-Kind: \(agentKindScalar)
+              calyx-mcp:
+                url: \(calyxMCPURLScalar)
+                headers:
+                  Authorization: \(authScalar)
+                  X-Calyx-Surface-ID: \(surfaceIDScalar)
+                  X-Calyx-Session-ID: \(sessionIDScalar)
+                  X-Calyx-Agent-Kind: \(agentKindScalar)
+                  X-Calyx-Herdr-Pane-ID: \(herdrPaneIDScalar)
+                  X-Calyx-Herdr-Socket-Path: \(herdrSocketPathScalar)
             """
         }
         let l1 = String(repeating: " ", count: unit)
@@ -233,6 +258,15 @@ struct HermesConfigManager: Sendable {
             "\(l2)X-Calyx-Surface-ID: \(surfaceIDScalar)",
             "\(l2)X-Calyx-Session-ID: \(sessionIDScalar)",
             "\(l2)X-Calyx-Agent-Kind: \(agentKindScalar)",
+            "calyx-mcp:",
+            "\(l1)url: \(calyxMCPURLScalar)",
+            "\(l1)headers:",
+            "\(l2)Authorization: \(authScalar)",
+            "\(l2)X-Calyx-Surface-ID: \(surfaceIDScalar)",
+            "\(l2)X-Calyx-Session-ID: \(sessionIDScalar)",
+            "\(l2)X-Calyx-Agent-Kind: \(agentKindScalar)",
+            "\(l2)X-Calyx-Herdr-Pane-ID: \(herdrPaneIDScalar)",
+            "\(l2)X-Calyx-Herdr-Socket-Path: \(herdrSocketPathScalar)",
         ].joined(separator: "\n")
     }
 
@@ -302,15 +336,16 @@ struct HermesConfigManager: Sendable {
         if trimmed.isEmpty { return true }
         if trimmed.hasPrefix("#") { return true }
         let ownKeyPrefixes = [
-            "mcp_servers:", "calyx-ipc:", "url:", "headers:", "Authorization:",
+            "mcp_servers:", "calyx-ipc:", "calyx-mcp:", "url:", "headers:", "Authorization:",
             "X-Calyx-Surface-ID:", "X-Calyx-Session-ID:", "X-Calyx-Agent-Kind:",
+            "X-Calyx-Herdr-Pane-ID:", "X-Calyx-Herdr-Socket-Path:",
         ]
         return ownKeyPrefixes.contains { trimmed.hasPrefix($0) }
     }
 
     /// Extracts every line inside a BEGIN...END (or self-healed orphan)
-    /// span that is NOT Calyx's own `calyx-ipc:` subtree, by YAML
-    /// indentation structure rather than line content: the `calyx-ipc:`
+    /// span that is NOT Calyx's own `calyx-ipc:` or `calyx-mcp:` subtree,
+    /// by YAML indentation structure rather than line content: each such
     /// key line and every following line indented strictly deeper than it
     /// are Calyx's own; everything else in the span is foreign and is
     /// returned byte-for-byte (indentation, trailing whitespace, comments,
@@ -333,26 +368,31 @@ struct HermesConfigManager: Sendable {
     /// is Calyx's own region too (it introduced nothing but Calyx's own
     /// entry) and is dropped along with it.
     private static func foreignBodyBytes(in doc: LineDoc, bodyLines: Range<Int>) -> [UInt8] {
-        let key = "calyx-ipc:"
-        guard let calyxIndex = bodyLines.first(where: {
-            String(decoding: doc.lineBytes(doc.lines[$0]), as: UTF8.self)
-                .trimmingCharacters(in: .whitespaces).hasPrefix(key)
-        }) else {
+        let ownKeys = ["calyx-ipc:", "calyx-mcp:"]
+        let keyIndices = bodyLines.filter { index in
+            let trimmed = String(decoding: doc.lineBytes(doc.lines[index]), as: UTF8.self)
+                .trimmingCharacters(in: .whitespaces)
+            return ownKeys.contains { trimmed.hasPrefix($0) }
+        }
+        guard let firstKeyIndex = keyIndices.first else {
             var result: [UInt8] = []
             for i in bodyLines { result.append(contentsOf: doc.rawBytes(forLines: i..<(i + 1))) }
             return result
         }
-        let calyxIndent = doc.leadingSpaceCount(doc.lines[calyxIndex])
+        let calyxIndent = doc.leadingSpaceCount(doc.lines[firstKeyIndex])
 
-        var subtreeEnd = calyxIndex + 1
-        while subtreeEnd < bodyLines.upperBound {
-            let raw = doc.lineBytes(doc.lines[subtreeEnd])
-            if raw.isEmpty { break }
-            if doc.leadingSpaceCount(doc.lines[subtreeEnd]) <= calyxIndent { break }
-            subtreeEnd += 1
+        var ownIndices = Set<Int>()
+        for keyIndex in keyIndices {
+            let keyIndent = doc.leadingSpaceCount(doc.lines[keyIndex])
+            var subtreeEnd = keyIndex + 1
+            while subtreeEnd < bodyLines.upperBound {
+                let raw = doc.lineBytes(doc.lines[subtreeEnd])
+                if raw.isEmpty { break }
+                if doc.leadingSpaceCount(doc.lines[subtreeEnd]) <= keyIndent { break }
+                subtreeEnd += 1
+            }
+            ownIndices.formUnion(keyIndex..<subtreeEnd)
         }
-        var ownIndices = Set(calyxIndex..<subtreeEnd)
-        ownIndices.insert(calyxIndex)
 
         let mcpServersParentIndex = bodyLines.first {
             !ownIndices.contains($0)

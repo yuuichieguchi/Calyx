@@ -22,16 +22,18 @@ class SettingsWindowController: NSWindowController {
     private let agentIPCSwitch = NSSwitch()
     private let agentIPCRefreshButton = NSButton(title: "Refresh", target: nil, action: nil)
     private let agentIPCStatusLabel = NSTextField(wrappingLabelWithString: "")
+    /// State behind the MCP Apps pane (`SettingsPane.mcpServers`), shared by every instance and
+    /// held by the type so the composition root configures it at launch
+    /// without creating the Settings window. Empty until
+    /// `configureMCPServers(_:)`.
+    static let mcpServerSettingsModel = MCPServerSettingsModel()
+
+    var mcpServerSettingsModel: MCPServerSettingsModel { Self.mcpServerSettingsModel }
 
     private let tabViewController = SettingsTabViewController()
-
-    /// Fixed width for every pane so switching tabs only ever changes the
-    /// window's height, matching standard macOS Settings behavior.
-    private static let paneWidth: CGFloat = 560
-    private static let paneContentInset: CGFloat = 24
-    /// Shared by `agentIPCStatusLabel.font` and `attributedStatusText`, so
-    /// the two can never drift apart.
-    private static let agentIPCStatusFont = NSFont.systemFont(ofSize: 11)
+    /// One content controller per pane, so a pane whose content changes
+    /// after construction can have its size measured again.
+    private var paneViewControllers: [SettingsPane: SettingsPaneContentViewController] = [:]
 
     #if DEBUG
     /// Test seam: overrides the root `commandTrackingDidChange(_:)`
@@ -44,7 +46,7 @@ class SettingsWindowController: NSWindowController {
 
     private init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: Self.paneWidth, height: 400),
+            contentRect: NSRect(x: 0, y: 0, width: SettingsLayout.paneWidth, height: 400),
             styleMask: [.titled, .closable, .resizable],
             backing: .buffered,
             defer: false
@@ -54,6 +56,8 @@ class SettingsWindowController: NSWindowController {
 
         super.init(window: window)
 
+        // IPC may have changed while no Settings window existed to observe it.
+        mcpServerSettingsModel.refreshIPCEnabled()
         setupContent()
 
         // Settings is AppKit, so @Observable does not drive it. Chain
@@ -87,9 +91,10 @@ class SettingsWindowController: NSWindowController {
         for pane in SettingsPane.allCases {
             let paneViewController = SettingsPaneContentViewController(
                 contentStack: paneStack(for: pane),
-                width: Self.paneWidth,
-                contentInset: Self.paneContentInset
+                width: SettingsLayout.paneWidth,
+                contentInset: SettingsLayout.paneContentInset
             )
+            paneViewControllers[pane] = paneViewController
             let tabItem = NSTabViewItem(viewController: paneViewController)
             tabItem.label = pane.title
             tabItem.image = NSImage(systemSymbolName: pane.icon, accessibilityDescription: pane.title)
@@ -153,6 +158,11 @@ class SettingsWindowController: NSWindowController {
                 title: "Agent Hook Approval",
                 subtitle: "Routes Claude Code and Codex permission prompts, all always-approve Grok tool calls, and every pi tool call to the Calyx approval banner. Off = agents decide alone, and pi, which has no prompt of its own, just runs the call."
             )
+        case .mcpServers:
+            return SectionHeading(
+                title: "MCP Apps",
+                subtitle: "MCP servers whose tools show interactive apps next to the agent that calls them."
+            )
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .glassOpacityCells, .themeColorWell, .themeColorHex, .lspRequireConfirmation,
@@ -163,20 +173,17 @@ class SettingsWindowController: NSWindowController {
     }
 
     private func paneStack(for pane: SettingsPane) -> NSStackView {
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 18
+        let stack = SettingsLayout.column()
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         let rowsInPane = SettingsRow.allCases.filter { $0.pane == pane }
         for (index, settingsRow) in rowsInPane.enumerated() {
             if let heading = Self.sectionHeading(for: settingsRow) {
                 if index > 0 {
-                    stack.addArrangedSubview(sectionDivider())
+                    stack.addArrangedSubview(SettingsLayout.sectionDivider())
                 }
                 if let title = heading.title {
-                    stack.addArrangedSubview(sectionTitleLabel(title))
+                    stack.addArrangedSubview(SettingsLayout.sectionTitleLabel(title))
                 }
                 if let subtitle = heading.subtitle {
                     stack.addArrangedSubview(SettingsLabelFactory.descriptionLabel(subtitle))
@@ -221,6 +228,8 @@ class SettingsWindowController: NSWindowController {
             return commandTrackingRow()
         case .agentHookApproval:
             return agentHookApprovalRow()
+        case .mcpServers:
+            return mcpServersRow()
         case .openSessionBrowserButton:
             return sessionBrowserButtonRow()
         case .openConfigFileFooter:
@@ -260,7 +269,7 @@ class SettingsWindowController: NSWindowController {
 
         let opacityRow = NSStackView()
         opacityRow.orientation = .horizontal
-        opacityRow.spacing = 12
+        opacityRow.spacing = SettingsLayout.controlSpacing
         opacityRow.alignment = .centerY
         let opacityText = NSTextField(labelWithString: "Glass opacity")
         opacityText.font = .systemFont(ofSize: 13, weight: .medium)
@@ -375,21 +384,14 @@ class SettingsWindowController: NSWindowController {
         agentIPCRefreshButton.action = #selector(agentIPCRefreshButtonPressed(_:))
 
         agentIPCStatusLabel.setAccessibilityIdentifier(AccessibilityID.Settings.agentIPCStatusLabel)
-        agentIPCStatusLabel.font = Self.agentIPCStatusFont
-        agentIPCStatusLabel.preferredMaxLayoutWidth = Self.paneWidth - 2 * Self.paneContentInset
+        agentIPCStatusLabel.font = SettingsLayout.statusFont
+        agentIPCStatusLabel.preferredMaxLayoutWidth = SettingsLayout.contentWidth
 
-        let refreshRow = NSStackView()
-        refreshRow.orientation = .horizontal
-        refreshRow.addArrangedSubview(agentIPCRefreshButton)
-        refreshRow.addArrangedSubview(NSView())
-
-        let column = NSStackView()
-        column.orientation = .vertical
-        column.alignment = .leading
-        column.spacing = 18
-        column.addArrangedSubview(controlRow(label: "Enable AI Agent IPC", control: agentIPCSwitch))
-        column.addArrangedSubview(agentIPCStatusLabel)
-        column.addArrangedSubview(refreshRow)
+        let column = SettingsLayout.column([
+            controlRow(label: "Enable AI Agent IPC", control: agentIPCSwitch),
+            agentIPCStatusLabel,
+            SettingsLayout.buttonRow([agentIPCRefreshButton]),
+        ])
 
         updateAgentIPCRow()
         return column
@@ -440,48 +442,33 @@ class SettingsWindowController: NSWindowController {
         return controlRow(label: "Show agent tool prompts in the approval banner", control: toggleSwitch)
     }
 
+    /// The whole MCP Apps pane below its heading, built from the same
+    /// `SettingsLayout` metrics as every other pane. Its content follows
+    /// `mcpServerSettingsModel`; each change measures the pane again so
+    /// the window height keeps following the content.
+    private func mcpServersRow() -> NSView {
+        MCPServersSettingsView(model: mcpServerSettingsModel) { [weak self] in
+            self?.paneViewControllers[.mcpServers]?.contentDidChange()
+        }
+    }
+
+    /// Gives the MCP Apps pane its registry, connections, catalog,
+    /// secret store and actions. Does not create the Settings window.
+    static func configureMCPServers(_ dependencies: MCPServerSettingsModel.Dependencies) {
+        mcpServerSettingsModel.configure(dependencies)
+    }
+
     private func sessionBrowserButtonRow() -> NSView {
-        let openBrowserButton = NSButton(
-            title: "Open Session Browser", target: self, action: #selector(openSessionBrowser(_:))
-        )
-        openBrowserButton.bezelStyle = .rounded
-        let sessionsActions = NSStackView()
-        sessionsActions.orientation = .horizontal
-        sessionsActions.addArrangedSubview(openBrowserButton)
-        sessionsActions.addArrangedSubview(NSView())
-        return sessionsActions
+        SettingsLayout.buttonRow([
+            SettingsLayout.button("Open Session Browser", target: self, action: #selector(openSessionBrowser(_:))),
+        ])
     }
 
     private func configFileFooterRow() -> NSView {
-        let actions = NSStackView()
-        actions.orientation = .horizontal
-        actions.spacing = 8
-        actions.alignment = .centerY
-
-        let openButton = NSButton(title: "Open Config File", target: self, action: #selector(openConfigFile(_:)))
-        openButton.bezelStyle = .rounded
-        actions.addArrangedSubview(openButton)
-
+        let openButton = SettingsLayout.button("Open Config File", target: self, action: #selector(openConfigFile(_:)))
         let helpButton = NSButton(title: "", target: self, action: #selector(showConfigHelp(_:)))
         helpButton.bezelStyle = .helpButton
-        actions.addArrangedSubview(helpButton)
-
-        actions.addArrangedSubview(NSView())
-        return actions
-    }
-
-    private func sectionTitleLabel(_ text: String) -> NSTextField {
-        let label = NSTextField(labelWithString: text)
-        label.font = .systemFont(ofSize: 20, weight: .semibold)
-        return label
-    }
-
-    private func sectionDivider() -> NSView {
-        let box = NSBox()
-        box.boxType = .separator
-        box.translatesAutoresizingMaskIntoConstraints = false
-        box.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        return box
+        return SettingsLayout.buttonRow([openButton, helpButton])
     }
 
     func showSettings() {
@@ -646,6 +633,7 @@ class SettingsWindowController: NSWindowController {
         let enabled = sender.state == .on
         IPCSettings.enabled = enabled
         updateAgentIPCRow()
+        mcpServerSettingsModel.refreshIPCEnabled()
         guard LaunchEnvironmentPolicy.mayPerformAgentIPCActivation() else { return }
         Task {
             if enabled {
@@ -695,7 +683,7 @@ class SettingsWindowController: NSWindowController {
         agentIPCSwitch.isEnabled = state.switchEnabled
         agentIPCRefreshButton.isEnabled = state.refreshEnabled
         agentIPCStatusLabel.isHidden = Self.statusLabelIsHidden(for: state)
-        agentIPCStatusLabel.attributedStringValue = Self.attributedStatusText(state.statusText)
+        agentIPCStatusLabel.attributedStringValue = SettingsLayout.statusText(state.statusText)
     }
 
     /// Whether the status label should be hidden for a given resolved
@@ -712,36 +700,9 @@ class SettingsWindowController: NSWindowController {
         state.statusText.isEmpty
     }
 
-    /// Renders `statusText`'s lines (see `AgentIPCRowResolver`: line 0 is
-    /// the one-line summary, any further lines are failure/skip detail)
-    /// with the summary in `.labelColor` and every detail line in
-    /// `.secondaryLabelColor`, so a failure is visually distinguishable
-    /// from the summary it follows. `NSTextField.attributedStringValue`
-    /// does not fall back to the field's own `font`, so every segment
-    /// (including the `"\n"` joiners) carries it explicitly. Also carries
-    /// a word-wrapping paragraph style, since an attributed string does
-    /// not inherit the field cell's own wrap mode.
-    private static func attributedStatusText(_ statusText: String) -> NSAttributedString {
-        let font = agentIPCStatusFont
-        let paragraphStyle = NSMutableParagraphStyle()
-        paragraphStyle.lineBreakMode = .byWordWrapping
-        let lines = statusText.components(separatedBy: "\n")
-        let result = NSMutableAttributedString()
-        for (index, line) in lines.enumerated() {
-            if index > 0 {
-                result.append(NSAttributedString(string: "\n", attributes: [.font: font, .paragraphStyle: paragraphStyle]))
-            }
-            let color: NSColor = index == 0 ? .labelColor : .secondaryLabelColor
-            result.append(NSAttributedString(
-                string: line,
-                attributes: [.font: font, .foregroundColor: color, .paragraphStyle: paragraphStyle]
-            ))
-        }
-        return result
-    }
-
     @objc private func agentIPCStateDidChange(_ notification: Notification) {
         updateAgentIPCRow()
+        mcpServerSettingsModel.refreshIPCEnabled()
     }
 
     @objc private func openSessionBrowser(_ sender: Any?) {
@@ -801,15 +762,7 @@ class SettingsWindowController: NSWindowController {
     }
 
     private func controlRow(label: String, control: NSView) -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.spacing = 12
-        stack.alignment = .centerY
-        let text = NSTextField(labelWithString: label)
-        text.setContentHuggingPriority(.required, for: .horizontal)
-        stack.addArrangedSubview(text)
-        stack.addArrangedSubview(control)
-        return stack
+        SettingsLayout.controlRow(label: label, control: control)
     }
 
     private func updateOpacityLabel() {
@@ -929,7 +882,7 @@ private final class SettingsTabViewController: NSTabViewController {
 /// its trailing rows stay reachable instead of being clipped below the
 /// window with no way to scroll to them.
 @MainActor
-private final class SettingsPaneContentViewController: NSViewController {
+final class SettingsPaneContentViewController: NSViewController {
 
     /// Vertical space reserved for the window's title bar, the Settings
     /// toolbar, and top/bottom margins when a pane's natural content
@@ -995,6 +948,20 @@ private final class SettingsPaneContentViewController: NSViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        measurePreferredContentSize()
+    }
+
+    /// Measures the pane again after its content changed height, and
+    /// resizes the window to it when this pane is the one on screen. A
+    /// pane not on screen is resized by `viewDidAppear()` when selected.
+    /// Does nothing before the view is loaded: `viewDidLoad()` measures.
+    func contentDidChange() {
+        guard isViewLoaded else { return }
+        measurePreferredContentSize()
+        fitWindowToPreferredHeight()
+    }
+
+    private func measurePreferredContentSize() {
         documentView.layoutSubtreeIfNeeded()
         let naturalHeight = documentView.fittingSize.height
         let maxHeight = (NSScreen.main?.visibleFrame.height ?? naturalHeight) - Self.verticalChrome
@@ -1016,6 +983,10 @@ private final class SettingsPaneContentViewController: NSViewController {
     /// the screen-height cap made the window shorter than the content.
     override func viewDidAppear() {
         super.viewDidAppear()
+        fitWindowToPreferredHeight()
+    }
+
+    private func fitWindowToPreferredHeight() {
         guard let window = view.window else { return }
         var contentRect = window.contentRect(forFrameRect: window.frame)
         let targetHeight = preferredContentSize.height

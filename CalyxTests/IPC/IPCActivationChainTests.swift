@@ -357,4 +357,73 @@ final class IPCActivationChainTests: XCTestCase {
         XCTAssertTrue(lastPost.disableWorkHasRun,
                       "the final post must land after the disable's own work has already run, never before")
     }
+
+    // MARK: - Enable announcement ordering (K53)
+
+    /// `MCPHostComposition` installs the `/calyx-mcp` router from the post
+    /// that announces a running enable, so that post must reach
+    /// observers, reading `.enabling`, before the enable's work (which
+    /// starts the server) runs: both for an enable entering an idle chain
+    /// and for one queued behind a disable.
+    func test_enablingPost_reachesObserversBeforeTheEnableWorkRuns() async throws {
+        let chain = IPCActivationChain()
+
+        @MainActor final class SnapshotBox {
+            var enablingPostsBeforeWork = 0
+            var enableWorkRuns = 0
+            var enableWorkHasRunInThisOperation = false
+        }
+        let box = SnapshotBox()
+
+        let observer = NotificationCenter.default.addObserver(
+            forName: .calyxIPCStateDidChange,
+            object: nil,
+            queue: nil
+        ) { _ in
+            // Same isolation reasoning as the observer in
+            // test_runningOperation_neverObservedNil_untilBothQueuedOperationsComplete.
+            MainActor.assumeIsolated {
+                if chain.runningOperation == .enabling, !box.enableWorkHasRunInThisOperation {
+                    box.enablingPostsBeforeWork += 1
+                }
+            }
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let enableWork: @MainActor () async -> IPCActivationOutcome = {
+            box.enableWorkRuns += 1
+            XCTAssertEqual(box.enablingPostsBeforeWork, box.enableWorkRuns,
+                           "each enable must be announced as .enabling before its work runs")
+            box.enableWorkHasRunInThisOperation = true
+            return .serverFailed(.tokenGeneration)
+        }
+
+        // An enable entering an idle chain.
+        let first = await withTimeout { await chain.runEnable(enableWork) }
+        XCTAssertNotNil(first)
+        box.enableWorkHasRunInThisOperation = false
+
+        // An enable queued behind a running disable.
+        let releaseDisable = Gate()
+        let disableTask = Task { @MainActor in
+            await chain.runDisable { () async -> IPCDeactivationReport in
+                await releaseDisable.wait()
+                return makeDeactivationReport()
+            }
+        }
+        let enableTask = Task { @MainActor in
+            await chain.runEnable(enableWork)
+        }
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        await releaseDisable.fire()
+
+        let completed = await withTimeout {
+            _ = await disableTask.value
+            _ = await enableTask.value
+            return true
+        }
+        XCTAssertNotNil(completed, "both queued operations must complete without hanging")
+        XCTAssertEqual(box.enableWorkRuns, 2)
+        XCTAssertEqual(box.enablingPostsBeforeWork, 2)
+    }
 }

@@ -247,6 +247,15 @@ final class HermesConfigManagerTests: XCTestCase {
             "      X-Calyx-Surface-ID: \"${CALYX_SURFACE_ID}\"\n" +
             "      X-Calyx-Session-ID: \"${CALYX_SESSION_ID}\"\n" +
             "      X-Calyx-Agent-Kind: \"hermes\"\n" +
+            "  calyx-mcp:\n" +
+            "    url: \"http://127.0.0.1:41830/calyx-mcp\"\n" +
+            "    headers:\n" +
+            "      Authorization: \"Bearer tok\"\n" +
+            "      X-Calyx-Surface-ID: \"${CALYX_SURFACE_ID}\"\n" +
+            "      X-Calyx-Session-ID: \"${CALYX_SESSION_ID}\"\n" +
+            "      X-Calyx-Agent-Kind: \"hermes\"\n" +
+            "      X-Calyx-Herdr-Pane-ID: \"${HERDR_PANE_ID}\"\n" +
+            "      X-Calyx-Herdr-Socket-Path: \"${HERDR_SOCKET_PATH}\"\n" +
             "  # END CALYX IPC\n"
         let content = readConfig()
         XCTAssertEqual(content, expected,
@@ -329,6 +338,15 @@ final class HermesConfigManagerTests: XCTestCase {
               X-Calyx-Surface-ID: "${CALYX_SURFACE_ID}"
               X-Calyx-Session-ID: "${CALYX_SESSION_ID}"
               X-Calyx-Agent-Kind: "hermes"
+          calyx-mcp:
+            url: "http://127.0.0.1:55555/calyx-mcp"
+            headers:
+              Authorization: "Bearer second"
+              X-Calyx-Surface-ID: "${CALYX_SURFACE_ID}"
+              X-Calyx-Session-ID: "${CALYX_SESSION_ID}"
+              X-Calyx-Agent-Kind: "hermes"
+              X-Calyx-Herdr-Pane-ID: "${HERDR_PANE_ID}"
+              X-Calyx-Herdr-Socket-Path: "${HERDR_SOCKET_PATH}"
           # END CALYX IPC
         toolsets:
           - web
@@ -1158,5 +1176,39 @@ final class HermesConfigManagerTests: XCTestCase {
         XCTAssertTrue(content.contains("calyx-ipc:"), "calyx-ipc must be nested under the single mcp_servers: mapping")
         XCTAssertTrue(content.contains("Bearer fresh"))
         XCTAssertFalse(content.contains("Bearer stale"))
+    }
+
+    // MARK: - calyx-mcp entry
+
+    // enableIPC must also write a calyx-mcp: sibling entry, sharing
+    // calyx-ipc's host/port but the /calyx-mcp path, carrying the same
+    // headers plus the two herdr headers -- Hermes's own ${VAR} (no
+    // ":-" default) syntax, matching the existing X-Calyx-Surface-ID /
+    // X-Calyx-Session-ID entries.
+    func test_enableIPC_alsoWritesCalyxMCPEntry() throws {
+        try HermesConfigManager.enableIPC(port: 41830, token: "abc123", configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertTrue(content.contains("calyx-mcp:"),
+                      "enableIPC must also write a calyx-mcp: entry")
+        XCTAssertTrue(content.contains("url: \"http://127.0.0.1:41830/calyx-mcp\""),
+                      "calyx-mcp must share calyx-ipc's host/port but use the /calyx-mcp path")
+        XCTAssertTrue(content.contains("X-Calyx-Herdr-Pane-ID: \"${HERDR_PANE_ID}\""),
+                      "calyx-mcp must additionally carry the herdr pane header")
+        XCTAssertTrue(content.contains("X-Calyx-Herdr-Socket-Path: \"${HERDR_SOCKET_PATH}\""),
+                      "calyx-mcp must additionally carry the herdr socket-path header")
+    }
+
+    func test_disableIPC_removesBothCalyxIPCAndCalyxMCPEntries() throws {
+        // Seeded with an unrelated sibling mapping, same rationale as
+        // the Codex/Grok counterparts above.
+        try writeConfig("other: 1\n")
+        try HermesConfigManager.enableIPC(port: 41830, token: "abc123", configPath: configPath)
+        try HermesConfigManager.disableIPC(configPath: configPath)
+
+        let content = readConfig()
+        XCTAssertFalse(content.contains("calyx-ipc:"))
+        XCTAssertFalse(content.contains("calyx-mcp:"),
+                       "disableIPC must also remove the calyx-mcp: entry")
     }
 }

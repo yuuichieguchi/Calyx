@@ -11,6 +11,9 @@ struct ClaudeConfigManager: Sendable {
 
     private static let mcpServersKey = "mcpServers"
     private static let calyxIPCKey = "calyx-ipc"
+    /// The `/calyx-mcp` entry: the tools of the MCP servers configured in
+    /// Calyx, re-published, approved separately from `calyx-ipc`.
+    private static let calyxMCPKey = "calyx-mcp"
 
     // MARK: - Public API
 
@@ -47,10 +50,28 @@ struct ClaudeConfigManager: Sendable {
         // input-equals-output no-write check on every restart.
         let entryData = try JSONSerialization.data(withJSONObject: calyxEntry, options: [.sortedKeys])
 
-        // 0600: this entry carries the bearer token, so ~/.claude.json's
+        // Same host, port and identity headers as calyx-ipc, plus the herdr
+        // pane and socket headers `/calyx-mcp` resolves a herdr pane by.
+        // `${HERDR_SOCKET_PATH:-}` is empty unless the user set it; the
+        // server then looks the pane up under herdr's default socket.
+        let calyxMCPEntry: [String: Any] = [
+            "type": "http",
+            "url": "http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)",
+            "headers": [
+                "Authorization": "Bearer \(token)",
+                "X-Calyx-Surface-ID": "${CALYX_SURFACE_ID:-}",
+                "X-Calyx-Session-ID": "${CALYX_SESSION_ID:-}",
+                "X-Calyx-Herdr-Pane-ID": "${HERDR_PANE_ID:-}",
+                "X-Calyx-Herdr-Socket-Path": "${HERDR_SOCKET_PATH:-}"
+            ]
+        ]
+        let calyxMCPEntryData = try JSONSerialization.data(withJSONObject: calyxMCPEntry, options: [.sortedKeys])
+
+        // 0600: these entries carry the bearer token, so ~/.claude.json's
         // mode is enforced rather than left as-is.
         try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
-            try JSONConfigDocumentEditor.setValue(entryData, at: [mcpServersKey, calyxIPCKey], in: current)
+            let withIPC = try JSONConfigDocumentEditor.setValue(entryData, at: [mcpServersKey, calyxIPCKey], in: current)
+            return try JSONConfigDocumentEditor.setValue(calyxMCPEntryData, at: [mcpServersKey, calyxMCPKey], in: withIPC)
         }
     }
 
@@ -62,7 +83,8 @@ struct ClaudeConfigManager: Sendable {
         // than forcing 0600 (that mode belongs to enableIPC, which
         // writes the token).
         try ConfigFileUtils.withExclusiveConfig(path: path) { current in
-            try JSONConfigDocumentEditor.removeValue(at: [mcpServersKey, calyxIPCKey], in: current)
+            let withoutIPC = try JSONConfigDocumentEditor.removeValue(at: [mcpServersKey, calyxIPCKey], in: current)
+            return try JSONConfigDocumentEditor.removeValue(at: [mcpServersKey, calyxMCPKey], in: withoutIPC)
         }
     }
 
