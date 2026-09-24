@@ -40,19 +40,26 @@ final class MCPServerRegistryTests: XCTestCase {
         )
     }
 
+    private func assertThrowsAsync(_ body: () async throws -> Void, file: StaticString = #filePath, line: UInt = #line) async {
+        do {
+            try await body()
+            XCTFail("expected an error", file: file, line: line)
+        } catch {}
+    }
+
     // MARK: - Persists to <directory>/mcp-servers.json
 
-    func test_add_persistsToMcpServersJSON_underGivenDirectory() throws {
+    func test_add_persistsToMcpServersJSON_underGivenDirectory() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
-        try registry.add(makeConfig())
+        try await registry.add(makeConfig())
 
         let filePath = (tempDir as NSString).appendingPathComponent("mcp-servers.json")
         XCTAssertTrue(FileManager.default.fileExists(atPath: filePath))
     }
 
-    func test_add_writesSchemaVersionOne() throws {
+    func test_add_writesSchemaVersionOne() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
-        try registry.add(makeConfig())
+        try await registry.add(makeConfig())
 
         let filePath = (tempDir as NSString).appendingPathComponent("mcp-servers.json")
         let data = try Data(contentsOf: URL(fileURLWithPath: filePath))
@@ -62,9 +69,9 @@ final class MCPServerRegistryTests: XCTestCase {
 
     // MARK: - Written through ConfigFileUtils.withExclusiveConfig (a lock file exists for the resolved path)
 
-    func test_add_writesThroughExclusiveConfigLock_lockFileExistsForResolvedPath() throws {
+    func test_add_writesThroughExclusiveConfigLock_lockFileExistsForResolvedPath() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
-        try registry.add(makeConfig())
+        try await registry.add(makeConfig())
 
         let filePath = (tempDir as NSString).appendingPathComponent("mcp-servers.json")
         let resolvedPath = try ConfigFileUtils.resolveConfigPath(filePath)
@@ -74,9 +81,9 @@ final class MCPServerRegistryTests: XCTestCase {
 
     // MARK: - File mode 0600
 
-    func test_add_fileMode_is0600() throws {
+    func test_add_fileMode_is0600() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
-        try registry.add(makeConfig())
+        try await registry.add(makeConfig())
 
         let filePath = (tempDir as NSString).appendingPathComponent("mcp-servers.json")
         let attributes = try FileManager.default.attributesOfItem(atPath: filePath)
@@ -86,10 +93,10 @@ final class MCPServerRegistryTests: XCTestCase {
 
     // MARK: - In-memory servers reflect what was added
 
-    func test_add_appendsToServers_reloadedRegistryReadsItBack() throws {
+    func test_add_appendsToServers_reloadedRegistryReadsItBack() async throws {
         let config = makeConfig()
         let first = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
-        try first.add(config)
+        try await first.add(config)
         XCTAssertEqual(first.servers, [config])
 
         let second = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
@@ -98,20 +105,20 @@ final class MCPServerRegistryTests: XCTestCase {
 
     // MARK: - add rejects a duplicate alias
 
-    func test_add_duplicateAlias_throws_serversUnchanged() throws {
+    func test_add_duplicateAlias_throws_serversUnchanged() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
-        try registry.add(makeConfig(alias: "myserver"))
+        try await registry.add(makeConfig(alias: "myserver"))
 
-        XCTAssertThrowsError(try registry.add(makeConfig(alias: "myserver")))
+        await assertThrowsAsync { try await registry.add(makeConfig(alias: "myserver")) }
         XCTAssertEqual(registry.servers.count, 1)
     }
 
     // MARK: - update rejects an alias change (alias is immutable after creation)
 
-    func test_update_aliasChanged_throws_storedAliasUnchanged() throws {
+    func test_update_aliasChanged_throws_storedAliasUnchanged() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
         let original = makeConfig(alias: "myserver")
-        try registry.add(original)
+        try await registry.add(original)
 
         var renamed = original
         renamed.displayName = "Renamed"
@@ -119,18 +126,18 @@ final class MCPServerRegistryTests: XCTestCase {
             id: original.id, alias: MCPServerAlias(rawValue: "otheralias")!, displayName: "Renamed",
             isEnabled: original.isEnabled, transport: original.transport, auth: original.auth
         )
-        XCTAssertThrowsError(try registry.update(withDifferentAlias))
+        await assertThrowsAsync { try await registry.update(withDifferentAlias) }
         XCTAssertEqual(registry.servers.first?.alias.rawValue, "myserver")
     }
 
-    func test_update_sameAlias_differentDisplayName_succeeds() throws {
+    func test_update_sameAlias_differentDisplayName_succeeds() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
         let original = makeConfig(alias: "myserver")
-        try registry.add(original)
+        try await registry.add(original)
 
         var updated = original
         updated.displayName = "New Display Name"
-        try registry.update(updated)
+        try await registry.update(updated)
 
         XCTAssertEqual(registry.servers.first?.displayName, "New Display Name")
         XCTAssertEqual(registry.servers.first?.alias.rawValue, "myserver")
@@ -178,8 +185,8 @@ final class MCPServerRegistryTests: XCTestCase {
         try await secretStore.set("b-env", forKey: .env(serverID: configB.id, name: "MYVAR"))
 
         let registry = MCPServerRegistry(directory: tempDir, secretStore: secretStore)
-        try registry.add(configA)
-        try registry.add(configB)
+        try await registry.add(configA)
+        try await registry.add(configB)
         try await registry.remove(id: configA.id)
 
         let remainingEnv = try await secretStore.get(.env(serverID: configA.id, name: "MYVAR"))
@@ -218,7 +225,7 @@ final class MCPServerRegistryTests: XCTestCase {
     func test_importServers_replacePolicy_overwritesConfigKeepingID() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
         let original = makeConfig(alias: "myserver")
-        try registry.add(original)
+        try await registry.add(original)
 
         let outcome = try await registry.importServers([makeImported(name: "myserver", command: "/usr/bin/replacement")], conflictPolicy: .replace)
 
@@ -237,7 +244,7 @@ final class MCPServerRegistryTests: XCTestCase {
     func test_importServers_renamePolicy_appliesNumericSuffix_reportsRename() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
         let original = makeConfig(alias: "myserver")
-        try registry.add(original)
+        try await registry.add(original)
 
         let outcome = try await registry.importServers([makeImported(name: "myserver")], conflictPolicy: .rename)
 
@@ -253,7 +260,7 @@ final class MCPServerRegistryTests: XCTestCase {
     func test_importServers_skipPolicy_leavesExistingConfig_reportsAlias() async throws {
         let registry = MCPServerRegistry(directory: tempDir, secretStore: InMemoryMCPSecretStore())
         let original = makeConfig(alias: "myserver")
-        try registry.add(original)
+        try await registry.add(original)
 
         let outcome = try await registry.importServers([makeImported(name: "myserver", command: "/usr/bin/should-not-apply")], conflictPolicy: .skip)
 
@@ -302,7 +309,7 @@ final class MCPServerRegistryTests: XCTestCase {
         let secretStore = InMemoryMCPSecretStore()
         let registry = MCPServerRegistry(directory: tempDir, secretStore: secretStore)
         let original = makeConfig(alias: "myserver")
-        try registry.add(original)
+        try await registry.add(original)
         try await secretStore.set("old-value", forKey: .env(serverID: original.id, name: "MYVAR"))
 
         _ = try await registry.importServers([makeImported(name: "myserver", envValues: ["MYVAR": "new-value"])], conflictPolicy: .replace)
@@ -315,7 +322,7 @@ final class MCPServerRegistryTests: XCTestCase {
         let secretStore = InMemoryMCPSecretStore()
         let registry = MCPServerRegistry(directory: tempDir, secretStore: secretStore)
         let original = makeConfig(alias: "myserver")
-        try registry.add(original)
+        try await registry.add(original)
         try await secretStore.set("stale", forKey: .env(serverID: original.id, name: "MYVAR"))
 
         _ = try await registry.importServers([makeImported(name: "myserver", envValues: ["OTHERVAR": "fresh"])], conflictPolicy: .replace)

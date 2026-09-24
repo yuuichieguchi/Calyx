@@ -51,7 +51,9 @@ class SplitContainerView: NSView {
     /// Docks whose leaf left the tree: detached but kept, and put back
     /// when the leaf returns.
     private var parkedDocks: [UUID: NSView] = [:]
-    /// The leaf whose dock covers the whole container.
+    /// The leaf whose dock covers the whole container. Kept while the leaf
+    /// is out of the tree; cleared by `setFullscreen(false, ...)` and
+    /// `detachDock(fromLeaf:)`.
     private var fullscreenLeafID: UUID?
     var onDeferredLayoutComplete: (() -> Void)?
     var onActiveLeafChange: ((UUID) -> Void)?
@@ -263,9 +265,6 @@ class SplitContainerView: NSView {
             dock.removeFromSuperview()
             parkedDocks[id] = dock
             docks.removeValue(forKey: id)
-        }
-        if let fullscreenID = fullscreenLeafID, !leafIDs.contains(fullscreenID) {
-            fullscreenLeafID = nil
         }
     }
 

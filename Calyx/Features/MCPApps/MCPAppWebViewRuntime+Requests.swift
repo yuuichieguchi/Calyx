@@ -194,7 +194,10 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
         switch consentGate.beginRequest(viewID: viewID, hasPane: route != .copyOnly) {
         case .noPaneCopyOnly:
             do {
-                state.pane.showCopyOnly(text: try MCPAppMessageFormatter.format(content: blocks).pastedText)
+                let formatted = try await MCPAppMessageFormatter.formatOffCallerActor(
+                    content: blocks, imageDirectory: MCPAppMessageFormatter.imageDirectory
+                )
+                state.pane.showCopyOnly(text: formatted.pastedText)
             } catch {
                 return .failure(Self.serverError("The message could not be prepared: \(error)"))
             }
@@ -255,7 +258,9 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
         }
     }
 
-    /// One save panel per item, in order. Any cancel or failure reports isError.
+    /// One save panel per item, in order. Any cancel or failure reports
+    /// isError. Listing Downloads and writing the file run on
+    /// `DispatchQueue.global()`.
     private func downloadFiles(viewID: UUID, params: [String: AnyCodable]?, session: any MCPAppServerSession) async
         -> Result<AnyCodable, JSONRPCError> {
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
@@ -267,7 +272,7 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
                 logger.error("ui/download-file item could not be read: \(error, privacy: .public)")
                 return .success(Self.errorFlag)
             }
-            let existing = downloads.flatMap { try? FileManager.default.contentsOfDirectory(atPath: $0.path) } ?? []
+            let existing = await Self.fileNames(in: downloads)
             let panel = NSSavePanel()
             panel.nameFieldStringValue = MCPAppFilenameSanitizer.sanitize(file.name, existingNames: existing)
             panel.directoryURL = downloads
@@ -281,13 +286,37 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
             }
             guard response == .OK, let url = panel.url else { return .success(Self.errorFlag) }
             do {
-                try file.data.write(to: url, options: [.atomic])
+                try await Self.write(file.data, to: url)
             } catch {
                 logger.error("ui/download-file could not write \(url.path, privacy: .public): \(error, privacy: .public)")
                 return .success(Self.errorFlag)
             }
         }
         return .success(Self.emptyObject)
+    }
+
+    /// The names in `directory`, for the save panel's unique default name;
+    /// none when there is no directory or it cannot be listed.
+    private nonisolated static func fileNames(in directory: URL?) async -> [String] {
+        guard let directory else { return [] }
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global().async {
+                continuation.resume(returning: (try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
+            }
+        }
+    }
+
+    private nonisolated static func write(_ data: Data, to url: URL) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global().async {
+                do {
+                    try data.write(to: url, options: [.atomic])
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     /// An EmbeddedResource's own content, or a ResourceLink read from the server.

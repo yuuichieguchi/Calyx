@@ -135,11 +135,16 @@ actor MCPCalyxMCPNotificationHub {
 
     /// Starts watching the `events` of every server in `serverIDs` not
     /// watched yet. A server without a connection is tried again on the
-    /// next call.
+    /// next call. When a watched connection's events end, the server's
+    /// current connection is watched if the lookup returns one other than
+    /// the connection that ended (the supervisor replaced it).
     func watchServers(_ serverIDs: [MCPServerID], connections: any MCPConnectionLookup) {
         for serverID in serverIDs where watchedServers.insert(serverID).inserted {
             Task {
-                if let connection = await connections.connection(forServerID: serverID) {
+                var watched: (any MCPUpstreamConnecting)?
+                while let connection = await connections.connection(forServerID: serverID),
+                      !Self.isSame(connection, watched) {
+                    watched = connection
                     for await event in await connection.events {
                         self.serverEvent(event, serverID: serverID)
                     }
@@ -147,6 +152,12 @@ actor MCPCalyxMCPNotificationHub {
                 self.stopWatching(serverID)
             }
         }
+    }
+
+    /// Connections are actors, compared by identity.
+    private static func isSame(_ connection: any MCPUpstreamConnecting, _ other: (any MCPUpstreamConnecting)?) -> Bool {
+        guard let other else { return false }
+        return (connection as AnyObject) === (other as AnyObject)
     }
 
     private func serverEvent(_ event: MCPServerEvent, serverID: MCPServerID) {

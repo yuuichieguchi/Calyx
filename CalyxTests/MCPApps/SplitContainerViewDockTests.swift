@@ -14,7 +14,7 @@
 //  the same NSView instance retained) when its leaf temporarily leaves
 //  the tree, and fullscreen hides the terminal wrapper without zeroing
 //  its frame (so un-fullscreening doesn't need a relayout to recover
-//  geometry).
+//  geometry). Fullscreen is kept while the leaf is out of the tree.
 //
 
 import AppKit
@@ -191,5 +191,29 @@ final class SplitContainerViewDockTests: XCTestCase {
             fixture.container.subviews.compactMap { $0 as? SurfaceScrollView }.first { $0.surfaceView === view }
         }
         XCTAssertFalse(wrapper?.isHidden ?? true)
+    }
+
+    // MARK: - Fullscreen survives the leaf leaving and returning
+
+    func test_fullscreen_isKept_whenTheLeafLeavesTheTreeAndReturns() {
+        let fixture = makeFixture()
+        let leafA = UUID()
+        let leafB = UUID()
+        registerLeaf(leafA, in: fixture.registry)
+        registerLeaf(leafB, in: fixture.registry)
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: nil))
+        let dock = NSView()
+        fixture.container.attachDock(dock, toLeaf: leafA)
+        fixture.container.setFullscreen(true, forLeaf: leafA)
+
+        fixture.container.updateLayout(tree: singleLeafTree(leafB))
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: nil))
+
+        XCTAssertEqual(fixture.container.dockView(forLeaf: leafA), dock)
+        XCTAssertFalse(dock.isHidden)
+        XCTAssertEqual(dock.frame, fixture.container.bounds, "the returning leaf's dock still covers the container")
+        let wrappers = fixture.container.subviews.compactMap { $0 as? SurfaceScrollView }
+        XCTAssertFalse(wrappers.isEmpty)
+        XCTAssertTrue(wrappers.allSatisfy(\.isHidden), "the terminals stay hidden while the view is fullscreen")
     }
 }

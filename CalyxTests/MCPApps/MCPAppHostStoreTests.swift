@@ -10,6 +10,10 @@
 //  viewProcessDidTerminate/viewRequestedTeardown), app-tool registration
 //  forwarding to MCPAppToolRegistry, and user actions (reload/close).
 //
+//  `CoupledRuntime` follows `.calyxMCPAppViewsChanged` the way the real
+//  runtime does, so removal, retirement, server teardown and a destroyed
+//  surface are checked against that coupling.
+//
 //  FakeMCPAppServerSession and FakeAppToolRegistry are shared doubles
 //  (§14); FakePaneResolver and FakeTeardownRequester stay local since
 //  §14 assigns them their own dedicated file names
@@ -54,6 +58,117 @@ private final class FakeTeardownRequester: MCPAppViewRuntime {
     func unmount(viewID: UUID) {
         unmountedViewIDs.append(viewID)
     }
+}
+
+/// Mirrors how `MCPAppWebViewRuntime` is coupled to the store: it follows
+/// `.calyxMCPAppViewsChanged` synchronously (the real observer runs on the
+/// posting main thread) and drops the web view of any view the store no
+/// longer lists, without closing its bridge. `requestTeardown` and
+/// `unmount` act, and are recorded, only for a view still mounted; the
+/// teardown request suspends once, as the real one waits for the reply.
+/// A request sent to a view waits until `unmount` fails it (the real
+/// bridge's `close()`).
+@MainActor
+private final class CoupledRuntime: NSObject, MCPAppViewRuntime {
+    weak var store: MCPAppHostStore?
+    private(set) var mounted: Set<UUID> = []
+    private(set) var teardownRequestedViewIDs: [UUID] = []
+    private(set) var unmountedViewIDs: [UUID] = []
+    private(set) var sentMessages: [(message: JSONRPCMessage, viewID: UUID)] = []
+    private var pendingRequests: [UUID: [CheckedContinuation<JSONRPCMessage?, Error>]] = [:]
+
+    override init() {
+        super.init()
+        // Delivered on the posting thread, before `post` returns.
+        NotificationCenter.default.addObserver(self, selector: #selector(viewsChanged(_:)), name: .calyxMCPAppViewsChanged, object: nil)
+    }
+
+    @objc private func viewsChanged(_ notification: Notification) {
+        guard let store, notification.object as AnyObject? === store else { return }
+        let listed = Set(store.allSnapshots().map(\.viewID))
+        mounted = mounted.filter { listed.contains($0) }
+    }
+
+    var pendingRequestCount: Int { pendingRequests.values.reduce(0) { $0 + $1.count } }
+
+    func requestTeardown(viewID: UUID) async {
+        guard mounted.contains(viewID) else { return }
+        teardownRequestedViewIDs.append(viewID)
+        await Task.yield()
+    }
+
+    func mount(viewID: UUID, document: MCPAppViewDocument) async throws {
+        mounted.insert(viewID)
+    }
+
+    func send(_ message: JSONRPCMessage, to viewID: UUID) async throws -> JSONRPCMessage? {
+        sentMessages.append((message, viewID))
+        guard case .request = message else { return nil }
+        guard mounted.contains(viewID) else { throw MCPAppBridgeError.viewUnavailable }
+        return try await withCheckedThrowingContinuation { continuation in
+            pendingRequests[viewID, default: []].append(continuation)
+        }
+    }
+
+    func unmount(viewID: UUID) {
+        guard mounted.remove(viewID) != nil else { return }
+        unmountedViewIDs.append(viewID)
+        for continuation in pendingRequests.removeValue(forKey: viewID) ?? [] {
+            continuation.resume(throwing: MCPAppBridgeError.closed)
+        }
+    }
+}
+
+/// A session whose `resources/read` waits until `release()`.
+private final class BlockingReadSession: MCPAppServerSession, @unchecked Sendable {
+    let serverID = MCPServerID(rawValue: UUID())
+    let serverDisplayName = "Weather"
+    private let lock = NSLock()
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var isReleased = false
+    private let result: [String: AnyCodable]
+
+    init(result: [String: AnyCodable]) {
+        self.result = result
+    }
+
+    func release() {
+        let released = lock.withLock { () -> [CheckedContinuation<Void, Never>] in
+            isReleased = true
+            defer { waiters.removeAll() }
+            return waiters
+        }
+        released.forEach { $0.resume() }
+    }
+
+    func readResource(uri: String) async throws -> [String: AnyCodable] {
+        await withCheckedContinuation { continuation in
+            let resumeNow = lock.withLock { () -> Bool in
+                if isReleased { return true }
+                waiters.append(continuation)
+                return false
+            }
+            if resumeNow { continuation.resume() }
+        }
+        return result
+    }
+
+    func callTool(name: String, arguments: [String: AnyCodable]) async throws -> MCPCallToolResult { MCPCallToolResult(raw: [:]) }
+    func listTools() async -> [MCPToolDefinition] { [] }
+    func listResources(cursor: String?) async throws -> (items: [[String: AnyCodable]], nextCursor: String?) { ([], nil) }
+    func listResourceTemplates(cursor: String?) async throws -> (items: [[String: AnyCodable]], nextCursor: String?) { ([], nil) }
+    func listPrompts(cursor: String?) async throws -> (items: [[String: AnyCodable]], nextCursor: String?) { ([], nil) }
+    func events() -> AsyncStream<MCPServerEvent> { AsyncStream { _ in } }
+}
+
+/// Holds a value a test Task produced, for bounded polling.
+@MainActor
+private final class Box<Value> {
+    var value: Value?
+}
+
+private struct WaitTimedOut: Error, CustomStringConvertible {
+    let description: String
 }
 
 @MainActor
@@ -105,6 +220,13 @@ final class MCPAppHostStoreTests: XCTestCase {
         ["contents": AnyCodable([AnyCodable]())]
     }
 
+    /// Starts the invocation and waits for the store's load of its
+    /// resource (read, validation, mount) to finish.
+    private func startAndLoad(_ store: MCPAppHostStore, _ invocation: MCPUIToolInvocation, session: any MCPAppServerSession) async {
+        await store.uiToolInvocationDidStart(invocation, session: session)
+        await store.resourceLoad(forView: invocation.id.rawValue)?.value
+    }
+
     private func makeStore(
         resolver: FakePaneResolver = FakePaneResolver(),
         teardownRequester: FakeTeardownRequester = FakeTeardownRequester(),
@@ -123,7 +245,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(invalidReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         let snapshot = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first)
         guard case .resourceError = snapshot.status else {
@@ -141,7 +263,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .failure(FakeSessionError(message: "upstream timeout")))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         let snapshot = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first)
         guard case .readFailed = snapshot.status else {
@@ -157,7 +279,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .failure(FakeSessionError(message: "boom")))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         XCTAssertEqual(session.readResourceCallCount, 1)
 
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
@@ -176,7 +298,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
 
         store.viewDidLoadDocument(viewID: viewID)
@@ -197,7 +319,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
         store.viewDidLoadDocument(viewID: viewID)
 
@@ -219,7 +341,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
         store.viewDidLoadDocument(viewID: viewID)
         store.viewDidInitialize(viewID: viewID)
@@ -242,7 +364,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
         store.viewDidLoadDocument(viewID: viewID)
         store.viewDidInitialize(viewID: viewID)
@@ -263,7 +385,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
         store.viewDidLoadDocument(viewID: viewID)
         store.viewDidInitialize(viewID: viewID)
@@ -289,7 +411,7 @@ final class MCPAppHostStoreTests: XCTestCase {
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: nil, toolName: "dashboard", serverDisplayName: "Weather", clientName: "Claude Code")
 
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         let snapshot = try XCTUnwrap(store.standaloneSnapshots().first)
         XCTAssertEqual(snapshot.title, "dashboard · Weather · Claude Code")
@@ -300,7 +422,7 @@ final class MCPAppHostStoreTests: XCTestCase {
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: nil, toolName: "dashboard", serverDisplayName: "Weather", clientName: nil)
 
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         let snapshot = try XCTUnwrap(store.standaloneSnapshots().first)
         XCTAssertEqual(snapshot.title, "dashboard · Weather")
@@ -317,7 +439,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
         store.viewDidLoadDocument(viewID: viewID)
         store.viewDidInitialize(viewID: viewID)
@@ -334,7 +456,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         XCTAssertFalse(store.hasBackgroundActivity(in: unrelated))
     }
@@ -350,7 +472,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
 
         let appTool = try MCPToolDefinition(raw: ["name": AnyCodable("record_event")])
@@ -373,7 +495,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
         let appTool = try MCPToolDefinition(raw: ["name": AnyCodable("record_event")])
         store.registerAppTools([appTool], viewID: viewID)
@@ -393,7 +515,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
 
         store.updateModelContext(viewID: viewID, entry: MCPAppModelContextEntry(
@@ -419,7 +541,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
         store.viewDidLoadDocument(viewID: viewID)
         store.viewDidInitialize(viewID: viewID)
@@ -441,7 +563,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         XCTAssertTrue(store.hasActiveView(forSurface: surfaceID))
 
         NotificationCenter.default.post(name: .calyxSurfaceDestroyed, object: nil, userInfo: ["surfaceID": surfaceID])
@@ -459,7 +581,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         NotificationCenter.default.post(name: .calyxSurfaceDestroyed, object: nil, userInfo: ["surfaceID": otherSurfaceID])
 
@@ -479,7 +601,7 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: oldSurfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         store.remapSurface(old: oldSurfaceID, new: newSurfaceID)
 
@@ -504,8 +626,8 @@ final class MCPAppHostStoreTests: XCTestCase {
         let sessionB = FakeMCPAppServerSession(serverID: serverID, readResourceResult: .success(validReadResourceResult()))
         let invA = try invocation(serverID: serverID, surfaceID: surfaceA)
         let invB = try invocation(serverID: serverID, surfaceID: surfaceB)
-        await store.uiToolInvocationDidStart(invA, session: sessionA)
-        await store.uiToolInvocationDidStart(invB, session: sessionB)
+        await startAndLoad(store, invA, session: sessionA)
+        await startAndLoad(store, invB, session: sessionB)
 
         await store.teardownViews(forServer: serverID, reason: "server disabled")
 
@@ -532,13 +654,13 @@ final class MCPAppHostStoreTests: XCTestCase {
 
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
         let viewID = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first?.viewID)
         store.viewDidLoadDocument(viewID: viewID)
         store.viewDidInitialize(viewID: viewID)
         store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("record_event")])], viewID: viewID)
 
-        let result = await store.callAppTool(surfaceID: surfaceID, name: "record_event", arguments: ["text": AnyCodable("hi")])
+        let result = await store.callAppTool(surfaceID: surfaceID, viewID: viewID, name: "record_event", arguments: ["text": AnyCodable("hi")])
 
         XCTAssertEqual(result.raw, viewResult, "the view's own tools/call result is returned verbatim")
         let request = try XCTUnwrap(runtime.sentMessages.last { entry in
@@ -559,7 +681,7 @@ final class MCPAppHostStoreTests: XCTestCase {
         let runtime = FakeTeardownRequester()
         let store = makeStore(resolver: resolver, teardownRequester: runtime)
 
-        let result = await store.callAppTool(surfaceID: surfaceID, name: "record_event", arguments: [:])
+        let result = await store.callAppTool(surfaceID: surfaceID, viewID: UUID(), name: "record_event", arguments: [:])
 
         XCTAssertEqual(result.raw["isError"]?.boolValue, true)
         XCTAssertTrue(runtime.sentMessages.isEmpty, "with no owning view nothing is sent to any view")
@@ -585,7 +707,7 @@ final class MCPAppHostStoreTests: XCTestCase {
         ]
         let session = FakeMCPAppServerSession(readResourceResult: .success(result))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         let applied = try XCTUnwrap(store.appliedCSP(forView: inv.id.rawValue))
         XCTAssertEqual(applied.connectDomains, ["https://api.example.com"])
@@ -607,12 +729,271 @@ final class MCPAppHostStoreTests: XCTestCase {
         let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
         session.listResourcesResult = .failure(FakeSessionError(message: "resources/list unsupported"))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
-        await store.uiToolInvocationDidStart(inv, session: session)
+        await startAndLoad(store, inv, session: session)
 
         let snapshot = try XCTUnwrap(store.snapshots(forSurface: surfaceID).first)
         if case .readFailed = snapshot.status {
             XCTFail("a failed metadata fallback must not fail a view whose resources/read succeeded")
         }
         XCTAssertEqual(runtime.mountedViewIDs, [inv.id.rawValue], "the view mounts with the undeclared defaults")
+    }
+
+    // MARK: - Second review fixes
+
+    /// Polls `condition` on the main actor; throws when it stays false.
+    private func waitUntil(timeout: TimeInterval = 2, _ description: String, _ condition: @MainActor () -> Bool) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else { throw WaitTimedOut(description: description) }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    private func makeCoupled(resolver: FakePaneResolver = FakePaneResolver(), appToolRegistry: FakeAppToolRegistry = FakeAppToolRegistry())
+        -> (store: MCPAppHostStore, runtime: CoupledRuntime) {
+        let runtime = CoupledRuntime()
+        let store = MCPAppHostStore(paneResolver: resolver, runtime: runtime, appToolRegistry: appToolRegistry)
+        runtime.store = store
+        return (store, runtime)
+    }
+
+    /// Starts a view in `surfaceID` and brings it to live.
+    private func startLiveView(
+        _ store: MCPAppHostStore, surfaceID: UUID?, serverID: MCPServerID = MCPServerID(rawValue: UUID())
+    ) async throws -> UUID {
+        let session = FakeMCPAppServerSession(serverID: serverID, readResourceResult: .success(validReadResourceResult()))
+        let inv = try invocation(serverID: serverID, surfaceID: surfaceID)
+        await startAndLoad(store, inv, session: session)
+        let viewID = inv.id.rawValue
+        store.viewDidLoadDocument(viewID: viewID)
+        store.viewDidInitialize(viewID: viewID)
+        return viewID
+    }
+
+    /// `callAppTool` with a bound: a request the coupled runtime parks is
+    /// answered only by `unmount`, so a misrouted call would never return.
+    private func callAppTool(
+        _ store: MCPAppHostStore, surfaceID: UUID, viewID: UUID, name: String
+    ) async throws -> MCPCallToolResult {
+        let box = Box<MCPCallToolResult>()
+        Task { @MainActor in
+            box.value = await store.callAppTool(surfaceID: surfaceID, viewID: viewID, name: name, arguments: [:])
+        }
+        try await waitUntil("callAppTool returns") { box.value != nil }
+        return try XCTUnwrap(box.value)
+    }
+
+    private func methods(sentTo viewID: UUID, by runtime: CoupledRuntime) -> [String] {
+        runtime.sentMessages.filter { $0.viewID == viewID }.compactMap { entry in
+            switch entry.message {
+            case .notification(let method, _), .request(_, let method, _): return method
+            default: return nil
+            }
+        }
+    }
+
+    // Finding 1: teardown and unmount reach the runtime on every removal path.
+
+    func test_close_sendsTeardownAndUnmounts_withACoupledRuntime() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+
+        await store.close(viewID: viewID)
+
+        XCTAssertEqual(runtime.teardownRequestedViewIDs, [viewID], "ui/resource-teardown must reach the still-mounted view")
+        XCTAssertEqual(runtime.unmountedViewIDs, [viewID], "the web view must be released")
+        XCTAssertFalse(store.hasActiveView(forSurface: surfaceID))
+    }
+
+    func test_retirement_sendsTeardownAndUnmounts_withACoupledRuntime() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let first = try await startLiveView(store, surfaceID: surfaceID)
+        await store.uiToolInvocationDidFinish(MCPInvocationID(rawValue: first), result: MCPCallToolResult(raw: [:]))
+        XCTAssertEqual(store.snapshot(viewID: first)?.status, .completed)
+
+        let session = FakeMCPAppServerSession(readResourceResult: .success(validReadResourceResult()))
+        let next = try invocation(serverID: session.serverID, surfaceID: surfaceID)
+        await startAndLoad(store, next, session: session)
+
+        XCTAssertEqual(runtime.teardownRequestedViewIDs, [first], "the retired view gets ui/resource-teardown")
+        XCTAssertEqual(runtime.unmountedViewIDs, [first])
+        XCTAssertNil(store.snapshot(viewID: first))
+    }
+
+    func test_serverTeardown_sendsTeardownAndUnmounts_withACoupledRuntime() async throws {
+        let (store, runtime) = makeCoupled()
+        let serverID = MCPServerID(rawValue: UUID())
+        let viewID = try await startLiveView(store, surfaceID: UUID(), serverID: serverID)
+
+        await store.teardownViews(forServer: serverID, reason: "server removed")
+
+        XCTAssertEqual(runtime.teardownRequestedViewIDs, [viewID])
+        XCTAssertEqual(runtime.unmountedViewIDs, [viewID])
+    }
+
+    func test_surfaceDestroyed_sendsTeardownAndUnmounts_withACoupledRuntime() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+
+        NotificationCenter.default.post(name: .calyxSurfaceDestroyed, object: nil, userInfo: ["surfaceID": surfaceID])
+
+        XCTAssertFalse(store.hasActiveView(forSurface: surfaceID), "the table drops the view before the post returns")
+        XCTAssertEqual(runtime.teardownRequestedViewIDs, [viewID], "the teardown request starts before the post returns")
+        try await waitUntil("the destroyed pane's view is unmounted") { runtime.unmountedViewIDs == [viewID] }
+    }
+
+    func test_callAppTool_awaitingAViewThatIsClosed_returnsIsError() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+        store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("record_event")])], viewID: viewID)
+
+        let box = Box<MCPCallToolResult>()
+        Task { @MainActor in
+            box.value = await store.callAppTool(surfaceID: surfaceID, viewID: viewID, name: "record_event", arguments: [:])
+        }
+        try await waitUntil("the tools/call request reaches the view") { runtime.pendingRequestCount == 1 }
+        await store.close(viewID: viewID)
+
+        try await waitUntil("the pending call returns once the view is closed") { box.value != nil }
+        XCTAssertEqual(box.value?.raw["isError"]?.boolValue, true)
+    }
+
+    // Finding 2: an app tool call goes to exactly the view the catalog named.
+
+    func test_callAppTool_toAViewThatNoLongerExists_isError_evenWhenAnotherViewOffersTheName() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let closed = try await startLiveView(store, surfaceID: surfaceID)
+        store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("pick")])], viewID: closed)
+        let other = try await startLiveView(store, surfaceID: surfaceID)
+        store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("pick")])], viewID: other)
+        await store.close(viewID: closed)
+
+        let result = try await callAppTool(store, surfaceID: surfaceID, viewID: closed, name: "pick")
+
+        XCTAssertEqual(result.raw["isError"]?.boolValue, true)
+        XCTAssertFalse(methods(sentTo: other, by: runtime).contains("tools/call"), "the call is not rerouted to another view")
+    }
+
+    func test_callAppTool_twoViewsInOnePaneWithTheSameToolName_routeSeparately() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let viewA = try await startLiveView(store, surfaceID: surfaceID)
+        let viewB = try await startLiveView(store, surfaceID: surfaceID)
+        for viewID in [viewA, viewB] {
+            store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("pick")])], viewID: viewID)
+        }
+
+        Task { @MainActor in _ = await store.callAppTool(surfaceID: surfaceID, viewID: viewA, name: "pick", arguments: [:]) }
+        try await waitUntil("the call reaches view A") { self.methods(sentTo: viewA, by: runtime).contains("tools/call") }
+        Task { @MainActor in _ = await store.callAppTool(surfaceID: surfaceID, viewID: viewB, name: "pick", arguments: [:]) }
+        try await waitUntil("the call reaches view B") { self.methods(sentTo: viewB, by: runtime).contains("tools/call") }
+
+        XCTAssertEqual(methods(sentTo: viewA, by: runtime).filter { $0 == "tools/call" }.count, 1)
+        XCTAssertEqual(methods(sentTo: viewB, by: runtime).filter { $0 == "tools/call" }.count, 1)
+        await store.close(viewID: viewA)
+        await store.close(viewID: viewB)
+    }
+
+    func test_callAppTool_withASurfaceTheViewIsNotIn_isError() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+        store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("pick")])], viewID: viewID)
+
+        let result = try await callAppTool(store, surfaceID: UUID(), viewID: viewID, name: "pick")
+
+        XCTAssertEqual(result.raw["isError"]?.boolValue, true)
+        XCTAssertFalse(methods(sentTo: viewID, by: runtime).contains("tools/call"))
+    }
+
+    // Finding 5: the phase never moves back.
+
+    func test_viewDidLoadDocument_afterLive_keepsTheViewLive() async throws {
+        let surfaceID = UUID()
+        let (store, _) = makeCoupled()
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+
+        store.viewDidLoadDocument(viewID: viewID)
+
+        XCTAssertEqual(store.snapshot(viewID: viewID)?.status, .live)
+    }
+
+    func test_secondInitialized_isIgnored() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+        await store.uiToolInvocationDidFinish(MCPInvocationID(rawValue: viewID), result: MCPCallToolResult(raw: [:]))
+        try await waitUntil("tool-result reaches the view") {
+            self.methods(sentTo: viewID, by: runtime).contains("ui/notifications/tool-result")
+        }
+
+        store.viewDidInitialize(viewID: viewID)
+
+        XCTAssertEqual(store.snapshot(viewID: viewID)?.status, .completed, "a second initialized does not move a completed view back to live")
+        XCTAssertEqual(methods(sentTo: viewID, by: runtime).filter { $0 == "ui/notifications/tool-input" }.count, 1)
+    }
+
+    func test_initializedAfterReload_isHandledAgain() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+        try await waitUntil("tool-input reaches the view") {
+            self.methods(sentTo: viewID, by: runtime).contains("ui/notifications/tool-input")
+        }
+        store.viewProcessDidTerminate(viewID: viewID)
+
+        await store.reload(viewID: viewID)
+        store.viewDidLoadDocument(viewID: viewID)
+        XCTAssertEqual(store.snapshot(viewID: viewID)?.status, .waitingForApp, "a reload starts the phases again")
+        store.viewDidInitialize(viewID: viewID)
+
+        XCTAssertEqual(store.snapshot(viewID: viewID)?.status, .live)
+        try await waitUntil("the reloaded view gets tool-input again") {
+            self.methods(sentTo: viewID, by: runtime).filter { $0 == "ui/notifications/tool-input" }.count == 2
+        }
+    }
+
+    // Finding 6: the upstream call does not wait for the view's resource.
+
+    func test_uiToolInvocationDidStart_returnsBeforeTheResourceReadCompletes() async throws {
+        let surfaceID = UUID()
+        let (store, runtime) = makeCoupled()
+        let session = BlockingReadSession(result: validReadResourceResult())
+        let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
+        defer { session.release() }
+
+        let returned = Box<Bool>()
+        Task { @MainActor in
+            await store.uiToolInvocationDidStart(inv, session: session)
+            returned.value = true
+        }
+        try await waitUntil("uiToolInvocationDidStart returns while resources/read is blocked") { returned.value == true }
+
+        XCTAssertEqual(store.snapshot(viewID: inv.id.rawValue)?.status, .loadingResource, "the view is registered at once")
+        session.release()
+        await store.resourceLoad(forView: inv.id.rawValue)?.value
+        XCTAssertEqual(runtime.mounted, [inv.id.rawValue], "the load finishes in the store's own task")
+    }
+
+    // Finding 12: a view's tool set is replaced, not merged.
+
+    func test_registerAppTools_replacesTheViewsPreviousTools() async throws {
+        let surfaceID = UUID()
+        let appToolRegistry = FakeAppToolRegistry()
+        let (store, runtime) = makeCoupled(appToolRegistry: appToolRegistry)
+        let viewID = try await startLiveView(store, surfaceID: surfaceID)
+
+        store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("a")]), try MCPToolDefinition(raw: ["name": AnyCodable("b")])], viewID: viewID)
+        store.registerAppTools([try MCPToolDefinition(raw: ["name": AnyCodable("b")])], viewID: viewID)
+
+        XCTAssertEqual(appToolRegistry.registerCalls.last?.tools, ["b"], "the registry gets only the view's current tools")
+        let result = try await callAppTool(store, surfaceID: surfaceID, viewID: viewID, name: "a")
+        XCTAssertEqual(result.raw["isError"]?.boolValue, true, "a tool the view no longer lists is not callable")
+        XCTAssertFalse(methods(sentTo: viewID, by: runtime).contains("tools/call"))
     }
 }

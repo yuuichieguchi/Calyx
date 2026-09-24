@@ -48,6 +48,22 @@ final class MCPAppViewRequestPolicyTests: XCTestCase {
         XCTAssertFalse(MCPAppOpenLinkPolicy.isAllowedScheme(URL(string: "calyx-mcp-app://x")!))
     }
 
+    // MARK: - URL-mode elicitation opens only what ui/open-link may open
+
+    @MainActor
+    func test_urlElicitation_httpsAndMailto_areOpenable() {
+        XCTAssertEqual(MCPElicitationURLState(text: "https://example.com/verify").url, URL(string: "https://example.com/verify"))
+        XCTAssertEqual(MCPElicitationURLState(text: "http://example.com/verify").url, URL(string: "http://example.com/verify"))
+        XCTAssertEqual(MCPElicitationURLState(text: "mailto:someone@example.com").url, URL(string: "mailto:someone@example.com"))
+    }
+
+    @MainActor
+    func test_urlElicitation_otherSchemes_areNotOpenable() {
+        for text in ["file:///etc/passwd", "javascript:alert(1)", "calyx-mcp-app://x", "ssh://host", "x-apple.systempreferences:com.apple.preference"] {
+            XCTAssertNil(MCPElicitationURLState(text: text).url, "\(text) must not enable Open")
+        }
+    }
+
     // MARK: - sampling/createMessage: never declared, always -32601
 
     func test_sampling_isAlwaysMinus32601() {

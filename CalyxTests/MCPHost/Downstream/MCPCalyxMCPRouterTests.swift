@@ -125,11 +125,11 @@ final class MCPCalyxMCPRouterTests: XCTestCase {
         )
     }
 
-    private func makeRegistry(alias: String, serverID: MCPServerID) -> MCPServerRegistry {
+    private func makeRegistry(alias: String, serverID: MCPServerID) async -> MCPServerRegistry {
         registryDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
         try! FileManager.default.createDirectory(atPath: registryDir, withIntermediateDirectories: true)
         let registry = MCPServerRegistry(directory: registryDir, secretStore: InMemoryMCPSecretStore())
-        try! registry.add(MCPServerConfig(
+        try! await registry.add(MCPServerConfig(
             id: serverID, alias: MCPServerAlias(rawValue: alias)!, displayName: "Weather",
             isEnabled: true, transport: .stdio(command: "/usr/bin/tool", args: [], envNames: [], cwd: nil), auth: nil
         ))
@@ -252,7 +252,7 @@ final class MCPCalyxMCPRouterTests: XCTestCase {
         let serverID = MCPServerID(rawValue: UUID())
         let readResult: [String: AnyCodable] = ["contents": AnyCodable([AnyCodable(["uri": AnyCodable("ui://widget/index.html"), "text": AnyCodable("<html></html>")])])]
         let connection = FakeUpstreamConnection(serverID: serverID, readResourceResult: .success(readResult))
-        let registry = makeRegistry(alias: "weather", serverID: serverID)
+        let registry = await makeRegistry(alias: "weather", serverID: serverID)
         let router = MCPCalyxMCPRouterTestSupport.makeMinimalRouter(
             registry: registry, connections: FakeConnectionLookup([serverID: connection]), bearerToken: { [testToken] in testToken }
         )
@@ -289,7 +289,7 @@ final class MCPCalyxMCPRouterTests: XCTestCase {
         let serverID = MCPServerID(rawValue: UUID())
         let connection = FakeUpstreamConnection(serverID: serverID, initialTools: [try tool("get_weather")])
         let router = MCPCalyxMCPRouterTestSupport.makeMinimalRouter(
-            registry: makeRegistry(alias: "weather", serverID: serverID),
+            registry: await makeRegistry(alias: "weather", serverID: serverID),
             connections: FakeConnectionLookup([serverID: connection]), bearerToken: { [testToken] in testToken }
         )
 

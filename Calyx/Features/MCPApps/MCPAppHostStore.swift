@@ -95,6 +95,8 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         var droppedCSPEntries: [(raw: String, reason: String)] = []
         var appliedCSP: MCPAppCSPBuilder.CSPDomains?
         var isMounted = false
+        /// `remove(viewID:)` is tearing the view down.
+        var isRemoving = false
         var appTools: [String: MCPToolDefinition] = [:]
         var modelContext: MCPAppModelContextEntry?
         var pendingHostContext: [String: AnyCodable] = [:]
@@ -112,6 +114,9 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
     private var disconnectedServers: Set<MCPServerID> = []
     private var nextRequestNumber = 0
     private var surfaceObserver: SurfaceDestroyedObserver?
+    /// The running load of each view's resource started by
+    /// `uiToolInvocationDidStart`.
+    private var resourceLoads: [UUID: Task<Void, Never>] = [:]
 
     init(paneResolver: any MCPPaneResolving, runtime: any MCPAppViewRuntime, appToolRegistry: any MCPAppToolRegistry) {
         self.paneResolver = paneResolver
@@ -128,22 +133,35 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
 
     // MARK: - MCPAppViewHosting
 
+    /// Registers the view and returns. Retiring the pane's finished views,
+    /// reading and validating the resource, and mounting run in a task the
+    /// store owns, so the upstream call does not wait for them.
     func uiToolInvocationDidStart(_ invocation: MCPUIToolInvocation, session: any MCPAppServerSession) async {
         let paneKey: MCPAppGeneration.PaneKey = invocation.surfaceID.map { .pane($0) } ?? .paneless
         let retired = MCPAppGeneration.viewsToRetire(
             existing: order.compactMap { id in records[id].map { generationSnapshot($0) } },
             newCallPaneKey: paneKey
         )
-        for viewID in order where retired.contains(viewID) {
-            await remove(viewID: viewID)
-        }
+        let retiredInOrder = order.filter { retired.contains($0) }
 
         let record = ViewRecord(invocation: invocation, session: session, surfaceID: invocation.surfaceID)
-        records[record.viewID] = record
-        order.append(record.viewID)
+        let viewID = record.viewID
+        records[viewID] = record
+        order.append(viewID)
         postChange()
 
-        await loadResource(viewID: record.viewID)
+        resourceLoads[viewID] = Task { @MainActor [weak self] in
+            for retiredID in retiredInOrder {
+                await self?.remove(viewID: retiredID)
+            }
+            await self?.loadResource(viewID: viewID)
+            self?.resourceLoads[viewID] = nil
+        }
+    }
+
+    /// The load `uiToolInvocationDidStart` started for the view, while it runs.
+    func resourceLoad(forView viewID: UUID) -> Task<Void, Never>? {
+        resourceLoads[viewID]
     }
 
     func uiToolInvocationDidFinish(_ id: MCPInvocationID, result: MCPCallToolResult) async {
@@ -154,12 +172,13 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         recordOutcome(.cancelled, viewID: id.rawValue)
     }
 
-    func callAppTool(surfaceID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult {
-        let owner = order.reversed().compactMap { records[$0] }.first { record in
-            record.surfaceID == surfaceID && record.appTools[name] != nil && record.lifecycle.hasReceivedInitialized
-        }
-        guard let owner else {
-            return Self.errorResult("No live MCP App view in this pane provides the tool \(name).")
+    /// Sends `tools/call` to the view `viewID` only, when it is in
+    /// `surfaceID`, lists `name`, has sent `initialized` and is not being
+    /// removed.
+    func callAppTool(surfaceID: UUID, viewID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult {
+        guard let owner = records[viewID], owner.surfaceID == surfaceID, owner.appTools[name] != nil,
+              owner.lifecycle.hasReceivedInitialized, !owner.isRemoving else {
+            return Self.errorResult("The MCP App view that provided the tool \(name) is no longer available in this pane.")
         }
         nextRequestNumber += 1
         let request = JSONRPCMessage.request(
@@ -168,7 +187,7 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
             params: ["name": AnyCodable(name), "arguments": AnyCodable(arguments)]
         )
         do {
-            let reply = try await runtime.send(request, to: owner.viewID)
+            let reply = try await runtime.send(request, to: viewID)
             guard case .response(_, let result, let error)? = reply else {
                 return Self.errorResult("The MCP App view did not answer the call to \(name).")
             }
@@ -239,16 +258,19 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
 
     // MARK: - Notifications from the runtime
 
+    /// Moves a view from `.loadingResource` to `.waitingForApp`; a load in
+    /// any other phase changes nothing.
     func viewDidLoadDocument(viewID: UUID) {
-        guard records[viewID] != nil else { return }
+        guard records[viewID]?.phase == .loadingResource else { return }
         records[viewID]?.phase = .waitingForApp
         postChange()
     }
 
     /// `ui/notifications/initialized`: sends tool-input, then any recorded
-    /// outcome and held host-context changes.
+    /// outcome and held host-context changes. Ignored when the view already
+    /// initialized since its last crash or reload.
     func viewDidInitialize(viewID: UUID) {
-        guard records[viewID] != nil else { return }
+        guard let record = records[viewID], !record.lifecycle.hasReceivedInitialized else { return }
         apply(.clientInitialized, viewID: viewID)
         records[viewID]?.phase = .live
         apply(.toolInputReady, viewID: viewID)
@@ -273,13 +295,12 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         await remove(viewID: viewID)
     }
 
-    /// Publishes the view's tools to the agent of the pane that owns it. A
-    /// standalone view has no pane agent to publish to.
+    /// Replaces the view's tools and publishes them to the agent of the pane
+    /// that owns it. A standalone view has no pane agent to publish to. Of
+    /// two tools with one name, the later is kept.
     func registerAppTools(_ tools: [MCPToolDefinition], viewID: UUID) {
         guard var record = records[viewID] else { return }
-        for tool in tools {
-            record.appTools[tool.name] = tool
-        }
+        record.appTools = Dictionary(tools.map { ($0.name, $0) }, uniquingKeysWith: { _, later in later })
         records[viewID] = record
         guard let surfaceID = record.surfaceID else { return }
         appToolRegistry.registerAppTools(
@@ -300,7 +321,7 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
     /// Reads the resource again and mounts a fresh web view. Only from
     /// `.readFailed`, `.stopped` and `.waitingForApp`.
     func reload(viewID: UUID) async {
-        guard let record = records[viewID] else { return }
+        guard let record = records[viewID], !record.isRemoving else { return }
         switch record.phase {
         case .readFailed, .stopped, .waitingForApp:
             break
@@ -383,18 +404,19 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
     // MARK: - .calyxSurfaceDestroyed
 
     /// Drops the surface's views from the table at once, then tears their
-    /// web views down. `Task.immediate` reaches the runtime before the
-    /// notification post returns.
+    /// web views down and posts the change. `Task.immediate` reaches the
+    /// runtime before the notification post returns.
     fileprivate func surfaceDestroyed(_ surfaceID: UUID) {
         let viewIDs = order.filter { records[$0]?.surfaceID == surfaceID }
         guard !viewIDs.isEmpty else { return }
         let removed = viewIDs.compactMap { detach(viewID: $0) }
-        postChange()
-        Task.immediate { @MainActor [runtime] in
-            for record in removed where record.isMounted {
+        Task.immediate { @MainActor [weak self, runtime] in
+            // A view already being removed is torn down by `remove(viewID:)`.
+            for record in removed where record.isMounted && !record.isRemoving {
                 await runtime.requestTeardown(viewID: record.viewID)
                 runtime.unmount(viewID: record.viewID)
             }
+            self?.postChange()
         }
     }
 
@@ -425,7 +447,7 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         let listEntryMeta = await listEntryMetaIfNeeded(
             contents: contents, uri: ui.declaredResourceURI, session: record.session
         )
-        guard records[viewID] != nil else { return }
+        guard let current = records[viewID], !current.isRemoving else { return }
 
         switch MCPAppUIResourceValidator.validate(contents: contents, listEntryMeta: listEntryMeta) {
         case .failure(let error):
@@ -564,16 +586,19 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
         }
     }
 
-    /// Tears the view down (when it has a web view) and removes it.
+    /// Tears the view down (when it has a web view), then removes it and
+    /// posts the change. The runtime follows the change by dropping the
+    /// view's card, so the teardown and unmount come first.
     private func remove(viewID: UUID) async {
-        guard records[viewID] != nil else { return }
+        guard let record = records[viewID], !record.isRemoving else { return }
+        records[viewID]?.isRemoving = true
         apply(.viewRemovalRequested, viewID: viewID)
-        guard let record = detach(viewID: viewID) else { return }
-        postChange()
         if record.isMounted {
             await runtime.requestTeardown(viewID: viewID)
             runtime.unmount(viewID: viewID)
         }
+        guard detach(viewID: viewID) != nil else { return }
+        postChange()
     }
 
     /// Removes the record and its app tools from every table.

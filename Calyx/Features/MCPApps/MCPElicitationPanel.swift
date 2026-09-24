@@ -15,7 +15,8 @@
 //  Accept; the panel then stays up with Done until the user closes it or
 //  the client calls `dismiss(_:)` on `notifications/elicitation/complete`.
 //  Decline and Cancel answer before anything is opened. A URL that does
-//  not parse is shown with only Decline and Cancel.
+//  not parse, or whose scheme `MCPAppOpenLinkPolicy` does not allow, is
+//  shown with only Decline and Cancel.
 //
 //  Cancelling the task awaiting `present(_:)` answers Cancel and closes
 //  the panel.
@@ -265,13 +266,14 @@ final class MCPElicitationForm {
 @MainActor @Observable
 final class MCPElicitationURLState {
     let text: String
-    /// Nil when `text` is not a URL.
+    /// Nil when `text` is not a URL or its scheme is one
+    /// `MCPAppOpenLinkPolicy` does not open.
     let url: URL?
     var isOpened = false
 
     init(text: String) {
         self.text = text
-        self.url = URL(string: text)
+        self.url = URL(string: text).flatMap { MCPAppOpenLinkPolicy.isAllowedScheme($0) ? $0 : nil }
     }
 }
 

@@ -88,8 +88,10 @@ final class MCPHostCoordinator {
         guard let resolved = await catalog.resolve(exportedName: exportedName, surfaceID: surfaceID) else {
             return Self.errorResult("Tool \(exportedName) is not offered by any configured MCP server. The server may have been removed.")
         }
-        if case .app(let appSurfaceID) = resolved.origin {
-            return await viewHosting.callAppTool(surfaceID: appSurfaceID, name: resolved.upstreamToolName, arguments: arguments)
+        if case .app(let appSurfaceID, let viewID) = resolved.origin {
+            return await viewHosting.callAppTool(
+                surfaceID: appSurfaceID, viewID: viewID, name: resolved.upstreamToolName, arguments: arguments
+            )
         }
         guard let connection = await connections.connection(forServerID: resolved.serverID) else {
             return Self.errorResult("MCP server \(resolved.serverDisplayName) is no longer configured.")

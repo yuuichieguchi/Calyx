@@ -158,7 +158,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
     func test_connectionStateChanges_reachTheViewHost() async throws {
         let harness = makeHarness()
         let config = try missingCommandConfig()
-        try harness.registry.add(config)
+        try await harness.registry.add(config)
 
         await harness.supervisor.connectAll()
         try await waitUntil { harness.viewHost.states(for: config.id).contains(where: Self.isFailed) }
@@ -171,7 +171,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
     func test_retry_movesAFailedConnectionBackToConnecting() async throws {
         let harness = makeHarness()
         let config = try missingCommandConfig()
-        try harness.registry.add(config)
+        try await harness.registry.add(config)
         await harness.supervisor.connectAll()
         try await waitUntil { harness.viewHost.states(for: config.id).contains(where: Self.isFailed) }
         let countBeforeRetry = harness.viewHost.states(for: config.id).count
@@ -197,7 +197,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
     func test_authState_stdioServer_isNotRequired() async throws {
         let harness = makeHarness()
         let config = try missingCommandConfig()
-        try harness.registry.add(config)
+        try await harness.registry.add(config)
 
         let state = try await harness.supervisor.authState(for: config.id)
 
@@ -207,7 +207,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
     func test_authState_httpServer_followsTheStoredTokens() async throws {
         let harness = makeHarness()
         let config = try httpConfig()
-        try harness.registry.add(config)
+        try await harness.registry.add(config)
         let credentials = MCPSecretStoreOAuthCredentials(secretStore: harness.secretStore)
 
         let before = try await harness.supervisor.authState(for: config.id)
@@ -224,7 +224,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
     func test_signOut_deletesTheTokensButKeepsTheClientRegistration() async throws {
         let harness = makeHarness()
         let config = try httpConfig()
-        try harness.registry.add(config)
+        try await harness.registry.add(config)
         let credentials = MCPSecretStoreOAuthCredentials(secretStore: harness.secretStore)
         let client = MCPOAuthStoredClient(
             clientID: "registered-client",
@@ -251,7 +251,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
     func test_signOut_ofAConnectedServer_reconnectsTheSameConnection_withoutTearingDownViews() async throws {
         let harness = makeHarness()
         let config = try httpConfig()
-        try harness.registry.add(config)
+        try await harness.registry.add(config)
         recorder.enqueue { _ in .empty(status: 500) }
         await harness.supervisor.connectAll()
         try await waitUntil { harness.viewHost.states(for: config.id).contains(where: Self.isFailed) }
@@ -271,7 +271,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
     func test_disconnectAll_closesEveryConnection_andConnectAllBringsThemBack() async throws {
         let harness = makeHarness()
         let config = try missingCommandConfig()
-        try harness.registry.add(config)
+        try await harness.registry.add(config)
         await harness.supervisor.connectAll()
         XCTAssertNotNil(harness.supervisor.connection(forServerID: config.id))
 
@@ -284,7 +284,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
 
     func test_reconcile_postsConnectionsDidChange() async throws {
         let harness = makeHarness()
-        try harness.registry.add(try missingCommandConfig())
+        try await harness.registry.add(try missingCommandConfig())
         let posted = expectation(forNotification: .calyxMCPConnectionsDidChange, object: nil)
 
         await harness.supervisor.connectAll()
@@ -294,7 +294,7 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
 
     func test_disconnectAll_postsConnectionsDidChange() async throws {
         let harness = makeHarness()
-        try harness.registry.add(try missingCommandConfig())
+        try await harness.registry.add(try missingCommandConfig())
         await harness.supervisor.connectAll()
         let posted = expectation(forNotification: .calyxMCPConnectionsDidChange, object: nil)
 
@@ -302,13 +302,72 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
 
         await fulfillment(of: [posted], timeout: 2)
     }
+
+    // MARK: - Reconciliation runs one at a time
+
+    private func missingCommandConfig(id: MCPServerID, alias: String, command: String) throws -> MCPServerConfig {
+        MCPServerConfig(
+            id: id,
+            alias: try XCTUnwrap(MCPServerAlias(rawValue: alias)),
+            displayName: "Broken Server",
+            isEnabled: true,
+            transport: .stdio(command: command, args: [], envNames: [], cwd: nil),
+            auth: nil
+        )
+    }
+
+    private static func isConnecting(_ state: MCPConnectionState) -> Bool { state == .connecting }
+    private static func isDisabled(_ state: MCPConnectionState) -> Bool { state == .disabled }
+
+    /// Every connection the supervisor starts reports `.connecting` once
+    /// (a missing command fails without restarting), and `.disabled` once
+    /// when it is stopped. Started minus stopped is the number still open.
+    func test_twoRegistryChangesWhileReconciling_leaveExactlyOneOpenConnection() async throws {
+        let harness = makeHarness()
+        let serverID = MCPServerID()
+        try await harness.registry.add(try missingCommandConfig(id: serverID, alias: "broken", command: "/nonexistent/calyx-reconcile-a"))
+        await harness.supervisor.connectAll()
+        harness.supervisor.startObservingRegistry()
+        try await waitUntil { harness.viewHost.states(for: serverID).contains(where: Self.isFailed) }
+
+        harness.viewHost.holdsTeardowns = true
+        try await harness.registry.update(try missingCommandConfig(id: serverID, alias: "broken", command: "/nonexistent/calyx-reconcile-b"))
+        try await waitUntil { harness.viewHost.heldTeardownCount == 1 }
+        try await harness.registry.update(try missingCommandConfig(id: serverID, alias: "broken", command: "/nonexistent/calyx-reconcile-c"))
+        // Gives a second, concurrent reconciliation the chance to start.
+        try await Task.sleep(for: .milliseconds(100))
+        harness.viewHost.releaseTeardowns()
+
+        let open = { () -> Int in
+            let states = harness.viewHost.states(for: serverID)
+            return states.filter(Self.isConnecting).count - states.filter(Self.isDisabled).count
+        }
+        try await waitUntil { harness.viewHost.tornDownServers.count == 2 && open() == 1 }
+        XCTAssertEqual(open(), 1, "one connection is open for the server after both changes")
+
+        await harness.supervisor.disconnectAll()
+        try await waitUntil { open() == 0 }
+        XCTAssertEqual(open(), 0, "every connection the supervisor started is stopped; none leaked")
+    }
 }
 
-/// Records the connection states the supervisor forwards.
+/// Records the connection states the supervisor forwards. While
+/// `holdsTeardowns` is set, `teardownViews` waits until `releaseTeardowns()`.
 @MainActor
 private final class RecordingViewHost: MCPAppViewHosting {
     private var recordedStates: [MCPServerID: [MCPConnectionState]] = [:]
     private(set) var tornDownServers: [MCPServerID] = []
+    var holdsTeardowns = false
+    private var heldTeardowns: [CheckedContinuation<Void, Never>] = []
+
+    var heldTeardownCount: Int { heldTeardowns.count }
+
+    func releaseTeardowns() {
+        holdsTeardowns = false
+        let held = heldTeardowns
+        heldTeardowns.removeAll()
+        held.forEach { $0.resume() }
+    }
 
     func states(for serverID: MCPServerID) -> [MCPConnectionState] {
         recordedStates[serverID] ?? []
@@ -324,8 +383,10 @@ private final class RecordingViewHost: MCPAppViewHosting {
     func remapSurface(old: UUID, new: UUID) {}
     func teardownViews(forServer serverID: MCPServerID, reason: String) async {
         tornDownServers.append(serverID)
+        guard holdsTeardowns else { return }
+        await withCheckedContinuation { heldTeardowns.append($0) }
     }
-    func callAppTool(surfaceID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult {
+    func callAppTool(surfaceID: UUID, viewID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult {
         MCPCallToolResult(raw: [:])
     }
     func uiToolInvocationDidFinish(_ id: MCPInvocationID, result: MCPCallToolResult) async {}

@@ -4,7 +4,8 @@
 //
 //  The configured upstream MCP servers, persisted as
 //  `<directory>/mcp-servers.json` (mode 0600, written through
-//  `ConfigFileUtils.withExclusiveConfig`):
+//  `ConfigFileUtils.withExclusiveConfig` on `DispatchQueue.global()`,
+//  one change at a time):
 //
 //      {"schemaVersion": 1, "servers": [<MCPServerConfig>, ...]}
 //
@@ -60,6 +61,8 @@ final class MCPServerRegistry {
     private let directory: String
     private let filePath: String
     private let secretStore: any MCPSecretStore
+    /// The last queued change; see `serialized(_:)`.
+    @ObservationIgnored private var changeTail: Task<Void, Never>?
 
     /// Production callers pass `AppSupportDirectory.path`.
     init(directory: String, secretStore: any MCPSecretStore) {
@@ -72,36 +75,42 @@ final class MCPServerRegistry {
     }
 
     /// Throws `.duplicateAlias` when another server already has the alias.
-    func add(_ config: MCPServerConfig) throws {
-        guard !servers.contains(where: { $0.alias == config.alias }) else {
-            throw MCPServerRegistryError.duplicateAlias(config.alias.rawValue)
+    func add(_ config: MCPServerConfig) async throws {
+        try await serialized { registry in
+            guard !registry.servers.contains(where: { $0.alias == config.alias }) else {
+                throw MCPServerRegistryError.duplicateAlias(config.alias.rawValue)
+            }
+            try await registry.commit(registry.servers + [config])
         }
-        try commit(servers + [config])
     }
 
     /// Replaces the server with the same id. Throws `.aliasChanged` when
     /// the alias differs from the stored one.
-    func update(_ config: MCPServerConfig) throws {
-        guard let index = servers.firstIndex(where: { $0.id == config.id }) else {
-            throw MCPServerRegistryError.unknownServer(config.id)
+    func update(_ config: MCPServerConfig) async throws {
+        try await serialized { registry in
+            guard let index = registry.servers.firstIndex(where: { $0.id == config.id }) else {
+                throw MCPServerRegistryError.unknownServer(config.id)
+            }
+            let stored = registry.servers[index]
+            guard stored.alias == config.alias else {
+                throw MCPServerRegistryError.aliasChanged(from: stored.alias.rawValue, to: config.alias.rawValue)
+            }
+            var updated = registry.servers
+            updated[index] = config
+            try await registry.commit(updated)
         }
-        let stored = servers[index]
-        guard stored.alias == config.alias else {
-            throw MCPServerRegistryError.aliasChanged(from: stored.alias.rawValue, to: config.alias.rawValue)
-        }
-        var updated = servers
-        updated[index] = config
-        try commit(updated)
     }
 
     /// Deletes every secret of the server, then the server itself. Other
     /// servers' secrets are untouched.
     func remove(id: MCPServerID) async throws {
-        guard servers.contains(where: { $0.id == id }) else {
-            throw MCPServerRegistryError.unknownServer(id)
+        try await serialized { registry in
+            guard registry.servers.contains(where: { $0.id == id }) else {
+                throw MCPServerRegistryError.unknownServer(id)
+            }
+            try await registry.secretStore.deleteAll(forServer: id)
+            try await registry.commit(registry.servers.filter { $0.id != id })
         }
-        try await secretStore.deleteAll(forServer: id)
-        try commit(servers.filter { $0.id != id })
     }
 
     /// Registers imported servers. An imported server's alias is derived
@@ -118,6 +127,12 @@ final class MCPServerRegistry {
     /// previous transport and not written again by this import are
     /// deleted.
     func importServers(_ imported: [MCPImportedServer], conflictPolicy: MCPImportConflictPolicy) async throws -> MCPImportOutcome {
+        try await serialized { registry in
+            try await registry.performImport(imported, conflictPolicy: conflictPolicy)
+        }
+    }
+
+    private func performImport(_ imported: [MCPImportedServer], conflictPolicy: MCPImportConflictPolicy) async throws -> MCPImportOutcome {
         var updated = servers
         var staleSecrets: [MCPSecretKey] = []
         var secretWrites: [(key: MCPSecretKey, value: String)] = []
@@ -166,7 +181,7 @@ final class MCPServerRegistry {
         for write in secretWrites {
             try await secretStore.set(write.value, forKey: write.key)
         }
-        try commit(updated)
+        try await commit(updated)
         let writtenKeys = Set(secretWrites.map(\.key))
         for key in staleSecrets where !writtenKeys.contains(key) {
             try await secretStore.delete(key)
@@ -217,22 +232,51 @@ final class MCPServerRegistry {
         case duplicateAlias
     }
 
-    /// Writes `newServers`, then publishes them. `servers` is unchanged
-    /// when the write throws.
-    private func commit(_ newServers: [MCPServerConfig]) throws {
+    /// Runs `body` after every change queued before it, so each change
+    /// reads `servers` as the previous one left it.
+    private func serialized<T: Sendable>(_ body: @escaping @MainActor (MCPServerRegistry) async throws -> T) async throws -> T {
+        let previous = changeTail
+        let change = Task { @MainActor in
+            await previous?.value
+            return try await body(self)
+        }
+        // The next change waits for this one whether it succeeds or throws;
+        // its error reaches the caller through `change.value`.
+        changeTail = Task { _ = await change.result }
+        return try await change.value
+    }
+
+    /// Writes `newServers` off the main actor, then publishes them.
+    /// `servers` is unchanged when the write throws.
+    private func commit(_ newServers: [MCPServerConfig]) async throws {
         if case .unavailable = loadError {
             throw MCPServerRegistryError.fileUnavailable(path: filePath)
-        }
-        let fileManager = FileManager.default
-        if !fileManager.fileExists(atPath: directory) {
-            try fileManager.createDirectory(atPath: directory, withIntermediateDirectories: true)
         }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(Document(schemaVersion: Self.currentSchemaVersion, servers: newServers))
-        // 0600: Calyx owns this file outright.
-        try ConfigFileUtils.withExclusiveConfig(path: filePath, mode: 0o600, restoreModeOnNoWrite: true) { _ in data }
+        try await Self.write(data, directory: directory, filePath: filePath)
         servers = newServers
+    }
+
+    /// The file write and its lock wait (up to 10 seconds) run on
+    /// `DispatchQueue.global()`.
+    private nonisolated static func write(_ data: Data, directory: String, filePath: String) async throws {
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global().async {
+                do {
+                    let fileManager = FileManager.default
+                    if !fileManager.fileExists(atPath: directory) {
+                        try fileManager.createDirectory(atPath: directory, withIntermediateDirectories: true)
+                    }
+                    // 0600: Calyx owns this file outright.
+                    try ConfigFileUtils.withExclusiveConfig(path: filePath, mode: 0o600, restoreModeOnNoWrite: true) { _ in data }
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
     }
 
     private static func load(filePath: String) -> (servers: [MCPServerConfig], error: MCPServerRegistryLoadError?) {

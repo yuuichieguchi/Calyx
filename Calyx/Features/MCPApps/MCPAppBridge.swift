@@ -119,7 +119,10 @@ final class MCPAppBridge: NSObject, WKScriptMessageHandlerWithReply {
     // MARK: - Host to view
 
     /// Posts a notification, or a request and waits for its reply. A
-    /// request's id is replaced by one of the bridge's own.
+    /// request's id is replaced by one of the bridge's own. A request ends
+    /// with the view's reply, with `CancellationError` when the awaiting
+    /// task is cancelled, or with `.closed` when the bridge closes (the
+    /// view is torn down or its process ended). It has no timer.
     func send(_ message: JSONRPCMessage) async throws -> JSONRPCMessage? {
         guard !isClosed, let webView else { throw MCPAppBridgeError.viewUnavailable }
         switch message {
@@ -129,15 +132,24 @@ final class MCPAppBridge: NSObject, WKScriptMessageHandlerWithReply {
             let request = JSONRPCMessage.request(id: .string(key), method: method, params: params)
             let json = try Self.serialize(request)
             let world = world
-            return try await withCheckedThrowingContinuation { continuation in
-                pendingReplies[key] = continuation
-                Task { @MainActor [weak self] in
-                    do {
-                        let posted = try await MCPAppWebViewFactory.postToView(webView, json: json, world: world)
-                        if !posted { self?.failReply(key: key, error: MCPAppBridgeError.viewUnavailable) }
-                    } catch {
-                        self?.failReply(key: key, error: error)
+            return try await withTaskCancellationHandler {
+                try await withCheckedThrowingContinuation { continuation in
+                    pendingReplies[key] = continuation
+                    // The cancellation handler hops to the main actor, so it
+                    // runs after this registration even for a task that was
+                    // already cancelled.
+                    Task { @MainActor [weak self] in
+                        do {
+                            let posted = try await MCPAppWebViewFactory.postToView(webView, json: json, world: world)
+                            if !posted { self?.failReply(key: key, error: MCPAppBridgeError.viewUnavailable) }
+                        } catch {
+                            self?.failReply(key: key, error: error)
+                        }
                     }
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.failReply(key: key, error: CancellationError())
                 }
             }
         default:

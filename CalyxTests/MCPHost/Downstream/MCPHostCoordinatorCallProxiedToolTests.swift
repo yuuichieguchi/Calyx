@@ -53,7 +53,7 @@ private final class FakeViewHost: MCPAppViewHosting {
     private(set) var startedInvocations: [MCPUIToolInvocation] = []
     private(set) var startedSessions: [any MCPAppServerSession] = []
     private var activeSurfaces: Set<UUID> = []
-    private(set) var appToolCalls: [(surfaceID: UUID, name: String, arguments: [String: AnyCodable])] = []
+    private(set) var appToolCalls: [(surfaceID: UUID, viewID: UUID, name: String, arguments: [String: AnyCodable])] = []
     var appToolResult = MCPCallToolResult(raw: [:])
 
     func uiToolInvocationDidStart(_ invocation: MCPUIToolInvocation, session: any MCPAppServerSession) async {
@@ -66,8 +66,8 @@ private final class FakeViewHost: MCPAppViewHosting {
     func remapSurface(old: UUID, new: UUID) {}
     func teardownViews(forServer serverID: MCPServerID, reason: String) async {}
 
-    func callAppTool(surfaceID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult {
-        appToolCalls.append((surfaceID, name, arguments))
+    func callAppTool(surfaceID: UUID, viewID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult {
+        appToolCalls.append((surfaceID, viewID, name, arguments))
         return appToolResult
     }
 
@@ -97,6 +97,71 @@ private final class FakeAuthorizationPrompting: MCPAuthorizationPrompting {
     func promptSignIn(serverID: MCPServerID, serverDisplayName: String, surfaceID: UUID?) async {
         calls.append((serverID, serverDisplayName, surfaceID))
     }
+}
+
+/// A ready connection whose `resources/read` waits until `release()`.
+private actor ReadBlockingConnection: MCPUpstreamConnecting {
+    nonisolated let serverID: MCPServerID
+    private let outcome: MCPUpstreamClient.ToolCallOutcome
+    private let readResult: [String: AnyCodable]
+    private let state: MCPConnectionState
+    private var readWaiters: [CheckedContinuation<Void, Never>] = []
+    private var isReleased = false
+    private(set) var toolCallCount = 0
+    private let eventsStream: AsyncStream<MCPServerEvent>
+
+    init(serverID: MCPServerID, state: MCPConnectionState, outcome: MCPUpstreamClient.ToolCallOutcome, readResult: [String: AnyCodable]) {
+        self.serverID = serverID
+        self.state = state
+        self.outcome = outcome
+        self.readResult = readResult
+        self.eventsStream = AsyncStream { _ in }
+    }
+
+    func release() {
+        isReleased = true
+        readWaiters.forEach { $0.resume() }
+        readWaiters.removeAll()
+    }
+
+    func tools() async -> [MCPToolDefinition] { [] }
+    func state() async -> MCPConnectionState { state }
+    var events: AsyncStream<MCPServerEvent> { get async { eventsStream } }
+
+    func callTool(name: String, arguments: [String: AnyCodable], context: MCPToolCallContext) async -> MCPUpstreamClient.ToolCallOutcome {
+        toolCallCount += 1
+        return outcome
+    }
+
+    func readResource(uri: String) async throws -> [String: AnyCodable] {
+        if !isReleased {
+            await withCheckedContinuation { readWaiters.append($0) }
+        }
+        return readResult
+    }
+
+    func listResources(cursor: String?) async throws -> (items: [[String: AnyCodable]], nextCursor: String?) { ([], nil) }
+    func listResourceTemplates(cursor: String?) async throws -> (items: [[String: AnyCodable]], nextCursor: String?) { ([], nil) }
+    func listPrompts(cursor: String?) async throws -> (items: [[String: AnyCodable]], nextCursor: String?) { ([], nil) }
+}
+
+/// The runtime seam, doing nothing: no web view is ever mounted.
+@MainActor
+private final class InertViewRuntime: MCPAppViewRuntime {
+    func requestTeardown(viewID: UUID) async {}
+    func mount(viewID: UUID, document: MCPAppViewDocument) async throws {}
+    func send(_ message: JSONRPCMessage, to viewID: UUID) async throws -> JSONRPCMessage? { nil }
+    func unmount(viewID: UUID) {}
+}
+
+@MainActor
+private final class NoPaneResolver: MCPPaneResolving {
+    func paneHost(owningSurface surfaceID: UUID) -> MCPPaneHost? { nil }
+}
+
+@MainActor
+private final class ResultBox {
+    var result: MCPCallToolResult?
 }
 
 @MainActor
@@ -660,12 +725,13 @@ final class MCPHostCoordinatorCallProxiedToolTests: XCTestCase {
     func test_appOriginTool_routedToViewHostCallAppTool_resultReturnedVerbatim_upstreamNeverCalled() async throws {
         let serverID = MCPServerID(rawValue: UUID())
         let appSurfaceID = UUID()
+        let appViewID = UUID()
         let connection = FakeUpstreamConnection(serverID: serverID, initialState: readyState(), initialTools: [try tool("get_weather")])
         let definition = try tool("pick_color")
         let catalog = FakeCatalogProviding(resolvedTools: [
             "srv-app-pick_color": resolvedTool(
                 exportedName: "srv-app-pick_color", serverID: serverID, upstreamToolName: "pick_color",
-                definition: definition, origin: .app(surfaceID: appSurfaceID)
+                definition: definition, origin: .app(surfaceID: appSurfaceID, viewID: appViewID)
             ),
         ])
         let viewHost = FakeViewHost()
@@ -687,6 +753,7 @@ final class MCPHostCoordinatorCallProxiedToolTests: XCTestCase {
         XCTAssertEqual(result.raw, rawResult, "the view's result is returned verbatim")
         XCTAssertEqual(viewHost.appToolCalls.count, 1)
         XCTAssertEqual(viewHost.appToolCalls.first?.surfaceID, appSurfaceID)
+        XCTAssertEqual(viewHost.appToolCalls.first?.viewID, appViewID, "the call names the view that registered the tool")
         XCTAssertEqual(viewHost.appToolCalls.first?.name, "pick_color")
         XCTAssertEqual(viewHost.appToolCalls.first?.arguments, arguments)
         let upstreamCalls = await connection.callToolInvocations
@@ -704,7 +771,7 @@ final class MCPHostCoordinatorCallProxiedToolTests: XCTestCase {
         let catalog = FakeCatalogProviding(resolvedTools: [
             "srv-app-pick_color": resolvedTool(
                 exportedName: "srv-app-pick_color", serverID: serverID, upstreamToolName: "pick_color",
-                definition: try tool("pick_color"), origin: .app(surfaceID: paneA)
+                definition: try tool("pick_color"), origin: .app(surfaceID: paneA, viewID: UUID())
             ),
         ])
         let viewHost = FakeViewHost()
@@ -721,5 +788,44 @@ final class MCPHostCoordinatorCallProxiedToolTests: XCTestCase {
         XCTAssertEqual(resolveCalls.map(\.surfaceID), [paneB], "the caller's pane is what the catalog resolves against")
         XCTAssertEqual(result.raw["isError"]?.boolValue, true, "pane B's agent cannot call pane A's app tool")
         XCTAssertTrue(viewHost.appToolCalls.isEmpty, "the view in pane A is never called from pane B")
+    }
+
+    // MARK: - The upstream call does not wait for the view's resource
+
+    func test_renderedCall_upstreamCallRunsWhileTheViewsResourceReadIsBlocked() async throws {
+        let serverID = MCPServerID(rawValue: UUID())
+        let rawResult: [String: AnyCodable] = ["content": AnyCodable([AnyCodable]())]
+        let connection = ReadBlockingConnection(
+            serverID: serverID, state: readyState(), outcome: .result(MCPCallToolResult(raw: rawResult)), readResult: [:]
+        )
+        let catalog = FakeCatalogProviding(resolvedTools: [
+            "srv-get_weather": resolvedTool(
+                exportedName: "srv-get_weather", serverID: serverID, upstreamToolName: "get_weather",
+                definition: try tool("get_weather", resourceUri: "ui://weather/card.html")
+            ),
+        ])
+        let store = MCPAppHostStore(paneResolver: NoPaneResolver(), runtime: InertViewRuntime(), appToolRegistry: FakeAppToolRegistry())
+        let coordinator = makeCoordinator(connections: [serverID: connection], catalog: catalog, viewHosting: store)
+        let surfaceID = UUID()
+
+        let box = ResultBox()
+        Task { @MainActor in
+            box.result = await coordinator.callProxiedTool(
+                exportedName: "srv-get_weather", arguments: [:], surfaceID: surfaceID, clientName: "claude-code",
+                clientDeclaredUI: false,
+                cancellationKey: MCPDownstreamCancellationKey(sessionNonce: "sess-1", requestID: .int(40)),
+                progress: nil
+            )
+        }
+        let deadline = Date().addingTimeInterval(2)
+        while box.result == nil, Date() < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        await connection.release()
+
+        XCTAssertEqual(box.result?.raw, rawResult, "the agent gets the upstream result while the view's resources/read is still blocked")
+        let toolCallCount = await connection.toolCallCount
+        XCTAssertEqual(toolCallCount, 1)
+        XCTAssertTrue(store.hasActiveView(forSurface: surfaceID), "the view was registered before the upstream call")
     }
 }

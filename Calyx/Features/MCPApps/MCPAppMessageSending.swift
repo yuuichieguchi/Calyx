@@ -11,7 +11,8 @@ import Foundation
 enum MCPAppMessageSending {
     /// `{}` when delivered. A formatting failure (an image that cannot be
     /// written) or a delivery failure is -32000, and nothing is delivered
-    /// after a formatting failure. Runs `deliver` in the caller's isolation.
+    /// after a formatting failure. Formats off the caller's actor; runs
+    /// `deliver` in the caller's isolation.
     static func send(
         _ blocks: [MCPMessageContentBlock],
         imageDirectory: URL = MCPAppMessageFormatter.imageDirectory,
@@ -20,7 +21,7 @@ enum MCPAppMessageSending {
     ) async -> Result<AnyCodable, JSONRPCError> {
         let text: String
         do {
-            text = try MCPAppMessageFormatter.format(content: blocks, imageDirectory: imageDirectory).pastedText
+            text = try await MCPAppMessageFormatter.formatOffCallerActor(content: blocks, imageDirectory: imageDirectory).pastedText
         } catch {
             return .failure(JSONRPCError(code: -32000, message: "The message could not be prepared: \(error)", data: nil))
         }

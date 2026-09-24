@@ -13,6 +13,9 @@ final class MCPAppPiPWindow: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 
+    /// Called when the user closes the window.
+    var onUserClose: (() -> Void)?
+
     init(size: NSSize) {
         super.init(
             contentRect: NSRect(origin: .zero, size: size),
@@ -48,8 +51,16 @@ final class MCPAppPiPWindow: NSPanel {
         pane.frame = container.bounds
     }
 
-    /// Hands the pane back and closes.
+    override func close() {
+        let handler = onUserClose
+        onUserClose = nil
+        super.close()
+        handler?()
+    }
+
+    /// Hands the pane back and closes, without reporting a user close.
     func dismiss() {
+        onUserClose = nil
         parent?.removeChildWindow(self)
         orderOut(nil)
         contentView = nil

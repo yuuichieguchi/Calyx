@@ -44,11 +44,14 @@ final class MCPLiveAppToolRegistry: MCPAppToolRegistry {
     }
 
     func appTools(forSurface surfaceID: UUID) -> [MCPCatalogPaneAppTool] {
-        order.compactMap { registrations[$0] }
-            .filter { $0.surfaceID == surfaceID }
-            .flatMap { registration in
+        order.compactMap { viewID in registrations[viewID].map { (viewID, $0) } }
+            .filter { $0.1.surfaceID == surfaceID }
+            .flatMap { viewID, registration in
                 registration.tools.map {
-                    MCPCatalogPaneAppTool(surfaceID: registration.surfaceID, serverID: registration.serverID, name: $0.name, definition: $0)
+                    MCPCatalogPaneAppTool(
+                        surfaceID: registration.surfaceID, viewID: viewID, serverID: registration.serverID,
+                        name: $0.name, definition: $0
+                    )
                 }
             }
     }

@@ -34,6 +34,19 @@ final class MCPLiveAppToolRegistryTests: XCTestCase {
         XCTAssertTrue(registry.appTools(forSurface: otherPane).isEmpty)
     }
 
+    func test_appTools_carryTheViewThatRegisteredThem() throws {
+        let registry = MCPLiveAppToolRegistry()
+        let pane = UUID()
+        let viewA = UUID()
+        let viewB = UUID()
+
+        registry.registerAppTools([try tool("pick_color")], forSurface: pane, viewID: viewA, serverID: MCPServerID())
+        registry.registerAppTools([try tool("pick_color")], forSurface: pane, viewID: viewB, serverID: MCPServerID())
+
+        XCTAssertEqual(registry.appTools(forSurface: pane).map(\.viewID), [viewA, viewB],
+                       "two views of one pane offering the same tool name stay distinct by view")
+    }
+
     func test_registerAgain_replacesTheViewsTools() throws {
         let registry = MCPLiveAppToolRegistry()
         let pane = UUID()

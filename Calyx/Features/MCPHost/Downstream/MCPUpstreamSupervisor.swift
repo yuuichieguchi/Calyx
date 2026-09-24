@@ -40,7 +40,8 @@ enum MCPUpstreamSupervisorError: Error, Equatable {
 @MainActor
 final class MCPUpstreamSupervisor: MCPConnectionLookup {
 
-    /// Per request of the upstream client, the handshake included.
+    /// Per request of the upstream client, the handshake included;
+    /// `tools/call` has none.
     static let requestTimeout: TimeInterval = 60
     static let maxMRTRRounds = 8
     static let maxCrashesBeforeFailed = 5
@@ -64,6 +65,10 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
     private var viewHosting: (any MCPAppViewHosting)?
     private var elicitationPresenting: (any MCPElicitationPresenting)?
     private var isObservingRegistry = false
+    /// The last queued change of `entries`. `connectAll()`,
+    /// `disconnectAll()` and each registry change run after it, one at a
+    /// time, so no two of them interleave at an `await`.
+    private var entriesTail: Task<Void, Never>?
     /// Whether `connectAll()` has run: until then, registry changes build
     /// connections but start none.
     private var mayConnect = false
@@ -108,11 +113,13 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
     /// `LaunchEnvironmentPolicy.mayPerformAgentIPCActivation()` is false.
     func connectAll() async {
         guard LaunchEnvironmentPolicy.mayPerformAgentIPCActivation() else { return }
-        mayConnect = true
-        await reconcile()
-        for entry in entries.values where entry.config.isEnabled {
-            // `start()` acts only on a connection that is still `.disabled`.
-            await entry.connection.start()
+        await enqueue { supervisor in
+            supervisor.mayConnect = true
+            await supervisor.reconcile()
+            for entry in supervisor.entries.values where entry.config.isEnabled {
+                // `start()` acts only on a connection that is still `.disabled`.
+                await entry.connection.start()
+            }
         }
     }
 
@@ -120,13 +127,28 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
     /// builds none until the next `connectAll()`. Used when AI Agent IPC
     /// is turned off.
     func disconnectAll() async {
-        mayConnect = false
-        let retiring = entries
-        entries.removeAll()
-        for entry in retiring.values {
-            await retire(entry, reason: "Calyx AI Agent IPC was turned off.")
+        await enqueue { supervisor in
+            supervisor.mayConnect = false
+            let retiring = supervisor.entries
+            supervisor.entries.removeAll()
+            for entry in retiring.values {
+                await supervisor.retire(entry, reason: "Calyx AI Agent IPC was turned off.")
+            }
+            NotificationCenter.default.post(name: .calyxMCPConnectionsDidChange, object: nil)
         }
-        NotificationCenter.default.post(name: .calyxMCPConnectionsDidChange, object: nil)
+    }
+
+    /// Runs `step` after every step queued before it, and returns when it
+    /// has finished.
+    private func enqueue(_ step: @escaping @MainActor (MCPUpstreamSupervisor) async -> Void) async {
+        let previous = entriesTail
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            await step(self)
+        }
+        entriesTail = task
+        await task.value
     }
 
     /// Follows every later change of `registry.servers`. Idempotent.
@@ -143,7 +165,7 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.observeRegistry()
-                await self.reconcile()
+                await self.enqueue { await $0.reconcile() }
             }
         }
     }
@@ -236,27 +258,38 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
 
     // MARK: - Registry reconciliation
 
+    /// Brings `entries` in line with `registry.servers`. Runs only through
+    /// `enqueue`. An entry leaves `entries` (removed or replaced) before it
+    /// is retired, and the config of a kept entry is written in place, so no
+    /// copy of an entry is written back after an `await`.
     private func reconcile() async {
         let configs = registry.servers
         let configuredIDs = Set(configs.map(\.id))
 
-        for (serverID, entry) in entries where !configuredIDs.contains(serverID) {
+        for serverID in Array(entries.keys) where !configuredIDs.contains(serverID) {
+            guard let entry = entries.removeValue(forKey: serverID) else { continue }
             await retire(entry, reason: "The MCP server was removed.")
-            entries[serverID] = nil
         }
 
         for config in configs {
-            guard var entry = entries[config.id] else {
+            guard let entry = entries[config.id] else {
                 await add(config)
                 continue
             }
             if entry.config.transport != config.transport || entry.config.auth != config.auth {
+                // The replacement is listed before the old connection stops,
+                // so a reader whose events end finds the new connection.
+                let replacement = makeEntry(for: config)
+                entries[config.id] = replacement
                 await retire(entry, reason: "The MCP server's configuration changed.")
-                entries[config.id] = nil
-                await add(config)
+                if config.isEnabled, mayConnect {
+                    await replacement.connection.start()
+                }
                 continue
             }
-            if entry.config.isEnabled != config.isEnabled {
+            let wasEnabled = entry.config.isEnabled
+            entries[config.id]?.config = config
+            if wasEnabled != config.isEnabled {
                 if config.isEnabled {
                     if mayConnect {
                         await entry.connection.enable()
@@ -266,13 +299,21 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
                     await viewHosting?.teardownViews(forServer: config.id, reason: "The MCP server was disabled.")
                 }
             }
-            entry.config = config
-            entries[config.id] = entry
         }
         NotificationCenter.default.post(name: .calyxMCPConnectionsDidChange, object: nil)
     }
 
     private func add(_ config: MCPServerConfig) async {
+        let entry = makeEntry(for: config)
+        entries[config.id] = entry
+        if config.isEnabled, mayConnect {
+            await entry.connection.start()
+        }
+    }
+
+    /// Builds the connection for `config` and the task that forwards its
+    /// events. Starts nothing.
+    private func makeEntry(for config: MCPServerConfig) -> Entry {
         let connection = makeConnection(for: config)
         let supervised = MCPSupervisedConnection(connection: connection)
         let fingerprint = config.transport.fingerprint
@@ -289,10 +330,7 @@ final class MCPUpstreamSupervisor: MCPConnectionLookup {
             }
             await supervised.finish()
         }
-        entries[config.id] = Entry(config: config, connection: connection, supervised: supervised, pump: pump)
-        if config.isEnabled, mayConnect {
-            await connection.start()
-        }
+        return Entry(config: config, connection: connection, supervised: supervised, pump: pump)
     }
 
     private func retire(_ entry: Entry, reason: String) async {

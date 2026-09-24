@@ -9,8 +9,10 @@
 //  Requests:
 //    - Ids are integers allocated here. A reply is matched to its request
 //      by id; `0` is never allocated but would match like any other id.
-//    - Each request waits at most `requestTimeout` on the injected clock.
-//      A timeout or cancellation of the awaiting Task calls
+//    - Each request other than `tools/call` waits at most `requestTimeout`
+//      on the injected clock. `tools/call` has no timer: it ends with the
+//      server's reply, cancellation of the awaiting Task, or the loss of
+//      the transport. A timeout or cancellation of the awaiting Task calls
 //      `transport.cancel(requestID:reason:)` before the result is settled.
 //    - Modern-era requests carry the `io.modelcontextprotocol/*` `_meta`
 //      keys. Legacy-era requests carry `_meta.progressToken` only, and
@@ -507,7 +509,8 @@ actor MCPUpstreamClient {
             let reply = await request(
                 method: "tools/call",
                 params: params,
-                kind: .request(headerMirrors: context.headerMirrors)
+                kind: .request(headerMirrors: context.headerMirrors),
+                deadline: .none
             )
             guard case .result(let value) = reply else {
                 return Self.toolCallOutcome(forFailure: reply)
@@ -624,12 +627,19 @@ actor MCPUpstreamClient {
 
     // MARK: - Request Lifecycle
 
+    /// Whether a request waits for its reply against `requestTimeout`.
+    private enum Deadline {
+        case requestTimeout
+        case none
+    }
+
     /// Sends one request and waits for how it ends.
     private func request(
         method: String,
         params: [String: AnyCodable],
         kind: MCPOutboundKind = .request(headerMirrors: []),
-        awaitsAcknowledgement: Bool = false
+        awaitsAcknowledgement: Bool = false,
+        deadline: Deadline = .requestTimeout
     ) async -> Reply {
         if let termination { return termination.reply }
         // Nothing has been sent yet, so there is nothing to cancel.
@@ -658,7 +668,7 @@ actor MCPUpstreamClient {
             return .transportError(MCPTransportSignal(httpStatus: nil, message: "\(method) send failed: \(error)"))
         }
 
-        let reply = await awaitReply(id: id)
+        let reply = await awaitReply(id: id, deadline: deadline)
         switch reply {
         case .timeout:
             await transport.cancel(requestID: .int(id), reason: "request timed out")
@@ -670,17 +680,19 @@ actor MCPUpstreamClient {
         return reply
     }
 
-    /// Races the reply against `requestTimeout` and cancellation of the
-    /// calling Task. The timer is cancelled and awaited before returning,
-    /// so no timer outlives its request.
-    private func awaitReply(id: Int) async -> Reply {
+    /// Races the reply against cancellation of the calling Task and, for
+    /// `.requestTimeout`, against `requestTimeout`. The timer is cancelled
+    /// and awaited before returning, so no timer outlives its request.
+    private func awaitReply(id: Int, deadline: Deadline) async -> Reply {
         let clock = self.clock
         let timeout = configuration.requestTimeout
         return await withTaskGroup(of: Void.self, returning: Reply.self) { group in
-            group.addTask {
-                await clock.sleep(for: timeout)
-                guard !Task.isCancelled else { return }
-                await self.settle(id: id, with: .timeout)
+            if case .requestTimeout = deadline {
+                group.addTask {
+                    await clock.sleep(for: timeout)
+                    guard !Task.isCancelled else { return }
+                    await self.settle(id: id, with: .timeout)
+                }
             }
             let reply = await withTaskCancellationHandler {
                 await waitForReply(id: id)
@@ -735,7 +747,8 @@ actor MCPUpstreamClient {
             } catch {
                 // A frame that is not JSON-RPC cannot be matched to a
                 // request or answered; a request it belonged to ends by
-                // its timeout.
+                // its timeout, or a `tools/call` by cancellation or the
+                // loss of the transport.
                 return
             }
             await dispatch(message)

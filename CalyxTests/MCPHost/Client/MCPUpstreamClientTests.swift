@@ -148,7 +148,9 @@ final class MCPUpstreamClientTests: XCTestCase {
 
     // MARK: - timeout cancels via the transport, never a hand-rolled frame
 
-    func test_callTool_timeout_cancelsRequestOnTransport() async throws {
+    /// `tools/call` has no request timeout (see the next test), so the
+    /// timeout path is exercised with `resources/read`.
+    func test_readResource_timeout_cancelsRequestOnTransport() async throws {
         let transport = InMemoryMCPTransport()
         let clock = ManualMCPClock()
         let requestTimeout: TimeInterval = 5
@@ -156,7 +158,7 @@ final class MCPUpstreamClientTests: XCTestCase {
         let baseline = try await negotiateModern(client, transport: transport)
 
         let sleepsBefore = clock.sleepDurations().count
-        let task = Task { await client.callTool(name: "slow_tool", arguments: [:], context: .none) }
+        let task = Task { try await client.readResource(uri: "ui://server/slow") }
         try await waitUntil { await transport.sentMessages().count == baseline + 1 }
         let sent = try decodeSent(await transport.sentMessages()[baseline])
         let id = sent["id"] as! Int
@@ -167,17 +169,55 @@ final class MCPUpstreamClientTests: XCTestCase {
         // timeout's own sleep to actually register first.
         try await waitUntil { clock.sleepDurations().count > sleepsBefore }
         clock.advance(by: requestTimeout)
-        let outcome = await task.value
-        guard case .protocolError(let error) = outcome else {
-            return XCTFail("expected timeout to surface as a protocol error outcome, got \(outcome)")
+        do {
+            _ = try await task.value
+            XCTFail("expected resources/read to time out")
+        } catch let error as MCPClientProtocolError {
+            XCTAssertEqual(error, .timeout)
         }
-        XCTAssertEqual(error, .timeout)
 
         let cancelled = await transport.cancelledRequestIDs()
         XCTAssertEqual(cancelled, [.int(id)])
         // No `notifications/cancelled` frame is ever sent by the client itself.
         let sentMethods = try await transport.sentMessages().map(decodeSent).compactMap { $0["method"] as? String }
         XCTAssertFalse(sentMethods.contains("notifications/cancelled"))
+    }
+
+    // MARK: - tools/call has no request timeout; other requests keep theirs
+
+    func test_callTool_outlivesTheRequestTimeout_whileAnotherRequestTimesOut() async throws {
+        let transport = InMemoryMCPTransport()
+        let clock = ManualMCPClock()
+        let requestTimeout: TimeInterval = 5
+        let client = makeClient(transport: transport, presenter: FakeElicitationPresenter(scriptedResponses: []), clock: clock, requestTimeout: requestTimeout)
+        let baseline = try await negotiateModern(client, transport: transport)
+
+        let callTask = Task { await client.callTool(name: "slow_tool", arguments: [:], context: .none) }
+        try await waitUntil { await transport.sentMessages().count == baseline + 1 }
+        let callID = try decodeSent(await transport.sentMessages()[baseline])["id"] as! Int
+
+        let sleepsBefore = clock.sleepDurations().count
+        let readTask = Task { try await client.readResource(uri: "ui://server/slow") }
+        try await waitUntil { await transport.sentMessages().count == baseline + 2 }
+        let readID = try decodeSent(await transport.sentMessages()[baseline + 1])["id"] as! Int
+        try await waitUntil { clock.sleepDurations().count > sleepsBefore }
+        clock.advance(by: requestTimeout * 3)
+
+        do {
+            _ = try await readTask.value
+            XCTFail("expected resources/read to time out")
+        } catch let error as MCPClientProtocolError {
+            XCTAssertEqual(error, .timeout, "every request other than tools/call keeps the request timeout")
+        }
+
+        await respondSuccess(transport, id: callID, resultJSON: #"{"content":[],"resultType":"complete"}"#)
+        let outcome = await callTask.value
+        guard case .result(let result) = outcome else {
+            return XCTFail("tools/call must still be waiting for its reply past the request timeout, got \(outcome)")
+        }
+        XCTAssertEqual(result.raw["resultType"]?.stringValue, "complete")
+        let cancelled = await transport.cancelledRequestIDs()
+        XCTAssertEqual(cancelled, [.int(readID)], "only the timed-out request is cancelled on the transport")
     }
 
     // MARK: - cancellation of the awaiting task cancels via the transport

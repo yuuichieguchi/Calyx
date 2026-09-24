@@ -40,10 +40,11 @@ protocol MCPAppViewHosting: AnyObject {
     func isStandalonePanel(_ id: MCPInvocationID) -> Bool
     func remapSurface(old: UUID, new: UUID)
     func teardownViews(forServer serverID: MCPServerID, reason: String) async
-    /// Calls an app tool (`MCPCatalogToolOrigin.app`) on the view in
-    /// `surfaceID` that registered it. Without such a view the result is
+    /// Calls an app tool (`MCPCatalogToolOrigin.app`) on the view
+    /// `viewID` in `surfaceID` that registered it. When that view is gone,
+    /// is not in `surfaceID`, or does not offer `name`, the result is
     /// `isError`.
-    func callAppTool(surfaceID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult
+    func callAppTool(surfaceID: UUID, viewID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult
     /// The upstream call finished. `result` is the same result returned to
     /// the agent, `isError` included. Records it and returns at once,
     /// without waiting for the view: `ui/notifications/tool-result` goes

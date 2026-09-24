@@ -182,12 +182,7 @@ final class MCPServerSettingsModel {
     func setEnabled(_ isEnabled: Bool, for config: MCPServerConfig) {
         var updated = config
         updated.isEnabled = isEnabled
-        do {
-            try requireDependencies().registry.update(updated)
-            rowErrors[config.id] = nil
-        } catch {
-            rowErrors[config.id] = Self.describe(error)
-        }
+        runRowAction(config.id) { try await $0.registry.update(updated) }
     }
 
     func retry(_ serverID: MCPServerID) {
@@ -265,7 +260,7 @@ final class MCPServerSettingsModel {
         // registered, so they are written first.
         try await writeSecrets(of: draft.transport, authDraft: draft.authDraft, serverID: config.id, secretStore: dependencies.secretStore)
         do {
-            try dependencies.registry.add(config)
+            try await dependencies.registry.add(config)
         } catch {
             try await dependencies.secretStore.deleteAll(forServer: config.id)
             throw error
@@ -319,7 +314,7 @@ final class MCPServerSettingsModel {
             auth: MCPServerDraftConversion.authConfig(transport: draft.transport, authDraft: draft.authDraft, existing: config.auth)
         )
         try await writeSecrets(of: draft.transport, authDraft: draft.authDraft, serverID: config.id, secretStore: dependencies.secretStore)
-        try dependencies.registry.update(updated)
+        try await dependencies.registry.update(updated)
         let kept = Set(MCPServerDraftConversion.secretKeys(of: updated.transport, serverID: config.id))
         for key in MCPServerDraftConversion.secretKeys(of: config.transport, serverID: config.id) where !kept.contains(key) {
             try await dependencies.secretStore.delete(key)

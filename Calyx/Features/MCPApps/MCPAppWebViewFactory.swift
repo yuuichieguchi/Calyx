@@ -244,4 +244,6 @@ enum MCPAppWebViewFactory {
 enum MCPAppWebViewFactoryError: Error, Equatable {
     /// A document origin did not form a URL.
     case invalidOrigin
+    /// The store dropped the view before its web view was built.
+    case viewRemoved
 }

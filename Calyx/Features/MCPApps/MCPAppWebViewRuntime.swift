@@ -72,13 +72,23 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         }
     }
 
+    /// A pane's dock and the container it was attached to. The dock is
+    /// detached through that container: a destroyed surface is no longer
+    /// found through `environment`.
+    private struct DockAttachment {
+        let dock: MCPAppDockView
+        weak var container: SplitContainerView?
+    }
+
     weak var store: MCPAppHostStore? {
         didSet { syncWithStore() }
     }
     let environment: any MCPAppRuntimeEnvironment
     let consentGate = MCPAppMessageConsentGate()
     private(set) var views: [UUID: ViewState] = [:]
-    private var docks: [UUID: MCPAppDockView] = [:]
+    /// Web views of views the store dropped, kept until `unmount`.
+    private var retiringMounts: [UUID: Mounted] = [:]
+    private var docks: [UUID: DockAttachment] = [:]
     private var observers: [NSObjectProtocol] = []
 
     init(environment: any MCPAppRuntimeEnvironment) {
@@ -98,8 +108,15 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
 
     // MARK: - MCPAppViewRuntime
 
+    /// Throws `MCPAppWebViewFactoryError.viewRemoved`, after removing the
+    /// compiled rule list, when the store dropped the view while the
+    /// configuration was being built.
     func mount(viewID: UUID, document: MCPAppViewDocument) async throws {
         let configuration = try await MCPAppWebViewFactory.makeViewConfiguration(document: document, additionalSchemeHandlers: [:])
+        guard store?.snapshot(viewID: viewID) != nil else {
+            await removeContentRuleList(identifier: document.contentRuleListIdentifier)
+            throw MCPAppWebViewFactoryError.viewRemoved
+        }
         guard let hostPageURL = MCPAppSchemeHandler.hostPageURL(hostOrigin: document.hostOrigin),
               let viewURL = MCPAppSchemeHandler.viewDocumentURL(viewOrigin: document.viewOrigin) else {
             throw MCPAppWebViewFactoryError.invalidOrigin
@@ -111,7 +128,11 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         MCPAppWebViewFactory.installBridge(into: webView, world: bridge.world, handler: bridge)
         let navigationGuard = MCPAppNavigationGuard(allowedInitialURLs: [hostPageURL, viewURL])
         navigationGuard.onDidFinishLoad = { [weak self] in self?.store?.viewDidLoadDocument(viewID: viewID) }
-        navigationGuard.onProcessTerminated = { [weak self] in self?.store?.viewProcessDidTerminate(viewID: viewID) }
+        navigationGuard.onProcessTerminated = { [weak self, weak bridge] in
+            // A dead process answers nothing: pending requests fail now.
+            bridge?.close()
+            self?.store?.viewProcessDidTerminate(viewID: viewID)
+        }
         let mediaDelegate = MCPAppMediaPermissionDelegate()
         webView.navigationDelegate = navigationGuard
         webView.uiDelegate = mediaDelegate
@@ -126,15 +147,20 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     }
 
     func send(_ message: JSONRPCMessage, to viewID: UUID) async throws -> JSONRPCMessage? {
-        guard let bridge = views[viewID]?.mounted?.bridge else { throw MCPAppBridgeError.viewUnavailable }
+        guard let bridge = mounted(viewID)?.bridge else { throw MCPAppBridgeError.viewUnavailable }
         return try await bridge.send(message)
+    }
+
+    /// The view's web view, whether its card is shown or already dropped.
+    private func mounted(_ viewID: UUID) -> Mounted? {
+        views[viewID]?.mounted ?? retiringMounts[viewID]
     }
 
     /// Sends `ui/resource-teardown` to a view that initialized (the host
     /// sends nothing before `initialized`) and waits up to 2 seconds.
     func requestTeardown(viewID: UUID) async {
         resolvePendingConsent(viewID: viewID)
-        guard let bridge = views[viewID]?.mounted?.bridge, bridge.hasReceivedInitialized else { return }
+        guard let bridge = mounted(viewID)?.bridge, bridge.hasReceivedInitialized else { return }
         let request = JSONRPCMessage.request(id: .string("teardown"), method: "ui/resource-teardown", params: [:])
         let wait = Self.teardownReplyWait
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
@@ -156,23 +182,34 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
 
     func unmount(viewID: UUID) {
         resolvePendingConsent(viewID: viewID)
-        guard let state = views[viewID], let mounted = state.mounted else { return }
-        state.mounted = nil
-        // A remounted view initializes again and gets a full host context.
-        state.lastHostContext = [:]
+        let mounted: Mounted
+        if let state = views[viewID], let shown = state.mounted {
+            state.mounted = nil
+            // A remounted view initializes again and gets a full host context.
+            state.lastHostContext = [:]
+            state.pane.setWebView(nil)
+            mounted = shown
+        } else if let retiring = retiringMounts.removeValue(forKey: viewID) {
+            mounted = retiring
+        } else {
+            return
+        }
         mounted.bridge.close()
         mounted.webView.stopLoading()
         MCPAppWebViewFactory.removeBridgeAndContent(from: mounted.webView, world: mounted.bridge.world)
         mounted.webView.navigationDelegate = nil
         mounted.webView.uiDelegate = nil
-        state.pane.setWebView(nil)
         let identifier = mounted.document.contentRuleListIdentifier
-        Task { @MainActor in
-            do {
-                try await MCPAppWebViewFactory.removeContentRuleList(identifier: identifier)
-            } catch {
-                logger.error("Could not remove content rule list \(identifier, privacy: .public): \(error, privacy: .public)")
-            }
+        Task { @MainActor [weak self] in
+            await self?.removeContentRuleList(identifier: identifier)
+        }
+    }
+
+    private func removeContentRuleList(identifier: String) async {
+        do {
+            try await MCPAppWebViewFactory.removeContentRuleList(identifier: identifier)
+        } catch {
+            logger.error("Could not remove content rule list \(identifier, privacy: .public): \(error, privacy: .public)")
         }
     }
 
@@ -204,14 +241,18 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
 
     /// The dock of `surfaceID`, attached to its leaf.
     private func dock(for surfaceID: UUID) -> MCPAppDockView? {
-        if let dock = docks[surfaceID] { return dock }
+        if let attachment = docks[surfaceID] { return attachment.dock }
         guard let container = environment.splitContainer(owningSurface: surfaceID) else { return nil }
         let dock = MCPAppDockView(surfaceID: surfaceID)
-        docks[surfaceID] = dock
+        docks[surfaceID] = DockAttachment(dock: dock, container: container)
         container.attachDock(dock, toLeaf: surfaceID)
         return dock
     }
 
+    /// Puts the card in its pane's dock or its standalone panel. The view's
+    /// `displayMode` is the only record of fullscreen: a card entering a
+    /// dock (first placement, return from PiP, a remapped surface) sets
+    /// the container's fullscreen from it.
     private func place(_ state: ViewState, snapshot: MCPAppViewSnapshot) {
         let viewID = snapshot.viewID
         if state.surfaceID != snapshot.surfaceID, let old = state.surfaceID {
@@ -221,8 +262,12 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
 
         if let surfaceID = snapshot.surfaceID {
             guard state.pipWindow == nil, let dock = dock(for: surfaceID) else { return }
+            let isEntering = !dock.panes.contains { $0 === state.pane }
             dock.add(state.pane)
             dock.setTitle(snapshot.title, forViewID: viewID)
+            if isEntering, state.displayMode == "fullscreen" {
+                docks[surfaceID]?.container?.setFullscreen(true, forLeaf: surfaceID)
+            }
         } else if state.panel == nil {
             let panel = MCPAppStandalonePanel(viewID: viewID, pane: state.pane)
             panel.title = snapshot.title
@@ -254,13 +299,17 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         Task { @MainActor in await store.close(viewID: viewID) }
     }
 
-    /// Drops the card of a view the store no longer has.
+    /// Drops the card of a view the store no longer has. A web view still
+    /// mounted is kept for `requestTeardown` and `unmount`.
     private func discard(viewID: UUID) {
         guard let state = views.removeValue(forKey: viewID) else { return }
+        if let mounted = state.mounted {
+            retiringMounts[viewID] = mounted
+        }
         state.pane.dismissPrompt()
         if let surfaceID = state.surfaceID {
             if state.displayMode == "fullscreen" {
-                environment.splitContainer(owningSurface: surfaceID)?.setFullscreen(false, forLeaf: surfaceID)
+                docks[surfaceID]?.container?.setFullscreen(false, forLeaf: surfaceID)
             }
             removeFromDock(viewID: viewID, surfaceID: surfaceID)
         }
@@ -270,11 +319,11 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
     }
 
     private func removeFromDock(viewID: UUID, surfaceID: UUID) {
-        guard let dock = docks[surfaceID] else { return }
-        dock.remove(viewID: viewID)
-        if dock.panes.isEmpty {
+        guard let attachment = docks[surfaceID] else { return }
+        attachment.dock.remove(viewID: viewID)
+        if attachment.dock.panes.isEmpty {
             docks.removeValue(forKey: surfaceID)
-            environment.splitContainer(owningSurface: surfaceID)?.detachDock(fromLeaf: surfaceID)
+            attachment.container?.detachDock(fromLeaf: surfaceID)
         }
     }
 
@@ -318,6 +367,8 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
                     )
                     // "pip" always reports a width and a height.
                     let pip = MCPAppPiPWindow(size: NSSize(width: dimensions.width!, height: dimensions.height!))
+                    // Closing the window is `ui/request-display-mode` inline.
+                    pip.onUserClose = { [weak self] in self?.applyDisplayMode("inline", viewID: viewID) }
                     state.pipWindow = pip
                     pip.present(state.pane, over: window)
                 }

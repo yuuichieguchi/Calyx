@@ -17,6 +17,8 @@ final class MCPAppViewPane: NSView {
     /// The content height before the view reports one with size-changed.
     static let initialContentHeight: CGFloat = 240
     static let headerHeight: CGFloat = 28
+    /// The prompt text's height limit; a longer text scrolls.
+    static let maxPromptTextHeight: CGFloat = 120
 
     let viewID: UUID
     var onClose: (() -> Void)?
@@ -285,10 +287,7 @@ final class MCPAppViewPane: NSView {
 
     private func showPrompt(message: String, buttons: [(title: String, identifier: String, action: () -> Void)]) {
         promptArea.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let label = NSTextField(wrappingLabelWithString: message)
-        label.maximumNumberOfLines = 6
-        label.lineBreakMode = .byTruncatingTail
-        promptArea.addArrangedSubview(label)
+        addPromptText(message)
         let row = NSStackView()
         row.orientation = .horizontal
         for button in buttons {
@@ -299,6 +298,46 @@ final class MCPAppViewPane: NSView {
         promptArea.addArrangedSubview(row)
         promptArea.isHidden = false
         preferredHeightDidChange()
+    }
+
+    /// Adds the prompt's text, whole: a read-only, selectable text view that
+    /// scrolls once it is taller than `maxPromptTextHeight`. The scroll view
+    /// joins `promptArea` before its constraints are activated, because a
+    /// constraint between views with no common ancestor raises.
+    private func addPromptText(_ message: String) {
+        let insets = promptArea.edgeInsets.left + promptArea.edgeInsets.right
+        let textView = NSTextView(usingTextLayoutManager: false)
+        textView.frame = NSRect(x: 0, y: 0, width: max(bounds.width - insets, 120), height: 0)
+        textView.string = message
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.font = .systemFont(ofSize: NSFont.systemFontSize)
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.textContainer?.widthTracksTextView = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+
+        let scrollView = NSScrollView()
+        scrollView.documentView = textView
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+
+        var textHeight: CGFloat = 0
+        if let layoutManager = textView.layoutManager, let container = textView.textContainer {
+            layoutManager.ensureLayout(for: container)
+            textHeight = ceil(layoutManager.usedRect(for: container).height)
+        }
+        promptArea.addArrangedSubview(scrollView)
+        NSLayoutConstraint.activate([
+            scrollView.widthAnchor.constraint(equalTo: promptArea.widthAnchor, constant: -insets),
+            scrollView.heightAnchor.constraint(equalToConstant: min(max(textHeight, 1), Self.maxPromptTextHeight)),
+        ])
     }
 
     private func hidePrompt() {

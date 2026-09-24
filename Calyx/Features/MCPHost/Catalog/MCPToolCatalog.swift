@@ -11,8 +11,9 @@ import Foundation
 enum MCPCatalogToolOrigin: Sendable, Equatable {
     /// A tool of the upstream server.
     case server
-    /// A tool registered by the view in that pane. Calls go to the view.
-    case app(surfaceID: UUID)
+    /// A tool registered by the view `viewID` in that pane. Calls go to
+    /// that view.
+    case app(surfaceID: UUID, viewID: UUID)
 }
 
 struct MCPCatalogResolvedTool: Sendable, Equatable {
@@ -42,6 +43,8 @@ struct MCPCatalogResult: Sendable, Equatable {
 
 struct MCPCatalogPaneAppTool: Sendable, Equatable {
     let surfaceID: UUID
+    /// The view that registered the tool.
+    let viewID: UUID
     /// The server that owns the view. Its alias prefixes the exported name.
     let serverID: MCPServerID
     let name: String
@@ -161,7 +164,7 @@ enum MCPToolCatalog {
                 serverID: appTool.serverID,
                 serverDisplayName: server.displayName,
                 upstreamToolName: appTool.name,
-                origin: .app(surfaceID: appTool.surfaceID),
+                origin: .app(surfaceID: appTool.surfaceID, viewID: appTool.viewID),
                 definition: appTool.definition,
                 exportedRaw: appTool.definition.raw
             ))

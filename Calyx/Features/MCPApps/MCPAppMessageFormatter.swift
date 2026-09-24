@@ -50,6 +50,23 @@ enum MCPAppMessageFormatter {
         try format(content: content, imageDirectory: imageDirectory)
     }
 
+    /// `format(content:imageDirectory:)` run on `DispatchQueue.global()`,
+    /// so the image writes leave the caller's actor.
+    static func formatOffCallerActor(
+        content: [MCPMessageContentBlock],
+        imageDirectory directory: URL
+    ) async throws -> (pastedText: String, writtenFilePaths: [String]) {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global().async {
+                do {
+                    continuation.resume(returning: try format(content: content, imageDirectory: directory))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     /// `format(content:)` writing images under `directory`.
     static func format(
         content: [MCPMessageContentBlock],

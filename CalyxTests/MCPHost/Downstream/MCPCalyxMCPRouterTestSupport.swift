@@ -85,7 +85,7 @@ final class NoOpAppViewHosting: MCPAppViewHosting {
     func isStandalonePanel(_ id: MCPInvocationID) -> Bool { false }
     func remapSurface(old: UUID, new: UUID) {}
     func teardownViews(forServer serverID: MCPServerID, reason: String) async {}
-    func callAppTool(surfaceID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult {
+    func callAppTool(surfaceID: UUID, viewID: UUID, name: String, arguments: [String: AnyCodable]) async -> MCPCallToolResult {
         MCPCallToolResult(raw: [:])
     }
     func uiToolInvocationDidFinish(_ id: MCPInvocationID, result: MCPCallToolResult) async {}

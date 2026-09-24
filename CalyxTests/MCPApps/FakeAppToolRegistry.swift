@@ -47,10 +47,12 @@ final class FakeAppToolRegistry: MCPAppToolRegistry {
     }
 
     func appTools(forSurface surfaceID: UUID) -> [MCPCatalogPaneAppTool] {
-        toolsByViewID.values
-            .filter { $0.surfaceID == surfaceID }
-            .flatMap { entry in
-                entry.tools.map { MCPCatalogPaneAppTool(surfaceID: entry.surfaceID, serverID: entry.serverID, name: $0.name, definition: $0) }
+        toolsByViewID
+            .filter { $0.value.surfaceID == surfaceID }
+            .flatMap { viewID, entry in
+                entry.tools.map {
+                    MCPCatalogPaneAppTool(surfaceID: entry.surfaceID, viewID: viewID, serverID: entry.serverID, name: $0.name, definition: $0)
+                }
             }
     }
 }

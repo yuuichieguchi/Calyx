@@ -16,7 +16,7 @@
 //
 //    enum MCPCatalogToolOrigin: Sendable, Equatable {
 //        case server
-//        case app(surfaceID: UUID)
+//        case app(surfaceID: UUID, viewID: UUID)
 //    }
 //    struct MCPCatalogResolvedTool: Sendable, Equatable {
 //        let exportedName: String
@@ -37,6 +37,7 @@
 //    }
 //    struct MCPCatalogPaneAppTool: Sendable, Equatable {
 //        let surfaceID: UUID
+//        let viewID: UUID            // the view that registered the tool
 //        let serverID: MCPServerID   // the server owning the view (alias is that server's)
 //        let name: String
 //        let definition: MCPToolDefinition
@@ -49,7 +50,7 @@
 //    }
 //
 //  App tools (§8, resolved text): each `MCPCatalogPaneAppTool` entry
-//  becomes an `MCPCatalogResolvedTool` with `origin: .app(surfaceID:)`,
+//  becomes an `MCPCatalogResolvedTool` with `origin: .app(surfaceID:viewID:)`,
 //  `exportedName = MCPExportedName.name(alias:, upstreamToolName: "app_" +
 //  name, isTaken:)`, and `upstreamToolName = name` (NOT "app_" + name --
 //  the "app_" prefix is folded into the NAME GENERATION step only). A name
@@ -326,12 +327,13 @@ final class MCPToolCatalogTests: XCTestCase {
     func test_paneAppTool_exportedWithAppPrefixedNameAndOwningSurfaceOrigin() throws {
         let serverID = MCPServerID()
         let surfaceID = UUID()
+        let viewID = UUID()
         let appDefinition = try MCPToolDefinition(raw: [
             "name": AnyCodable("record_event"),
             "description": AnyCodable("d"),
             "inputSchema": AnyCodable(["type": AnyCodable("object")]),
         ])
-        let paneAppTool = MCPCatalogPaneAppTool(surfaceID: surfaceID, serverID: serverID, name: "record_event", definition: appDefinition)
+        let paneAppTool = MCPCatalogPaneAppTool(surfaceID: surfaceID, viewID: viewID, serverID: serverID, name: "record_event", definition: appDefinition)
 
         let result = MCPToolCatalog.build(
             serverTools: [serverID: (alias: alias("srv"), displayName: "srv", tools: [], clientDeclaredUI: true)],
@@ -345,7 +347,8 @@ final class MCPToolCatalogTests: XCTestCase {
         XCTAssertEqual(resolved.upstreamToolName, "record_event",
                        "upstreamToolName is the bare name, NOT \"app_\" + name -- the app_ prefix is folded " +
                        "only into the exported-name generation step")
-        XCTAssertEqual(resolved.origin, .app(surfaceID: surfaceID))
+        XCTAssertEqual(resolved.origin, .app(surfaceID: surfaceID, viewID: viewID),
+                       "the origin names the pane and the view that registered the tool")
         XCTAssertEqual(resolved.serverID, serverID)
     }
 
@@ -361,7 +364,7 @@ final class MCPToolCatalogTests: XCTestCase {
             "description": AnyCodable("d"),
             "inputSchema": AnyCodable(["type": AnyCodable("object")]),
         ])
-        let paneAppTool = MCPCatalogPaneAppTool(surfaceID: surfaceID, serverID: serverID, name: "widget", definition: appDefinition)
+        let paneAppTool = MCPCatalogPaneAppTool(surfaceID: surfaceID, viewID: UUID(), serverID: serverID, name: "widget", definition: appDefinition)
 
         let result = MCPToolCatalog.build(
             serverTools: [serverID: (alias: alias("srv"), displayName: "srv", tools: [serverTool], clientDeclaredUI: true)],

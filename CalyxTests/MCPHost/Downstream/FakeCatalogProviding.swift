@@ -34,7 +34,7 @@ actor FakeCatalogProviding: MCPCatalogProviding {
     func resolve(exportedName: String, surfaceID: UUID?) async -> MCPCatalogResolvedTool? {
         resolveCalls.append((exportedName, surfaceID))
         guard let tool = resolvedTools[exportedName] else { return nil }
-        if case .app(let owner) = tool.origin, owner != surfaceID {
+        if case .app(let owner, _) = tool.origin, owner != surfaceID {
             return nil
         }
         return tool
