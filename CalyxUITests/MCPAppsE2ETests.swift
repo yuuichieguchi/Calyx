@@ -105,9 +105,6 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
     private static let promptContainerID = "calyx.mcpApps.prompt.container"
     private static let promptPrimaryButtonID = "calyx.mcpApps.prompt.primaryButton"
     private static let standalonePanelPrefix = "calyx.mcpApps.standalonePanel."
-    private static let viewStateLabelPredicate = NSPredicate(
-        format: "identifier BEGINSWITH 'calyx.mcpApps.view.' AND identifier ENDSWITH '.stateLabel'"
-    )
 
     // MARK: - Scoped launch + fixture pre-registration
 
@@ -502,7 +499,9 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
     }
 
     func anyViewStateLabel() -> XCUIElement {
-        app.staticTexts.matching(Self.viewStateLabelPredicate).firstMatch
+        app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH 'calyx.mcpApps.view.' AND identifier ENDSWITH '.stateLabel'"
+        )).firstMatch
     }
 
     func anyStandalonePanel() -> XCUIElement {
