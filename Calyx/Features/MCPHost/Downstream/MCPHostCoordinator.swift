@@ -74,8 +74,10 @@ final class MCPHostCoordinator {
         return clientDeclaredUI ? .stepAside : .render(surfaceID: nil)
     }
 
-    /// Returns the upstream or view result verbatim, or an `isError` result
-    /// naming why the call could not be made.
+    /// Returns the view's result verbatim, the upstream result with its
+    /// `ui://` resource URIs exported under the server's alias (as in
+    /// `tools/list`), or an `isError` result naming why the call could
+    /// not be made.
     func callProxiedTool(
         exportedName: String,
         arguments: [String: AnyCodable],
@@ -130,7 +132,8 @@ final class MCPHostCoordinator {
 
         let outcome = await connection.callTool(name: resolved.upstreamToolName, arguments: arguments, context: context)
         let result = Self.result(for: outcome, serverDisplayName: resolved.serverDisplayName)
-        // The view receives the same result the agent does.
+        // The view receives the result the agent does, in the upstream
+        // server's namespace its session is bound to.
         if let renderedInvocationID {
             if case .cancelled = outcome {
                 await viewHosting.uiToolInvocationWasCancelled(renderedInvocationID)
@@ -138,7 +141,15 @@ final class MCPHostCoordinator {
                 await viewHosting.uiToolInvocationDidFinish(renderedInvocationID, result: result)
             }
         }
-        return result
+        return Self.exportedForAgent(result, alias: resolved.serverAlias)
+    }
+
+    /// `result` with the `ui://` resource URIs of its `_meta` exported
+    /// under `alias`, the way the catalog exports the tool's definition,
+    /// so the agent can read the resource through Calyx. A result without
+    /// `_meta` is unchanged: `_meta.ui` is not added from the definition.
+    private static func exportedForAgent(_ result: MCPCallToolResult, alias: MCPServerAlias) -> MCPCallToolResult {
+        MCPCallToolResult(raw: MCPUIResourceURI.exportingUIMeta(inRaw: result.raw, alias: alias.rawValue))
     }
 
     // MARK: - Waiting for the connection

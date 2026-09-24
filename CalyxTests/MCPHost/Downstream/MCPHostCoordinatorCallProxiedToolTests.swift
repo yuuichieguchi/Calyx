@@ -190,11 +190,11 @@ final class MCPHostCoordinatorCallProxiedToolTests: XCTestCase {
 
     private func resolvedTool(
         exportedName: String, serverID: MCPServerID, serverDisplayName: String = "Weather Service",
-        upstreamToolName: String, definition: MCPToolDefinition, origin: MCPCatalogToolOrigin = .server
+        serverAlias: String = "srv", upstreamToolName: String, definition: MCPToolDefinition, origin: MCPCatalogToolOrigin = .server
     ) -> MCPCatalogResolvedTool {
         MCPCatalogResolvedTool(
             exportedName: exportedName, serverID: serverID, serverDisplayName: serverDisplayName,
-            upstreamToolName: upstreamToolName,
+            serverAlias: MCPServerAlias(rawValue: serverAlias)!, upstreamToolName: upstreamToolName,
             origin: origin, definition: definition, exportedRaw: definition.raw
         )
     }
@@ -827,5 +827,123 @@ final class MCPHostCoordinatorCallProxiedToolTests: XCTestCase {
         let toolCallCount = await connection.toolCallCount
         XCTAssertEqual(toolCallCount, 1)
         XCTAssertTrue(store.hasActiveView(forSurface: surfaceID), "the view was registered before the upstream call")
+    }
+
+    // MARK: - `ui://` resource URIs in a server tool's result are exported (K62)
+
+    private func uiMetaResult(resourceUri: String, flatResourceUri: String?) -> [String: AnyCodable] {
+        var meta: [String: AnyCodable] = [
+            "ui": AnyCodable([
+                "resourceUri": AnyCodable(resourceUri),
+                "visibility": AnyCodable([AnyCodable("model")]),
+            ]),
+            "io.modelcontextprotocol/serverInfo": AnyCodable(["name": AnyCodable("weather")]),
+        ]
+        if let flatResourceUri { meta["ui/resourceUri"] = AnyCodable(flatResourceUri) }
+        return [
+            "content": AnyCodable([AnyCodable(["type": AnyCodable("text"), "text": AnyCodable("72F")])]),
+            "structuredContent": AnyCodable(["temp": AnyCodable(72)]),
+            "_meta": AnyCodable(meta),
+        ]
+    }
+
+    private func callWeather(_ coordinator: MCPHostCoordinator, surfaceID: UUID?, clientDeclaredUI: Bool = false) async -> MCPCallToolResult {
+        await coordinator.callProxiedTool(
+            exportedName: "srv-get_weather", arguments: [:], surfaceID: surfaceID, clientName: nil,
+            clientDeclaredUI: clientDeclaredUI,
+            cancellationKey: MCPDownstreamCancellationKey(sessionNonce: nil, requestID: .int(62)),
+            progress: nil
+        )
+    }
+
+    func test_serverToolResult_uiResourceUriAndFlatKey_exportedUnderTheServersAlias() async throws {
+        let serverID = MCPServerID(rawValue: UUID())
+        let connection = FakeUpstreamConnection(serverID: serverID, initialState: readyState(), initialTools: [try tool("get_weather")])
+        await connection.enqueueToolCallOutcome(.result(MCPCallToolResult(
+            raw: uiMetaResult(resourceUri: "ui://weather/card.html", flatResourceUri: "ui://weather/card.html")
+        )))
+        let catalog = FakeCatalogProviding(resolvedTools: [
+            "srv-get_weather": resolvedTool(
+                exportedName: "srv-get_weather", serverID: serverID, serverAlias: "fx",
+                upstreamToolName: "get_weather", definition: try tool("get_weather")
+            ),
+        ])
+        let coordinator = makeCoordinator(connections: [serverID: connection], catalog: catalog, viewHosting: FakeViewHost())
+
+        let result = await callWeather(coordinator, surfaceID: nil, clientDeclaredUI: true)
+
+        let expected = uiMetaResult(resourceUri: "ui://fx/weather/card.html", flatResourceUri: "ui://fx/weather/card.html")
+        XCTAssertEqual(result.raw, expected,
+                       "both _meta.ui.resourceUri and the deprecated flat key are exported the way tools/list exports them; nothing else changes")
+    }
+
+    func test_serverToolResult_nonUIResourceUri_leftAsIs() async throws {
+        let serverID = MCPServerID(rawValue: UUID())
+        let connection = FakeUpstreamConnection(serverID: serverID, initialState: readyState(), initialTools: [try tool("get_weather")])
+        let raw = uiMetaResult(resourceUri: "https://weather.example/card.html", flatResourceUri: "https://weather.example/card.html")
+        await connection.enqueueToolCallOutcome(.result(MCPCallToolResult(raw: raw)))
+        let catalog = FakeCatalogProviding(resolvedTools: [
+            "srv-get_weather": resolvedTool(exportedName: "srv-get_weather", serverID: serverID, upstreamToolName: "get_weather", definition: try tool("get_weather")),
+        ])
+        let coordinator = makeCoordinator(connections: [serverID: connection], catalog: catalog, viewHosting: FakeViewHost())
+
+        let result = await callWeather(coordinator, surfaceID: nil, clientDeclaredUI: true)
+
+        XCTAssertEqual(result.raw, raw, "a resourceUri that is not ui:// is not rewritten, as in tools/list")
+    }
+
+    func test_serverToolResult_withoutUIMeta_getsNoUIMetaFromTheToolDefinition() async throws {
+        let (serverID, connection, catalog) = try uiToolFixture()
+        let raw: [String: AnyCodable] = [
+            "content": AnyCodable([AnyCodable(["type": AnyCodable("text"), "text": AnyCodable("shown")])]),
+            "structuredContent": AnyCodable(["action": AnyCodable("none")]),
+        ]
+        await connection.enqueueToolCallOutcome(.result(MCPCallToolResult(raw: raw)))
+        let coordinator = makeCoordinator(connections: [serverID: connection], catalog: catalog, viewHosting: FakeViewHost())
+
+        let result = await callWeather(coordinator, surfaceID: UUID())
+
+        XCTAssertEqual(result.raw, raw,
+                       "the definition's _meta.ui is not copied into a result that carries none (plan section 4: results are forwarded raw)")
+    }
+
+    func test_renderedCall_viewReceivesTheUpstreamURI_agentReceivesTheExportedURI() async throws {
+        let (serverID, connection, catalog) = try uiToolFixture()
+        let upstreamRaw = uiMetaResult(resourceUri: "ui://weather/card.html", flatResourceUri: nil)
+        await connection.enqueueToolCallOutcome(.result(MCPCallToolResult(raw: upstreamRaw)))
+        let viewHost = FakeViewHost()
+        let coordinator = makeCoordinator(connections: [serverID: connection], catalog: catalog, viewHosting: viewHost)
+
+        let result = await callWeather(coordinator, surfaceID: UUID())
+
+        XCTAssertEqual(result.raw, uiMetaResult(resourceUri: "ui://srv/weather/card.html", flatResourceUri: nil),
+                       "the agent reads resources through Calyx, so it gets the ui://<alias>/... form")
+        XCTAssertEqual(viewHost.finishedInvocations.first?.result.raw, upstreamRaw,
+                       "the view's session is bound to the upstream server and reads the upstream URI")
+    }
+
+    func test_appOriginToolResult_uiResourceUri_notRewritten() async throws {
+        let serverID = MCPServerID(rawValue: UUID())
+        let appSurfaceID = UUID()
+        let connection = FakeUpstreamConnection(serverID: serverID, initialState: readyState(), initialTools: [])
+        let catalog = FakeCatalogProviding(resolvedTools: [
+            "srv-app_pick": resolvedTool(
+                exportedName: "srv-app_pick", serverID: serverID, upstreamToolName: "pick",
+                definition: try tool("pick"), origin: .app(surfaceID: appSurfaceID, viewID: UUID())
+            ),
+        ])
+        let viewHost = FakeViewHost()
+        let raw = uiMetaResult(resourceUri: "ui://weather/card.html", flatResourceUri: "ui://weather/card.html")
+        viewHost.appToolResult = MCPCallToolResult(raw: raw)
+        let coordinator = makeCoordinator(connections: [serverID: connection], catalog: catalog, viewHosting: viewHost)
+
+        let result = await coordinator.callProxiedTool(
+            exportedName: "srv-app_pick", arguments: [:], surfaceID: appSurfaceID, clientName: nil,
+            clientDeclaredUI: false,
+            cancellationKey: MCPDownstreamCancellationKey(sessionNonce: nil, requestID: .int(63)),
+            progress: nil
+        )
+
+        XCTAssertEqual(result.raw, raw, "an app tool's definition is exported verbatim (MCPToolCatalog), and so is its result")
     }
 }

@@ -3690,4 +3690,97 @@ final class AgentRegistryConversationEndedTests: XCTestCase {
         XCTAssertTrue(recorder.surfaceIDs.isEmpty)
         registry.reset()
     }
+
+
+    // MARK: - A plain shell pane never posts; a real agent exit does (K63)
+
+    /// The MCP Apps E2E panes: a login shell running commands (`sh <script>`,
+    /// `cat -u > <file>`), with Calyx's shell integration and ghostty's OSC
+    /// 133 reporting every command, and no agent. No path creates a row for
+    /// such a pane, so nothing enters `.done` and nothing posts.
+    func test_plainShellPane_finishingCommands_neverPosts() {
+        let registry = AgentRegistry()
+        registry.markServerStarted()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        let start = Date()
+
+        for step in 0..<3 {
+            let now = start.addingTimeInterval(Double(step))
+            registry.recordCalyxShellIntegrationReported(surfaceID: surfaceID, phase: .commandStart, now: now)
+            XCTAssertFalse(registry.handlePaneCommandFinished(surfaceID: surfaceID, exitCode: 0, now: now))
+            XCTAssertFalse(registry.handleGhosttyCommandFinished(surfaceID: surfaceID, exitCode: 0, now: now))
+            registry.handleScreenClassification(surfaceID: surfaceID, state: nil, now: now)
+        }
+        XCTAssertFalse(registry.handlePaneCommandFinished(surfaceID: surfaceID, exitCode: 130))
+        registry.sweepStaleEntries(now: start.addingTimeInterval(3600))
+
+        XCTAssertNil(registry.entries[surfaceID], "a pane with no agent never gets a row")
+        XCTAssertTrue(recorder.surfaceIDs.isEmpty)
+        registry.reset()
+    }
+
+    /// Only ghostty's OSC 133 reports on a bash pane (no Calyx shell
+    /// integration there); with no row it defers nothing and settles
+    /// nothing.
+    func test_plainShellPane_ghosttyOnly_neverPosts() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        let start = Date()
+
+        XCTAssertFalse(registry.handleGhosttyCommandFinished(surfaceID: surfaceID, exitCode: 0, now: start))
+        XCTAssertFalse(registry.handleGhosttyCommandFinished(surfaceID: surfaceID, exitCode: 1, now: start.addingTimeInterval(1)))
+        registry.sweepStaleEntries(now: start.addingTimeInterval(3600))
+
+        XCTAssertNil(registry.entries[surfaceID])
+        XCTAssertTrue(recorder.surfaceIDs.isEmpty)
+    }
+
+    /// An inferred row is never settled by a finished command.
+    func test_titleHeuristicRow_finishingCommands_neverPosts() {
+        let registry = AgentRegistry()
+        registry.markServerStarted()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        let start = Date()
+        registry.handleScreenClassification(surfaceID: surfaceID, state: .working, now: start)
+        XCTAssertEqual(registry.entries[surfaceID]?.source, .titleHeuristic, "precondition: an inferred row")
+
+        XCTAssertFalse(registry.handlePaneCommandFinished(surfaceID: surfaceID, exitCode: 0, now: start.addingTimeInterval(1)))
+        XCTAssertFalse(registry.handleGhosttyCommandFinished(surfaceID: surfaceID, exitCode: 0, now: start.addingTimeInterval(2)))
+        registry.sweepStaleEntries(now: start.addingTimeInterval(3600))
+
+        XCTAssertNotEqual(registry.entries[surfaceID]?.state, .done)
+        XCTAssertTrue(recorder.surfaceIDs.isEmpty)
+        registry.reset()
+    }
+
+    /// The agent CLI (hook-tracked since `SessionStart`) exits and the
+    /// shell's prompt returns: the conversation ended.
+    func test_hookTrackedAgent_exitReportedByTheShell_posts() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID)
+        registry.handleHookEvent(event("Stop"), surfaceID: surfaceID)
+
+        XCTAssertTrue(registry.handlePaneCommandFinished(surfaceID: surfaceID, exitCode: 0))
+        registry.handleHookEvent(event("SessionEnd"), surfaceID: surfaceID)
+
+        XCTAssertEqual(recorder.surfaceIDs, [surfaceID], "one exit posts once")
+    }
+
+    /// The same exit seen only by ghostty on a bash pane, settled by the
+    /// ghostty signal itself.
+    func test_hookTrackedAgent_exitReportedByGhostty_posts() {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID)
+
+        XCTAssertTrue(registry.handleGhosttyCommandFinished(surfaceID: surfaceID, exitCode: 0))
+
+        XCTAssertEqual(recorder.surfaceIDs, [surfaceID])
+    }
 }

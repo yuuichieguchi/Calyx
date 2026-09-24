@@ -21,6 +21,9 @@ struct MCPCatalogResolvedTool: Sendable, Equatable {
     let serverID: MCPServerID
     /// Title for sign-in prompts and standalone panels.
     let serverDisplayName: String
+    /// The alias the server's tool names and `ui://` resource URIs are
+    /// exported under.
+    let serverAlias: MCPServerAlias
     let upstreamToolName: String
     let origin: MCPCatalogToolOrigin
     let definition: MCPToolDefinition
@@ -130,6 +133,7 @@ enum MCPToolCatalog {
                 exportedName: exportedName,
                 serverID: candidate.serverID,
                 serverDisplayName: candidate.displayName,
+                serverAlias: candidate.alias,
                 upstreamToolName: candidate.tool.name,
                 origin: .server,
                 definition: candidate.tool,
@@ -163,6 +167,7 @@ enum MCPToolCatalog {
                 exportedName: name,
                 serverID: appTool.serverID,
                 serverDisplayName: server.displayName,
+                serverAlias: server.alias,
                 upstreamToolName: appTool.name,
                 origin: .app(surfaceID: appTool.surfaceID, viewID: appTool.viewID),
                 definition: appTool.definition,
@@ -197,22 +202,12 @@ enum MCPToolCatalog {
     }
 
     /// Rewrites both `_meta.ui.resourceUri` and the deprecated flat
-    /// `_meta["ui/resourceUri"]` when they hold a `ui://` URI.
+    /// `_meta["ui/resourceUri"]` when they hold a `ui://` URI
+    /// (`MCPUIResourceURI.exportingUIMeta`, shared with proxied results).
     private static func exportedRaw(for tool: MCPToolDefinition, alias: MCPServerAlias) -> [String: AnyCodable] {
-        var raw = MCPXMCPHeaderValidation.strippingXMCPHeaderAnnotations(from: tool.raw)
-        guard var meta = raw["_meta"]?.objectValue else { return raw }
-
-        if var ui = meta["ui"]?.objectValue,
-           let uri = ui["resourceUri"]?.stringValue,
-           let exported = MCPUIResourceURI.export(upstreamURI: uri, alias: alias.rawValue) {
-            ui["resourceUri"] = AnyCodable(exported)
-            meta["ui"] = AnyCodable(ui)
-        }
-        if let uri = meta["ui/resourceUri"]?.stringValue,
-           let exported = MCPUIResourceURI.export(upstreamURI: uri, alias: alias.rawValue) {
-            meta["ui/resourceUri"] = AnyCodable(exported)
-        }
-        raw["_meta"] = AnyCodable(meta)
-        return raw
+        MCPUIResourceURI.exportingUIMeta(
+            inRaw: MCPXMCPHeaderValidation.strippingXMCPHeaderAnnotations(from: tool.raw),
+            alias: alias.rawValue
+        )
     }
 }

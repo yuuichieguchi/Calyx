@@ -349,6 +349,76 @@ final class MCPUpstreamSupervisorTests: XCTestCase {
         try await waitUntil { open() == 0 }
         XCTAssertEqual(open(), 0, "every connection the supervisor started is stopped; none leaked")
     }
+
+    // MARK: - A crash after ready reaches the Settings row (K65)
+
+    /// A stdio MCP server (legacy handshake, newline-delimited JSON) that
+    /// answers `initialize` and `tools/list` with one UI tool, then exits
+    /// with status 1 half a second later: a crash after `ready`.
+    private static let crashingServerScript = """
+    import json, sys, threading, os, time
+    def send(message):
+        sys.stdout.write(json.dumps(message) + "\\n")
+        sys.stdout.flush()
+    def crash_soon():
+        time.sleep(0.5)
+        os._exit(1)
+    for line in sys.stdin:
+        message = json.loads(line)
+        method = message.get("method")
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "crashing", "version": "1.0"}}})
+        elif method == "tools/list":
+            send({"jsonrpc": "2.0", "id": message["id"], "result": {"tools": [{
+                "name": "show", "inputSchema": {"type": "object"},
+                "_meta": {"ui": {"resourceUri": "ui://crashing/show.html"}}}]}})
+            threading.Thread(target=crash_soon).start()
+        elif "id" in message:
+            send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "no"}})
+    """
+
+    func test_crashAfterReady_reachesTheSettingsRowAsDisconnected() async throws {
+        let harness = makeHarness()
+        let config = MCPServerConfig(
+            id: MCPServerID(),
+            alias: try XCTUnwrap(MCPServerAlias(rawValue: "crashing")),
+            displayName: "Crashing Server",
+            isEnabled: true,
+            transport: .stdio(command: "/usr/bin/python3", args: ["-u", "-c", Self.crashingServerScript], envNames: [], cwd: nil),
+            auth: nil
+        )
+        try await harness.registry.add(config)
+        let model = MCPServerSettingsModel()
+        model.configure(MCPServerSettingsModel.Dependencies(
+            registry: harness.registry,
+            connections: harness.supervisor,
+            catalog: FakeCatalogProviding(),
+            secretStore: harness.secretStore,
+            actions: MCPSupervisorSettingsActions(supervisor: harness.supervisor)
+        ))
+
+        await harness.supervisor.connectAll()
+        // What the composition root does on `.calyxMCPConnectionsDidChange`.
+        model.refreshConnections()
+        var seen: [String] = []
+        let deadline = Date().addingTimeInterval(10)
+        while Date() < deadline, !seen.contains(where: { $0.contains("Disconnected") }) {
+            let text = model.rowState(for: config).statusText
+            if seen.last != text { seen.append(text) }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await harness.supervisor.disconnectAll()
+
+        let readyIndex = try XCTUnwrap(seen.firstIndex(of: "1 tool, 1 with UI"), "the row never showed ready -- saw \(seen)")
+        let disconnectedIndex = try XCTUnwrap(
+            seen.firstIndex(of: "Disconnected (reconnecting)"),
+            "a crash after ready must reach the row as disconnected -- saw \(seen)"
+        )
+        XCTAssertLessThan(readyIndex, disconnectedIndex, "saw \(seen)")
+    }
 }
 
 /// Records the connection states the supervisor forwards. While

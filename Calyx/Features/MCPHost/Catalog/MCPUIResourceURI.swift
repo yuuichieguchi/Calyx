@@ -18,6 +18,34 @@ enum MCPUIResourceURI {
         return scheme + alias + "/" + upstreamURI.dropFirst(scheme.count)
     }
 
+    /// `meta` (a tool's or a tool result's `_meta`) with `ui.resourceUri`
+    /// and the deprecated flat `ui/resourceUri` exported under `alias` when
+    /// they hold a `ui://` URI. Every other key and value is unchanged.
+    static func exportingUIMeta(_ meta: [String: AnyCodable], alias: String) -> [String: AnyCodable] {
+        var meta = meta
+        if var ui = meta["ui"]?.objectValue,
+           let uri = ui["resourceUri"]?.stringValue,
+           let exported = export(upstreamURI: uri, alias: alias) {
+            ui["resourceUri"] = AnyCodable(exported)
+            meta["ui"] = AnyCodable(ui)
+        }
+        if let uri = meta["ui/resourceUri"]?.stringValue,
+           let exported = export(upstreamURI: uri, alias: alias) {
+            meta["ui/resourceUri"] = AnyCodable(exported)
+        }
+        return meta
+    }
+
+    /// `raw` (a tool definition or a `tools/call` result) with its
+    /// `_meta` passed through `exportingUIMeta`. A `raw` without an object
+    /// `_meta` is returned unchanged: nothing is added.
+    static func exportingUIMeta(inRaw raw: [String: AnyCodable], alias: String) -> [String: AnyCodable] {
+        guard let meta = raw["_meta"]?.objectValue else { return raw }
+        var raw = raw
+        raw["_meta"] = AnyCodable(exportingUIMeta(meta, alias: alias))
+        return raw
+    }
+
     /// Splits `ui://<alias>/<rest>` into the alias and `ui://<rest>`. Nil for
     /// any other scheme, and when there is no `/` after a non-empty alias.
     static func resolve(exportedURI: String) -> (alias: String, upstreamURI: String)? {

@@ -116,11 +116,11 @@ final class MCPCalyxMCPRouterTests: XCTestCase {
 
     private func resolvedTool(
         exportedName: String, serverID: MCPServerID, serverDisplayName: String = "Weather Service",
-        upstreamToolName: String, definition: MCPToolDefinition
+        serverAlias: String = "srv", upstreamToolName: String, definition: MCPToolDefinition
     ) -> MCPCatalogResolvedTool {
         MCPCatalogResolvedTool(
             exportedName: exportedName, serverID: serverID, serverDisplayName: serverDisplayName,
-            upstreamToolName: upstreamToolName,
+            serverAlias: MCPServerAlias(rawValue: serverAlias)!, upstreamToolName: upstreamToolName,
             origin: .server, definition: definition, exportedRaw: definition.raw
         )
     }
@@ -566,5 +566,43 @@ final class MCPCalyxMCPRouterTests: XCTestCase {
         }
         XCTAssertTrue(observed, "the route's Task must be cancelled (and that cancellation must reach the upstream " +
                       "connection's callTool) once the request's own stream stops being consumed")
+    }
+
+    // MARK: - A proxied result's `ui://` resource URI reaches the client exported (K62)
+
+    func test_toolsCall_resultUIResourceUri_bothGenerations_exportedUnderTheAlias() async throws {
+        for isModern in [true, false] {
+            let serverID = MCPServerID(rawValue: UUID())
+            let connection = FakeUpstreamConnection(serverID: serverID, initialState: readyState(), initialTools: [try tool("show_counter")])
+            await connection.enqueueToolCallOutcome(.result(MCPCallToolResult(raw: [
+                "content": AnyCodable([AnyCodable(["type": AnyCodable("text"), "text": AnyCodable("shown")])]),
+                "_meta": AnyCodable([
+                    "ui": AnyCodable(["resourceUri": AnyCodable("ui://fixture/counter.html")]),
+                    "ui/resourceUri": AnyCodable("ui://fixture/counter.html"),
+                ]),
+            ])))
+            let catalog = FakeCatalogProviding(resolvedTools: [
+                "fx-show_counter": resolvedTool(
+                    exportedName: "fx-show_counter", serverID: serverID, serverAlias: "fx",
+                    upstreamToolName: "show_counter", definition: try tool("show_counter")
+                ),
+            ])
+            let router = MCPCalyxMCPRouterTestSupport.makeMinimalRouter(
+                catalog: catalog, connections: FakeConnectionLookup([serverID: connection]), bearerToken: { [testToken] in testToken }
+            )
+            let request = isModern
+                ? modernRequest(method: "tools/call", name: "fx-show_counter", params: ["arguments": [:] as [String: Any]])
+                : legacyRequest(method: "tools/call", params: ["name": "fx-show_counter", "arguments": [:] as [String: Any]])
+
+            let routed = await router.routeCalyxMCP(
+                request: request,
+                paneContext: MCPPaneResolutionContext(surfaceID: nil, clientName: nil, herdrPaneRef: nil)
+            )
+
+            let meta = try XCTUnwrap(try bufferedResult(routed)["_meta"] as? [String: Any], "modern: \(isModern)")
+            XCTAssertEqual((meta["ui"] as? [String: Any])?["resourceUri"] as? String, "ui://fx/fixture/counter.html",
+                           "modern: \(isModern) -- the same exported form tools/list gives, which resources/read resolves")
+            XCTAssertEqual(meta["ui/resourceUri"] as? String, "ui://fx/fixture/counter.html", "modern: \(isModern)")
+        }
     }
 }

@@ -55,4 +55,35 @@ final class MCPUIResourceURITests: XCTestCase {
         XCTAssertEqual(resolved?.upstreamURI, "ui://weather/nested/deep/widget.html")
         XCTAssertEqual(resolved?.alias, "srv")
     }
+
+    // MARK: - exportingUIMeta (shared by the catalog and proxied results, K62)
+
+    func test_exportingUIMeta_rewritesBothKeys_leavesTheRestUnchanged() {
+        let meta: [String: AnyCodable] = [
+            "ui": AnyCodable(["resourceUri": AnyCodable("ui://fixture/counter.html"), "prefersBorder": AnyCodable(true)]),
+            "ui/resourceUri": AnyCodable("ui://fixture/counter.html"),
+            "other": AnyCodable("kept"),
+        ]
+
+        let exported = MCPUIResourceURI.exportingUIMeta(meta, alias: "fx")
+
+        XCTAssertEqual(exported, [
+            "ui": AnyCodable(["resourceUri": AnyCodable("ui://fx/fixture/counter.html"), "prefersBorder": AnyCodable(true)]),
+            "ui/resourceUri": AnyCodable("ui://fx/fixture/counter.html"),
+            "other": AnyCodable("kept"),
+        ])
+    }
+
+    func test_exportingUIMeta_nonUIScheme_unchanged() {
+        let meta: [String: AnyCodable] = [
+            "ui": AnyCodable(["resourceUri": AnyCodable("https://example.com/w.html")]),
+            "ui/resourceUri": AnyCodable("https://example.com/w.html"),
+        ]
+        XCTAssertEqual(MCPUIResourceURI.exportingUIMeta(meta, alias: "fx"), meta)
+    }
+
+    func test_exportingUIMetaInRaw_withoutMeta_addsNothing() {
+        let raw: [String: AnyCodable] = ["content": AnyCodable([AnyCodable]())]
+        XCTAssertEqual(MCPUIResourceURI.exportingUIMeta(inRaw: raw, alias: "fx"), raw)
+    }
 }
