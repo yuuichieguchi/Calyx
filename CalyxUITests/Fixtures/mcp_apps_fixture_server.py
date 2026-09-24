@@ -19,8 +19,15 @@ into the WKWebView's accessibility tree.
 `<event-log>.crashed` next to the event log. On the NEXT startup (the
 restarted child Calyx spawns), if that marker exists this script deletes
 it and sleeps 5 seconds before answering `initialize`, so a test polling
-for "Server disconnected" has a real window to observe that state before
-the reconnect clears it.
+the Settings row has a real window to observe a non-ready state
+(Calyx's own restart backoff, then its connecting state during this
+sleep) before the reconnect makes the row ready again.
+
+Every UI tool's `tools/call` result carries
+`_meta: {"ui": {"resourceUri": <that tool's own upstream resourceUri>}}`
+(the same URI its `tools/list` definition declares), so the test can
+observe Calyx exporting a result's `ui://` URI into the
+`ui://<alias>/<upstream host>/...` namespace on the way to the agent.
 """
 import base64
 import json
@@ -218,6 +225,14 @@ TOOLS = [
 ]
 
 
+def tool_resource_uri(name):
+    """The `_meta.ui.resourceUri` the tool named `name` declares in TOOLS."""
+    for definition in TOOLS:
+        if definition["name"] == name:
+            return definition["_meta"]["ui"]["resourceUri"]
+    raise KeyError(name)
+
+
 def write_message(message):
     sys.stdout.write(json.dumps(message) + "\n")
     sys.stdout.flush()
@@ -288,6 +303,7 @@ def handle_tools_call(request_id, params, event_log_path, crash_marker_path):
         respond(request_id, {
             "content": [{"type": "text", "text": "shown"}],
             "structuredContent": {"action": action},
+            "_meta": {"ui": {"resourceUri": tool_resource_uri(name)}},
         })
         return
 

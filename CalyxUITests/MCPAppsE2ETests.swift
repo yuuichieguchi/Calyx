@@ -39,8 +39,14 @@
 //   plan §4) and answers a plain JSON body (not SSE) when sent
 //   `Accept: application/json`; `X-Calyx-Surface-ID` resolves the
 //   calling pane (plan §4 pane resolution order).
-// - `_meta.ui.resourceUri` on a proxied tool RESULT is rewritten into
-//   the `ui://<alias>/...` namespace (plan §4 "UI リソース URI").
+// - `_meta.ui.resourceUri` on a proxied tool RESULT is exported to the
+//   agent in the `ui://<alias>/<upstream host>/<rest>` form (contract
+//   C11, `MCPUIResourceURI.export`: the alias is PREPENDED and the
+//   upstream host is kept), so the fixture's `ui://fixture/counter.html`
+//   reaches this suite as `ui://fx/fixture/counter.html`. The fixture's
+//   own `tools/call` results carry `_meta.ui.resourceUri` (Calyx never
+//   adds one from the tool definition, K62). The VIEW receives the
+//   upstream form, since its session is bound to the upstream server.
 // - Accessibility identifiers (implementer adds all of these):
 //   `calyx.mcpApps.dock.<surfaceID>`,
 //   `calyx.mcpApps.view.<viewID>.{web,header,stateLabel,closeButton}`,
@@ -57,15 +63,16 @@
 //   identifier -- mirrors SettingsWindowE2ETests's own established
 //   toolbar-button-by-label idiom, see that file's header for why).
 // - Settings row status text and view state-label text are asserted by
-//   a single case-insensitive SUBSTRING keyword per state (production
-//   wording is undetermined by the plan): "isconnected" (server
-//   crashed / upstream disconnected), "with UI" (ready: the Settings
-//   row reads "N tools, M with UI"), "MIME" (wrong
+//   a single case-insensitive SUBSTRING keyword per state: "with UI"
+//   (ready: the Settings row reads "N tools, M with UI"), "MIME" (wrong
 //   resource MIME type), "multiple" (2+ content items), "large"
 //   (oversized resource), "base64" (invalid blob), "ui://" (non-ui://
-//   resourceUri). These are this suite's own binding assumption, not
-//   read from any source -- flag to the user if the implementer's
-//   actual strings diverge enough that no substring here ever matches.
+//   resourceUri). After a crash of a ready server the row is non-ready
+//   in one of two states before it is ready again: `restarting`
+//   ("Disconnected (reconnecting)", during the restart backoff) and
+//   then `connecting` ("Connecting", during the restarted fixture's own
+//   5 s sleep and handshake) -- `MCPServerRowStatusResolver`'s strings,
+//   so the crash scenario accepts either "Disconnected" or "Connecting".
 // - `toggle_split_zoom`'s default keybinding is unmodified from
 //   ghostty's own default (`ghostty/src/config/Config.zig`, "Toggle
 //   zoom a split"): Cmd+Shift+Return. Calyx's own config never
@@ -86,8 +93,23 @@
 // "host:tool-result", "host:tool-cancelled", "host:context-changed",
 // "view:message_sent", "view:model_only_error:<code>". `crash` leaves a
 // marker file (`<event-log>.crashed`) and exits; on the NEXT process
-// start the fixture sleeps 5s before answering `initialize`, giving a
-// real window to observe "disconnected" before the reconnect clears it.
+// start the fixture sleeps 5s before answering `initialize`, widening
+// the non-ready window (restart backoff, then connecting) before the
+// reconnect makes the row ready again. Every UI tool's `tools/call`
+// result carries `_meta.ui.resourceUri` = that tool's upstream URI.
+//
+// PANE COMMANDS AND TEMP FILES: every `/tmp` file this suite reads back
+// (command output, background call output, the `cat` receive file)
+// has a fresh UUID in its name, and a file that already exists before
+// its command runs fails the test. The sandboxed test runner cannot
+// delete files under `/tmp` (a `try? removeItem` there fails silently),
+// so a reused name would read a previous test's output. A command is
+// typed into a pane only while that pane's shell is at its prompt:
+// once `cat -u > <file>` holds the foreground, a typed `sh <script>`
+// line is read by `cat`, not run. A call that must be issued while
+// the pane cannot accept typing (a foreground `cat`, a key Settings
+// window) is typed EARLIER as a background job -- started at once, or
+// held until the runner creates a trigger file.
 
 import XCTest
 import AppKit
@@ -247,6 +269,64 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
         return lines
     }
 
+    // MARK: - Pane commands with unique output files
+
+    /// `/tmp/calyx-e2e-mcpapps-<tag>-<UUID>.<ext>`: a path in `/tmp`
+    /// (the pane's shell writes it, this sandboxed runner reads it) that
+    /// no earlier test or call can have used. See this file's header
+    /// ("PANE COMMANDS AND TEMP FILES").
+    func uniqueTmpPath(_ tag: String, ext: String) -> String {
+        "/tmp/calyx-e2e-mcpapps-\(tag)-\(UUID().uuidString).\(ext)"
+    }
+
+    /// Fails the test when `path` already exists before the command that
+    /// is supposed to create it has run, and returns `false` so the
+    /// caller does not type that command.
+    func assertAbsentBeforeCommand(_ path: String) -> Bool {
+        guard !FileManager.default.fileExists(atPath: path) else {
+            XCTFail("\(path) already exists before the command that writes it ran -- a stale file would be read as this command's output")
+            return false
+        }
+        return true
+    }
+
+    /// Writes `content` to a UUID-named script under the runner's own
+    /// container tmp and types `sh <scriptPath>` + Return into the
+    /// frontmost pane, with the same `[A-Za-z0-9/._-]` path guard and
+    /// no quoting as `PaneCLIExec.swift`'s private `typePaneScript` (see
+    /// that file's header for why). The caller must know the pane's
+    /// shell is at its prompt (see this file's header).
+    private func typeMCPPaneScript(_ content: String) {
+        let scriptFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calyx-e2e-mcpapps-\(UUID().uuidString).sh").path
+        do {
+            try content.write(toFile: scriptFile, atomically: true, encoding: .utf8)
+        } catch {
+            XCTFail("failed to write pane script \(scriptFile): \(error)")
+            return
+        }
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/._-")
+        guard scriptFile.unicodeScalars.allSatisfy(allowed.contains) else {
+            XCTFail("pane script path contains a character requiring quoting: \(scriptFile)")
+            return
+        }
+        Thread.sleep(forTimeInterval: 1)
+        app.typeText("sh \(scriptFile)\n")
+    }
+
+    /// `PaneCLIExec.paneExec` with a UUID-named output file that must not
+    /// exist before the command runs (see this file's header): runs
+    /// `command` in the frontmost pane with stdout+stderr redirected to
+    /// that file and polls it until it has content or `timeoutAttempts`
+    /// half-second polls elapse, returning the trimmed content, or
+    /// "(no output)".
+    func mcpPaneExec(_ command: String, timeoutAttempts: Int = 20) -> String {
+        let outFile = uniqueTmpPath("out", ext: "txt")
+        guard assertAbsentBeforeCommand(outFile) else { return "(no output)" }
+        typeMCPPaneScript("\(command) > \(outFile) 2>&1\n")
+        return waitForFileContent(atPath: outFile, timeoutAttempts: timeoutAttempts)
+    }
+
     // MARK: - /calyx-mcp request script
 
     /// Builds a python3 script that POSTs one JSON-RPC request to the
@@ -313,14 +393,13 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
 
     @discardableResult
     func mcpAppsCallSync(
-        method: String, paramsJSON: String, surfaceID: String?, counter: inout Int, timeoutAttempts: Int = 20
+        method: String, paramsJSON: String, surfaceID: String?, timeoutAttempts: Int = 20
     ) -> [String: Any] {
         let script = mcpAppsRequestScript(method: method, paramsJSON: paramsJSON, surfaceID: surfaceID, maxTimeSeconds: 10)
         let encoded = Data(script.utf8).base64EncodedString()
-        counter += 1
-        let scriptPath = "/tmp/calyx-e2e-mcpapps-sync-\(ProcessInfo.processInfo.processIdentifier)-\(counter).py"
+        let scriptPath = uniqueTmpPath("sync", ext: "py")
         let command = "printf '%s' '\(encoded)' | base64 -d > \(scriptPath) && python3 \(scriptPath)"
-        let resultText = paneExec(command, counter: &counter, timeoutAttempts: timeoutAttempts)
+        let resultText = mcpPaneExec(command, timeoutAttempts: timeoutAttempts)
         guard resultText != "(no output)",
               let data = resultText.data(using: .utf8),
               let envelope = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -330,22 +409,39 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
         return envelope
     }
 
+    /// Types (into the frontmost pane, whose shell must be at its
+    /// prompt) a background job that issues one `tools/call` and writes
+    /// the decoded envelope to a fresh UUID-named `/tmp` file, returning
+    /// that file's path; the pane's shell is back at its prompt as soon
+    /// as the job is started. With `startWhenFileExists`, the job waits
+    /// until the runner creates that file (the runner cannot type into
+    /// the pane then, see this file's header) and gives up without
+    /// calling after 120 s, so a test that fails before creating it does
+    /// not leave the job polling forever.
+    @discardableResult
     func mcpAppsCallBackgrounded(
-        name: String, argumentsJSON: String, surfaceID: String?, outFile: String, counter: inout Int,
-        maxTimeSeconds: Int = 65, curlMarker: String? = nil
-    ) {
-        try? FileManager.default.removeItem(atPath: outFile)
+        name: String, argumentsJSON: String, surfaceID: String?,
+        maxTimeSeconds: Int = 65, curlMarker: String? = nil, startWhenFileExists triggerFile: String? = nil
+    ) -> String {
+        let outFile = uniqueTmpPath("bg-out", ext: "json")
+        guard assertAbsentBeforeCommand(outFile) else { return outFile }
         let paramsJSON = toolCallParamsJSON(name: name, argumentsJSON: argumentsJSON)
         let script = mcpAppsRequestScript(
             method: "tools/call", paramsJSON: paramsJSON, surfaceID: surfaceID,
             maxTimeSeconds: maxTimeSeconds, curlMarker: curlMarker
         )
         let encoded = Data(script.utf8).base64EncodedString()
-        counter += 1
-        let scriptPath = "/tmp/calyx-e2e-mcpapps-bg-\(ProcessInfo.processInfo.processIdentifier)-\(counter).py"
-        let command = "printf '%s' '\(encoded)' | base64 -d > \(scriptPath) && " +
-            "(python3 \(scriptPath) > \(outFile) 2>&1 &); disown"
-        panePasteAndReturn(command)
+        let scriptPath = uniqueTmpPath("bg", ext: "py")
+        let call = "python3 \(scriptPath) > \(outFile) 2>&1"
+        let job: String
+        if let triggerFile {
+            job = "i=0; while [ ! -e '\(triggerFile)' ] && [ $i -lt 600 ]; do sleep 0.2; i=$((i+1)); done; " +
+                "if [ -e '\(triggerFile)' ]; then \(call); fi"
+        } else {
+            job = call
+        }
+        typeMCPPaneScript("printf '%s' '\(encoded)' | base64 -d > \(scriptPath) && (\(job)) &\n")
+        return outFile
     }
 
     func waitForFileContent(atPath path: String, timeoutAttempts: Int = 130) -> String {
@@ -382,7 +478,7 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
     /// `PaneCLIExec`, matching this codebase's established convention
     /// (see `CockpitApprovalE2ETests.swift`'s own header).
     @discardableResult
-    func legacyIPCCallSync(name: String, argumentsJSON: String, counter: inout Int, timeoutAttempts: Int = 20) -> [String: Any] {
+    func legacyIPCCallSync(name: String, argumentsJSON: String, timeoutAttempts: Int = 20) -> [String: Any] {
         var lines: [String] = []
         lines.append("import json")
         lines.append("import os")
@@ -425,10 +521,9 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
         lines.append("    print(json.dumps({\"error\": repr(e)}))")
         let script = lines.joined(separator: "\n") + "\n"
         let encoded = Data(script.utf8).base64EncodedString()
-        counter += 1
-        let scriptPath = "/tmp/calyx-e2e-mcpapps-legacy-\(ProcessInfo.processInfo.processIdentifier)-\(counter).py"
+        let scriptPath = uniqueTmpPath("legacy", ext: "py")
         let command = "printf '%s' '\(encoded)' | base64 -d > \(scriptPath) && python3 \(scriptPath)"
-        let resultText = paneExec(command, counter: &counter, timeoutAttempts: timeoutAttempts)
+        let resultText = mcpPaneExec(command, timeoutAttempts: timeoutAttempts)
         guard resultText != "(no output)",
               let data = resultText.data(using: .utf8),
               let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -447,10 +542,10 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
     /// Also asserts, as a real side effect of this same catalog read,
     /// that the app-only `fx-record_event` is never exported to a
     /// caller whose pane resolved (plan §5's host MUST).
-    func waitForFixtureReady(surfaceID: String, counter: inout Int) {
+    func waitForFixtureReady(surfaceID: String) {
         var lastNames: [String] = []
         for _ in 0..<40 {
-            let envelope = mcpAppsCallSync(method: "tools/list", paramsJSON: "{}", surfaceID: surfaceID, counter: &counter)
+            let envelope = mcpAppsCallSync(method: "tools/list", paramsJSON: "{}", surfaceID: surfaceID)
             if let result = envelope["result"] as? [String: Any],
                let tools = result["tools"] as? [[String: Any]] {
                 lastNames = tools.compactMap { $0["name"] as? String }
@@ -526,16 +621,15 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
     // MARK: 1. show_counter opens the dock; event order is initialize -> initialized -> tool-input -> tool-result
 
     func test_showCounter_opensDockWithOrderedEventLog() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
         XCTAssertFalse(surfaceID.isEmpty, "$CALYX_SURFACE_ID must be set for every ghostty-spawned pane")
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        waitForFixtureReady(surfaceID: surfaceID)
 
         let envelope = mcpAppsCallSync(
             method: "tools/call",
             paramsJSON: toolCallParamsJSON(name: "\(Self.fixtureAlias)-show_counter", argumentsJSON: "{\"action\": \"none\"}"),
-            surfaceID: surfaceID, counter: &counter, timeoutAttempts: 30
+            surfaceID: surfaceID, timeoutAttempts: 30
         )
         guard let toolResult = envelope["result"] as? [String: Any] else {
             XCTFail("show_counter produced no result -- got: \(envelope)")
@@ -544,8 +638,9 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
         XCTAssertNil(toolResult["isError"], "show_counter must not report isError -- got: \(envelope)")
         let resourceURI = ((toolResult["_meta"] as? [String: Any])?["ui"] as? [String: Any])?["resourceUri"] as? String
         XCTAssertEqual(
-            resourceURI, "ui://\(Self.fixtureAlias)/counter.html",
-            "the tool result's _meta.ui.resourceUri must be rewritten into the ui://<alias>/... namespace -- got: \(String(describing: resourceURI))"
+            resourceURI, "ui://\(Self.fixtureAlias)/fixture/counter.html",
+            "the tool result's _meta.ui.resourceUri (the fixture's ui://fixture/counter.html) must reach the agent " +
+            "exported as ui://<alias>/<upstream host>/... (contract C11) -- got: \(String(describing: resourceURI))"
         )
 
         let dock = dockElement(surfaceID: surfaceID)
@@ -567,27 +662,46 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
     // MARK: 2. ui/message shows the consent prompt; Allow delivers to a foreground `cat -u > <file>`
 
     func test_uiMessage_consentPromptDeliversToForegroundPane() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
         XCTAssertFalse(surfaceID.isEmpty)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        waitForFixtureReady(surfaceID: surfaceID)
 
-        let recvFile = "/tmp/calyx-e2e-mcpapps-recv-\(ProcessInfo.processInfo.processIdentifier).txt"
-        try? FileManager.default.removeItem(atPath: recvFile)
+        // The call is typed as a background job while the pane's shell
+        // is still at its prompt: once `cat` holds the foreground below,
+        // a typed `sh <script>` line would be read by `cat` instead of
+        // run (see this file's header). The job waits for a trigger file
+        // the runner creates only after `cat` is in the foreground, so
+        // no dock or consent prompt exists (and none can take keyboard
+        // focus) while either line is typed. The view's ui/message is
+        // delivered when the prompt's button is clicked.
+        let callTrigger = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calyx-e2e-mcpapps-message-trigger-\(UUID().uuidString)").path
+        guard assertAbsentBeforeCommand(callTrigger) else { return }
+        let callOutFile = mcpAppsCallBackgrounded(
+            name: "\(Self.fixtureAlias)-show_counter", argumentsJSON: "{\"action\": \"message\"}",
+            surfaceID: surfaceID, maxTimeSeconds: 30, startWhenFileExists: callTrigger
+        )
+
+        let recvFile = uniqueTmpPath("recv", ext: "txt")
+        let catReadyFile = uniqueTmpPath("recv-ready", ext: "txt")
+        guard assertAbsentBeforeCommand(recvFile), assertAbsentBeforeCommand(catReadyFile) else { return }
         // `-u`: unbuffered cat, so a single delivered line is flushed to
         // the file immediately instead of sitting in a full stdio
         // buffer until EOF (cat's stdout here is a plain file, not a
-        // tty, so it is fully buffered by default).
-        panePasteAndReturn("cat -u > \(recvFile)")
-        Thread.sleep(forTimeInterval: 1)
+        // tty, so it is fully buffered by default). `exec` makes `cat`
+        // the pane's foreground process reading the tty; the ready file
+        // is written just before it.
+        panePasteAndReturn("echo ready > \(catReadyFile) && exec cat -u > \(recvFile)")
+        let catReady = waitForFileContent(atPath: catReadyFile, timeoutAttempts: 20)
+        XCTAssertEqual(catReady, "ready", "the foreground `cat -u` never started in the calling pane")
+        try Data().write(to: URL(fileURLWithPath: callTrigger))
 
-        let envelope = mcpAppsCallSync(
-            method: "tools/call",
-            paramsJSON: toolCallParamsJSON(name: "\(Self.fixtureAlias)-show_counter", argumentsJSON: "{\"action\": \"message\"}"),
-            surfaceID: surfaceID, counter: &counter, timeoutAttempts: 30
-        )
-        XCTAssertNil((envelope["result"] as? [String: Any])?["isError"], "show_counter must not report isError -- got: \(envelope)")
+        let callOutput = waitForFileContent(atPath: callOutFile, timeoutAttempts: 60)
+        let envelope = callOutput.data(using: .utf8)
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        XCTAssertNotNil(envelope?["result"] as? [String: Any], "show_counter produced no result -- got: \(callOutput)")
+        XCTAssertNil((envelope?["result"] as? [String: Any])?["isError"], "show_counter must not report isError -- got: \(callOutput)")
 
         let dock = dockElement(surfaceID: surfaceID)
         XCTAssertTrue(waitFor(dock, timeout: 20), "the dock never appeared")
@@ -607,15 +721,14 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
     // MARK: 3. Counter state (and the view itself) survives switching to another tab and back
 
     func test_counterState_survivesTabSwitchAndBack() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
+        waitForFixtureReady(surfaceID: surfaceID)
 
         let envelope = mcpAppsCallSync(
             method: "tools/call",
             paramsJSON: toolCallParamsJSON(name: "\(Self.fixtureAlias)-show_counter", argumentsJSON: "{\"action\": \"none\"}"),
-            surfaceID: surfaceID, counter: &counter, timeoutAttempts: 30
+            surfaceID: surfaceID, timeoutAttempts: 30
         )
         XCTAssertNil((envelope["result"] as? [String: Any])?["isError"])
 
@@ -644,15 +757,14 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
     // MARK: 4. Zooming another pane in the same tab hides the dock; unzoom shows it
 
     func test_zoomingAnotherPane_hidesDock_unzoomShowsIt() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
+        waitForFixtureReady(surfaceID: surfaceID)
 
         let envelope = mcpAppsCallSync(
             method: "tools/call",
             paramsJSON: toolCallParamsJSON(name: "\(Self.fixtureAlias)-show_counter", argumentsJSON: "{\"action\": \"none\"}"),
-            surfaceID: surfaceID, counter: &counter, timeoutAttempts: 30
+            surfaceID: surfaceID, timeoutAttempts: 30
         )
         XCTAssertNil((envelope["result"] as? [String: Any])?["isError"])
 
@@ -660,7 +772,7 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
         XCTAssertTrue(waitFor(dock, timeout: 20), "the dock never appeared")
 
         let splitResult = legacyIPCCallSync(
-            name: "pane_split", argumentsJSON: "{\"surface_id\": \"\(surfaceID)\", \"direction\": \"right\"}", counter: &counter
+            name: "pane_split", argumentsJSON: "{\"surface_id\": \"\(surfaceID)\", \"direction\": \"right\"}"
         )
         XCTAssertNotNil(splitResult["surface_id"] as? String, "pane_split must return the newly created pane's surface_id")
 
@@ -681,23 +793,20 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
     // MARK: 5. Closing the pane mid-call (slow_tool) removes the dock
 
     func test_closingPaneDuringSlowTool_removesDock() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
+        waitForFixtureReady(surfaceID: surfaceID)
 
         // A sibling pane keeps the tab (and window) alive once the
         // original pane is closed below.
         let splitResult = legacyIPCCallSync(
-            name: "pane_split", argumentsJSON: "{\"surface_id\": \"\(surfaceID)\", \"direction\": \"right\"}", counter: &counter
+            name: "pane_split", argumentsJSON: "{\"surface_id\": \"\(surfaceID)\", \"direction\": \"right\"}"
         )
         XCTAssertNotNil(splitResult["surface_id"] as? String)
         Thread.sleep(forTimeInterval: 1)
 
-        let outFile = "/tmp/calyx-e2e-mcpapps-slowclose-\(ProcessInfo.processInfo.processIdentifier).json"
         mcpAppsCallBackgrounded(
-            name: "\(Self.fixtureAlias)-slow_tool", argumentsJSON: "{}", surfaceID: surfaceID,
-            outFile: outFile, counter: &counter, maxTimeSeconds: 60
+            name: "\(Self.fixtureAlias)-slow_tool", argumentsJSON: "{}", surfaceID: surfaceID, maxTimeSeconds: 60
         )
 
         let dock = dockElement(surfaceID: surfaceID)
@@ -718,16 +827,14 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
     // MARK: 6. Cancelling the call (killing the client mid-call) reaches the view as tool-cancelled
 
     func test_cancellingCall_reachesViewAsToolCancelled() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
+        waitForFixtureReady(surfaceID: surfaceID)
 
-        let marker = "mcpapps-cancel-marker-\(ProcessInfo.processInfo.processIdentifier)"
-        let outFile = "/tmp/calyx-e2e-mcpapps-cancel-\(ProcessInfo.processInfo.processIdentifier).json"
+        let marker = "mcpapps-cancel-marker-\(UUID().uuidString)"
         mcpAppsCallBackgrounded(
             name: "\(Self.fixtureAlias)-slow_tool", argumentsJSON: "{}", surfaceID: surfaceID,
-            outFile: outFile, counter: &counter, maxTimeSeconds: 60, curlMarker: marker
+            maxTimeSeconds: 60, curlMarker: marker
         )
 
         let dock = dockElement(surfaceID: surfaceID)
@@ -748,10 +855,9 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
     // MARK: 7. Each malformed resource case shows an error card with a matching reason
 
     func test_malformedResources_showErrorCardWithMatchingReason() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
+        waitForFixtureReady(surfaceID: surfaceID)
 
         let cases: [(tool: String, keyword: String)] = [
             ("show_bad_mime", "MIME"),
@@ -765,7 +871,7 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
             let envelope = mcpAppsCallSync(
                 method: "tools/call",
                 paramsJSON: toolCallParamsJSON(name: "\(Self.fixtureAlias)-\(testCase.tool)", argumentsJSON: "{}"),
-                surfaceID: surfaceID, counter: &counter, timeoutAttempts: 30
+                surfaceID: surfaceID, timeoutAttempts: 30
             )
             guard let toolResult = envelope["result"] as? [String: Any] else {
                 XCTFail("\(testCase.tool) produced no result -- got: \(envelope)")
@@ -785,15 +891,14 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
     // MARK: 8. The view's own call to a model-only tool is rejected with -32000
 
     func test_viewCallToModelOnlyTool_isRejected() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
+        waitForFixtureReady(surfaceID: surfaceID)
 
         let envelope = mcpAppsCallSync(
             method: "tools/call",
             paramsJSON: toolCallParamsJSON(name: "\(Self.fixtureAlias)-show_counter", argumentsJSON: "{\"action\": \"call_model_only\"}"),
-            surfaceID: surfaceID, counter: &counter, timeoutAttempts: 30
+            surfaceID: surfaceID, timeoutAttempts: 30
         )
         XCTAssertNil((envelope["result"] as? [String: Any])?["isError"])
 
@@ -805,38 +910,58 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
             "a view's own tools/call against a model-only tool must be rejected with JSON-RPC code -32000 -- observed: \(events)")
     }
 
-    // MARK: 9. crash shows "disconnected" on the view/Settings row, then "Ready" after auto-restart
+    // MARK: 9. crash takes the Settings row out of ready ("Disconnected" or "Connecting"), then back to ready after auto-restart
 
     func test_crashingServer_showsDisconnectedThenReadyAfterRestart() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
+        waitForFixtureReady(surfaceID: surfaceID)
 
-        // The crash tool's own process exit means this call is never
-        // expected to return a normal JSON-RPC result -- only that it
-        // was actually SENT (mcpAppsCallSync tolerates an eventual
-        // curl timeout via its own "(no output)"/invalid-JSON XCTFail
-        // path, so a bounded timeoutAttempts here keeps this from
-        // stalling the whole suite on a call that must never answer).
-        _ = mcpAppsCallSync(
-            method: "tools/call",
-            paramsJSON: toolCallParamsJSON(name: "\(Self.fixtureAlias)-crash", argumentsJSON: "{}"),
-            surfaceID: surfaceID, counter: &counter, timeoutAttempts: 8
+        // Settings is opened and the row located BEFORE the crash: the
+        // non-ready window (about 1 s of restart backoff, then the
+        // restarted fixture's 5 s sleep and handshake) is shorter than
+        // opening Settings takes. The Settings window then has key
+        // focus, so the crash call cannot be typed into the pane at that
+        // point; it is typed now as a background job that waits for a
+        // trigger file the runner creates once the row reads ready. The
+        // crash never answers normally, so its output is not read.
+        let crashTrigger = FileManager.default.temporaryDirectory
+            .appendingPathComponent("calyx-e2e-mcpapps-crash-trigger-\(UUID().uuidString)").path
+        guard assertAbsentBeforeCommand(crashTrigger) else { return }
+        mcpAppsCallBackgrounded(
+            name: "\(Self.fixtureAlias)-crash", argumentsJSON: "{}", surfaceID: surfaceID,
+            maxTimeSeconds: 10, startWhenFileExists: crashTrigger
         )
 
         let settingsWindow = openMCPServersSettingsPane()
         let statusLabel = settingsWindow.staticTexts["calyx.settings.mcpServers.row.\(serverID).status"]
         XCTAssertTrue(waitFor(statusLabel, timeout: 15), "the MCP Servers row for the fixture server never appeared")
 
-        var sawDisconnected = false
-        let disconnectDeadline = Date().addingTimeInterval(15)
-        while Date() < disconnectDeadline {
-            if elementText(statusLabel).localizedCaseInsensitiveContains("isconnected") { sawDisconnected = true; break }
+        var sawReadyBeforeCrash = false
+        let readyBeforeDeadline = Date().addingTimeInterval(20)
+        while Date() < readyBeforeDeadline {
+            if elementText(statusLabel).localizedCaseInsensitiveContains("with UI") { sawReadyBeforeCrash = true; break }
             Thread.sleep(forTimeInterval: 0.3)
         }
-        XCTAssertTrue(sawDisconnected,
-            "the MCP Servers row must show a disconnected state once the fixture server crashes -- last seen: \(elementText(statusLabel))")
+        XCTAssertTrue(sawReadyBeforeCrash,
+            "the MCP Servers row must be ready before the crash is issued -- last seen: \(elementText(statusLabel))")
+
+        try Data().write(to: URL(fileURLWithPath: crashTrigger))
+
+        var nonReadyText: String?
+        let nonReadyDeadline = Date().addingTimeInterval(25)
+        while Date() < nonReadyDeadline {
+            let text = elementText(statusLabel)
+            if !text.localizedCaseInsensitiveContains("with UI"),
+               text.localizedCaseInsensitiveContains("Disconnected") || text.localizedCaseInsensitiveContains("Connecting") {
+                nonReadyText = text
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        XCTAssertNotNil(nonReadyText,
+            "once the fixture server crashes, the MCP Servers row must leave ready and show \"Disconnected\" or " +
+            "\"Connecting\" -- last seen: \(elementText(statusLabel))")
 
         var sawReady = false
         let readyDeadline = Date().addingTimeInterval(30)
@@ -845,21 +970,21 @@ final class MCPAppsE2ETests: MCPAppsE2ETestCaseBase {
             Thread.sleep(forTimeInterval: 0.5)
         }
         XCTAssertTrue(sawReady,
-            "the MCP Servers row must return to Ready once the fixture server auto-restarts -- last seen: \(elementText(statusLabel))")
+            "the MCP Servers row must return to ready once the fixture server auto-restarts -- non-ready text seen: " +
+            "\(nonReadyText ?? "(none)"), last seen: \(elementText(statusLabel))")
     }
 
     // MARK: 10. A call with no surface header opens the independent standalone panel
 
     func test_callWithNoSurfaceHeader_opensStandalonePanel() throws {
-        var counter = 0
         waitForIPCActivation()
-        let surfaceID = paneExec("echo $CALYX_SURFACE_ID", counter: &counter)
-        waitForFixtureReady(surfaceID: surfaceID, counter: &counter)
+        let surfaceID = mcpPaneExec("echo $CALYX_SURFACE_ID")
+        waitForFixtureReady(surfaceID: surfaceID)
 
         let envelope = mcpAppsCallSync(
             method: "tools/call",
             paramsJSON: toolCallParamsJSON(name: "\(Self.fixtureAlias)-show_counter", argumentsJSON: "{\"action\": \"none\"}"),
-            surfaceID: nil, counter: &counter, timeoutAttempts: 30
+            surfaceID: nil, timeoutAttempts: 30
         )
         XCTAssertNil((envelope["result"] as? [String: Any])?["isError"], "got: \(envelope)")
 
