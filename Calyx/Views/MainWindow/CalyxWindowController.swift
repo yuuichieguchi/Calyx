@@ -5376,7 +5376,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         do {
             let moreCommits = try await GitService.commitLog(
-                location: descriptor.location, resolvedScope: resolvedScope, maxCount: 50, skip: loadedCount
+                location: descriptor.location, resolvedScope: resolvedScope, maxCount: GitRepoChanges.commitPageSize, skip: loadedCount
             )
             guard !Task.isCancelled else { return }
             guard windowSession.gitRepoChanges[repoID] != nil else { return }
@@ -5604,7 +5604,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func loadMoreCommits(repoID: String) {
-        guard windowSession.gitChanges(for: repoID).hasMoreCommits else { return }
+        // A row appearing again while a page is queued or in flight must
+        // not add another page.
+        guard windowSession.gitChanges(for: repoID).hasMoreCommits,
+              !gitSectionRefreshes.isLoadingMoreCommits(repoID: repoID)
+        else { return }
         // Queued on the section's own queue rather than run alongside its
         // refresh: the page to fetch is decided by how many commits the
         // list holds, and a refresh replaces that list wholesale.

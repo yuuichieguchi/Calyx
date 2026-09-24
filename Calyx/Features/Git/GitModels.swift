@@ -257,6 +257,27 @@ struct GitRepoChanges: Equatable, Sendable {
         Set(entries.map(\.path)).count
     }
 
+    /// How many rows before the end of the commit list the next page is
+    /// requested.
+    static let commitPrefetchThreshold = 12
+
+    /// How many commits one load-more page fetches. It must exceed
+    /// `commitPrefetchThreshold`: otherwise the trigger index after an
+    /// append lands on a row that is already realized, its appearance never
+    /// fires again, and paging stalls.
+    static let commitPageSize = 50
+
+    /// The index of the commit row whose appearance should request the next
+    /// page, or nil when the list is empty. With fewer rows than the
+    /// threshold the first row triggers.
+    static func commitPrefetchTriggerIndex(
+        commitCount: Int,
+        threshold: Int = commitPrefetchThreshold
+    ) -> Int? {
+        guard commitCount > 0 else { return nil }
+        return max(commitCount - threshold, 0)
+    }
+
     /// The one mapping from a section's state to what it shows. Every state
     /// is spelled out, so a state added later cannot fall through to an
     /// empty change list. A fetch that has content to keep on screen shows
