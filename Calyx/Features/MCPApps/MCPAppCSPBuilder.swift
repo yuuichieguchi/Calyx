@@ -6,9 +6,11 @@
 //  and the WKContentRuleList that blocks every load outside the same
 //  origins as defense in depth.
 //
-//  Omitted `_meta.ui.csp` uses the MCP Apps "Restrictive Default" block
-//  verbatim. A declared `csp` uses the spec's domain mapping, which always
-//  emits font-src, frame-src and base-uri. Both add object-src 'none',
+//  The policy has the directives of the ext-apps reference host
+//  (examples/basic-host/serve.ts, `buildCspHeader`), which the reference
+//  apps are built against: 'unsafe-eval' and blob: workers (CesiumJS,
+//  Three.js) included. An omitted `_meta.ui.csp` is the declared form with
+//  every domain list empty, as in the reference. Calyx adds
 //  form-action 'none' and frame-ancestors <host page origin>.
 //
 
@@ -32,47 +34,37 @@ enum MCPAppCSPBuilder {
         csp: CSPDomains?,
         hostOrigin: String
     ) -> (policy: String, dropped: [(raw: String, reason: String)], applied: CSPDomains?) {
-        guard let csp else {
-            let directives = [
-                "default-src 'none'",
-                "script-src 'self' 'unsafe-inline'",
-                "style-src 'self' 'unsafe-inline'",
-                "img-src 'self' data:",
-                "media-src 'self' data:",
-                "connect-src 'none'",
-                "object-src 'none'",
-                "form-action 'none'",
-                "frame-ancestors \(hostOrigin)",
-            ]
-            return (directives.joined(separator: "; ") + ";", [], nil)
-        }
-
+        // The reference host builds an omitted `csp` with every list empty.
+        let declared = csp ?? CSPDomains(resourceDomains: [], connectDomains: [], frameDomains: [], baseUriDomains: [])
         var dropped: [(raw: String, reason: String)] = []
-        let resource = accepted(csp.resourceDomains, dropped: &dropped).map(\.text)
-        let connect = accepted(csp.connectDomains, dropped: &dropped).map(\.text)
-        let frame = accepted(csp.frameDomains, dropped: &dropped).map(\.text)
-        let baseURI = accepted(csp.baseUriDomains, dropped: &dropped).map(\.text)
+        let resource = accepted(declared.resourceDomains, dropped: &dropped).map(\.text)
+        let connect = accepted(declared.connectDomains, dropped: &dropped).map(\.text)
+        let frame = accepted(declared.frameDomains, dropped: &dropped).map(\.text)
+        let baseURI = accepted(declared.baseUriDomains, dropped: &dropped).map(\.text)
 
         let directives = [
-            "default-src 'none'",
-            directive("script-src", ["'self'", "'unsafe-inline'"] + resource),
-            directive("style-src", ["'self'", "'unsafe-inline'"] + resource),
+            directive("default-src", ["'self'", "'unsafe-inline'"]),
+            directive("script-src", ["'self'", "'unsafe-inline'", "'unsafe-eval'", "blob:", "data:"] + resource),
+            directive("style-src", ["'self'", "'unsafe-inline'", "blob:", "data:"] + resource),
+            directive("img-src", ["'self'", "data:", "blob:"] + resource),
+            directive("font-src", ["'self'", "data:", "blob:"] + resource),
+            directive("media-src", ["'self'", "data:", "blob:"] + resource),
             directive("connect-src", ["'self'"] + connect),
-            directive("img-src", ["'self'", "data:"] + resource),
-            directive("font-src", ["'self'"] + resource),
-            directive("media-src", ["'self'", "data:"] + resource),
+            directive("worker-src", ["'self'", "blob:"] + resource),
             directive("frame-src", frame.isEmpty ? ["'none'"] : frame),
             "object-src 'none'",
-            directive("base-uri", baseURI.isEmpty ? ["'self'"] : baseURI),
+            directive("base-uri", baseURI.isEmpty ? ["'none'"] : baseURI),
             "form-action 'none'",
             "frame-ancestors \(hostOrigin)",
         ]
-        let applied = CSPDomains(
-            resourceDomains: resource,
-            connectDomains: connect,
-            frameDomains: frame,
-            baseUriDomains: baseURI
-        )
+        let applied = csp.map { _ in
+            CSPDomains(
+                resourceDomains: resource,
+                connectDomains: connect,
+                frameDomains: frame,
+                baseUriDomains: baseURI
+            )
+        }
         return (directives.joined(separator: "; ") + ";", dropped, applied)
     }
 

@@ -170,6 +170,83 @@ final class WebKitGatingTests: XCTestCase {
         XCTAssertEqual(declared, "ok", "connect-src must allow a domain that WAS declared")
     }
 
+    // MARK: - Reference-host script allowances (eval, blob: workers)
+
+    // The ext-apps reference apps (map/CesiumJS, threejs) evaluate strings
+    // and start workers from blob: URLs. Both must run under the built
+    // policy AND the built rule list, inside the sandboxed view document.
+    func test_builtPolicy_allowsEvalAndBlobWorker() async throws {
+        let domains = MCPAppCSPBuilder.CSPDomains(
+            resourceDomains: ["https://*.cesium.com"], connectDomains: [], frameDomains: [], baseUriDomains: []
+        )
+        let html = """
+        <!DOCTYPE html><html><body><script>
+        window.results = {};
+        try { window.results.eval = String(eval('1+1')); } catch (e) { window.results.eval = 'error:' + e.message; }
+        try {
+          const url = URL.createObjectURL(new Blob(['self.postMessage("hi")'], { type: 'application/javascript' }));
+          const worker = new Worker(url);
+          worker.onmessage = (event) => { window.results.worker = event.data === 'hi' ? 'ok' : 'unexpected'; };
+          worker.onerror = (event) => { window.results.worker = 'error:' + event.message; };
+        } catch (e) { window.results.worker = 'error:' + e.message; }
+        </script></body></html>
+        """
+        let configuration = try await MCPAppWebViewFactory.makeViewConfiguration(
+            html: html,
+            cspPolicy: MCPAppCSPBuilder.buildPolicy(csp: domains, hostOrigin: "calyx-mcp-host://abc").policy,
+            contentRuleListJSON: MCPAppCSPBuilder.contentRuleList(csp: domains, hostOrigin: "calyx-mcp-host://abc", calyxOrigins: []),
+            additionalSchemeHandlers: [:]
+        )
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        try await NavigationWaiter().wait(for: webView, load: URL(string: "\(MCPAppWebViewFactory.appScheme)://app.local/index.html")!)
+
+        var evalResult: String?
+        var workerResult: String?
+        for _ in 0..<40 {
+            evalResult = try await evaluate(webView, "window.results.eval") as? String
+            workerResult = try await evaluate(webView, "window.results.worker") as? String
+            if evalResult != nil && workerResult != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        XCTAssertEqual(evalResult, "2", "script-src must carry 'unsafe-eval' like the reference host")
+        XCTAssertEqual(workerResult, "ok", "worker-src blob: and the rule list must let a blob: worker start")
+    }
+
+    func test_builtPolicy_omittedCSP_stillBlocksUndeclaredFetch() async throws {
+        let server = try await LoopbackHTTPServer.start()
+        defer { server.stop() }
+        let html = """
+        <!DOCTYPE html><html><body><script>
+        window.result = 'pending';
+        fetch('\(server.origin)/x').then(() => window.result = 'ok').catch(e => window.result = 'blocked');
+        </script></body></html>
+        """
+        // The rule list lifts the loopback origin, so only the CSP decides.
+        let liftingDomains = MCPAppCSPBuilder.CSPDomains(
+            resourceDomains: [], connectDomains: [server.origin], frameDomains: [], baseUriDomains: []
+        )
+        let configuration = try await MCPAppWebViewFactory.makeViewConfiguration(
+            html: html,
+            cspPolicy: MCPAppCSPBuilder.buildPolicy(csp: nil, hostOrigin: "calyx-mcp-host://abc").policy,
+            contentRuleListJSON: MCPAppCSPBuilder.contentRuleList(
+                csp: liftingDomains, hostOrigin: "calyx-mcp-host://abc", calyxOrigins: []
+            ),
+            additionalSchemeHandlers: [:]
+        )
+        let webView = WKWebView(frame: .zero, configuration: configuration)
+        try await NavigationWaiter().wait(for: webView, load: URL(string: "\(MCPAppWebViewFactory.appScheme)://app.local/index.html")!)
+
+        var result: String?
+        for _ in 0..<20 {
+            result = try await evaluate(webView, "window.result") as? String
+            if result != "pending" { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+
+        XCTAssertEqual(result, "blocked", "connect-src 'self' must still reject an origin that was never declared")
+    }
+
     // MARK: - Content rule list blocks even when CSP alone would allow it
 
     func test_contentRuleList_blocksFetch_evenWithPermissiveCSP() async throws {

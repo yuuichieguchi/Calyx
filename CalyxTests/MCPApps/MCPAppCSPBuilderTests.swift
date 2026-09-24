@@ -6,17 +6,12 @@
 //  domains (or none) it produces the exact Content-Security-Policy string
 //  the view's WKWebView response carries, plus a WKContentRuleList JSON
 //  document providing defense in depth. Values are pinned against the
-//  MCP Apps spec stable 2026-01-26 (apps.mdx):
-//    - the "Restrictive Default" block (used verbatim when `csp` is
-//      omitted) does not itself list font-src, frame-src, or base-uri;
-//      those fall back to default-src 'none', frame-src 'none', and
-//      base-uri 'self' respectively per the Host Behavior bullets.
-//    - the domain-mapping formula (used when `csp` IS declared) is taken
-//      from the spec's own reference implementation snippet, which always
-//      emits font-src, frame-src, and base-uri explicitly.
-//  Calyx adds object-src 'none', form-action 'none', and
-//  frame-ancestors <hostOrigin> in both cases (spec Host Behavior + Calyx
-//  hardening, not spec-mandated wording).
+//  ext-apps reference host (examples/basic-host/serve.ts, buildCspHeader):
+//  the same directives whether `csp` is omitted or declared, an omitted
+//  `csp` being the declared form with every domain list empty. The
+//  reference apps (map/CesiumJS, threejs) rely on its 'unsafe-eval' and
+//  blob: workers, so Calyx is not stricter than it.
+//  Calyx adds form-action 'none' and frame-ancestors <hostOrigin>.
 //
 
 import XCTest
@@ -28,17 +23,47 @@ final class MCPAppCSPBuilderTests: XCTestCase {
 
     // MARK: - Exact default policy (csp omitted)
 
-    func test_defaultPolicy_omittedCSP_matchesSpecRestrictiveDefaultVerbatim() {
+    func test_defaultPolicy_omittedCSP_matchesReferenceHostWithNoDomains() {
         let result = MCPAppCSPBuilder.buildPolicy(csp: nil, hostOrigin: hostOrigin)
 
         let expected = [
-            "default-src 'none'",
-            "script-src 'self' 'unsafe-inline'",
-            "style-src 'self' 'unsafe-inline'",
-            "img-src 'self' data:",
-            "media-src 'self' data:",
-            "connect-src 'none'",
+            "default-src 'self' 'unsafe-inline'",
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data:",
+            "style-src 'self' 'unsafe-inline' blob: data:",
+            "img-src 'self' data: blob:",
+            "font-src 'self' data: blob:",
+            "media-src 'self' data: blob:",
+            "connect-src 'self'",
+            "worker-src 'self' blob:",
+            "frame-src 'none'",
             "object-src 'none'",
+            "base-uri 'none'",
+            "form-action 'none'",
+            "frame-ancestors \(hostOrigin)",
+        ].joined(separator: "; ") + ";"
+
+        XCTAssertEqual(result.policy, expected)
+        XCTAssertTrue(result.dropped.isEmpty)
+    }
+
+    func test_declaredCSP_cesiumResourceDomain_matchesReferenceHostExactly() {
+        let csp = MCPAppCSPBuilder.CSPDomains(
+            resourceDomains: ["https://*.cesium.com"], connectDomains: [], frameDomains: [], baseUriDomains: []
+        )
+        let result = MCPAppCSPBuilder.buildPolicy(csp: csp, hostOrigin: hostOrigin)
+
+        let expected = [
+            "default-src 'self' 'unsafe-inline'",
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https://*.cesium.com",
+            "style-src 'self' 'unsafe-inline' blob: data: https://*.cesium.com",
+            "img-src 'self' data: blob: https://*.cesium.com",
+            "font-src 'self' data: blob: https://*.cesium.com",
+            "media-src 'self' data: blob: https://*.cesium.com",
+            "connect-src 'self'",
+            "worker-src 'self' blob: https://*.cesium.com",
+            "frame-src 'none'",
+            "object-src 'none'",
+            "base-uri 'none'",
             "form-action 'none'",
             "frame-ancestors \(hostOrigin)",
         ].joined(separator: "; ") + ";"
@@ -54,7 +79,7 @@ final class MCPAppCSPBuilderTests: XCTestCase {
 
     // MARK: - Domain mapping when csp IS declared
 
-    func test_domainMapping_resourceDomains_appliedToScriptStyleImgFontMediaSrc() {
+    func test_domainMapping_resourceDomains_appliedToScriptStyleImgFontMediaWorkerSrc() {
         let csp = MCPAppCSPBuilder.CSPDomains(
             resourceDomains: ["https://cdn.jsdelivr.net"],
             connectDomains: [],
@@ -63,11 +88,12 @@ final class MCPAppCSPBuilderTests: XCTestCase {
         )
         let result = MCPAppCSPBuilder.buildPolicy(csp: csp, hostOrigin: hostOrigin)
 
-        XCTAssertTrue(result.policy.contains("script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"))
-        XCTAssertTrue(result.policy.contains("style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net"))
-        XCTAssertTrue(result.policy.contains("img-src 'self' data: https://cdn.jsdelivr.net"))
-        XCTAssertTrue(result.policy.contains("font-src 'self' https://cdn.jsdelivr.net"))
-        XCTAssertTrue(result.policy.contains("media-src 'self' data: https://cdn.jsdelivr.net"))
+        XCTAssertTrue(result.policy.contains("script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https://cdn.jsdelivr.net;"))
+        XCTAssertTrue(result.policy.contains("style-src 'self' 'unsafe-inline' blob: data: https://cdn.jsdelivr.net;"))
+        XCTAssertTrue(result.policy.contains("img-src 'self' data: blob: https://cdn.jsdelivr.net;"))
+        XCTAssertTrue(result.policy.contains("font-src 'self' data: blob: https://cdn.jsdelivr.net;"))
+        XCTAssertTrue(result.policy.contains("media-src 'self' data: blob: https://cdn.jsdelivr.net;"))
+        XCTAssertTrue(result.policy.contains("worker-src 'self' blob: https://cdn.jsdelivr.net;"))
     }
 
     func test_domainMapping_connectDomains_appliedToConnectSrcWithSelf() {
@@ -95,11 +121,11 @@ final class MCPAppCSPBuilderTests: XCTestCase {
         XCTAssertTrue(result.policy.contains("frame-src https://embed.example.com"))
     }
 
-    func test_domainMapping_baseUriDomains_absent_fallsBackToSelf() {
+    func test_domainMapping_baseUriDomains_absent_fallsBackToNone() {
         let csp = MCPAppCSPBuilder.CSPDomains(resourceDomains: [], connectDomains: [], frameDomains: [], baseUriDomains: [])
         let result = MCPAppCSPBuilder.buildPolicy(csp: csp, hostOrigin: hostOrigin)
 
-        XCTAssertTrue(result.policy.contains("base-uri 'self'"))
+        XCTAssertTrue(result.policy.contains("base-uri 'none'"))
     }
 
     func test_domainMapping_baseUriDomains_present_usedVerbatim() {
@@ -182,7 +208,7 @@ final class MCPAppCSPBuilderTests: XCTestCase {
         )
         let result = MCPAppCSPBuilder.buildPolicy(csp: csp, hostOrigin: hostOrigin)
         let scriptDirective = result.policy.components(separatedBy: "; ").first { $0.hasPrefix("script-src") }
-        XCTAssertEqual(scriptDirective, "script-src 'self' 'unsafe-inline' https://a.example.com")
+        XCTAssertEqual(scriptDirective, "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https://a.example.com")
     }
 
     func test_schemeless_ruleListLiftsExactlyTheHTTPSOrigin() throws {
@@ -328,7 +354,7 @@ final class MCPAppCSPBuilderTests: XCTestCase {
         let scriptDirective = first.policy
             .components(separatedBy: "; ")
             .first { $0.hasPrefix("script-src") }
-        XCTAssertEqual(scriptDirective, "script-src 'self' 'unsafe-inline' https://z.example.com https://a.example.com")
+        XCTAssertEqual(scriptDirective, "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https://z.example.com https://a.example.com")
     }
 
     func test_dedup_duplicateDomainsCollapsedToOne() {
@@ -337,7 +363,7 @@ final class MCPAppCSPBuilderTests: XCTestCase {
         )
         let result = MCPAppCSPBuilder.buildPolicy(csp: csp, hostOrigin: hostOrigin)
         let scriptDirective = result.policy.components(separatedBy: "; ").first { $0.hasPrefix("script-src") }
-        XCTAssertEqual(scriptDirective, "script-src 'self' 'unsafe-inline' https://a.example.com")
+        XCTAssertEqual(scriptDirective, "script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https://a.example.com")
     }
 
     // MARK: - WKContentRuleList JSON
