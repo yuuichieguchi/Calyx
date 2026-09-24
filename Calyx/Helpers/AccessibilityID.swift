@@ -297,6 +297,7 @@ enum AccessibilityID {
         static let editorSaveButton = "calyx.settings.mcpServers.editor.saveButton"
         static let importTextView = "calyx.settings.mcpServers.import.textView"
         static let importPreview = "calyx.settings.mcpServers.import.preview"
+        static let importParseError = "calyx.settings.mcpServers.import.parseError"
         static let importConfirmButton = "calyx.settings.mcpServers.import.confirmButton"
     }
 }

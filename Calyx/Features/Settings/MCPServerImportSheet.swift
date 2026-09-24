@@ -69,11 +69,9 @@ struct MCPServerImportSheet: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            TextEditor(text: $text)
-                .font(.system(size: 12, design: .monospaced))
+            MCPServerImportTextView(text: $text)
                 .frame(minHeight: 140)
                 .border(Color.secondary.opacity(0.4))
-                .accessibilityIdentifier(AccessibilityID.MCPServersSettings.importTextView)
                 .onChange(of: text) { _, newText in
                     parse(newText)
                 }
@@ -82,6 +80,7 @@ struct MCPServerImportSheet: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier(AccessibilityID.MCPServersSettings.importParseError)
             }
             if !imported.isEmpty {
                 preview

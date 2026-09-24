@@ -173,4 +173,33 @@ final class MCPServersJSONImporterTests: XCTestCase {
         let resolved = MCPServersJSONImporter.resolveAliasClashes(candidates: ["weather", "search"], existingAliases: [])
         XCTAssertEqual(resolved, ["weather", "search"])
     }
+
+    // MARK: - The import sheet's E2E input (K70)
+
+    /// The exact text `MCPAppsSettingsE2ETests` types into the import
+    /// sheet parses to one stdio server named "imported".
+    func test_parse_importSheetE2EInput_yieldsOneStdioServer() throws {
+        let typed = "{\"mcpServers\": {\"imported\": {\"command\": \"/usr/bin/python3\", \"args\": [\"--version\"]}}}"
+        let servers = try MCPServersJSONImporter.parse(typed, environment: [:])
+        XCTAssertEqual(servers.count, 1)
+        XCTAssertEqual(servers.first?.name, "imported")
+        guard case .stdio(let command, let args, _, _) = servers.first?.transport else {
+            return XCTFail("expected stdio transport")
+        }
+        XCTAssertEqual(command, "/usr/bin/python3")
+        XCTAssertEqual(args, ["--version"])
+    }
+
+    /// The same text after macOS smart-quote and smart-dash substitution
+    /// (what a text view with those substitutions on turns it into) is not
+    /// JSON; the importer reports it as a parse error at line 1.
+    func test_parse_smartQuotedInput_isRejectedAsParseError() {
+        let substituted = "{\u{201C}mcpServers\u{201D}: {\u{201C}imported\u{201D}: {\u{201C}command\u{201D}: \u{201C}/usr/bin/python3\u{201D}, \u{201C}args\u{201D}: [\u{201C}\u{2014}version\u{201D}]}}}"
+        XCTAssertThrowsError(try MCPServersJSONImporter.parse(substituted, environment: [:])) { error in
+            guard case MCPServersJSONImportError.parseError(let line, _, _) = error else {
+                return XCTFail("expected .parseError, got \(error)")
+            }
+            XCTAssertEqual(line, 1)
+        }
+    }
 }
