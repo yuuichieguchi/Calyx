@@ -7,7 +7,8 @@
 //  terminal, separated by a 1pt divider, and is bounded like a split pane.
 //  Its default width is 40% of the leaf width. For a leaf width W, each
 //  side keeps at least m = max(50pt, 0.1 * W) when W >= 2 * 50 + 1, and
-//  m = 0.1 * W below that; a requested dock width is clamped to
+//  m = 0.1 * W below that, and m is at least 6pt (twice the divider hit
+//  expansion, K71) when W - 1 >= 12; a requested dock width is clamped to
 //  [m, W - 1 - m]. Every leaf width gets a split (the dock is never
 //  hidden). `mode` is a String, not an enum (§11.10 signature).
 //
@@ -180,6 +181,20 @@ final class MCPAppDockLayoutTests: XCTestCase {
         XCTAssertEqual(narrow.terminalRect.width, 53, accuracy: 0.01)
     }
 
+    func test_50ptLeaf_keepsTwiceTheDividerHitExpansionOnEachSide() {
+        let leaf = CGRect(x: 0, y: 0, width: 50, height: 600)
+        // 0.1 * 50 = 5 is less than 2 * 3 = 6, so each side keeps 6pt and
+        // the dock divider's hit area stays clear of the neighbouring
+        // split divider's: the dock is limited to [6, 43].
+        let wide = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 50)
+        XCTAssertEqual(wide.dockRect.width, 43, accuracy: 0.01)
+        XCTAssertEqual(wide.terminalRect.width, 6, accuracy: 0.01)
+
+        let narrow = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 0)
+        XCTAssertEqual(narrow.dockRect.width, 6, accuracy: 0.01)
+        XCTAssertEqual(narrow.terminalRect.width, 43, accuracy: 0.01)
+    }
+
     func test_splitPartsNeverHaveANegativeWidth_inALeafNarrowerThanTheDivider() {
         let leaf = CGRect(x: 0, y: 0, width: 1, height: 600)
         let result = MCPAppDockLayout.split(leafRect: leaf, dockWidth: 5)
@@ -187,6 +202,14 @@ final class MCPAppDockLayoutTests: XCTestCase {
         for rect in [result.terminalRect, result.dividerRect, result.dockRect] {
             XCTAssertGreaterThanOrEqual(rect.width, 0)
         }
+    }
+
+    /// `split` cannot pass a negative width (`CGRect.width` is the
+    /// standardized, non-negative width), but `clampedDockWidth` is also
+    /// called directly with a leaf width.
+    func test_clampedDockWidth_ofANegativeLeafWidth_isZero() {
+        XCTAssertEqual(MCPAppDockLayout.clampedDockWidth(-5, leafWidth: -10), 0)
+        XCTAssertEqual(MCPAppDockLayout.clampedDockWidth(5, leafWidth: -10), 0)
     }
 
     // MARK: - Divider drag

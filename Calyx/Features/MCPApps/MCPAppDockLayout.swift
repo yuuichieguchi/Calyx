@@ -26,6 +26,15 @@ enum MCPAppDockLayout {
     /// Each side keeps at least this share of the leaf's width. The lower
     /// bound of `SplitData.clampRatio` ([0.1, 0.9]).
     static let minSideShare: CGFloat = 0.1
+    /// How far a divider's hit area reaches past each side of its visible
+    /// frame (`SplitContainerView.placeDividerView`), for split and dock
+    /// dividers alike.
+    static let dividerHitExpansion: CGFloat = 3
+    /// Each side keeps at least this many points when the leaf has room
+    /// for it on both sides of the divider, so the dock divider's hit
+    /// area does not overlap the hit area of a split divider at the
+    /// leaf's edge (each reaches `dividerHitExpansion` into the side).
+    static let minSideHitClearance: CGFloat = 2 * dividerHitExpansion
 
     struct SplitResult: Sendable, Equatable {
         let terminalRect: CGRect
@@ -42,16 +51,23 @@ enum MCPAppDockLayout {
     /// side of the divider keeps at least max(`minSideWidth`,
     /// `minSideShare` * leaf width) when the leaf is at least
     /// 2 * `minSideWidth` + `dividerThickness` wide, and
-    /// `minSideShare` * leaf width when it is narrower. When the width left
+    /// `minSideShare` * leaf width when it is narrower, raised to
+    /// `minSideHitClearance` when the width left after the divider holds
+    /// that on both sides. When the width left
     /// after the divider cannot hold both side minimums (a leaf narrower
     /// than 1.25 pt), the dock gets the side minimum capped to that width
-    /// and the terminal the rest, so no part has a negative width.
+    /// and the terminal the rest, so no part has a negative width. A
+    /// negative leaf width is treated as 0, so the dock width is 0.
     static func clampedDockWidth(_ dockWidth: CGFloat, leafWidth: CGFloat) -> CGFloat {
+        let leafWidth = max(0, leafWidth)
         let sides = max(0, leafWidth - dividerThickness)
         let proportional = minSideShare * leafWidth
-        let sideMinimum = leafWidth >= 2 * minSideWidth + dividerThickness
+        let splitMinimum = leafWidth >= 2 * minSideWidth + dividerThickness
             ? max(minSideWidth, proportional)
             : proportional
+        let sideMinimum = sides >= 2 * minSideHitClearance
+            ? max(minSideHitClearance, splitMinimum)
+            : splitMinimum
         let lower = min(sideMinimum, sides)
         let upper = max(lower, sides - sideMinimum)
         return min(max(dockWidth, lower), upper)

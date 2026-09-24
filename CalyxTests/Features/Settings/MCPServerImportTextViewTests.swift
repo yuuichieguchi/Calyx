@@ -28,6 +28,7 @@ final class MCPServerImportTextViewTests: XCTestCase {
         textView.isAutomaticLinkDetectionEnabled = true
         textView.isAutomaticDataDetectionEnabled = true
         textView.isContinuousSpellCheckingEnabled = true
+        textView.smartInsertDeleteEnabled = true
         textView.isRichText = true
         return textView
     }
@@ -48,6 +49,7 @@ final class MCPServerImportTextViewTests: XCTestCase {
         XCTAssertFalse(textView.isAutomaticLinkDetectionEnabled)
         XCTAssertFalse(textView.isAutomaticDataDetectionEnabled)
         XCTAssertFalse(textView.isContinuousSpellCheckingEnabled)
+        XCTAssertFalse(textView.smartInsertDeleteEnabled)
         XCTAssertFalse(textView.isRichText)
     }
 

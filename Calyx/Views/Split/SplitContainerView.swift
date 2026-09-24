@@ -457,7 +457,7 @@ class SplitContainerView: NSView {
         containingRect: CGRect
     ) -> SplitDividerView {
         // Expand hit area around the visible divider
-        let hitExpansion: CGFloat = 3
+        let hitExpansion = MCPAppDockLayout.dividerHitExpansion
         let hitFrame: CGRect
         switch direction {
         case .horizontal:

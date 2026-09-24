@@ -22,8 +22,9 @@
 //  which is kept through re-layouts, tab switches, parking and view
 //  changes, and dropped when the dock is detached. The dock is bounded
 //  like a split pane (K67): for a leaf width W each side keeps at least
-//  max(50pt, 0.1 * W) (0.1 * W when W < 2 * 50 + 1), and the dock shows at
-//  every leaf width.
+//  max(50pt, 0.1 * W) (0.1 * W when W < 2 * 50 + 1), and at least 6pt so
+//  the dock divider's hit area stays clear of a neighbouring split
+//  divider's (K71), and the dock shows at every leaf width.
 //
 
 import AppKit
@@ -468,6 +469,35 @@ final class SplitContainerViewDockTests: XCTestCase {
         XCTAssertEqual(dock.frame.width, 50, accuracy: 0.01)
         XCTAssertEqual(dock.frame.maxX, 399.5, accuracy: 0.01)
         XCTAssertFalse(dock.isHidden)
+    }
+
+    func test_dragLimitsInA50ptSplitLeaf_keepTheDividerHitAreasApart() throws {
+        let fixture = makeFixture()
+        // (101 - 1) / 2: two 50pt leaves with a split divider at x = 50.
+        fixture.container.setFrameSize(NSSize(width: 101, height: 600))
+        let leafA = UUID()
+        let leafB = UUID()
+        registerLeaf(leafA, in: fixture.registry)
+        registerLeaf(leafB, in: fixture.registry)
+        fixture.container.updateLayout(tree: twoLeafTree(first: leafA, second: leafB, zoomed: nil))
+        let dock = NSView()
+        fixture.container.attachDock(dock, toLeaf: leafA)
+        let divider = try dockDivider(in: fixture, leafID: leafA)
+        let wrapper = try XCTUnwrap(wrapper(for: leafA, in: fixture))
+        XCTAssertEqual(dock.frame.maxX, 50, accuracy: 0.01, "leaf A is 50pt")
+
+        let dividers = { fixture.container.subviews.compactMap { $0 as? SplitDividerView }.filter { !$0.isHidden } }
+
+        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 0, y: 300))
+        XCTAssertEqual(wrapper.frame.width, 6, accuracy: 0.01)
+        XCTAssertEqual(dock.frame.width, 43, accuracy: 0.01)
+
+        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 100, y: 300))
+        XCTAssertEqual(dock.frame.width, 6, accuracy: 0.01)
+        XCTAssertEqual(wrapper.frame.width, 43, accuracy: 0.01)
+        let all = dividers()
+        XCTAssertEqual(all.count, 2, "the split divider and the dock divider")
+        XCTAssertFalse(all[0].frame.intersects(all[1].frame), "the hit areas do not overlap: \(all.map(\.frame))")
     }
 
     func test_unzoomingAnotherLeaf_restoresTheDockInTheSplitLeaf() throws {

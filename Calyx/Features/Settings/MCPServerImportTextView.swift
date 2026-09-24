@@ -30,6 +30,7 @@ struct MCPServerImportTextView: NSViewRepresentable {
         textView.isAutomaticLinkDetectionEnabled = false
         textView.isAutomaticDataDetectionEnabled = false
         textView.isContinuousSpellCheckingEnabled = false
+        textView.smartInsertDeleteEnabled = false
         textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
         textView.setAccessibilityIdentifier(AccessibilityID.MCPServersSettings.importTextView)
     }
