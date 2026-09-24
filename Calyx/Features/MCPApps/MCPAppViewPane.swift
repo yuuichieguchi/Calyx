@@ -14,8 +14,6 @@ import WebKit
 @MainActor
 final class MCPAppViewPane: NSView {
 
-    /// The content height before the view reports one with size-changed.
-    static let initialContentHeight: CGFloat = 240
     static let headerHeight: CGFloat = 28
     /// The prompt text's height limit; a longer text scrolls.
     static let maxPromptTextHeight: CGFloat = 120
@@ -23,8 +21,6 @@ final class MCPAppViewPane: NSView {
     let viewID: UUID
     var onClose: (() -> Void)?
     var onReload: (() -> Void)?
-    /// Called when the preferred height changes.
-    var onPreferredHeightChange: (() -> Void)?
     /// Called when the appearance or the card's size changes (host context inputs).
     var onEnvironmentChange: (() -> Void)?
 
@@ -41,7 +37,6 @@ final class MCPAppViewPane: NSView {
     private let cardCloseButton = NSButton(title: "Close", target: nil, action: nil)
     private let borderLayerWidth: CGFloat
     private(set) weak var webView: WKWebView?
-    private var contentHeight: CGFloat = MCPAppViewPane.initialContentHeight
     private var promptContinuation: CheckedContinuation<MCPAppMessageConsentGate.PromptDecision, Never>?
 
     init(viewID: UUID, prefersBorder: Bool?) {
@@ -76,15 +71,6 @@ final class MCPAppViewPane: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    /// Header, any prompt, and the content height the view asked for.
-    var preferredHeight: CGFloat {
-        Self.headerHeight + (promptArea.isHidden ? 0 : promptArea.fittingSize.height) + contentHeight
-    }
-
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: NSView.noIntrinsicMetric, height: preferredHeight)
-    }
-
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         onEnvironmentChange?()
@@ -114,13 +100,6 @@ final class MCPAppViewPane: NSView {
             webView.topAnchor.constraint(equalTo: contentArea.topAnchor),
             webView.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
         ])
-    }
-
-    /// `ui/notifications/size-changed`, already clamped by the caller.
-    func setContentHeight(_ height: CGFloat) {
-        guard height != contentHeight else { return }
-        contentHeight = height
-        preferredHeightDidChange()
     }
 
     func update(snapshot: MCPAppViewSnapshot, droppedCSPEntries: [(raw: String, reason: String)]) {
@@ -297,7 +276,6 @@ final class MCPAppViewPane: NSView {
         }
         promptArea.addArrangedSubview(row)
         promptArea.isHidden = false
-        preferredHeightDidChange()
     }
 
     /// Adds the prompt's text, whole: a read-only, selectable text view that
@@ -344,7 +322,6 @@ final class MCPAppViewPane: NSView {
         guard !promptArea.isHidden else { return }
         promptArea.isHidden = true
         promptArea.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        preferredHeightDidChange()
     }
 
     private func resolvePrompt(_ decision: MCPAppMessageConsentGate.PromptDecision) {
@@ -352,11 +329,6 @@ final class MCPAppViewPane: NSView {
         promptContinuation = nil
         hidePrompt()
         continuation.resume(returning: decision)
-    }
-
-    private func preferredHeightDidChange() {
-        invalidateIntrinsicContentSize()
-        onPreferredHeightChange?()
     }
 
     @objc private func closeClicked() { onClose?() }

@@ -2,8 +2,9 @@
 //  MCPAppDockView.swift
 //  Calyx
 //
-//  The inline dock under one pane's terminal. With more than one view, a
-//  segmented switcher above the card picks which one shows.
+//  The inline dock to the right of one pane's terminal. With more than one
+//  view, a segmented switcher above the card picks which one shows. The
+//  split container sets the dock's frame; the dock does not ask for a size.
 //
 
 import AppKit
@@ -37,16 +38,15 @@ final class MCPAppDockView: NSView {
 
     override var isFlipped: Bool { true }
 
-    override var intrinsicContentSize: NSSize {
-        let paneHeight = selectedPane?.preferredHeight ?? 0
-        return NSSize(width: NSView.noIntrinsicMetric, height: paneHeight + (panes.count > 1 ? Self.switcherHeight : 0))
+    /// The size of the card area: the dock without the switcher strip.
+    var cardSize: CGSize {
+        CGSize(width: bounds.width, height: bounds.height - shownSwitcherHeight)
     }
 
     /// Adds a pane and shows it.
     func add(_ pane: MCPAppViewPane) {
         guard !panes.contains(where: { $0 === pane }) else { return }
         panes.append(pane)
-        pane.onPreferredHeightChange = { [weak self] in self?.preferredHeightDidChange() }
         select(pane.viewID)
     }
 
@@ -59,7 +59,7 @@ final class MCPAppDockView: NSView {
             if let last = panes.last { select(last.viewID) }
         }
         rebuildSwitcher()
-        preferredHeightDidChange()
+        needsLayout = true
     }
 
     func select(_ viewID: UUID) {
@@ -69,7 +69,6 @@ final class MCPAppDockView: NSView {
         addSubview(pane)
         rebuildSwitcher()
         needsLayout = true
-        preferredHeightDidChange()
     }
 
     /// Titles for the switcher, in pane order.
@@ -80,16 +79,20 @@ final class MCPAppDockView: NSView {
 
     override func layout() {
         super.layout()
-        let showsSwitcher = panes.count > 1
-        switcher.isHidden = !showsSwitcher
-        let top = showsSwitcher ? Self.switcherHeight : 0
-        if showsSwitcher {
+        let top = shownSwitcherHeight
+        switcher.isHidden = top == 0
+        if top > 0 {
             switcher.frame = NSRect(x: 6, y: 2, width: bounds.width - 12, height: Self.switcherHeight - 4)
         }
         selectedPane?.frame = NSRect(x: 0, y: top, width: bounds.width, height: max(0, bounds.height - top))
     }
 
     // MARK: - Private
+
+    /// The switcher shows with more than one view.
+    private var shownSwitcherHeight: CGFloat {
+        panes.count > 1 ? Self.switcherHeight : 0
+    }
 
     private var selectedPane: MCPAppViewPane? {
         panes.first { $0.viewID == selectedViewID }
@@ -104,12 +107,6 @@ final class MCPAppDockView: NSView {
             switcher.setWidth(0, forSegment: index)
             if pane.viewID == selectedViewID { switcher.selectedSegment = index }
         }
-    }
-
-    private func preferredHeightDidChange() {
-        invalidateIntrinsicContentSize()
-        needsLayout = true
-        (superview as? SplitContainerView)?.dockPreferredHeightDidChange()
     }
 
     @objc private func switcherChanged() {

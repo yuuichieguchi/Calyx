@@ -4,36 +4,55 @@
 //
 //  Geometry of the inline dock and the container dimensions reported to
 //  the view for each display mode. Rects are in a flipped coordinate space
-//  (`SplitContainerView.isFlipped`): the terminal sits on top, the dock
-//  below it.
+//  (`SplitContainerView.isFlipped`): the terminal sits on the left, the
+//  dock on the right, with a divider between them.
 //
 
 import CoreGraphics
 import Foundation
 
 enum MCPAppDockLayout {
-    /// The dock never takes more than this share of its leaf's height.
-    static let maxDockShare: CGFloat = 0.6
-    /// The terminal keeps at least this many points, or `minTerminalRows` rows if that is taller.
-    static let minTerminalHeight: CGFloat = 120
-    static let minTerminalRows: CGFloat = 6
+    /// A dock nobody has dragged is this share of its leaf's width.
+    static let defaultDockShare: CGFloat = 0.4
+    /// The terminal keeps at least this many points, or `minTerminalColumns` columns if that is wider.
+    static let minTerminalWidth: CGFloat = 120
+    static let minTerminalColumns: CGFloat = 40
+    /// The visible width of the divider between the terminal and the dock
+    /// (the split divider's width).
+    static let dividerThickness: CGFloat = 1
     static let defaultBorderWidth: CGFloat = 1
 
     struct SplitResult: Sendable, Equatable {
         let terminalRect: CGRect
+        let dividerRect: CGRect
         let dockRect: CGRect
     }
 
-    /// The terminal keeps at least max(120pt, 6 rows); the dock gets at
-    /// most 60% of the leaf height.
-    static func split(leafRect: CGRect, dockHeight: CGFloat, rowHeight: CGFloat) -> SplitResult {
-        let terminalMinimum = max(minTerminalHeight, minTerminalRows * rowHeight)
-        let dock = max(0, min(dockHeight, leafRect.height * maxDockShare, leafRect.height - terminalMinimum))
-        let terminal = leafRect.height - dock
+    /// The width of a dock nobody has dragged.
+    static func defaultDockWidth(leafWidth: CGFloat) -> CGFloat {
+        leafWidth * defaultDockShare
+    }
+
+    /// Terminal on the left, divider, dock on the right, each the leaf's
+    /// full height. The dock gets `dockWidth`, at most what leaves the
+    /// terminal max(120pt, 40 columns).
+    static func split(leafRect: CGRect, dockWidth: CGFloat, cellWidth: CGFloat) -> SplitResult {
+        let terminalMinimum = max(minTerminalWidth, minTerminalColumns * cellWidth)
+        let dock = max(0, min(dockWidth, leafRect.width - dividerThickness - terminalMinimum))
+        let terminal = max(0, leafRect.width - dividerThickness - dock)
+        let dividerX = leafRect.minX + terminal
         return SplitResult(
-            terminalRect: CGRect(x: leafRect.minX, y: leafRect.minY, width: leafRect.width, height: terminal),
-            dockRect: CGRect(x: leafRect.minX, y: leafRect.minY + terminal, width: leafRect.width, height: dock)
+            terminalRect: CGRect(x: leafRect.minX, y: leafRect.minY, width: terminal, height: leafRect.height),
+            dividerRect: CGRect(x: dividerX, y: leafRect.minY, width: dividerThickness, height: leafRect.height),
+            dockRect: CGRect(x: leafRect.maxX - dock, y: leafRect.minY, width: dock, height: leafRect.height)
         )
+    }
+
+    /// The dock width a divider drag asks for: the dock's left edge sits
+    /// under the cursor. `ratio` is the cursor's position across the leaf,
+    /// as `SplitDividerView` reports it.
+    static func dockWidth(forDividerRatio ratio: Double, leafWidth: CGFloat) -> CGFloat {
+        leafWidth * (1 - CGFloat(ratio))
     }
 
     /// `McpUiHostContext.containerDimensions`.
@@ -44,10 +63,13 @@ enum MCPAppDockLayout {
         let maxHeight: Double?
     }
 
-    /// Unknown modes are reported like "inline".
+    /// Unknown modes are reported like "inline". Inline is the fixed size
+    /// of the card area in the dock below `headerHeight` (at least 0): the
+    /// view fills it, and the host does not resize it on
+    /// `ui/notifications/size-changed`.
     static func containerDimensions(
         mode: String,
-        leafRect: CGRect,
+        dockSize: CGSize,
         windowSize: CGSize,
         tabTerminalRect: CGRect,
         headerHeight: CGFloat
@@ -63,17 +85,12 @@ enum MCPAppDockLayout {
             return ContainerDimensions(width: width, height: height, maxWidth: width, maxHeight: height)
         default:
             return ContainerDimensions(
-                width: Double(leafRect.width),
-                height: nil,
-                maxWidth: Double(leafRect.width),
-                maxHeight: Double(leafRect.height * maxDockShare)
+                width: Double(dockSize.width),
+                height: Double(max(0, dockSize.height - headerHeight)),
+                maxWidth: nil,
+                maxHeight: nil
             )
         }
-    }
-
-    /// `ui/notifications/size-changed` height, clamped to [0, 60% of the leaf].
-    static func clampSizeChanged(requestedHeight: CGFloat, leafHeight: CGFloat) -> CGFloat {
-        min(max(0, requestedHeight), leafHeight * maxDockShare)
     }
 
     /// `_meta.ui.prefersBorder`; omitted means the Calyx border.

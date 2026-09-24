@@ -363,7 +363,7 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
                 if let window = container?.window {
                     removeFromDock(viewID: viewID, surfaceID: surfaceID)
                     let dimensions = MCPAppDockLayout.containerDimensions(
-                        mode: "pip", leafRect: .zero, windowSize: window.frame.size, tabTerminalRect: .zero, headerHeight: 0
+                        mode: "pip", dockSize: .zero, windowSize: window.frame.size, tabTerminalRect: .zero, headerHeight: 0
                     )
                     // "pip" always reports a width and a height.
                     let pip = MCPAppPiPWindow(size: NSSize(width: dimensions.width!, height: dimensions.height!))
@@ -387,10 +387,14 @@ final class MCPAppWebViewRuntime: MCPAppViewRuntime {
         let pane = state.pane
         let window = pane.window
         let container = state.surfaceID.flatMap { environment.splitContainer(owningSurface: $0) }
-        let leafRect = state.surfaceID.flatMap { container?.leafRect(forLeaf: $0) } ?? pane.bounds
+        // A docked card's size is the dock's card area. A card in a panel, or
+        // in a dock not laid out yet (zero or negative card area), reports
+        // the pane's own size.
+        let cardSize = state.surfaceID.flatMap { docks[$0]?.dock.cardSize }
+            .flatMap { $0.width > 0 && $0.height > 0 ? $0 : nil }
         let dimensions = MCPAppDockLayout.containerDimensions(
             mode: state.displayMode,
-            leafRect: leafRect,
+            dockSize: cardSize ?? pane.bounds.size,
             windowSize: window?.frame.size ?? pane.bounds.size,
             tabTerminalRect: container?.bounds ?? pane.bounds,
             headerHeight: MCPAppViewPane.headerHeight

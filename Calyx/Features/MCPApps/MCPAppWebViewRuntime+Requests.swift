@@ -77,7 +77,10 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
         case "notifications/tools/list_changed":
             Task { @MainActor [weak self] in await self?.refreshAppTools(viewID: viewID) }
         case "ui/notifications/size-changed":
-            sizeChanged(viewID: viewID, params: params)
+            // The host sets the card's size (the dock width is the user's,
+            // the height is the leaf's) and reports it as fixed
+            // `containerDimensions`; the view's size does not change it.
+            break
         case "ui/notifications/request-teardown":
             Task { @MainActor in await store.viewRequestedTeardown(viewID: viewID) }
         case "notifications/message":
@@ -138,19 +141,6 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
         } catch {
             logger.error("Listing the tools of MCP App view \(viewID, privacy: .public) failed: \(error, privacy: .public)")
         }
-    }
-
-    private func sizeChanged(viewID: UUID, params: [String: AnyCodable]?) {
-        guard let state = views[viewID], let surfaceID = state.surfaceID, state.displayMode == "inline",
-              let height = Self.number(params?["height"]),
-              let leafRect = environment.splitContainer(owningSurface: surfaceID)?.leafRect(forLeaf: surfaceID) else {
-            return
-        }
-        let clamped = MCPAppDockLayout.clampSizeChanged(
-            requestedHeight: CGFloat(height), leafHeight: leafRect.height - MCPAppViewPane.headerHeight
-        )
-        state.pane.setContentHeight(clamped)
-        hostEnvironmentDidChange()
     }
 
     // MARK: - ui/* requests
@@ -410,10 +400,6 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
 
     private static func serverError(_ message: String) -> JSONRPCError {
         JSONRPCError(code: -32000, message: message, data: nil)
-    }
-
-    private static func number(_ value: AnyCodable?) -> Double? {
-        value?.doubleValue ?? value?.intValue.map(Double.init)
     }
 }
 

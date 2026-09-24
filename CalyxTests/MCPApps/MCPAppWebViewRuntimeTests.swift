@@ -9,6 +9,8 @@
 //  its WebContent process ends or its caller is cancelled, a pending
 //  `ui/message` fails with -32000 when the pane's agent ends, and a mount
 //  that finishes after the store dropped the view builds no web view.
+//  Inline sizing (K55): `ui/notifications/size-changed` does not resize
+//  the dock, and the host context reports the dock's size.
 //
 
 import AppKit
@@ -281,6 +283,104 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         try await waitUntil("the view is removed") { harness.store.snapshot(viewID: viewID) == nil }
     }
 
+    // MARK: - K55: the dock's size is the host's, not the view's
+
+    func test_sizeChanged_doesNotResizeTheDock() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let (container, _) = makeContainer(leaves: [surfaceID])
+        harness.environment.containers[surfaceID] = container
+        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+        let dock = try XCTUnwrap(container.dockView(forLeaf: surfaceID), "precondition: the view is docked")
+        let dockFrame = dock.frame
+        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
+
+        for size in [["width": 100.0, "height": 50.0], ["width": 700.0, "height": 580.0], ["height": 90.0]] {
+            harness.runtime.bridge(bridge, didReceiveNotification: "ui/notifications/size-changed",
+                                   params: size.mapValues { AnyCodable($0) })
+            container.layoutSubtreeIfNeeded()
+            XCTAssertEqual(dock.frame, dockFrame, "size-changed \(size) leaves the dock as it was")
+        }
+        await harness.store.close(viewID: viewID)
+    }
+
+    func test_hostContext_reportsTheDocksSize_andFollowsADrag() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let (container, _) = makeContainer(leaves: [surfaceID])
+        harness.environment.containers[surfaceID] = container
+        let viewID = try await startCardOnlyView(harness, surfaceID: surfaceID)
+
+        let before = try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions
+        XCTAssertEqual(before, MCPAppDockLayout.ContainerDimensions(
+            width: 320, height: Double(600 - MCPAppViewPane.headerHeight), maxWidth: nil, maxHeight: nil
+        ))
+
+        let divider = try XCTUnwrap(container.subviews.compactMap { $0 as? SplitDividerView }.first)
+        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 600, y: 300))
+
+        let after = try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions
+        XCTAssertEqual(after.width, 200)
+        XCTAssertEqual(after.height, Double(600 - MCPAppViewPane.headerHeight))
+    }
+
+    func test_draggingTheDockDivider_sendsTheNewWidthToAnInitializedView() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let (container, _) = makeContainer(leaves: [surfaceID])
+        harness.environment.containers[surfaceID] = container
+        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
+        _ = await harness.runtime.bridge(bridge, didReceiveRequest: "ui/initialize", params: [
+            "protocolVersion": AnyCodable("2026-01-26"),
+            "appCapabilities": AnyCodable([String: AnyCodable]()),
+        ])
+        container.layoutSubtreeIfNeeded()
+        let reportedWidth = { harness.runtime.views[viewID]?.lastHostContext["containerDimensions"]?["width"]?.doubleValue }
+        XCTAssertEqual(reportedWidth(), 320, "precondition: initialize reported the default dock width")
+
+        let divider = try XCTUnwrap(container.subviews.compactMap { $0 as? SplitDividerView }.first)
+        divider._testSimulateDrag(toSuperviewPoint: NSPoint(x: 600, y: 300))
+        container.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(reportedWidth(), 200, "the card's new size reaches the view's host context")
+        await harness.store.close(viewID: viewID)
+    }
+
+    func test_hostContext_reportsThePanesSize_whileTheDockIsNotLaidOut() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let registry = SurfaceRegistry()
+        registry._testInsert(view: SurfaceView(frame: .zero), id: surfaceID)
+        // A zero-bounds container lays nothing out, so the dock keeps a zero frame.
+        let container = SplitContainerView(registry: registry)
+        container.updateLayout(tree: tree([surfaceID]))
+        harness.environment.containers[surfaceID] = container
+        let viewID = try await startCardOnlyView(harness, surfaceID: surfaceID)
+        let dock = try XCTUnwrap(container.dockView(forLeaf: surfaceID))
+        XCTAssertEqual(dock.frame.size, .zero, "precondition: the dock is not laid out")
+        let pane = try XCTUnwrap(harness.runtime.views[viewID]?.pane)
+        pane.frame = NSRect(x: 0, y: 0, width: 300, height: 400)
+
+        let dimensions = try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions
+
+        XCTAssertEqual(dimensions.width, 300)
+        XCTAssertEqual(dimensions.height, Double(400 - MCPAppViewPane.headerHeight))
+    }
+
+    func test_hostContext_leavesOutTheSwitcher_whenTheDockShowsTwoViews() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let (container, _) = makeContainer(leaves: [surfaceID])
+        harness.environment.containers[surfaceID] = container
+        let viewID = try await startCardOnlyView(harness, surfaceID: surfaceID)
+        _ = try await startCardOnlyView(harness, surfaceID: surfaceID)
+
+        let dimensions = try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions
+        XCTAssertEqual(dimensions.width, 320)
+        XCTAssertEqual(dimensions.height, Double(600 - MCPAppDockView.switcherHeight - MCPAppViewPane.headerHeight))
+    }
+
     // MARK: - Finding 1: a mount the store no longer wants builds nothing
 
     func test_mountOfAViewTheStoreDoesNotHave_throws_andRemovesItsRuleList() async throws {
@@ -337,5 +437,18 @@ final class MCPAppViewPanePromptTests: XCTestCase {
         pane.dismissPrompt()
         let decision = await task.value
         XCTAssertEqual(decision, .dontSend)
+    }
+
+    func test_webView_fillsTheCardBelowTheHeader() {
+        let pane = MCPAppViewPane(viewID: UUID(), prefersBorder: nil)
+        let webView = WKWebView(frame: .zero)
+        pane.setWebView(webView)
+        pane.frame = NSRect(x: 0, y: 0, width: 320, height: 600)
+
+        pane.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(webView.frame.width, 320, accuracy: 0.5)
+        XCTAssertEqual(webView.frame.height, 600 - MCPAppViewPane.headerHeight, accuracy: 0.5,
+            "the web view takes the whole card below the header")
     }
 }

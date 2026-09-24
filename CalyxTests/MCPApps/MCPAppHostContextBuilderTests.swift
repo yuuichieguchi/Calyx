@@ -234,6 +234,20 @@ final class MCPAppHostContextBuilderTests: XCTestCase {
         XCTAssertEqual(out["height"]?.doubleValue, 320)
     }
 
+    func test_buildHostContext_inlineDockDimensions_areAFixedWidthAndHeightWithoutMaximums() throws {
+        let dims = MCPAppDockLayout.containerDimensions(
+            mode: "inline", dockSize: CGSize(width: 320, height: 600), windowSize: CGSize(width: 1200, height: 800),
+            tabTerminalRect: CGRect(x: 0, y: 0, width: 1200, height: 760), headerHeight: 28
+        )
+        let context = MCPAppHostContextBuilder.buildHostContext(environment(containerDimensions: dims))
+        let out = try XCTUnwrap(context["containerDimensions"]?.objectValue)
+
+        XCTAssertEqual(out["width"]?.doubleValue, 320)
+        XCTAssertEqual(out["height"]?.doubleValue, 572)
+        XCTAssertNil(out["maxWidth"], "a fixed width is reported without maxWidth")
+        XCTAssertNil(out["maxHeight"], "a fixed height is reported without maxHeight")
+    }
+
     func test_buildHostContext_theme_reflectsIsDarkTheme() throws {
         let context = MCPAppHostContextBuilder.buildHostContext(environment())
         XCTAssertEqual(context["theme"]?.stringValue, "light")
