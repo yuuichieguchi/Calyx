@@ -7,10 +7,12 @@
 //  the view to a remapped leaf, closing the picture-in-picture window
 //  returns the view inline, a host request to a mounted view fails when
 //  its WebContent process ends or its caller is cancelled, a pending
-//  `ui/message` fails with -32000 when the pane's agent ends, and a mount
-//  that finishes after the store dropped the view builds no web view.
+//  `ui/message` fails with -32000 when the pane's conversation ends, and a
+//  mount that finishes after the store dropped the view builds no web view.
 //  Inline sizing (K55): `ui/notifications/size-changed` does not resize
-//  the dock, and the host context reports the dock's size.
+//  the dock, and the host context reports the dock's size. The reported
+//  height leaves out a shown consent prompt, and showing or hiding one
+//  sends `host-context-changed` (K60).
 //
 
 import AppKit
@@ -36,6 +38,46 @@ private final class RecordingInputDelivery: MCPAppInputDelivering {
     private(set) var deliveredTexts: [String] = []
     func deliverUserMessage(_ text: String, to surfaceID: UUID) async throws {
         deliveredTexts.append(text)
+    }
+}
+
+/// Records every message the store sends to a view, then passes it to
+/// the web view runtime.
+@MainActor
+private final class SendRecordingRuntime: MCPAppViewRuntime {
+    let inner: MCPAppWebViewRuntime
+    private(set) var sent: [(viewID: UUID, message: JSONRPCMessage)] = []
+
+    init(inner: MCPAppWebViewRuntime) {
+        self.inner = inner
+    }
+
+    func mount(viewID: UUID, document: MCPAppViewDocument) async throws {
+        try await inner.mount(viewID: viewID, document: document)
+    }
+
+    func send(_ message: JSONRPCMessage, to viewID: UUID) async throws -> JSONRPCMessage? {
+        sent.append((viewID, message))
+        return try await inner.send(message, to: viewID)
+    }
+
+    func unmount(viewID: UUID) {
+        inner.unmount(viewID: viewID)
+    }
+
+    func requestTeardown(viewID: UUID) async {
+        await inner.requestTeardown(viewID: viewID)
+    }
+
+    /// The `containerDimensions.height` of each `host-context-changed` sent to `viewID`, in order.
+    func hostContextChangedHeights(viewID: UUID) -> [Double?] {
+        sent.compactMap { entry -> Double?? in
+            guard entry.viewID == viewID,
+                  case .notification(let method, let params) = entry.message,
+                  method == "ui/notifications/host-context-changed",
+                  let dimensions = params?["containerDimensions"] else { return nil }
+            return .some(dimensions["height"]?.doubleValue)
+        }
     }
 }
 
@@ -68,6 +110,16 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         let store = MCPAppHostStore(paneResolver: NoPaneResolver(), runtime: runtime, appToolRegistry: FakeAppToolRegistry())
         runtime.store = store
         return Harness(runtime: runtime, store: store, environment: environment)
+    }
+
+    /// A harness whose store sends through a `SendRecordingRuntime`.
+    private func makeRecordingHarness() -> (harness: Harness, recorder: SendRecordingRuntime) {
+        let environment = FakeRuntimeEnvironment()
+        let runtime = MCPAppWebViewRuntime(environment: environment)
+        let recorder = SendRecordingRuntime(inner: runtime)
+        let store = MCPAppHostStore(paneResolver: NoPaneResolver(), runtime: recorder, appToolRegistry: FakeAppToolRegistry())
+        runtime.store = store
+        return (Harness(runtime: runtime, store: store, environment: environment), recorder)
     }
 
     private func makeContainer(leaves: [UUID]) -> (container: SplitContainerView, registry: SurfaceRegistry) {
@@ -379,6 +431,70 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         let dimensions = try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions
         XCTAssertEqual(dimensions.width, 320)
         XCTAssertEqual(dimensions.height, Double(600 - MCPAppDockView.switcherHeight - MCPAppViewPane.headerHeight))
+    }
+
+    // MARK: - The consent prompt takes height from the web view
+
+    func test_hostContext_heightShrinksWhileAPromptShows_andReturnsAfterItHides() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let (container, _) = makeContainer(leaves: [surfaceID])
+        harness.environment.containers[surfaceID] = container
+        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+        container.layoutSubtreeIfNeeded()
+        let pane = try XCTUnwrap(harness.runtime.views[viewID]?.pane)
+        let webView = try XCTUnwrap(pane.webView)
+        let fullHeight = Double(600 - MCPAppViewPane.headerHeight)
+        XCTAssertEqual(try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions.height, fullHeight,
+                       "precondition: no prompt")
+
+        pane.showCopyOnly(text: "hello")
+
+        let promptHeight = try XCTUnwrap(try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions.height)
+        XCTAssertLessThan(promptHeight, fullHeight, "the prompt sits between the header and the web view")
+        container.layoutSubtreeIfNeeded()
+        XCTAssertEqual(Double(webView.frame.height), promptHeight, accuracy: 0.5, "the reported height is the web view's height")
+
+        pane.dismissPrompt()
+
+        XCTAssertEqual(try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions.height, fullHeight)
+        container.layoutSubtreeIfNeeded()
+        XCTAssertEqual(Double(webView.frame.height), fullHeight, accuracy: 0.5)
+        await harness.store.close(viewID: viewID)
+    }
+
+    func test_showingAndHidingAPrompt_sendsHostContextChangedToAnInitializedView() async throws {
+        let (harness, recorder) = makeRecordingHarness()
+        let surfaceID = UUID()
+        let (container, _) = makeContainer(leaves: [surfaceID])
+        harness.environment.containers[surfaceID] = container
+        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
+        _ = await harness.runtime.bridge(bridge, didReceiveRequest: "ui/initialize", params: [
+            "protocolVersion": AnyCodable("2026-01-26"),
+            "appCapabilities": AnyCodable([String: AnyCodable]()),
+        ])
+        harness.runtime.bridge(bridge, didReceiveNotification: "ui/notifications/initialized", params: nil)
+        container.layoutSubtreeIfNeeded()
+        let pane = try XCTUnwrap(harness.runtime.views[viewID]?.pane)
+        let fullHeight = Double(600 - MCPAppViewPane.headerHeight)
+        let before = recorder.hostContextChangedHeights(viewID: viewID).count
+
+        pane.showCopyOnly(text: "hello")
+
+        try await waitUntil("host-context-changed follows the prompt") {
+            recorder.hostContextChangedHeights(viewID: viewID).count == before + 1
+        }
+        let shownHeight = try XCTUnwrap(recorder.hostContextChangedHeights(viewID: viewID).last ?? nil)
+        XCTAssertLessThan(shownHeight, fullHeight)
+
+        pane.dismissPrompt()
+
+        try await waitUntil("host-context-changed follows the prompt's dismissal") {
+            recorder.hostContextChangedHeights(viewID: viewID).count == before + 2
+        }
+        XCTAssertEqual(recorder.hostContextChangedHeights(viewID: viewID).last, fullHeight)
+        await harness.store.close(viewID: viewID)
     }
 
     // MARK: - Finding 1: a mount the store no longer wants builds nothing

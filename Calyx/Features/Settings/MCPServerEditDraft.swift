@@ -141,30 +141,45 @@ enum MCPServerArgumentSplitter {
         case trailingBackslash
     }
 
+    /// The scalars that separate arguments. `\r\n` is two of them.
+    private static let whitespace: Set<Unicode.Scalar> = [" ", "\t", "\n", "\r"]
+    /// The scalars `split` gives a meaning to.
+    private static let special: Set<Unicode.Scalar> = whitespace.union(["'", "\"", "\\"])
+
     /// Splits `text` into arguments the way a POSIX shell splits words,
     /// without expansions: spaces, tabs and newlines separate arguments;
     /// single quotes keep everything up to the next single quote; double
     /// quotes keep everything up to the next unescaped double quote, where
     /// a backslash escapes only `"` and `\`; outside quotes a backslash
-    /// keeps the next character, and a backslash before a newline joins
-    /// the lines. `''` and `""` are empty arguments.
+    /// keeps the next scalar, and a backslash before `\n` or `\r\n` joins
+    /// the lines. `''` and `""` are empty arguments. The text is read one
+    /// Unicode scalar at a time, so a quote, space or backslash followed by
+    /// a combining mark, ZWJ, variation selector or emoji modifier keeps
+    /// its meaning; the scalar after it is an ordinary one.
     static func split(_ text: String) throws(SplitError) -> [String] {
         var arguments: [String] = []
-        var current = ""
+        var current = String.UnicodeScalarView()
         var inWord = false
-        var characters = text.makeIterator()
-        while let character = characters.next() {
-            switch character {
-            case " ", "\t", "\n", "\r", "\r\n":
+        let scalars = text.unicodeScalars
+        var index = scalars.startIndex
+        /// The scalar at `index`, advancing past it; nil at the end.
+        func next() -> Unicode.Scalar? {
+            guard index < scalars.endIndex else { return nil }
+            defer { index = scalars.index(after: index) }
+            return scalars[index]
+        }
+        while let scalar = next() {
+            switch scalar {
+            case _ where whitespace.contains(scalar):
                 if inWord {
-                    arguments.append(current)
-                    current = ""
+                    arguments.append(String(current))
+                    current = String.UnicodeScalarView()
                     inWord = false
                 }
             case "'":
                 inWord = true
                 var closed = false
-                while let quoted = characters.next() {
+                while let quoted = next() {
                     if quoted == "'" {
                         closed = true
                         break
@@ -175,13 +190,13 @@ enum MCPServerArgumentSplitter {
             case "\"":
                 inWord = true
                 var closed = false
-                while let quoted = characters.next() {
+                while let quoted = next() {
                     if quoted == "\"" {
                         closed = true
                         break
                     }
                     if quoted == "\\" {
-                        guard let escaped = characters.next() else { throw SplitError.unterminatedQuote("\"") }
+                        guard let escaped = next() else { throw SplitError.unterminatedQuote("\"") }
                         if escaped != "\"" && escaped != "\\" {
                             current.append("\\")
                         }
@@ -192,36 +207,49 @@ enum MCPServerArgumentSplitter {
                 }
                 guard closed else { throw SplitError.unterminatedQuote("\"") }
             case "\\":
-                guard let escaped = characters.next() else { throw SplitError.trailingBackslash }
-                if escaped == "\n" || escaped == "\r\n" {
+                guard let escaped = next() else { throw SplitError.trailingBackslash }
+                if escaped == "\n" {
+                    continue
+                }
+                if escaped == "\r", index < scalars.endIndex, scalars[index] == "\n" {
+                    index = scalars.index(after: index)
                     continue
                 }
                 inWord = true
                 current.append(escaped)
             default:
                 inWord = true
-                current.append(character)
+                current.append(scalar)
             }
         }
         if inWord {
-            arguments.append(current)
+            arguments.append(String(current))
         }
         return arguments
     }
 
     /// The Arguments field text for `arguments`, which `split` turns back
-    /// into the same arguments. An argument made only of characters with
-    /// no meaning to `split` is written as is; any other is single-quoted,
-    /// with each single quote written as `'\''`.
+    /// into the same arguments. An argument with no scalar that has a
+    /// meaning to `split` is written as is; any other is single-quoted,
+    /// with each single quote scalar written as `'\''`.
     static func join(_ arguments: [String]) -> String {
         arguments.map(quote).joined(separator: " ")
     }
 
     private static func quote(_ argument: String) -> String {
-        let special: Set<Character> = [" ", "\t", "\n", "\r", "\r\n", "'", "\"", "\\"]
-        guard !argument.isEmpty, !argument.contains(where: special.contains) else {
-            return "'" + argument.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        guard argument.isEmpty || argument.unicodeScalars.contains(where: special.contains) else {
+            return argument
         }
-        return argument
+        var quoted = String.UnicodeScalarView()
+        quoted.append("'")
+        for scalar in argument.unicodeScalars {
+            if scalar == "'" {
+                quoted.append(contentsOf: "'\\''".unicodeScalars)
+            } else {
+                quoted.append(scalar)
+            }
+        }
+        quoted.append("'")
+        return String(quoted)
     }
 }

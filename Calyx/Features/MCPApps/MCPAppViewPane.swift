@@ -21,7 +21,8 @@ final class MCPAppViewPane: NSView {
     let viewID: UUID
     var onClose: (() -> Void)?
     var onReload: (() -> Void)?
-    /// Called when the appearance or the card's size changes (host context inputs).
+    /// Called when the appearance, the card's size, or the content area's
+    /// height (a prompt shows or hides) changes (host context inputs).
     var onEnvironmentChange: (() -> Void)?
 
     private let titleLabel = NSTextField(labelWithString: "")
@@ -83,6 +84,13 @@ final class MCPAppViewPane: NSView {
     }
 
     // MARK: - Content
+
+    /// The height of the card above the content area (the web view or the
+    /// status card): the header, and the prompt while it shows. The prompt's
+    /// height is its fitting height, which the card's stack gives it.
+    var contentTopInset: CGFloat {
+        Self.headerHeight + (promptArea.isHidden ? 0 : promptArea.fittingSize.height)
+    }
 
     func setWebView(_ webView: WKWebView?) {
         self.webView?.removeFromSuperview()
@@ -276,6 +284,7 @@ final class MCPAppViewPane: NSView {
         }
         promptArea.addArrangedSubview(row)
         promptArea.isHidden = false
+        onEnvironmentChange?()
     }
 
     /// Adds the prompt's text, whole: a read-only, selectable text view that
@@ -322,6 +331,7 @@ final class MCPAppViewPane: NSView {
         guard !promptArea.isHidden else { return }
         promptArea.isHidden = true
         promptArea.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        onEnvironmentChange?()
     }
 
     private func resolvePrompt(_ decision: MCPAppMessageConsentGate.PromptDecision) {

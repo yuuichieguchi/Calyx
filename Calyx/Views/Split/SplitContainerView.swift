@@ -252,10 +252,23 @@ class SplitContainerView: NSView {
     /// Lays out a leaf that has a dock: terminal on the left, the dock
     /// divider, the dock on the right. The divider is placed after the
     /// wrapper and the dock are in the container, so a newly created
-    /// divider sits above both and keeps its whole hit area.
+    /// divider sits above both and keeps its whole hit area. A leaf too
+    /// narrow for both minimums (no `MCPAppDockLayout.dockWidthRange`)
+    /// gives the terminal the whole leaf and hides the dock with its frame
+    /// left as it is; no divider is placed, so this pass reaps it. The
+    /// stored width is kept, and the dock shows again when the leaf is
+    /// wide enough.
     private func layoutDockedLeaf(_ leafID: UUID, wrapper: SurfaceScrollView, dock: NSView, cellWidth: CGFloat, in rect: CGRect) {
+        guard let range = MCPAppDockLayout.dockWidthRange(leafWidth: rect.width, cellWidth: cellWidth) else {
+            wrapper.frame = rect
+            if wrapper.superview !== self {
+                addSubview(wrapper)
+            }
+            dock.isHidden = true
+            return
+        }
         let dockWidth = dockWidths[leafID] ?? MCPAppDockLayout.defaultDockWidth(leafWidth: rect.width)
-        let split = MCPAppDockLayout.split(leafRect: rect, dockWidth: dockWidth, cellWidth: cellWidth)
+        let split = MCPAppDockLayout.split(leafRect: rect, dockWidth: dockWidth, in: range)
         wrapper.frame = split.terminalRect
         dock.frame = split.dockRect
         dock.isHidden = false
@@ -268,12 +281,11 @@ class SplitContainerView: NSView {
         let divider = placeDividerView(
             key: .dock(leafID: leafID), direction: .horizontal, frame: split.dividerRect, containingRect: rect
         )
-        // Rebound every pass so the drag uses the leaf's current rect and cell width.
+        // Rebound every pass so the drag uses the leaf's current rect and width range.
         divider.onTargetRatioChange = { [weak self] ratio in
             guard let self else { return }
             let requested = MCPAppDockLayout.dockWidth(forDividerRatio: ratio, leafWidth: rect.width)
-            let shown = MCPAppDockLayout.split(leafRect: rect, dockWidth: requested, cellWidth: cellWidth).dockRect.width
-            self.dockWidths[leafID] = shown
+            self.dockWidths[leafID] = MCPAppDockLayout.clamp(requested, to: range)
             self.dockPreferredWidthDidChange()
         }
     }

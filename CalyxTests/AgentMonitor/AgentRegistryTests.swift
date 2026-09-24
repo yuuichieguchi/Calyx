@@ -3596,6 +3596,22 @@ final class AgentRegistryConversationEndedTests: XCTestCase {
         XCTAssertEqual(recorder.surfaceIDs, [surfaceID])
     }
 
+    /// Claude Code sends `SessionEnd` with `reason: "clear"` on `/clear`
+    /// and keeps running. `/clear` starts a new conversation, so the post
+    /// (the pane's conversation ended) is intended here too.
+    func test_sessionEnd_withReasonClear_posts() throws {
+        let registry = AgentRegistry()
+        let recorder = ConversationEndedRecorder(registry: registry)
+        let surfaceID = UUID()
+        registry.handleHookEvent(event("SessionStart"), surfaceID: surfaceID)
+        let payload = Data(#"{"hook_event_name":"SessionEnd","session_id":"session-1","cwd":"/Users/dev/project","reason":"clear"}"#.utf8)
+        let clear = try XCTUnwrap(AgentEvent.decode(from: payload))
+
+        registry.handleHookEvent(clear, surfaceID: surfaceID)
+
+        XCTAssertEqual(recorder.surfaceIDs, [surfaceID])
+    }
+
     func test_secondSessionEnd_ofADoneRow_doesNotPostAgain() {
         let registry = AgentRegistry()
         let recorder = ConversationEndedRecorder(registry: registry)

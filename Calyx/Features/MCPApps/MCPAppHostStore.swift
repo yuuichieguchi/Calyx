@@ -426,12 +426,14 @@ final class MCPAppHostStore: MCPAppViewHosting, MCPAppModelContextProviding {
 
     // MARK: - .calyxAgentConversationEnded
 
-    /// A view belongs to the conversation that called it, which is the
-    /// agent process of its pane. When that agent ends, each of the pane's
-    /// views goes through `remove(viewID:)` in creation order: a mounted
-    /// view gets `ui/resource-teardown` and is unmounted, then leaves the
-    /// table. The pane itself still exists. `Task.immediate` starts the
-    /// first removal before the notification post returns.
+    /// A view belongs to the conversation that called it, not to the agent
+    /// process of its pane. When the pane's conversation ends (the agent
+    /// process exited or the session was cleared, as Claude Code's `/clear`
+    /// does), each of the pane's views goes through `remove(viewID:)` in
+    /// creation order: a mounted view gets `ui/resource-teardown` and is
+    /// unmounted, then leaves the table. The pane itself still exists.
+    /// `Task.immediate` starts the first removal before the notification
+    /// post returns.
     fileprivate func conversationEnded(_ surfaceID: UUID) {
         let viewIDs = order.filter { records[$0]?.surfaceID == surfaceID }
         guard !viewIDs.isEmpty else { return }

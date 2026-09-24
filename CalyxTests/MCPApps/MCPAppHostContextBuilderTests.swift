@@ -237,7 +237,7 @@ final class MCPAppHostContextBuilderTests: XCTestCase {
     func test_buildHostContext_inlineDockDimensions_areAFixedWidthAndHeightWithoutMaximums() throws {
         let dims = MCPAppDockLayout.containerDimensions(
             mode: "inline", dockSize: CGSize(width: 320, height: 600), windowSize: CGSize(width: 1200, height: 800),
-            tabTerminalRect: CGRect(x: 0, y: 0, width: 1200, height: 760), headerHeight: 28
+            tabTerminalRect: CGRect(x: 0, y: 0, width: 1200, height: 760), contentTopInset: 28
         )
         let context = MCPAppHostContextBuilder.buildHostContext(environment(containerDimensions: dims))
         let out = try XCTUnwrap(context["containerDimensions"]?.objectValue)

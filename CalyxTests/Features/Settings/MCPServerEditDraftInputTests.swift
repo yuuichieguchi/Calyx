@@ -64,6 +64,56 @@ final class MCPServerArgumentSplitterTests: XCTestCase {
         XCTAssertEqual(MCPServerArgumentSplitter.join(["server.py", "--port", "8080"]), "server.py --port 8080")
         XCTAssertEqual(MCPServerArgumentSplitter.join(["/a b/c"]), "'/a b/c'")
     }
+
+    // MARK: - Special characters followed by a combining scalar
+
+    // A quote, space or backslash followed by a combining mark, ZWJ,
+    // variation selector or emoji modifier forms one Character with it,
+    // but each is still special to the splitter.
+
+    func test_split_quoteFollowedByACombiningMark_opensAQuote() throws {
+        XCTAssertEqual(try MCPServerArgumentSplitter.split("'\u{301}x y'"), ["\u{301}x y"])
+    }
+
+    func test_split_spaceFollowedByACombiningMark_separatesArguments() throws {
+        XCTAssertEqual(try MCPServerArgumentSplitter.split("a \u{301}"), ["a", "\u{301}"])
+    }
+
+    func test_split_backslashFollowedByAVariationSelector_escapesTheSelector() throws {
+        XCTAssertEqual(try MCPServerArgumentSplitter.split("a\\\u{FE0F}b"), ["a\u{FE0F}b"])
+    }
+
+    func test_split_spaceFollowedByAnEmojiModifier_separatesArguments() throws {
+        XCTAssertEqual(try MCPServerArgumentSplitter.split("a \u{1F3FB}"), ["a", "\u{1F3FB}"])
+    }
+
+    func test_split_crlf_isTwoSeparators_andABackslashBeforeItJoinsTheLines() throws {
+        XCTAssertEqual(try MCPServerArgumentSplitter.split("a\r\nb"), ["a", "b"])
+        XCTAssertEqual(try MCPServerArgumentSplitter.split("a\\\r\nb"), ["ab"])
+        XCTAssertEqual(try MCPServerArgumentSplitter.split("a\\\nb"), ["ab"])
+    }
+
+    func test_join_argumentStartingWithACombiningMark_splitsBack() throws {
+        let arguments = ["\u{301}x y"]
+        XCTAssertEqual(try MCPServerArgumentSplitter.split(MCPServerArgumentSplitter.join(arguments)), arguments)
+    }
+
+    func test_join_argumentThatIsACombiningMark_staysASeparateArgument() throws {
+        let arguments = ["a", "\u{301}"]
+        XCTAssertEqual(try MCPServerArgumentSplitter.split(MCPServerArgumentSplitter.join(arguments)), arguments)
+    }
+
+    func test_join_zwjBeforeAQuote_roundTrips() throws {
+        let arguments = ["\u{200D}' z"]
+        XCTAssertEqual(try MCPServerArgumentSplitter.split(MCPServerArgumentSplitter.join(arguments)), arguments)
+    }
+
+    func test_join_combiningScalarsAfterEverySpecialCharacter_roundTrip() throws {
+        let arguments = [
+            "'\u{301}", "\"\u{FE0F}", "\\\u{1F3FB}", " \u{200D}", "\t\u{301}", "\n\u{301}", "\r\n\u{301}", "it\u{301}'s",
+        ]
+        XCTAssertEqual(try MCPServerArgumentSplitter.split(MCPServerArgumentSplitter.join(arguments)), arguments)
+    }
 }
 
 final class MCPServerAliasFieldStateTests: XCTestCase {

@@ -602,10 +602,12 @@ final class AgentRegistry {
     /// also posts `.calyxAgentConversationEnded` for `surfaceID`, after
     /// the row is written. `.done` is written only by a hook-reported
     /// `SessionEnd` and by the pane-exit settles, so the post means the
-    /// agent process of that pane ended. A `.remove` posts nothing: the
-    /// resolver's only `.remove` retires an inferred `.titleHeuristic`
-    /// row. `handleSurfaceDestroyed` and `reset()` do not pass through
-    /// here and post nothing either.
+    /// pane's conversation ended: the agent process exited or the session
+    /// was cleared. Claude Code sends `SessionEnd` with `reason: "clear"`
+    /// on `/clear` and keeps running; that also posts. A `.remove` posts
+    /// nothing: the resolver's only `.remove` retires an inferred
+    /// `.titleHeuristic` row. `handleSurfaceDestroyed` and `reset()` do
+    /// not pass through here and post nothing either.
     private func apply(_ r: AgentResolution, surfaceID: UUID) {
         let newEvidence = r.evidence.isEmpty ? nil : r.evidence
         if evidence[surfaceID] != newEvidence { evidence[surfaceID] = newEvidence }
@@ -941,7 +943,9 @@ extension Notification.Name {
     static let calyxSurfaceDestroyed = Notification.Name("com.calyx.agentMonitor.surfaceDestroyed")
 
     /// Posted by `AgentRegistry` when a pane's row enters `.done`: the
-    /// agent process running in that pane ended. `object` is the registry;
+    /// pane's conversation ended, because the agent process exited or the
+    /// session was cleared (Claude Code's `/clear` sends `SessionEnd` and
+    /// the process keeps running). `object` is the registry;
     /// `userInfo["surfaceID"]` carries the pane's surface `UUID`.
     static let calyxAgentConversationEnded = Notification.Name("com.calyx.agentMonitor.agentConversationEnded")
 
