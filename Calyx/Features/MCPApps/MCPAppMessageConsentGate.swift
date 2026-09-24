@@ -3,8 +3,9 @@
 //  Calyx
 //
 //  Per-message consent for `ui/message`. Every message asks by default
-//  (the view is third-party HTML); "Always for this view" lasts only as
-//  long as the view. Independent of the Cockpit auto-approve setting.
+//  (the view is third-party HTML); "Always for this view" lasts as long
+//  as the view: a Reload keeps it, the view's removal forgets it.
+//  Independent of the Cockpit auto-approve setting.
 //
 
 import Foundation
@@ -15,7 +16,6 @@ final class MCPAppMessageConsentGate {
     enum PromptDecision: Sendable, Equatable { case send, alwaysForThisView, dontSend }
     enum PromptOutcome: Sendable, Equatable { case send, dontSend }
     enum BeginOutcome: Sendable, Equatable { case noPaneCopyOnly, send }
-    enum TeardownOutcome: Sendable, Equatable { case viewTornDown }
 
     private var alwaysApproved: Set<UUID> = []
     private var pending: Set<UUID> = []
@@ -32,7 +32,7 @@ final class MCPAppMessageConsentGate {
 
     /// `.noPaneCopyOnly` without a pane, `.send` when already approved for
     /// the view, otherwise nil with the request pending until
-    /// `resolvePendingPrompt` or `viewDidTeardown`.
+    /// `resolvePendingPrompt`, `cancelPendingPrompt` or `viewWasRemoved`.
     func beginRequest(viewID: UUID, hasPane: Bool) -> BeginOutcome? {
         guard hasPane else { return .noPaneCopyOnly }
         guard requiresPrompt(viewID: viewID) else { return .send }
@@ -57,9 +57,16 @@ final class MCPAppMessageConsentGate {
         }
     }
 
-    /// Forgets the view's approval. A pending prompt resolves as torn down.
-    func viewDidTeardown(viewID: UUID) -> TeardownOutcome? {
+    /// Ends the pending request of a document that is unloading; the
+    /// view's approval stays.
+    func cancelPendingPrompt(viewID: UUID) {
+        pending.remove(viewID)
+    }
+
+    /// Forgets the approval and any pending request of a view the store
+    /// no longer has.
+    func viewWasRemoved(viewID: UUID) {
         alwaysApproved.remove(viewID)
-        return pending.remove(viewID) == nil ? nil : .viewTornDown
+        pending.remove(viewID)
     }
 }

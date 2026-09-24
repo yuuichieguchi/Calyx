@@ -152,10 +152,27 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
         guard MCPAppOpenLinkPolicy.isAllowedScheme(url) else {
             return .success(Self.errorFlag)
         }
-        guard let pane = views[viewID]?.pane, await pane.promptForLink(url) else {
+        guard let state = views[viewID] else {
             return .success(Self.errorFlag)
         }
-        return .success(NSWorkspace.shared.open(url) ? Self.emptyObject : Self.errorFlag)
+        if openLinkPolicy.requiresPrompt(viewID: viewID) {
+            let generation = state.documentGeneration
+            let decision = await state.pane.promptForLink(url)
+            // The document that asked unloaded (Reload) or the view was
+            // removed while the prompt was up: nothing opens, nothing is allowed.
+            guard isCurrentDocument(viewID: viewID, state: state, generation: generation) else {
+                return .success(Self.errorFlag)
+            }
+            switch decision {
+            case .open:
+                break
+            case .alwaysForThisView:
+                openLinkPolicy.recordAlways(viewID: viewID)
+            case .cancel:
+                return .success(Self.errorFlag)
+            }
+        }
+        return .success(environment.openLink(url) ? Self.emptyObject : Self.errorFlag)
     }
 
     private func deliverMessage(viewID: UUID, params: [String: AnyCodable]?) async -> Result<AnyCodable, JSONRPCError> {
@@ -199,10 +216,12 @@ extension MCPAppWebViewRuntime: MCPAppBridgeDelegate {
                 if case .text(let text) = block { return text }
                 return "[image]"
             }.joined(separator: "\n")
+            let generation = state.documentGeneration
             let decision = await state.pane.promptForMessage(preview: preview)
-            // No pending request is left to decide (the view's teardown
-            // clears it): nothing is sent.
-            guard consentGate.isPending(viewID: viewID) else {
+            // The document that asked unloaded (Reload, teardown) or the
+            // view was removed while the prompt was up: nothing is sent,
+            // nothing is approved.
+            guard isCurrentDocument(viewID: viewID, state: state, generation: generation) else {
                 return .failure(Self.serverError("Message sending denied"))
             }
             switch consentGate.resolvePendingPrompt(viewID: viewID, decision: decision) {
