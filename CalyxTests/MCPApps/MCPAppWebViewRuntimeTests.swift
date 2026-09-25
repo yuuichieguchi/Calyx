@@ -411,7 +411,7 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         await harness.store.close(viewID: viewID)
     }
 
-    func test_message_pendingConsent_foldsNewlinesInThePreview_andTargetsNoSurfaceWhenPaneless() async throws {
+    func test_paneless_uiMessage_pendingConsent_isCopyMessageWithNewlinesKept_andTargetsNoSurface() async throws {
         let harness = makeHarness()
         let viewID = try await startMountedView(harness, surfaceID: nil)
         let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
