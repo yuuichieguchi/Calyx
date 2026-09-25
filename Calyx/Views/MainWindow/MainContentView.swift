@@ -70,8 +70,15 @@ struct MainContentView: View {
     /// `body`, so SwiftUI observes the tabs' offsets and re-renders the
     /// map when a committed drag lands on a tab.
     let missionMapCardOffsets: () -> [UUID: CGSize]
+    /// UNIT TEST ONLY: see `MissionMapView.fixtureOverride`. `nil` in the app.
+    let missionMapFixtureOverride: MissionMapFixture?
     var onMissionMapFocusSurface: ((UUID) -> Void)?
-    var onDismissMissionMap: (() -> Void)?
+    var onMissionMapSelectCard: ((UUID) -> Void)?
+    /// A click on the map's tap-catcher (space the map leaves unhandled):
+    /// clears the selection; never closes the map.
+    var onMissionMapBackgroundClick: (() -> Void)?
+    var onMissionMapEscape: (() -> Void)?
+    var onMissionMapSelectableIDsChange: ((MissionMapSelectableIDs) -> Void)?
     var onMissionMapAllow: ((UUID) -> Void)?
     var onMissionMapOpenApproval: ((UUID) -> Void)?
     var onMissionMapKeyCatcherReady: ((NSView) -> Void)?
@@ -346,11 +353,12 @@ struct MainContentView: View {
 extension MainContentView {
     /// Mission Map over the whole content area (sidebar included). The
     /// near-transparent layer underneath catches clicks the map itself
-    /// leaves unhandled and closes it.
+    /// leaves unhandled, so they do not reach the content below, and
+    /// clears the selection with them (like a click on empty map space).
     fileprivate var missionMapOverlay: some View {
         ZStack {
             Color.black.opacity(0.01)
-                .onTapGesture { onDismissMissionMap?() }
+                .onTapGesture { onMissionMapBackgroundClick?() }
 
             MissionMapView(
                 panes: missionMapPanes,
@@ -359,11 +367,14 @@ extension MainContentView {
                 cardOffsets: missionMapCardOffsets(),
                 onCardOffsetChange: { surfaceID, offset in onMissionMapCardOffsetChange?(surfaceID, offset) },
                 onFocusSurface: onMissionMapFocusSurface,
-                onDismiss: onDismissMissionMap,
+                onSelectCard: onMissionMapSelectCard,
+                onEscape: onMissionMapEscape,
+                onSelectableIDsChange: onMissionMapSelectableIDsChange,
                 onAllow: onMissionMapAllow,
                 onOpenApproval: onMissionMapOpenApproval,
                 onKeyCatcherReady: onMissionMapKeyCatcherReady,
-                onPopoverPlacementChange: onMissionMapPopoverPlacementChange
+                onPopoverPlacementChange: onMissionMapPopoverPlacementChange,
+                fixtureOverride: missionMapFixtureOverride
             )
         }
     }

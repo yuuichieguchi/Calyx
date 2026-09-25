@@ -171,7 +171,9 @@ final class CalyxWindowControllerToggleMissionMapTests: XCTestCase {
 @MainActor
 final class CalyxWindowControllerMissionMapPopoverStackingTests: XCTestCase {
 
-    private func makeOpenMapController() -> (CalyxWindowController, CalyxWindow) {
+    private func makeOpenMapController(
+        fixture: MissionMapFixture? = nil
+    ) -> (CalyxWindowController, CalyxWindow) {
         let tab = Tab(title: "Shell")
         let group = TabGroup(name: "Default", tabs: [tab], activeTabID: tab.id)
         let session = WindowSession(groups: [group], activeGroupID: group.id)
@@ -182,8 +184,24 @@ final class CalyxWindowControllerMissionMapPopoverStackingTests: XCTestCase {
             defer: false
         )
         let controller = CalyxWindowController(window: window, windowSession: session, restoring: true)
+        controller.missionMapFixtureOverride = fixture
         controller.processToggleMissionMap()
         return (controller, window)
+    }
+
+    /// An open map showing `MissionMapFixture`, so a selected line is one
+    /// actually on the map and `MissionMapSelection.prune(cards:edges:)`
+    /// keeps it when the map re-reports what it shows (e.g. after
+    /// `recreateHostingView()`).
+    private func makeOpenFixtureMapController() -> (CalyxWindowController, CalyxWindow, MissionMapFixture) {
+        let fixture = MissionMapFixture.make(now: Date())
+        let (controller, window) = makeOpenMapController(fixture: fixture)
+        return (controller, window, fixture)
+    }
+
+    /// The fixture's pre-selected a1->a2 line.
+    private func selectedEdge(of fixture: MissionMapFixture) throws -> MissionMapEdge {
+        try XCTUnwrap(fixture.snapshot.edges.first { $0.id == fixture.selectedEdgeID })
     }
 
     private func makeEdge() -> MissionMapEdge {
@@ -197,11 +215,11 @@ final class CalyxWindowControllerMissionMapPopoverStackingTests: XCTestCase {
     /// (which adds the new one on top), the popover's view must sit
     /// directly above the NEW main hosting view in the content view.
     func test_recreateHostingView_restacksPopoverHostDirectlyAboveNewMainHostingView() throws {
-        let (controller, window) = makeOpenMapController()
+        let (controller, window, fixture) = makeOpenFixtureMapController()
         let contentView = try XCTUnwrap(window.contentView)
 
-        let edge = makeEdge()
-        controller.missionMapSelection.edgeID = edge.id
+        let edge = try selectedEdge(of: fixture)
+        controller.missionMapSelection.selectEdge(edge.id)
         controller.missionMapPopoverPlacementChanged(MissionMapPopoverPlacementInfo(
             edge: edge, rect: CGRect(x: 40, y: 60, width: 320, height: 80), emphasized: false
         ))
@@ -223,20 +241,20 @@ final class CalyxWindowControllerMissionMapPopoverStackingTests: XCTestCase {
     /// is still selected; B's placement then moves it; `nil` with no
     /// selection hides it.
     func test_placementChanged_nilWhileSelected_keepsHost_untilNextPlacement_nilWithoutSelection_hides() throws {
-        let (controller, window) = makeOpenMapController()
+        let (controller, window, fixture) = makeOpenFixtureMapController()
         let contentView = try XCTUnwrap(window.contentView)
         let host = controller.missionMapPopoverHost
-        let edgeA = makeEdge()
-        let edgeB = makeEdge()
+        let edgeA = try selectedEdge(of: fixture)
+        let edgeB = try XCTUnwrap(fixture.snapshot.edges.first { $0.id != edgeA.id })
 
-        controller.missionMapSelection.edgeID = edgeA.id
+        controller.missionMapSelection.selectEdge(edgeA.id)
         controller.missionMapPopoverPlacementChanged(MissionMapPopoverPlacementInfo(
             edge: edgeA, rect: CGRect(x: 40, y: 60, width: 320, height: 80), emphasized: false
         ))
         XCTAssertTrue(host.isShown, "Precondition: A's popover is shown")
         let frameA = try XCTUnwrap(host.view).frame
 
-        controller.missionMapSelection.edgeID = edgeB.id
+        controller.missionMapSelection.selectEdge(edgeB.id)
         controller.missionMapPopoverPlacementChanged(nil)
         XCTAssertTrue(host.isShown, "A nil placement while a line is selected must not hide the popover")
         XCTAssertEqual(try XCTUnwrap(host.view).frame, frameA, "The popover stays where it was until B is placed")
@@ -252,9 +270,168 @@ final class CalyxWindowControllerMissionMapPopoverStackingTests: XCTestCase {
             "B's placement must move the popover to B's rect"
         )
 
-        controller.missionMapSelection.edgeID = nil
+        controller.missionMapSelection.clear()
         controller.missionMapPopoverPlacementChanged(nil)
         XCTAssertFalse(host.isShown, "A nil placement with no selection must hide the popover")
+    }
+
+    /// Selection is exclusive (UX change C): selecting a CARD while a
+    /// line's popover is shown must clear the edge selection, so the next
+    /// `nil` placement report hides the popover exactly as if nothing had
+    /// ever been selected.
+    func test_selectingCardWhileEdgeSelected_thenNilPlacement_hidesHost() throws {
+        let (controller, _, fixture) = makeOpenFixtureMapController()
+        let host = controller.missionMapPopoverHost
+        let edgeA = try selectedEdge(of: fixture)
+
+        controller.missionMapSelection.selectEdge(edgeA.id)
+        controller.missionMapPopoverPlacementChanged(MissionMapPopoverPlacementInfo(
+            edge: edgeA, rect: CGRect(x: 40, y: 60, width: 320, height: 80), emphasized: false
+        ))
+        XCTAssertTrue(host.isShown, "Precondition: A's popover is shown")
+
+        controller.missionMapSelection.selectCard(UUID())
+        XCTAssertNil(controller.missionMapSelection.edgeID, "Selecting a card must clear the edge selection")
+
+        controller.missionMapPopoverPlacementChanged(nil)
+
+        XCTAssertFalse(host.isShown, "A nil placement once the selection has no edge must hide the popover")
+    }
+
+    // MARK: - Escape (UX change C: clear selection first, then dismiss)
+
+    /// With a selection, Escape must clear it and leave the map open.
+    func test_missionMapEscapePressed_withSelection_clearsSelection_leavesMapOpen() throws {
+        let (controller, _, fixture) = makeOpenFixtureMapController()
+        let edge = try selectedEdge(of: fixture)
+        controller.missionMapSelection.selectEdge(edge.id)
+        XCTAssertTrue(controller.windowSession.showMissionMap, "Precondition: map is open")
+
+        controller.missionMapEscapePressed()
+
+        XCTAssertNil(controller.missionMapSelection.target, "Escape with a selection must clear it")
+        XCTAssertTrue(
+            controller.windowSession.showMissionMap,
+            "Escape with a selection must leave the map open (two-step rule)"
+        )
+    }
+
+    /// With no selection, Escape must dismiss the map (the existing
+    /// key-catcher behavior).
+    func test_missionMapEscapePressed_withNoSelection_dismissesMap() {
+        let (controller, _) = makeOpenMapController()
+        XCTAssertNil(controller.missionMapSelection.target, "Precondition: nothing is selected")
+        XCTAssertTrue(controller.windowSession.showMissionMap, "Precondition: map is open")
+
+        controller.missionMapEscapePressed()
+
+        XCTAssertFalse(controller.windowSession.showMissionMap, "Escape with no selection must dismiss the map")
+    }
+
+    // MARK: - Background click (clears the selection, never dismisses)
+
+    /// A click on space the map leaves unhandled clears a selected line
+    /// (hiding its popover) and leaves the map open.
+    func test_missionMapBackgroundClicked_withSelection_clearsSelection_leavesMapOpen() throws {
+        let (controller, _, fixture) = makeOpenFixtureMapController()
+        let host = controller.missionMapPopoverHost
+        let edge = try selectedEdge(of: fixture)
+        controller.missionMapSelection.selectEdge(edge.id)
+        controller.missionMapPopoverPlacementChanged(MissionMapPopoverPlacementInfo(
+            edge: edge, rect: CGRect(x: 40, y: 60, width: 320, height: 80), emphasized: false
+        ))
+        XCTAssertTrue(host.isShown, "Precondition: the line's popover is shown")
+
+        controller.missionMapBackgroundClicked()
+
+        XCTAssertNil(controller.missionMapSelection.target, "A background click must clear the selection")
+        XCTAssertFalse(host.isShown, "A background click must hide the popover")
+        XCTAssertTrue(controller.windowSession.showMissionMap, "A background click must not close the map")
+    }
+
+    /// With nothing selected, a background click still leaves the map
+    /// open: only Escape (or the toggle) closes it.
+    func test_missionMapBackgroundClicked_withNoSelection_leavesMapOpen() {
+        let (controller, _) = makeOpenMapController()
+        XCTAssertNil(controller.missionMapSelection.target, "Precondition: nothing is selected")
+
+        controller.missionMapBackgroundClicked()
+
+        XCTAssertTrue(controller.windowSession.showMissionMap, "A background click must never close the map")
+    }
+
+    // MARK: - Pruning a selection whose target left
+
+    /// A selected line that leaves the map (it expired) is cleared and
+    /// its popover hidden, so Escape's next press closes the map instead
+    /// of clearing an invisible selection.
+    func test_missionMapSelectableIDsChanged_selectedEdgeGone_clearsSelection_hidesHost() {
+        let (controller, _) = makeOpenMapController()
+        let host = controller.missionMapPopoverHost
+        let edge = makeEdge()
+        controller.missionMapSelection.selectEdge(edge.id)
+        controller.missionMapPopoverPlacementChanged(MissionMapPopoverPlacementInfo(
+            edge: edge, rect: CGRect(x: 40, y: 60, width: 320, height: 80), emphasized: false
+        ))
+        XCTAssertTrue(host.isShown, "Precondition: the line's popover is shown")
+
+        controller.missionMapSelectableIDsChanged(MissionMapSelectableIDs(cards: [], edges: []))
+
+        XCTAssertNil(controller.missionMapSelection.target, "A selected line that left must be cleared")
+        XCTAssertFalse(host.isShown, "The popover of a line that left must be hidden")
+        XCTAssertTrue(controller.windowSession.showMissionMap, "Pruning must not close the map")
+
+        controller.missionMapEscapePressed()
+        XCTAssertFalse(
+            controller.windowSession.showMissionMap,
+            "With the stale selection pruned, the first Escape must close the map"
+        )
+    }
+
+    /// A selected card still on the map stays selected.
+    func test_missionMapSelectableIDsChanged_selectedCardPresent_keepsSelection() throws {
+        let (controller, _, fixture) = makeOpenFixtureMapController()
+        let cardID = try XCTUnwrap(fixture.snapshot.cards.first).id
+        controller.missionMapCardClicked(surfaceID: cardID)
+
+        controller.missionMapSelectableIDsChanged(MissionMapSelectableIDs(cards: [cardID], edges: []))
+
+        XCTAssertEqual(controller.missionMapSelection.cardID, cardID, "A card still on the map must stay selected")
+    }
+
+    // MARK: - Card click vs. double click (UX change B)
+
+    /// A single click on a card selects it and must NOT close the map.
+    func test_missionMapCardClicked_selectsCard_keepsMapOpen() {
+        let (controller, _) = makeOpenMapController()
+        let surfaceID = UUID()
+
+        controller.missionMapCardClicked(surfaceID: surfaceID)
+
+        XCTAssertEqual(
+            controller.missionMapSelection.cardID, surfaceID,
+            "A single click on a card must select it"
+        )
+        XCTAssertTrue(
+            controller.windowSession.showMissionMap,
+            "A single click on a card must not close the map"
+        )
+    }
+
+    /// A double click on a card (or its "open" arrow button) closes the
+    /// map and focuses the pane -- the existing
+    /// `focusSurfaceFromMissionMap` path.
+    func test_missionMapCardDoubleClicked_closesMap() {
+        let (controller, _) = makeOpenMapController()
+        let surfaceID = UUID()
+        XCTAssertTrue(controller.windowSession.showMissionMap, "Precondition: map is open")
+
+        controller.missionMapCardDoubleClicked(surfaceID: surfaceID)
+
+        XCTAssertFalse(
+            controller.windowSession.showMissionMap,
+            "A double click on a card must close the map"
+        )
     }
 }
 

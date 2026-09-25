@@ -3,16 +3,18 @@
 //
 // The small bubble a clicked Mission Map line opens: the IPC line's
 // messages (newest first, each with how long ago it was sent, once there
-// is more than one), or the conflicting file's full path.
+// is more than one), or the conflicting file's full path. Its header's
+// close button dismisses it; a click on the rest of the bubble does not.
 
 import AppKit
 import SwiftUI
 
 struct MissionMapEdgePopover: View {
     let edge: MissionMapEdge
-    /// A tap anywhere on the bubble. Mission Map clears the selection
-    /// with it, so the bubble dismisses instead of swallowing the tap.
-    var onTap: (() -> Void)?
+    /// The header's close button. Mission Map clears the selection with
+    /// it. The button is drawn even when this is `nil`, so a bubble
+    /// measured for placement has the size of the one drawn.
+    var onClose: (() -> Void)?
     /// `nil` keeps the relative times current on a one-second timeline
     /// (the live map); a date reads them once, as of that instant (static
     /// rendering) -- the same convention as `MissionMapCanvasLayer`.
@@ -43,34 +45,34 @@ struct MissionMapEdgePopover: View {
     /// itself is capped at `MissionMapSnapshot.maxShownIPCMessages`.)
     private static let listedMessageLineLimit = 3
 
+    /// The close button's side, its inset from the bubble's top-trailing
+    /// corner, and the room the title leaves for it.
+    private static let closeButtonSide: CGFloat = 16
+    private static let closeButtonInset: CGFloat = 6
+    private static let closeButtonClearance: CGFloat = 20
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
+            title
+                // Clear of the close button, which is overlaid rather than
+                // laid out beside the title: a Spacer there would stretch
+                // every bubble to its maximum width.
+                .padding(.trailing, Self.closeButtonClearance)
             switch edge.kind {
             case .ipc(let messages):
                 if messages.count == 1, let event = messages.first {
-                    Text(event.isBroadcast ? "Broadcast" : "Message")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
                     Text(event.content)
                         .font(.callout)
                         .lineLimit(8)
                         .modifier(PopoverTextSelection(enabled: selectableText))
+                } else if let frozenDate {
+                    messageList(messages, now: frozenDate)
                 } else {
-                    Text("\(messages.count) messages")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    if let frozenDate {
-                        messageList(messages, now: frozenDate)
-                    } else {
-                        TimelineView(.periodic(from: .now, by: 1)) { timeline in
-                            messageList(messages, now: timeline.date)
-                        }
+                    TimelineView(.periodic(from: .now, by: 1)) { timeline in
+                        messageList(messages, now: timeline.date)
                     }
                 }
-            case .conflict(let file, let fullPath):
-                Text("Both panes edited \(file)")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.red)
+            case .conflict(_, let fullPath):
                 Text(fullPath)
                     .font(.caption.monospaced())
                     .lineLimit(3)
@@ -78,13 +80,55 @@ struct MissionMapEdgePopover: View {
             }
         }
         .padding(10)
+        .overlay(alignment: .topTrailing) {
+            closeButton.padding(Self.closeButtonInset)
+        }
         .frame(maxWidth: 320, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
         .modifier(PopoverSurface(style: renderStyle, glass: glass, cornerRadius: Self.cornerRadius))
+        // Hit-testable as a whole, so a click on the bubble stays on it
+        // instead of falling through to the map (which would clear the
+        // selection).
         .contentShape(.rect(cornerRadius: Self.cornerRadius))
-        .onTapGesture { onTap?() }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.MissionMap.popover)
+    }
+
+    /// The header's caption: what kind of line this is.
+    @ViewBuilder
+    private var title: some View {
+        switch edge.kind {
+        case .ipc(let messages):
+            if messages.count == 1, let event = messages.first {
+                Text(event.isBroadcast ? "Broadcast" : "Message")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("\(messages.count) messages")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        case .conflict(let file, _):
+            Text("Both panes edited \(file)")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
+        }
+    }
+
+    private var closeButton: some View {
+        Button {
+            onClose?()
+        } label: {
+            Image(systemName: "xmark")
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.secondary)
+                .frame(width: Self.closeButtonSide, height: Self.closeButtonSide)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Close")
+        .accessibilityLabel("Close")
+        .accessibilityIdentifier(AccessibilityID.MissionMap.popoverCloseButton)
     }
 
     private var glass: Glass {

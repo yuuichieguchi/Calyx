@@ -36,15 +36,16 @@ final class MissionMapPopoverHost {
     /// Shows (or moves/updates) the popover at `placement.rect`, given in
     /// `mainHostingView`'s coordinates, as a subview of `container` (the
     /// window's content view, `mainHostingView`'s superview) directly
-    /// above `mainHostingView`. `onTap` runs on a tap on the bubble.
+    /// above `mainHostingView`. `onClose` runs on the bubble's close
+    /// button.
     func show(
         _ placement: MissionMapPopoverPlacementInfo,
         in container: NSView,
         above mainHostingView: NSView,
-        onTap: @escaping () -> Void
+        onClose: @escaping () -> Void
     ) {
         let content = MissionMapPopoverHostContent(
-            edge: placement.edge, emphasized: placement.emphasized, onTap: onTap
+            edge: placement.edge, emphasized: placement.emphasized, onClose: onClose
         )
         let host: PopoverHostingView
         if let hostingView {
@@ -83,7 +84,7 @@ final class MissionMapPopoverHost {
 }
 
 /// Never takes first responder: the map's key catcher must keep it so
-/// Escape still dismisses the map after a click on the popover.
+/// Escape still reaches it after a click on the popover.
 private final class PopoverHostingView: NSHostingView<MissionMapPopoverHostContent> {
     override var acceptsFirstResponder: Bool { false }
 }
@@ -95,7 +96,7 @@ private final class PopoverHostingView: NSHostingView<MissionMapPopoverHostConte
 struct MissionMapPopoverHostContent: View {
     let edge: MissionMapEdge
     let emphasized: Bool
-    let onTap: () -> Void
+    let onClose: () -> Void
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @AppStorage("terminalGlassOpacity") private var glassOpacity = MissionMapChromeModifier.defaultGlassOpacity
@@ -107,7 +108,7 @@ struct MissionMapPopoverHostContent: View {
         // No text selection: selecting would try to move first responder
         // into this view, away from the map's key catcher.
         let popover = MissionMapEdgePopover(
-            edge: edge, onTap: onTap, emphasized: emphasized, selectableText: false
+            edge: edge, onClose: onClose, emphasized: emphasized, selectableText: false
         )
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         if reduceTransparency {

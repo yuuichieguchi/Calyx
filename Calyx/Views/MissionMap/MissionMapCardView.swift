@@ -3,13 +3,20 @@
 //
 // One pane on Mission Map: agent CLI, pane title, cwd, state, current
 // tool, subagent rows, unread count, Git badge, and the inline approval
-// buttons. A tap focuses the pane; a drag moves the card.
+// buttons. A click selects the card; a double click, or the header's
+// open button, focuses the pane; a drag moves the card.
 
 import SwiftUI
 
 struct MissionMapCardView: View {
     let card: MissionMapCard
-    var onFocus: (() -> Void)?
+    /// Draws the card with an accent-colored border.
+    let isSelected: Bool
+    /// A single click.
+    let onSelect: () -> Void
+    /// A double click, the header's open button, or the accessibility
+    /// action: focus the pane.
+    let onOpen: () -> Void
     var onAllow: ((UUID) -> Void)?
     var onOpenApproval: ((UUID) -> Void)?
     /// Live drag translation, in global coordinates.
@@ -20,6 +27,11 @@ struct MissionMapCardView: View {
     static let cornerRadius: CGFloat = 14
     /// Opacity of the content of a pane no agent has reported from.
     private static let dimmedOpacity = 0.55
+    /// The open button's opacity while the card is neither selected nor
+    /// hovered: still visible (and clickable), but quiet.
+    private static let idleOpenButtonOpacity = 0.4
+
+    @State private var isHovered = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -58,8 +70,19 @@ struct MissionMapCardView: View {
                 MissionMapApprovalPulse(cornerRadius: Self.cornerRadius)
             }
         }
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous)
+                    .strokeBorder(Color.accentColor, lineWidth: 2)
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+            }
+        }
         .contentShape(RoundedRectangle(cornerRadius: Self.cornerRadius, style: .continuous))
-        .onTapGesture { onFocus?() }
+        .onHover { isHovered = $0 }
+        // The double click first, so it wins over the single click.
+        .onTapGesture(count: 2) { onOpen() }
+        .onTapGesture { onSelect() }
         .gesture(
             DragGesture(minimumDistance: 4, coordinateSpace: .global)
                 .onChanged { onDragChanged?($0.translation) }
@@ -67,8 +90,9 @@ struct MissionMapCardView: View {
         )
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.MissionMap.card(card.id))
-        .accessibilityAddTraits(.isButton)
-        .accessibilityAction { onFocus?() }
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAction { onSelect() }
+        .accessibilityAction(named: "Open") { onOpen() }
     }
 
     private var header: some View {
@@ -91,7 +115,25 @@ struct MissionMapCardView: View {
             if card.unreadCount > 0 {
                 UnreadCountBadge(count: card.unreadCount)
             }
+            openButton
         }
+    }
+
+    /// Focuses the pane and closes the map, like a double click.
+    private var openButton: some View {
+        Button {
+            onOpen()
+        } label: {
+            Image(systemName: "arrow.up.forward.square")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .opacity(isSelected || isHovered ? 1 : Self.idleOpenButtonOpacity)
+        .help("Open Pane")
+        .accessibilityLabel("Open Pane")
+        .accessibilityIdentifier(AccessibilityID.MissionMap.cardOpenButton(card.id))
     }
 
     private func gitLine(_ git: MissionMapGitBadge) -> some View {

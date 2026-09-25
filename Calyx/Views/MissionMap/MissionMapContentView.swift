@@ -41,6 +41,8 @@ struct MissionMapContentView: View {
     /// Where each band's name is drawn, keyed by group id.
     var bandOrigins: [UUID: CGPoint] = [:]
     var selectedEdgeID: UUID?
+    /// The selected card, drawn highlighted.
+    var selectedCardID: UUID?
     /// Whether the lines animate on a timeline (the live map) or are
     /// drawn once at `now`.
     var animatesEdges = false
@@ -55,14 +57,18 @@ struct MissionMapContentView: View {
     /// A tap on empty space or a line, in this view's coordinates, with
     /// the lines as drawn.
     var onBackgroundTap: ((CGPoint, [MissionMapEdgeSegment]) -> Void)?
-    /// A tap on the selected line's popover, when this view draws it
-    /// (`popoverOverlayEnabled`).
-    var onPopoverTap: (() -> Void)?
+    /// The close button of the selected line's popover, when this view
+    /// draws it (`popoverOverlayEnabled`).
+    var onPopoverClose: (() -> Void)?
     /// Where the selected line's popover goes, in this view's
     /// coordinates, each time that changes; `nil` while no line is
     /// selected (or its popover is not measured yet). Only reported while
     /// `popoverOverlayEnabled` is off.
     var onPopoverPlacementChange: ((MissionMapPopoverPlacementInfo?) -> Void)?
+    /// A single click on a card, with the card's id.
+    var onSelectCard: ((UUID) -> Void)?
+    /// A card opened (double click or its open button), with the pane to
+    /// focus.
     var onFocusSurface: ((UUID) -> Void)?
     var onAllow: ((UUID) -> Void)?
     var onOpenApproval: ((UUID) -> Void)?
@@ -129,9 +135,16 @@ struct MissionMapContentView: View {
 
         }
         .coordinateSpace(.named(Self.coordinateSpaceName))
+        .overlay(alignment: .bottomTrailing) {
+            // The live map draws the hint over its viewport instead
+            // (`MissionMapView`); this view's bounds are the scroll content.
+            if renderStyle == .flat {
+                MissionMapEscHint()
+            }
+        }
         .overlay(alignment: .topLeading) {
             if popoverOverlayEnabled {
-                popoverLayer(mode: .draw(onTap: onPopoverTap))
+                popoverLayer(mode: .draw(onClose: onPopoverClose))
             } else if let onPopoverPlacementChange {
                 popoverLayer(mode: .report(onPopoverPlacementChange))
             }
@@ -176,7 +189,9 @@ struct MissionMapContentView: View {
     private func cardView(_ card: MissionMapCard) -> some View {
         MissionMapCardView(
             card: card,
-            onFocus: {
+            isSelected: selectedCardID == card.id,
+            onSelect: { onSelectCard?(card.id) },
+            onOpen: {
                 guard let target = card.focusTarget else { return }
                 onFocusSurface?(target)
             },
@@ -210,7 +225,7 @@ private struct FlatColorScheme: ViewModifier {
 private struct MissionMapPopoverLayer: View {
     enum Mode {
         /// Draw the popover here (static rendering).
-        case draw(onTap: (() -> Void)?)
+        case draw(onClose: (() -> Void)?)
         /// Measure the popover without drawing it, and report where it
         /// goes (the live map, which draws it in `MissionMapPopoverHost`).
         case report((MissionMapPopoverPlacementInfo?) -> Void)
@@ -230,9 +245,9 @@ private struct MissionMapPopoverLayer: View {
         GeometryReader { proxy in
             let placement = placement(in: CGRect(origin: .zero, size: proxy.size))
             switch mode {
-            case .draw(let onTap):
+            case .draw(let onClose):
                 if let segment, let placement {
-                    popover(segment, onTap: onTap, emphasized: placement.emphasized)
+                    popover(segment, onClose: onClose, emphasized: placement.emphasized)
                         .position(x: placement.rect.midX, y: placement.rect.midY)
                 }
             case .report(let report):
@@ -240,7 +255,7 @@ private struct MissionMapPopoverLayer: View {
                     if let segment {
                         // Measured only; `MissionMapPopoverHost` draws the
                         // one on screen.
-                        popover(segment, onTap: nil, emphasized: false)
+                        popover(segment, onClose: nil, emphasized: false)
                             .hidden()
                             .accessibilityHidden(true)
                     }
@@ -266,10 +281,10 @@ private struct MissionMapPopoverLayer: View {
         )
     }
 
-    private func popover(_ segment: MissionMapEdgeSegment, onTap: (() -> Void)?, emphasized: Bool) -> some View {
+    private func popover(_ segment: MissionMapEdgeSegment, onClose: (() -> Void)?, emphasized: Bool) -> some View {
         MissionMapEdgePopover(
             edge: segment.edge,
-            onTap: onTap,
+            onClose: onClose,
             frozenDate: frozenDate,
             emphasized: emphasized,
             renderStyle: renderStyle
