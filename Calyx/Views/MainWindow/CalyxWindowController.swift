@@ -2270,7 +2270,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         focusedController?.setFocus(false)
         windowSession.showMissionMap = true
         missionMapGitPoller.start { [weak self] in
-            self?.missionMapPanes().compactMap(\.cwd) ?? []
+            // The same cwd each card resolves (entry cwd first), so
+            // the poller fetches the badge the card looks up.
+            self?.missionMapPanes().compactMap { pane in
+                MissionMapSnapshotBuilder.resolvedCwd(
+                    entryCwd: AgentRegistry.shared.entries[pane.surfaceID]?.cwd, paneCwd: pane.cwd
+                )
+            } ?? []
         }
         refreshHostingView()
     }

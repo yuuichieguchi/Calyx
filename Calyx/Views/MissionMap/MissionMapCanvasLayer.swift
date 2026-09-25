@@ -6,21 +6,31 @@
 // fading out after its own full-opacity window -- so drawing them
 // immediate-mode avoids giving each its own view identity and
 // animation lifetime. The layer takes no hits: `MissionMapView` matches
-// taps against the segments with `MissionMapEdgeHitTester`.
+// taps against the routed polylines with `MissionMapEdgeHitTester`.
 
 import SwiftUI
 
-/// One edge with the on-screen segment it is drawn along.
+/// One edge with the routed polyline it is drawn along.
 struct MissionMapEdgeSegment: Identifiable {
     let edge: MissionMapEdge
-    let a: CGPoint
-    let b: CGPoint
+    /// The route from `MissionMapRouter`: at least 2 points.
+    let points: [CGPoint]
 
     var id: UUID { edge.id }
 
-    var midpoint: CGPoint {
-        CGPoint(x: (a.x + b.x) / 2, y: (a.y + b.y) / 2)
+    /// Where the line's popover and conflict label sit: beside the middle
+    /// of its longest segment, on the side with more room among
+    /// `obstacles`. `extent` is the label's size; it is moved
+    /// perpendicular to the segment by half its extent that way plus
+    /// `labelGap`, so it does not cover the line.
+    func labelCenter(extent: CGSize, obstacles: [CGRect]) -> CGPoint {
+        let (anchor, normal) = MissionMapPolyline.labelPlacement(points, obstacles: obstacles)
+        let halfExtent = abs(normal.dx) * extent.width / 2 + abs(normal.dy) * extent.height / 2
+        let distance = halfExtent + Self.labelGap
+        return CGPoint(x: anchor.x + normal.dx * distance, y: anchor.y + normal.dy * distance)
     }
+
+    static let labelGap: CGFloat = 4
 }
 
 struct MissionMapCanvasLayer: View {
@@ -32,6 +42,11 @@ struct MissionMapCanvasLayer: View {
     /// own doc comment.
     let ipcEdgeFullOpacityDuration: TimeInterval
     let selectedEdgeID: UUID?
+    /// Cards and band headers, for placing labels beside the lines.
+    let obstacles: [CGRect]
+    /// `nil` animates the lines on a timeline (the live map); a date draws
+    /// them once, as they look at that instant (static rendering).
+    let frozenDate: Date?
 
     /// Seconds for a pulse dot to travel the length of an IPC line.
     private static let pulseTravelTime: TimeInterval = 1.2
@@ -43,10 +58,12 @@ struct MissionMapCanvasLayer: View {
     }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !hasAnimatedEdges)) { timeline in
-            Canvas { context, _ in
-                for segment in segments {
-                    draw(segment, in: &context, at: timeline.date)
+        Group {
+            if let frozenDate {
+                canvas(at: frozenDate)
+            } else {
+                TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !hasAnimatedEdges)) { timeline in
+                    canvas(at: timeline.date)
                 }
             }
         }
@@ -54,11 +71,20 @@ struct MissionMapCanvasLayer: View {
         .accessibilityIdentifier(AccessibilityID.MissionMap.edgeCanvas)
     }
 
+    private func canvas(at date: Date) -> some View {
+        Canvas { context, _ in
+            for segment in segments {
+                draw(segment, in: &context, at: date)
+            }
+        }
+    }
+
     private func draw(_ segment: MissionMapEdgeSegment, in context: inout GraphicsContext, at date: Date) {
         let isSelected = segment.id == selectedEdgeID
         var line = Path()
-        line.move(to: segment.a)
-        line.addLine(to: segment.b)
+        line.addLines(segment.points)
+        let lineWidth: CGFloat = isSelected ? 3 : 2
+        let stroke = StrokeStyle(lineWidth: lineWidth, lineJoin: .round)
 
         switch segment.edge.kind {
         case .ipc(let event):
@@ -77,31 +103,25 @@ struct MissionMapCanvasLayer: View {
                 alpha = max(0, 1 - fadeProgress)
             }
             guard alpha > 0 else { return }
-            context.stroke(
-                line,
-                with: .color(Color.accentColor.opacity(alpha)),
-                lineWidth: isSelected ? 3 : 2
-            )
+            context.stroke(line, with: .color(Color.accentColor.opacity(alpha)), style: stroke)
             let progress = max(0, age).truncatingRemainder(dividingBy: Self.pulseTravelTime) / Self.pulseTravelTime
-            let dot = CGPoint(
-                x: segment.a.x + (segment.b.x - segment.a.x) * progress,
-                y: segment.a.y + (segment.b.y - segment.a.y) * progress
-            )
+            let dot = MissionMapPolyline.point(along: segment.points, t: progress)
             context.fill(
                 Path(ellipseIn: CGRect(x: dot.x - 4, y: dot.y - 4, width: 8, height: 8)),
                 with: .color(Color.accentColor.opacity(alpha))
             )
 
         case .conflict(let file, _):
-            context.stroke(line, with: .color(.red), lineWidth: isSelected ? 3 : 2)
+            context.stroke(line, with: .color(.red), style: stroke)
             let label = context.resolve(
                 Text(file).font(.caption2.weight(.semibold)).foregroundStyle(.white)
             )
             let size = label.measure(in: CGSize(width: 200, height: 40))
-            let mid = segment.midpoint
+            let boxSize = CGSize(width: size.width + 10, height: size.height + 4)
+            let mid = segment.labelCenter(extent: boxSize, obstacles: obstacles)
             let box = CGRect(
-                x: mid.x - size.width / 2 - 5, y: mid.y - size.height / 2 - 2,
-                width: size.width + 10, height: size.height + 4
+                x: mid.x - boxSize.width / 2, y: mid.y - boxSize.height / 2,
+                width: boxSize.width, height: boxSize.height
             )
             context.fill(Path(roundedRect: box, cornerRadius: box.height / 2), with: .color(.red))
             context.draw(label, at: mid)

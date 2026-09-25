@@ -6,7 +6,9 @@
 // is read here in `body`, so @Observable tracking re-renders the map as
 // agents report (the same way the sidebar's `AgentStatusView` stays
 // current); the approval inbox alone arrives through the window
-// controller's `.calyxApprovalInboxChanged` refresh.
+// controller's `.calyxApprovalInboxChanged` refresh. This view turns that
+// state into a snapshot, card frames and routed lines, owns the drag and
+// selection state, and hands the drawing to `MissionMapContentView`.
 
 import SwiftUI
 
@@ -21,7 +23,10 @@ struct MissionMapView: View {
     var onKeyCatcherReady: ((NSView) -> Void)?
 
     static let cardSize = CGSize(width: 260, height: 150)
-    static let spacing: CGFloat = 16
+    /// Between cards, rows, bands and the map's edge: wide enough for
+    /// two lines each way through every gap at the router's track
+    /// spacing (40 - 2 x 6 margin = 28pt free, 4 tracks x 8pt fit).
+    static let spacing: CGFloat = 40
     /// How long an IPC pulse line stays on the map after its message was
     /// sent -- long enough to still be there when the user notices the
     /// notification, alt-tabs to Calyx, and presses Cmd+Shift+M, not just
@@ -32,14 +37,6 @@ struct MissionMapView: View {
     /// linearly across the remainder -- see that type's own `draw(_:in:at:)`.
     static let ipcEdgeFullOpacityDuration: TimeInterval = 10
 
-    /// How far (pt) each IPC line is shifted to the right-hand side of its
-    /// travel direction, so A→B and B→A messages between the same two
-    /// cards draw as two parallel lines instead of one. Conflict lines
-    /// stay on the center line.
-    static let ipcEdgeOffset: CGFloat = 6
-
-    private static let coordinateSpaceName = "calyx.missionMap.content"
-
     /// Committed per-card drag offsets. Memory only: a reopened map
     /// starts from the computed layout again.
     @State private var dragOffsets: [UUID: CGSize] = [:]
@@ -48,6 +45,8 @@ struct MissionMapView: View {
     /// Bumped when the oldest visible IPC line expires, so the snapshot
     /// is rebuilt and the line leaves (nothing observable changes then).
     @State private var expiryTick = 0
+    /// Skips re-routing when a re-render leaves the geometry unchanged.
+    @State private var routeCache = MissionMapRouteCache()
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
 
     private struct ActiveDrag: Equatable {
@@ -138,83 +137,59 @@ struct MissionMapView: View {
             cards: snapshot.cards, groups: snapshot.groups, in: area,
             cardSize: Self.cardSize, spacing: Self.spacing
         )
-        let segments = snapshot.edges.compactMap { edge -> MissionMapEdgeSegment? in
-            guard let from = movedFrames[edge.from], let to = movedFrames[edge.to] else { return nil }
-            let (a, b) = MissionMapLayout.edgeAnchors(from: from, to: to)
-            switch edge.kind {
-            case .ipc:
-                let (offsetA, offsetB) = MissionMapLayout.offsetSegment(a, b, by: Self.ipcEdgeOffset)
-                return MissionMapEdgeSegment(edge: edge, a: offsetA, b: offsetB)
-            case .conflict:
-                return MissionMapEdgeSegment(edge: edge, a: a, b: b)
-            }
-        }
         let contentHeight = (frames.values.map(\.maxY).max() ?? 0) + Self.spacing
+        let routes = routes(snapshot: snapshot, frames: movedFrames, bandOrigins: bandOrigins, contentSize: CGSize(
+            width: viewport.width, height: contentHeight
+        ))
 
-        ZStack(alignment: .topLeading) {
-            Color.clear
-                .contentShape(Rectangle())
-                .onTapGesture(coordinateSpace: .named(Self.coordinateSpaceName)) { point in
-                    handleBackgroundTap(at: point, segments: segments)
-                }
-
-            MissionMapCanvasLayer(
-                segments: segments,
-                ipcEdgeLifetime: Self.ipcEdgeLifetime,
-                ipcEdgeFullOpacityDuration: Self.ipcEdgeFullOpacityDuration,
-                selectedEdgeID: selectedEdgeID
-            )
-
-            ForEach(snapshot.groups) { group in
-                if let origin = bandOrigins[group.id] {
-                    Text(group.name)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .frame(height: MissionMapLayout.bandHeaderHeight, alignment: .leading)
-                        .offset(x: origin.x, y: origin.y)
-                        .allowsHitTesting(false)
-                }
-            }
-
-            ForEach(snapshot.cards) { card in
-                if let frame = movedFrames[card.id] {
-                    cardView(card)
-                        .frame(width: frame.width, height: frame.height)
-                        .offset(x: frame.minX, y: frame.minY)
-                }
-            }
-
-            if let selectedEdgeID, let segment = segments.first(where: { $0.id == selectedEdgeID }) {
-                MissionMapEdgePopover(edge: segment.edge)
-                    .position(segment.midpoint)
-            }
-        }
-        // At least the viewport's height, so the background tap layer
-        // covers empty space below the last band too.
-        .frame(width: viewport.width, height: max(contentHeight, viewport.height), alignment: .topLeading)
-        .coordinateSpace(.named(Self.coordinateSpaceName))
-    }
-
-    private func cardView(_ card: MissionMapCard) -> some View {
-        MissionMapCardView(
-            card: card,
-            onFocus: {
-                guard let target = card.focusTarget else { return }
-                onFocusSurface?(target)
-            },
+        MissionMapContentView(
+            snapshot: snapshot,
+            frames: movedFrames,
+            routes: routes,
+            now: Date(),
+            bandOrigins: bandOrigins,
+            selectedEdgeID: selectedEdgeID,
+            animatesEdges: true,
+            onBackgroundTap: { point, segments in handleBackgroundTap(at: point, segments: segments) },
+            onPopoverTap: { clearEdgeSelection() },
+            onFocusSurface: onFocusSurface,
             onAllow: onAllow,
             onOpenApproval: onOpenApproval,
-            onDragChanged: { activeDrag = ActiveDrag(cardID: card.id, translation: $0) },
-            onDragEnded: { translation in
-                let committed = dragOffsets[card.id] ?? .zero
-                dragOffsets[card.id] = CGSize(
+            onDragChanged: { cardID, translation in
+                activeDrag = ActiveDrag(cardID: cardID, translation: translation)
+            },
+            onDragEnded: { cardID, translation in
+                let committed = dragOffsets[cardID] ?? .zero
+                dragOffsets[cardID] = CGSize(
                     width: committed.width + translation.width,
                     height: committed.height + translation.height
                 )
                 activeDrag = nil
             }
         )
+        // At least the viewport's height, so the background tap layer
+        // covers empty space below the last band too.
+        .frame(width: viewport.width, height: max(contentHeight, viewport.height), alignment: .topLeading)
+    }
+
+    /// Every edge routed around every card (as currently placed, drags
+    /// included) and every band header. The routes stay inside the
+    /// content rect -- `spacing` around the laid-out cards -- grown to
+    /// keep that margin around any card dragged beyond it, so a dragged
+    /// card's lines can still reach it.
+    private func routes(
+        snapshot: MissionMapSnapshot, frames: [UUID: CGRect], bandOrigins: [UUID: CGPoint], contentSize: CGSize
+    ) -> [UUID: [CGPoint]] {
+        let cardFrames = snapshot.cards.compactMap { frames[$0.id] }
+        let obstacles = cardFrames + MissionMapLayout.bandHeaderObstacles(bandOrigins: bandOrigins)
+        let bounds = cardFrames.reduce(CGRect(origin: .zero, size: contentSize)) { rect, frame in
+            rect.union(frame.insetBy(dx: -Self.spacing, dy: -Self.spacing))
+        }
+        let requests = snapshot.edges.compactMap { edge -> MissionMapRouteRequest? in
+            guard let from = frames[edge.from], let to = frames[edge.to] else { return nil }
+            return MissionMapRouteRequest(id: edge.id, from: from, to: to)
+        }
+        return routeCache.routes(requests, obstacles: obstacles, bounds: bounds)
     }
 
     /// The committed offset of `cardID` plus any drag in progress.
@@ -232,14 +207,20 @@ struct MissionMapView: View {
     private func handleBackgroundTap(at point: CGPoint, segments: [MissionMapEdgeSegment]) {
         let hit = MissionMapEdgeHitTester.nearest(
             point: point,
-            edges: segments.map { (id: $0.id, a: $0.a, b: $0.b) }
+            polylines: segments.map { (id: $0.id, points: $0.points) }
         )
         if let hit {
             selectedEdgeID = hit
         } else if selectedEdgeID != nil {
-            selectedEdgeID = nil
+            clearEdgeSelection()
         } else {
             onDismiss?()
         }
+    }
+
+    /// Closes the selected line's popover: a tap on empty space while a
+    /// line is selected, or a tap on the popover itself.
+    private func clearEdgeSelection() {
+        selectedEdgeID = nil
     }
 }

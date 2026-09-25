@@ -108,28 +108,26 @@ final class AgentEditedFileLog {
 
     static let capacity = 256
 
-    private(set) var records: [AgentEditedFile] = []
+    private var log = BoundedLog<AgentEditedFile>(capacity: AgentEditedFileLog.capacity)
+
+    /// The recorded files, oldest first.
+    var records: [AgentEditedFile] { log.elements }
 
     /// Appends one record per path, evicting the oldest records past
     /// `capacity`. An empty `paths` records nothing.
     func record(surfaceID: UUID, paths: [String], toolName: String, at: Date) {
-        guard !paths.isEmpty else { return }
-        records.append(contentsOf: paths.map {
-            AgentEditedFile(surfaceID: surfaceID, path: $0, toolName: toolName, at: at)
-        })
-        let overflow = records.count - Self.capacity
-        if overflow > 0 {
-            records.removeFirst(overflow)
+        for path in paths {
+            log.append(AgentEditedFile(surfaceID: surfaceID, path: path, toolName: toolName, at: at))
         }
     }
 
     /// Drops every record for `surfaceID`: a destroyed pane can no longer
     /// conflict with anything.
     func removeAll(for surfaceID: UUID) {
-        records.removeAll { $0.surfaceID == surfaceID }
+        log.removeAll { $0.surfaceID == surfaceID }
     }
 
     func reset() {
-        records.removeAll()
+        log.removeAll()
     }
 }

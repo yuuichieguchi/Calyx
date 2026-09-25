@@ -111,6 +111,28 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
         )
     }
 
+    // MARK: - Git badge cwd
+
+    /// The git badge is looked up under the same cwd the label shows:
+    /// the entry's cwd when it differs from the pane's.
+    func test_build_gitBadge_keyedByEntryCwd_whenEntryCwdDiffersFromPaneCwd() {
+        let surfaceID = UUID()
+        let paneA = pane(surfaceID: surfaceID, cwd: "/Users/dev/pane-dir")
+        var agent = entry(surfaceID: surfaceID)
+        agent.cwd = "/Users/dev/entry-dir"
+        let badge = MissionMapGitBadge(branch: "main", shortHash: "abc1234", changedFileCount: 2)
+
+        let keyedByEntry = MissionMapSnapshotBuilder.build(input: input(
+            panes: [paneA], entries: [surfaceID: agent], git: ["/Users/dev/entry-dir": badge]
+        ))
+        let keyedByPane = MissionMapSnapshotBuilder.build(input: input(
+            panes: [paneA], entries: [surfaceID: agent], git: ["/Users/dev/pane-dir": badge]
+        ))
+
+        XCTAssertEqual(keyedByEntry.cards.first?.git, badge)
+        XCTAssertNil(keyedByPane.cards.first?.git)
+    }
+
     // MARK: - Cards
 
     func test_build_createsOneCardPerPane() {

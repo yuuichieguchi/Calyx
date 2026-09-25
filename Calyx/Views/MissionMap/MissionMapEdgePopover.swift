@@ -8,6 +8,9 @@ import SwiftUI
 
 struct MissionMapEdgePopover: View {
     let edge: MissionMapEdge
+    /// A tap anywhere on the bubble. Mission Map clears the selection
+    /// with it, so the bubble dismisses instead of swallowing the tap.
+    var onTap: (() -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -34,5 +37,7 @@ struct MissionMapEdgePopover: View {
         .frame(maxWidth: 320, alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
         .glassEffect(.regular, in: .rect(cornerRadius: 10))
+        .contentShape(.rect(cornerRadius: 10))
+        .onTapGesture { onTap?() }
     }
 }

@@ -15,6 +15,7 @@ struct MissionMapCardView: View {
     /// Live drag translation, in global coordinates.
     var onDragChanged: ((CGSize) -> Void)?
     var onDragEnded: ((CGSize) -> Void)?
+    var renderStyle: MissionMapRenderStyle = .glass
 
     static let cornerRadius: CGFloat = 14
     /// Opacity of the content of a pane no agent has reported from.
@@ -51,7 +52,7 @@ struct MissionMapCardView: View {
         .opacity(card.state == nil ? Self.dimmedOpacity : 1)
         .padding(12)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .glassEffect(.regular, in: .rect(cornerRadius: Self.cornerRadius))
+        .modifier(MissionMapCardSurface(style: renderStyle, cornerRadius: Self.cornerRadius))
         .overlay {
             if card.approval != nil {
                 MissionMapApprovalPulse(cornerRadius: Self.cornerRadius)
@@ -174,5 +175,25 @@ private struct MissionMapApprovalPulse: View {
     private func border(intensity: Double) -> some View {
         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
             .strokeBorder(Color.orange.opacity(intensity), lineWidth: 2)
+    }
+}
+
+/// A card's surface: Liquid Glass on the live map, or a solid rounded
+/// rect for `.flat` (static rendering, where glass has nothing behind it
+/// to refract and renders nearly invisible).
+private struct MissionMapCardSurface: ViewModifier {
+    let style: MissionMapRenderStyle
+    let cornerRadius: CGFloat
+
+    func body(content: Content) -> some View {
+        switch style {
+        case .glass:
+            content.glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+        case .flat:
+            let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+            content
+                .background(shape.fill(MissionMapRenderStyle.flatCardFill))
+                .overlay(shape.strokeBorder(MissionMapRenderStyle.flatCardBorder, lineWidth: 1))
+        }
     }
 }

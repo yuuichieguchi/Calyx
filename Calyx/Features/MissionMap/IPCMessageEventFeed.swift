@@ -42,17 +42,16 @@ final class IPCMessageEventFeed {
     /// currently guards against that.
     static let capacity = 512
 
-    private(set) var events: [IPCMessageEvent] = []
+    private var log = BoundedLog<IPCMessageEvent>(capacity: IPCMessageEventFeed.capacity)
+
+    /// The recorded messages, oldest first.
+    var events: [IPCMessageEvent] { log.elements }
 
     func record(_ event: IPCMessageEvent) {
-        events.append(event)
-        let overflow = events.count - Self.capacity
-        if overflow > 0 {
-            events.removeFirst(overflow)
-        }
+        log.append(event)
     }
 
     func reset() {
-        events.removeAll()
+        log.removeAll()
     }
 }

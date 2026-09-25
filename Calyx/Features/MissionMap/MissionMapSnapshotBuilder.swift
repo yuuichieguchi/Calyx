@@ -42,10 +42,21 @@ enum MissionMapSnapshotBuilder {
 
     // MARK: - Cards
 
+    /// The one cwd a card stands for: the agent entry's own cwd when it
+    /// has a non-empty one (as in the sidebar,
+    /// `AgentRowDisplay.cwdLabel(entryCwd:...)`), otherwise the pane's.
+    /// Both the cwd label and the git badge lookup use it, and
+    /// `CalyxWindowController.showMissionMap()` feeds
+    /// `MissionMapGitPoller` the same cwds, so a badge is always polled
+    /// for the directory the card names.
+    static func resolvedCwd(entryCwd: String?, paneCwd: String?) -> String? {
+        entryCwd.flatMap { $0.isEmpty ? nil : $0 } ?? paneCwd
+    }
+
     private static func makeCard(for pane: CockpitPaneInfo, input: MissionMapInput) -> MissionMapCard {
         let entry = input.entries[pane.surfaceID]
         let kind = entry?.kind ?? pane.agentKind
-        let entryCwd = entry?.cwd.flatMap { $0.isEmpty ? nil : $0 }
+        let cwd = resolvedCwd(entryCwd: entry?.cwd, paneCwd: pane.cwd)
         return MissionMapCard(
             id: pane.surfaceID,
             groupID: groupID(forName: pane.groupName),
@@ -53,10 +64,8 @@ enum MissionMapSnapshotBuilder {
             tabID: pane.tabID,
             kindLabel: kind.map(AgentEntry.displayName(forKind:)),
             paneTitle: AgentRowDisplay.primaryLabel(title: pane.title),
-            // The entry's own cwd wins, as in the sidebar
-            // (`AgentRowDisplay.cwdLabel(entryCwd:...)`).
             cwdLabel: MissionMapCwdAbbreviator.abbreviate(
-                entryCwd ?? pane.cwd, home: input.homeDirectory, maxComponents: cwdLabelComponents
+                cwd, home: input.homeDirectory, maxComponents: cwdLabelComponents
             ),
             state: entry?.state,
             toolLine: AgentRowDisplay.toolLine(toolName: entry?.currentToolName, toolSummary: entry?.currentToolSummary),
@@ -68,7 +77,7 @@ enum MissionMapSnapshotBuilder {
             },
             unreadCount: entry?.unreadCount ?? 0,
             approval: approval(for: pane.surfaceID, in: input.pendingApprovals),
-            git: pane.cwd.flatMap { input.git[$0] },
+            git: cwd.flatMap { input.git[$0] },
             // A pane with no agent row is still a real pane: its own
             // surface is the target, exactly as for a `.hooks` row.
             focusTarget: entry.map {

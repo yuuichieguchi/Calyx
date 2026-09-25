@@ -3,7 +3,8 @@
 //
 // Hit testing for Mission Map's lines. They are all drawn into one
 // Canvas, which has no per-element hit testing, so a tap is matched
-// against the line segments here instead.
+// against the lines' geometry here instead: the orthogonal polylines
+// `MissionMapRouter` produces, or plain segments.
 
 import CoreGraphics
 import Foundation
@@ -17,14 +18,36 @@ enum MissionMapEdgeHitTester {
     static func nearest(
         point: CGPoint, edges: [(id: UUID, a: CGPoint, b: CGPoint)], tolerance: CGFloat = 6
     ) -> UUID? {
+        nearest(point: point, polylines: edges.map { (id: $0.id, points: [$0.a, $0.b]) }, tolerance: tolerance)
+    }
+
+    /// The id of the polyline closest to `point`, if that distance is at
+    /// most `tolerance`; `nil` when every polyline is farther away. A
+    /// polyline's distance is the minimum over its consecutive segments
+    /// (a single-point polyline is measured to that point), so a routed
+    /// line is hit along its actual path, not along the chord between its
+    /// endpoints.
+    static func nearest(
+        point: CGPoint, polylines: [(id: UUID, points: [CGPoint])], tolerance: CGFloat = 6
+    ) -> UUID? {
         var best: (id: UUID, distance: CGFloat)?
-        for edge in edges {
-            let distance = distanceFrom(point, toSegment: edge.a, edge.b)
+        for polyline in polylines {
+            guard let distance = distanceFrom(point, toPolyline: polyline.points) else { continue }
             guard distance <= tolerance else { continue }
             if let current = best, current.distance <= distance { continue }
-            best = (edge.id, distance)
+            best = (polyline.id, distance)
         }
         return best?.id
+    }
+
+    /// Distance from `p` to the nearest segment of `points`; `nil` for an
+    /// empty polyline, which has no geometry to measure against.
+    static func distanceFrom(_ p: CGPoint, toPolyline points: [CGPoint]) -> CGFloat? {
+        guard let first = points.first else { return nil }
+        guard points.count > 1 else { return hypot(p.x - first.x, p.y - first.y) }
+        return zip(points, points.dropFirst())
+            .map { distanceFrom(p, toSegment: $0, $1) }
+            .min()
     }
 
     static func distanceFrom(_ p: CGPoint, toSegment a: CGPoint, _ b: CGPoint) -> CGFloat {

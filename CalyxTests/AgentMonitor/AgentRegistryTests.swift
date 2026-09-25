@@ -1380,11 +1380,16 @@ final class AgentRegistryTests: XCTestCase {
         registry.markServerStarted()
         registry.handleHookEvent(event("SessionStart", sessionID: "session-a"), surfaceID: UUID())
         XCTAssertEqual(registry.entries.count, 1, "Precondition: an entry must exist before reset")
+        IPCMessageEventFeed.shared.record(IPCMessageEvent(
+            id: UUID(), from: UUID(), to: UUID(), content: "hello", sentAt: Date(), isBroadcast: false
+        ))
+        XCTAssertFalse(IPCMessageEventFeed.shared.events.isEmpty, "Precondition: the IPC feed must hold an event")
 
         registry.reset()
 
         XCTAssertTrue(registry.entries.isEmpty, "reset() must clear every entry")
         XCTAssertFalse(registry.isServerRunning, "reset() must mark the server as not running")
+        XCTAssertTrue(IPCMessageEventFeed.shared.events.isEmpty, "reset() must empty the IPC message feed")
     }
 
     // MARK: - Staleness sweep

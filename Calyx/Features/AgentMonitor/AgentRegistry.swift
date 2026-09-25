@@ -207,6 +207,7 @@ final class AgentRegistry {
         sweepTask = nil
         subagentRegistry.reset()
         AgentEditedFileLog.shared.reset()
+        IPCMessageEventFeed.shared.reset()
     }
 
     // MARK: - External Entries (Herdr)

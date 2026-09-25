@@ -16,6 +16,9 @@ enum MissionMapLayout {
     static let bandHeaderHeight: CGFloat = 24
     /// Extra card height per subagent row.
     static let childRowHeight: CGFloat = 20
+    /// The width of the obstacle each band's header text occupies, so
+    /// routed lines do not run through the group's name.
+    static let bandHeaderObstacleWidth: CGFloat = 200
 
     /// A card's height: `baseHeight` plus one `childRowHeight` per child.
     static func cardHeight(for card: MissionMapCard, baseHeight: CGFloat) -> CGFloat {
@@ -28,6 +31,16 @@ enum MissionMapLayout {
         cards: [MissionMapCard], groups: [MissionMapGroup], in size: CGSize, cardSize: CGSize, spacing: CGFloat
     ) -> [UUID: CGPoint] {
         place(cards: cards, groups: groups, in: size, cardSize: cardSize, spacing: spacing).bandOrigins
+    }
+
+    /// The rectangle each band's header occupies (`bandHeaderObstacleWidth`
+    /// x `bandHeaderHeight` at its origin), for the edge router to avoid.
+    /// Sorted top to bottom, then left to right, so the same origins
+    /// always give the same list.
+    static func bandHeaderObstacles(bandOrigins: [UUID: CGPoint]) -> [CGRect] {
+        bandOrigins.values
+            .sorted { $0.y != $1.y ? $0.y < $1.y : $0.x < $1.x }
+            .map { CGRect(x: $0.x, y: $0.y, width: bandHeaderObstacleWidth, height: bandHeaderHeight) }
     }
 
     /// Every card's frame, keyed by card ID. Bands follow `groups`'
@@ -86,25 +99,6 @@ enum MissionMapLayout {
         return (
             borderPoint(of: from, toward: end),
             borderPoint(of: to, toward: start)
-        )
-    }
-
-    /// The segment `a`→`b` shifted `distance` perpendicular to its
-    /// direction, toward the right-hand side of travel in screen
-    /// coordinates (y grows downward): moving +x shifts toward +y. So
-    /// `a`→`b` and `b`→`a` offset by the same distance land on opposite
-    /// sides of the original line. A zero-length segment has no
-    /// direction and is returned unchanged.
-    static func offsetSegment(_ a: CGPoint, _ b: CGPoint, by distance: CGFloat) -> (CGPoint, CGPoint) {
-        let dx = b.x - a.x
-        let dy = b.y - a.y
-        let length = hypot(dx, dy)
-        guard length > 0 else { return (a, b) }
-        let shiftX = -dy / length * distance
-        let shiftY = dx / length * distance
-        return (
-            CGPoint(x: a.x + shiftX, y: a.y + shiftY),
-            CGPoint(x: b.x + shiftX, y: b.y + shiftY)
         )
     }
 
