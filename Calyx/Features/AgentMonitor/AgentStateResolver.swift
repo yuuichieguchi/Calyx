@@ -275,6 +275,41 @@ struct AgentResolution: Sendable {
         )
     }
 
+    /// The event names after which the parent turn has no tool call in
+    /// flight: the turn ended, the session ended, or a fresh prompt
+    /// started a turn that has not called anything yet.
+    private static let currentToolClearingEventNames: Set<String> = [
+        "Stop", "SessionEnd", "UserPromptSubmit",
+    ]
+
+    /// Maintains the written row's `currentToolName`/`currentToolSummary`
+    /// from a parent-scoped hook event: a `PreToolUse` sets both from the
+    /// event, `Stop` / `SessionEnd` / `UserPromptSubmit` clear both, and
+    /// every other event (`PostToolUse` included) leaves whatever the row
+    /// already carries. Only `resolveHook` calls this.
+    ///
+    /// A subagent event returns `self` unchanged: the child's own tool is
+    /// `SubagentRegistry`'s to show, and writing it onto the parent row
+    /// would make the parent card describe a call the parent never made.
+    /// A `.keep` or `.remove` also returns `self`: the event was not
+    /// accepted for the row, so it says nothing about the row's tool.
+    func withCurrentTool(from event: AgentEvent) -> AgentResolution {
+        guard !event.isSubagentEvent, case .write(var entry) = row else { return self }
+        if event.hookEventName == "PreToolUse" {
+            entry.currentToolName = event.toolName
+            entry.currentToolSummary = event.toolSummary
+        } else if Self.currentToolClearingEventNames.contains(event.hookEventName) {
+            entry.currentToolName = nil
+            entry.currentToolSummary = nil
+        } else {
+            return self
+        }
+        return AgentResolution(
+            row: .write(entry), evidence: evidence, didSettle: didSettle, learnedPeerID: learnedPeerID,
+            retiresChildren: retiresChildren
+        )
+    }
+
     /// Marks this resolution as retiring every child of the surface it
     /// resolves. Only `resolveHook` calls this, on its way out, once it
     /// already knows the event was both parent-scoped and accepted for
@@ -703,6 +738,7 @@ enum AgentStateResolver {
             evidence: evidence, blockedSince: blockedSince, now: now
         )
         .withLearnedPeerID(event.ipcSelfPeerID.flatMap(UUID.init(uuidString:)))
+        .withCurrentTool(from: event)
 
         guard !event.isSubagentEvent, case .write(let entry) = resolution.row else {
             return resolution

@@ -174,6 +174,9 @@ enum GhosttyActionRouter {
         case GHOSTTY_ACTION_TOGGLE_COMMAND_PALETTE:
             return handleToggleCommandPalette(app, target: target)
 
+        case GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW:
+            return handleToggleTabOverview(target: target)
+
         case GHOSTTY_ACTION_GOTO_WINDOW:
             return handleGotoWindow(app, target: target, direction: action.action.goto_window)
 
@@ -203,21 +206,13 @@ enum GhosttyActionRouter {
         // MARK: - Intentional No-Ops
         //
         // Unlike the "Known but unimplemented" group above, each of these
-        // three is a deliberate decision, not a placeholder for later work.
+        // two is a deliberate decision, not a placeholder for later work.
         // Each still returns `true`: a `false` here tells libghostty the
         // keybind that triggered the action was NOT consumed, so it falls
         // through and the raw key sequence gets sent to the shell instead
         // (see `ghostty_runtime_action_cb`'s doc comment in ghostty.h) --
         // exactly the wrong outcome for a keybind Calyx has consciously
         // decided has nothing to do here.
-
-        case GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW:
-            // AdwTabOverview (GTK's tab grid) only exists when GTK's
-            // libadwaita is >= 1.4 -- a GTK/Linux-only surface. Calyx
-            // already provides an always-available tab overview via its
-            // own TabBar/Sidebar UI, so there is no missing capability
-            // to route this to.
-            return true
 
         case GHOSTTY_ACTION_SHOW_GTK_INSPECTOR:
             // The GTK Inspector is a GTK-only debugging tool with no
@@ -1092,6 +1087,21 @@ enum GhosttyActionRouter {
         NotificationCenter.default.post(
             name: .ghosttyToggleCommandPalette,
             object: surfaceView
+        )
+        return true
+    }
+
+    /// `GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW`: GTK's tab grid
+    /// (AdwTabOverview) has no AppKit counterpart, so Calyx routes the
+    /// keybind to its own all-panes overview, Mission Map. Posts with the
+    /// triggering `SurfaceView`, or `nil` for a non-surface target (the
+    /// key window's controller then acts). Always returns `true`: a
+    /// `false` would tell libghostty the keybind was not consumed and
+    /// send the raw keys to the shell.
+    private static func handleToggleTabOverview(target: ghostty_target_s) -> Bool {
+        NotificationCenter.default.post(
+            name: .ghosttyToggleTabOverview,
+            object: surfaceView(from: target)
         )
         return true
     }

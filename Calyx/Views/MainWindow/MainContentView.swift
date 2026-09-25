@@ -32,6 +32,7 @@ struct MainContentView: View {
     var onCloseTab: ((UUID) -> Void)?
     var onCloseOtherTabs: ((UUID) -> Void)?
     var onCloseTabsToTheRight: ((UUID) -> Void)?
+    var onShowAllTabs: (() -> Void)?
     var onGroupRenamed: (() -> Void)?
     var onTabRenamed: (() -> Void)?
     var onToggleSidebar: (() -> Void)?
@@ -61,6 +62,14 @@ struct MainContentView: View {
     var onComposeOverlaySend: ((String) -> Bool)?
     var onDismissComposeOverlay: (() -> Void)?
     var onComposeOverlayEscapePressed: (() -> Void)?
+    let missionMapGitPoller: MissionMapGitPoller
+    /// This window's panes for Mission Map, in window order.
+    let missionMapPanes: () -> [CockpitPaneInfo]
+    var onMissionMapFocusSurface: ((UUID) -> Void)?
+    var onDismissMissionMap: (() -> Void)?
+    var onMissionMapAllow: ((UUID) -> Void)?
+    var onMissionMapOpenApproval: ((UUID) -> Void)?
+    var onMissionMapKeyCatcherReady: ((NSView) -> Void)?
     var totalReviewCommentCount: Int = 0
     var reviewFileCount: Int = 0
 
@@ -121,173 +130,193 @@ struct MainContentView: View {
         let activeTabs = activeGroup?.tabs ?? []
         let activeTabID = activeGroup?.activeTabID
 
+        // The `HStack` stays unconditional inside the `ZStack` (never in
+        // an `if`), for the same reason `body` applies `mainContent`
+        // unconditionally: it hosts the live terminal surfaces. Only the
+        // Mission Map overlay above it is conditional.
         return GlassEffectContainer {
-            HStack(spacing: 0) {
-                if windowSession.showSidebar {
-                    SidebarContentView(
-                        groups: windowSession.groups,
-                        activeGroupID: windowSession.activeGroupID,
-                        activeTabID: activeTabID,
-                        sidebarMode: $sidebarMode,
-                        gitSidebarState: gitSidebarState,
-                        onGroupSelected: onGroupSelected,
-                        onTabSelected: onTabSelected,
-                        onNewGroup: onNewGroup,
-                        onCloseTab: onCloseTab,
-                        onCloseOtherTabs: onCloseOtherTabs,
-                        onCloseTabsToTheRight: onCloseTabsToTheRight,
-                        onGroupRenamed: onGroupRenamed,
-                        onTabRenamed: onTabRenamed,
-                        onCollapseToggled: onCollapseToggled,
-                        onCloseAllTabsInGroup: onCloseAllTabsInGroup,
-                        onCloseOtherGroups: onCloseOtherGroups,
-                        onCloseGroupsBelow: onCloseGroupsBelow,
-                        onGroupColorChanged: onGroupColorChanged,
-                        onWorkingFileSelected: onWorkingFileSelected,
-                        onCommitFileSelected: onCommitFileSelected,
-                        onRefreshGitStatus: onRefreshGitStatus,
-                        onLoadMoreCommits: onLoadMoreCommits,
-                        onExpandCommit: onExpandCommit,
-                        onToggleGitRepoSection: onToggleGitRepoSection,
-                        onRetryGitRepoSection: onRetryGitRepoSection,
-                        onSelectRefFilter: onSelectRefFilter,
-                        onMoveTab: onMoveTab,
-                        paneTitle: paneTitle,
-                        paneCwd: paneCwd
-                    )
-                    .frame(width: windowSession.sidebarWidth)
-                    .overlay(alignment: .trailing) {
-                        SidebarResizeHandle(
-                            currentWidth: windowSession.sidebarWidth,
-                            onWidthChanged: { onSidebarWidthChanged?($0) },
-                            onDragCommitted: { onSidebarDragCommitted?() }
+            ZStack {
+                HStack(spacing: 0) {
+                    if windowSession.showSidebar {
+                        SidebarContentView(
+                            groups: windowSession.groups,
+                            activeGroupID: windowSession.activeGroupID,
+                            activeTabID: activeTabID,
+                            sidebarMode: $sidebarMode,
+                            gitSidebarState: gitSidebarState,
+                            onGroupSelected: onGroupSelected,
+                            onTabSelected: onTabSelected,
+                            onNewGroup: onNewGroup,
+                            onCloseTab: onCloseTab,
+                            onCloseOtherTabs: onCloseOtherTabs,
+                            onCloseTabsToTheRight: onCloseTabsToTheRight,
+                            onShowAllTabs: onShowAllTabs,
+                            onGroupRenamed: onGroupRenamed,
+                            onTabRenamed: onTabRenamed,
+                            onCollapseToggled: onCollapseToggled,
+                            onCloseAllTabsInGroup: onCloseAllTabsInGroup,
+                            onCloseOtherGroups: onCloseOtherGroups,
+                            onCloseGroupsBelow: onCloseGroupsBelow,
+                            onGroupColorChanged: onGroupColorChanged,
+                            onWorkingFileSelected: onWorkingFileSelected,
+                            onCommitFileSelected: onCommitFileSelected,
+                            onRefreshGitStatus: onRefreshGitStatus,
+                            onLoadMoreCommits: onLoadMoreCommits,
+                            onExpandCommit: onExpandCommit,
+                            onToggleGitRepoSection: onToggleGitRepoSection,
+                            onRetryGitRepoSection: onRetryGitRepoSection,
+                            onSelectRefFilter: onSelectRefFilter,
+                            onMoveTab: onMoveTab,
+                            paneTitle: paneTitle,
+                            paneCwd: paneCwd
                         )
-                        .offset(x: 0)
-                        .zIndex(1)
-                    }
-                }
-
-                ZStack {
-                    VStack(spacing: 0) {
-                        if !activeTabs.isEmpty {
-                            TabBarContentView(
-                                tabs: activeTabs,
-                                activeTabID: activeTabID,
-                                onTabSelected: onTabSelected,
-                                onNewTab: onNewTab,
-                                onCloseTab: onCloseTab,
-                                onCloseOtherTabs: onCloseOtherTabs,
-                                onCloseTabsToTheRight: onCloseTabsToTheRight,
-                                onMoveTab: activeGroup != nil
-                                    ? { from, to in onMoveTab?(activeGroup!.id, from, to) }
-                                    : nil,
-                                onTabRenamed: onTabRenamed,
-                                activeGroupID: activeGroup?.id
+                        .frame(width: windowSession.sidebarWidth)
+                        .overlay(alignment: .trailing) {
+                            SidebarResizeHandle(
+                                currentWidth: windowSession.sidebarWidth,
+                                onWidthChanged: { onSidebarWidthChanged?($0) },
+                                onDragCommitted: { onSidebarDragCommitted?() }
                             )
+                            .offset(x: 0)
+                            .zIndex(1)
                         }
+                    }
 
-                        if let diffSource = activeDiffSource, let diffState = activeDiffState {
-                            VStack(spacing: 0) {
-                                DiffToolbarView(
-                                    source: diffSource,
-                                    reviewStore: activeDiffReviewStore,
-                                    onSubmitReview: onSubmitReview,
-                                    onDiscardReview: onDiscardReview,
-                                    totalReviewCommentCount: totalReviewCommentCount,
-                                    reviewFileCount: reviewFileCount,
-                                    onSubmitAllReviews: onSubmitAllReviews,
-                                    onDiscardAllReviews: onDiscardAllReviews
+                    ZStack {
+                        VStack(spacing: 0) {
+                            if !activeTabs.isEmpty {
+                                TabBarContentView(
+                                    tabs: activeTabs,
+                                    activeTabID: activeTabID,
+                                    onTabSelected: onTabSelected,
+                                    onNewTab: onNewTab,
+                                    onCloseTab: onCloseTab,
+                                    onCloseOtherTabs: onCloseOtherTabs,
+                                    onCloseTabsToTheRight: onCloseTabsToTheRight,
+                                    onShowAllTabs: onShowAllTabs,
+                                    onMoveTab: activeGroup != nil
+                                        ? { from, to in onMoveTab?(activeGroup!.id, from, to) }
+                                        : nil,
+                                    onTabRenamed: onTabRenamed,
+                                    activeGroupID: activeGroup?.id
                                 )
-                                switch diffState {
-                                case .loading:
-                                    VStack {
-                                        Spacer()
-                                        ProgressView("Loading diff...")
-                                        Spacer()
-                                    }
-                                case .success(let diff):
-                                    DiffGlassContentView(
-                                        diff: diff,
-                                        reduceTransparency: reduceTransparency,
-                                        glassOpacity: glassOpacity,
-                                        reviewStore: activeDiffReviewStore
+                            }
+
+                            if let diffSource = activeDiffSource, let diffState = activeDiffState {
+                                VStack(spacing: 0) {
+                                    DiffToolbarView(
+                                        source: diffSource,
+                                        reviewStore: activeDiffReviewStore,
+                                        onSubmitReview: onSubmitReview,
+                                        onDiscardReview: onDiscardReview,
+                                        totalReviewCommentCount: totalReviewCommentCount,
+                                        reviewFileCount: reviewFileCount,
+                                        onSubmitAllReviews: onSubmitAllReviews,
+                                        onDiscardAllReviews: onDiscardAllReviews
                                     )
-                                        .accessibilityIdentifier(AccessibilityID.Diff.content)
-                                case .error(let message):
-                                    VStack(spacing: 12) {
-                                        Spacer()
-                                        Image(systemName: "exclamationmark.triangle")
-                                            .font(.largeTitle)
-                                            .foregroundStyle(.secondary)
-                                        Text(message)
-                                            .foregroundStyle(.secondary)
-                                        Spacer()
-                                    }
-                                }
-                            }
-                            .accessibilityIdentifier(AccessibilityID.Diff.container)
-                        } else if let browserController = activeBrowserController {
-                            BrowserContainerView(controller: browserController)
-                        } else {
-                            VStack(spacing: 0) {
-                                TerminalContainerView(
-                                    splitContainerView: splitContainerView,
-                                    reduceTransparency: reduceTransparency,
-                                    glassOpacity: glassOpacity
-                                )
-                                .onDrop(of: [.fileURL], delegate: TerminalDropDelegate(splitContainerView: splitContainerView))
-                                .layoutPriority(1)
-                                .overlay(alignment: .topTrailing) {
-                                    if secureInput.enabled {
-                                        SecureInputOverlay()
-                                    }
-                                }
-
-                                if windowSession.showComposeOverlay {
-                                    VStack(spacing: 0) {
-                                        ComposeResizeHandle(
-                                            currentHeight: windowSession.composeOverlayHeight,
-                                            onHeightChanged: { windowSession.composeOverlayHeight = $0 }
-                                        )
-
-                                        ComposeOverlayContainerView(
-                                            text: $windowSession.composeOverlayText,
-                                            onSend: onComposeOverlaySend,
-                                            onDismiss: onDismissComposeOverlay,
-                                            onEscapePressed: onComposeOverlayEscapePressed
-                                        )
-                                        .frame(height: windowSession.composeOverlayHeight)
-                                        .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                                        .overlay {
-                                            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
-                                                .allowsHitTesting(false)
+                                    switch diffState {
+                                    case .loading:
+                                        VStack {
+                                            Spacer()
+                                            ProgressView("Loading diff...")
+                                            Spacer()
                                         }
-                                        .padding(.horizontal, 12)
-                                        .padding(.bottom, 12)
+                                    case .success(let diff):
+                                        DiffGlassContentView(
+                                            diff: diff,
+                                            reduceTransparency: reduceTransparency,
+                                            glassOpacity: glassOpacity,
+                                            reviewStore: activeDiffReviewStore
+                                        )
+                                            .accessibilityIdentifier(AccessibilityID.Diff.content)
+                                    case .error(let message):
+                                        VStack(spacing: 12) {
+                                            Spacer()
+                                            Image(systemName: "exclamationmark.triangle")
+                                                .font(.largeTitle)
+                                                .foregroundStyle(.secondary)
+                                            Text(message)
+                                                .foregroundStyle(.secondary)
+                                            Spacer()
+                                        }
+                                    }
+                                }
+                                .accessibilityIdentifier(AccessibilityID.Diff.container)
+                            } else if let browserController = activeBrowserController {
+                                BrowserContainerView(controller: browserController)
+                            } else {
+                                VStack(spacing: 0) {
+                                    TerminalContainerView(
+                                        splitContainerView: splitContainerView,
+                                        reduceTransparency: reduceTransparency,
+                                        glassOpacity: glassOpacity
+                                    )
+                                    .onDrop(of: [.fileURL], delegate: TerminalDropDelegate(splitContainerView: splitContainerView))
+                                    .layoutPriority(1)
+                                    .overlay(alignment: .topTrailing) {
+                                        if secureInput.enabled {
+                                            SecureInputOverlay()
+                                        }
+                                    }
+
+                                    if windowSession.showComposeOverlay {
+                                        VStack(spacing: 0) {
+                                            ComposeResizeHandle(
+                                                currentHeight: windowSession.composeOverlayHeight,
+                                                onHeightChanged: { windowSession.composeOverlayHeight = $0 }
+                                            )
+
+                                            ComposeOverlayContainerView(
+                                                text: $windowSession.composeOverlayText,
+                                                onSend: onComposeOverlaySend,
+                                                onDismiss: onDismissComposeOverlay,
+                                                onEscapePressed: onComposeOverlayEscapePressed
+                                            )
+                                            .frame(height: windowSession.composeOverlayHeight)
+                                            .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+                                            .overlay {
+                                                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                                                    .allowsHitTesting(false)
+                                            }
+                                            .padding(.horizontal, 12)
+                                            .padding(.bottom, 12)
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    if windowSession.showCommandPalette, let commandRegistry {
-                        Color.black.opacity(0.01)
-                            .onTapGesture { onDismissCommandPalette?() }
+                        if windowSession.showCommandPalette, let commandRegistry {
+                            Color.black.opacity(0.01)
+                                .onTapGesture { onDismissCommandPalette?() }
 
-                        VStack {
-                            CommandPaletteContainerView(
-                                registry: commandRegistry,
-                                onDismiss: onDismissCommandPalette
-                            )
-                            .frame(width: 500, height: 340)
-                            .glassEffect(.regular, in: .rect(cornerRadius: 12))
+                            VStack {
+                                CommandPaletteContainerView(
+                                    registry: commandRegistry,
+                                    onDismiss: onDismissCommandPalette
+                                )
+                                .frame(width: 500, height: 340)
+                                .glassEffect(.regular, in: .rect(cornerRadius: 12))
 
-                            Spacer()
+                                Spacer()
+                            }
+                            .padding(.top, 40)
                         }
-                        .padding(.top, 40)
                     }
                 }
+
+                // The fade is scoped to this inner container so it only
+                // animates the map's insertion/removal, not layout changes
+                // in the `HStack` (compose overlay, command palette,
+                // terminal) that land in the same update.
+                ZStack {
+                    if windowSession.showMissionMap {
+                        missionMapOverlay
+                            .transition(.opacity)
+                    }
+                }
+                .animation(.easeOut(duration: 0.15), value: windowSession.showMissionMap)
             }
         }
         .background {
@@ -304,6 +333,28 @@ struct MainContentView: View {
             .allowsHitTesting(false)
         }
         .modifier(GlassAtmosphereBackground(themeColor: themeColor, glassOpacity: glassOpacity, reduceTransparency: reduceTransparency, specularStroke: true))
+    }
+}
+
+extension MainContentView {
+    /// Mission Map over the whole content area (sidebar included). The
+    /// near-transparent layer underneath catches clicks the map itself
+    /// leaves unhandled and closes it.
+    fileprivate var missionMapOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.01)
+                .onTapGesture { onDismissMissionMap?() }
+
+            MissionMapView(
+                panes: missionMapPanes,
+                gitPoller: missionMapGitPoller,
+                onFocusSurface: onMissionMapFocusSurface,
+                onDismiss: onDismissMissionMap,
+                onAllow: onMissionMapAllow,
+                onOpenApproval: onMissionMapOpenApproval,
+                onKeyCatcherReady: onMissionMapKeyCatcherReady
+            )
+        }
     }
 }
 

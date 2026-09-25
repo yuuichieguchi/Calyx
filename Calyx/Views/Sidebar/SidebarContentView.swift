@@ -18,6 +18,7 @@ struct SidebarContentView: View {
     var onCloseTab: ((UUID) -> Void)?
     var onCloseOtherTabs: ((UUID) -> Void)?
     var onCloseTabsToTheRight: ((UUID) -> Void)?
+    var onShowAllTabs: (() -> Void)?
     var onGroupRenamed: (() -> Void)?
     var onTabRenamed: (() -> Void)?
     var onCollapseToggled: (() -> Void)?
@@ -169,6 +170,7 @@ struct SidebarContentView: View {
                                 onCloseTab: onCloseTab,
                                 onCloseOtherTabs: onCloseOtherTabs,
                                 onCloseTabsToTheRight: onCloseTabsToTheRight,
+                                onShowAllTabs: onShowAllTabs,
                                 onGroupRenamed: onGroupRenamed,
                                 onTabRenamed: onTabRenamed,
                                 onCollapseToggled: onCollapseToggled,
@@ -291,6 +293,7 @@ private struct GroupSectionView: View {
     var onCloseTab: ((UUID) -> Void)?
     var onCloseOtherTabs: ((UUID) -> Void)?
     var onCloseTabsToTheRight: ((UUID) -> Void)?
+    var onShowAllTabs: (() -> Void)?
     var onGroupRenamed: (() -> Void)?
     var onTabRenamed: (() -> Void)?
     var onCollapseToggled: (() -> Void)?
@@ -472,6 +475,7 @@ private struct GroupSectionView: View {
                             onClose: { onCloseTab?(tab.id) },
                             onCloseOtherTabs: { onCloseOtherTabs?(tab.id) },
                             onCloseTabsToTheRight: { onCloseTabsToTheRight?(tab.id) },
+                            onShowAllTabs: onShowAllTabs,
                             onTabRenamed: onTabRenamed,
                             onDragChanged: { translation in
                                 // Tab reorder: equivalent to the former
@@ -610,6 +614,7 @@ private struct TabRowItemView: View {
     var onClose: (() -> Void)?
     var onCloseOtherTabs: (() -> Void)?
     var onCloseTabsToTheRight: (() -> Void)?
+    var onShowAllTabs: (() -> Void)?
     var onTabRenamed: (() -> Void)?
     var onDragChanged: ((CGSize) -> Void)?
     var onDragEnded: (() -> Void)?
@@ -670,6 +675,7 @@ private struct TabRowItemView: View {
                         close: { onClose?() },
                         closeOthers: { onCloseOtherTabs?() },
                         closeToTheRight: { onCloseTabsToTheRight?() },
+                        showAllTabs: { onShowAllTabs?() },
                         rename: { isEditing = true }
                     )
                 )

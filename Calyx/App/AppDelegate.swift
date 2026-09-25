@@ -2599,6 +2599,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         paletteItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(paletteItem)
 
+        let missionMapItem = NSMenuItem(
+            title: "Mission Map",
+            action: #selector(CalyxWindowController.toggleMissionMap),
+            keyEquivalent: "m"
+        )
+        missionMapItem.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(missionMapItem)
+
         viewMenu.addItem(.separator())
 
         viewMenu.addItem(
@@ -4127,6 +4135,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     ///
     /// Cases:
     /// - `commandPalette`: Cmd+Shift+P — toggle the command palette.
+    /// - `missionMap`:     Cmd+Shift+M — toggle Mission Map.
     /// - `unreadTab`:      Cmd+Shift+U — jump to most recent unread tab.
     /// - `nextTab`:        Cmd+Shift+] — select next tab (Issue #27).
     /// - `previousTab`:    Cmd+Shift+[ — select previous tab (Issue #27).
@@ -4134,6 +4143,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     /// - `debugSelect`:    Ctrl+Shift+D — UI-testing-only debug hook.
     enum KeyMonitorAction: Equatable, Sendable {
         case commandPalette
+        case missionMap
         case unreadTab
         case nextTab
         case previousTab
@@ -4166,6 +4176,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // Cmd+Shift+P — command palette
         if mods == [.command, .shift], lowered == "p" {
             return .commandPalette
+        }
+
+        // Cmd+Shift+M — Mission Map. Plain Cmd+M (Minimize) is left to
+        // the Window menu.
+        if mods == [.command, .shift], lowered == "m" {
+            return .missionMap
         }
 
         // Cmd+Shift+U — jump to most recent unread tab
@@ -4236,13 +4252,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
                 // Does not require a key window.
                 self.performDebugSelect()
                 return nil
-            case .commandPalette, .unreadTab, .nextTab, .previousTab, .selectTab:
+            case .commandPalette, .missionMap, .unreadTab, .nextTab, .previousTab, .selectTab:
                 // All window-targeted actions require a key window. If none,
                 // fall through so the event can still reach the responder
                 // chain / menu.
                 guard let wc = keyWC else { return event }
                 switch action {
                 case .commandPalette:        wc.toggleCommandPalette()
+                case .missionMap:            wc.toggleMissionMap()
                 case .unreadTab:             wc.jumpToMostRecentUnreadTab()
                 case .nextTab:               wc.selectNextTab(nil)
                 case .previousTab:           wc.selectPreviousTab(nil)

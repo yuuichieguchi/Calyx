@@ -455,6 +455,56 @@ final class CalyxMCPServer {
 
         let kind = agentKind(from: request.headers)
         agentRegistry.handleHookEvent(event, surfaceID: surfaceID, kind: kind)
+        // A `Stop` event that actually settled this surface's row to
+        // `.idle` (checked on the resolved row, not the raw event name,
+        // so a `Stop` the resolver rejected -- wrong session, a row still
+        // `.blocked` from a genuinely unrelated, still-live request --
+        // never fires this) means the agent's whole turn ended with
+        // nothing left to wait on: an idle surface cannot legitimately
+        // still be waiting on a human decision. Any `ApprovalRequest`
+        // still `pending` for `surfaceID` at that point is therefore
+        // stale, however it got that way. This is a LAST-RESORT fallback,
+        // not a primary detection path: the real fix for "the user
+        // answers the SAME permission prompt directly in the CLI while
+        // `calyx-approval-hook` is still blocked in its long-poll" lives
+        // in `ApprovalHookScript` itself -- its curl now runs backgrounded
+        // under a `trap` on TERM/HUP/INT, so the SIGTERM that kills the
+        // hook process (Node's `child_process.kill()` default) also kills
+        // curl instead of orphaning it (reparented to PID 1, empirically
+        // confirmed), closing the socket promptly and letting
+        // `routeApprovalRequest`'s own connection-drop detection (that
+        // method's own doc comment, invariant (c), via
+        // `dispatchRoute`'s sentinel receive) cancel the long-poll and
+        // expire the request the normal way. This code path only still
+        // matters for whatever bypasses that trap entirely -- chiefly
+        // SIGKILL, which no process can catch, so a SIGKILLed hook's curl
+        // still survives as an orphan and its connection stays open until
+        // curl's own `-m` deadline. `ApprovalHookTiming`'s nesting
+        // invariant (server timeout < curl timeout < the CLI's own
+        // hook-entry timeout) means curl's own deadline should never be
+        // what leaves a request stranded either, since the server always
+        // answers first -- this guards against whatever residual path
+        // still lets that happen in practice, without this code needing
+        // to know or assume which one occurred. Without this, a stranded
+        // request lingers in `pending` -- and every card/banner that
+        // reads it keeps showing "Waiting for approval" -- until its own
+        // `timeoutMs` (up to `ApprovalInboxStore.maxTimeoutMs`, an hour)
+        // finally elapses. `expireForSurface` is scoped to `surfaceID`
+        // alone, so this can never touch a different pane's genuinely
+        // still-pending request.
+        // Deliberately NOT scoped further to a specific tool
+        // (`PostToolUse`'s own `toolName`): Claude Code can run tool
+        // calls in parallel, one auto-approved while a different one is
+        // still genuinely prompting, so a `PostToolUse`-keyed expire
+        // risks discarding a live request; `Stop` alone carries no such
+        // ambiguity; it only ever means nothing is left running. The
+        // trade-off: a stale card can still show "Waiting for approval"
+        // with a `.working` (not yet `.idle`) dot for as long as the
+        // turn continues after the CLI resolved it some other way --
+        // only settling to `.idle` clears it here.
+        if event.hookEventName == "Stop", agentRegistry.entries[surfaceID]?.state == .idle {
+            approvalInbox.expireForSurface(surfaceID)
+        }
         // Record the agent's self-reported session ID (when
         // present) into the calyx-session daemon's per-session meta so
         // a later reattach can offer to resume this conversation. A
@@ -2140,6 +2190,10 @@ final class CalyxMCPServer {
 
         do {
             let message = try await store.sendMessage(from: fromUUID, to: toUUID, content: content)
+            IPCMessageEventFeed.shared.record(IPCMessageEvent(
+                id: message.id, from: message.from, to: message.to, content: message.content,
+                sentAt: message.timestamp, isBroadcast: false
+            ))
             // The recipient's unread badge (if a pane has learned a
             // binding to this peer — see AgentEvent.ipcSelfPeerID) is
             // refreshed once, after this handler returns, by
@@ -2165,6 +2219,17 @@ final class CalyxMCPServer {
 
         do {
             let messages = try await store.broadcast(from: fromUUID, content: content)
+            // ONE feed event per broadcast, not one per recipient: Mission
+            // Map fans a broadcast out to every other bound peer itself
+            // (`MissionMapSnapshotBuilder`), so a per-recipient record
+            // would draw every line once per recipient. A broadcast that
+            // reached nobody has no message to record and draws nothing.
+            if let first = messages.first {
+                IPCMessageEventFeed.shared.record(IPCMessageEvent(
+                    id: first.id, from: first.from, to: first.to, content: first.content,
+                    sentAt: first.timestamp, isBroadcast: true
+                ))
+            }
             // Every recipient's unread badge is refreshed once, after
             // this handler returns, by `handleToolCall`'s
             // `syncBoundPeerInboxCounts` — not with a per-recipient

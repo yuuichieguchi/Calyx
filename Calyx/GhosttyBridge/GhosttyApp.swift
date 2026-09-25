@@ -588,6 +588,10 @@ extension Notification.Name {
     /// `GHOSTTY_ACTION_TOGGLE_COMMAND_PALETTE`. `object` is the
     /// triggering `SurfaceView`; no `userInfo`.
     static let ghosttyToggleCommandPalette = Notification.Name("com.calyx.ghostty.toggleCommandPalette")
+    /// `GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW`, repurposed to toggle Mission
+    /// Map. `object` is the triggering `SurfaceView`, or `nil` when the
+    /// action did not come from a surface; no `userInfo`.
+    static let ghosttyToggleTabOverview = Notification.Name("com.calyx.ghostty.toggleTabOverview")
     /// `GHOSTTY_ACTION_MOVE_TAB`. `object` is the triggering
     /// `SurfaceView`; `userInfo["amount"]` is an `Int`
     /// (`ghostty_action_move_tab_s.amount`, `ssize_t`).

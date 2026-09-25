@@ -206,6 +206,8 @@ final class AgentRegistry {
         sweepTask?.cancel()
         sweepTask = nil
         subagentRegistry.reset()
+        AgentEditedFileLog.shared.reset()
+        IPCMessageEventFeed.shared.reset()
     }
 
     // MARK: - External Entries (Herdr)
@@ -313,6 +315,7 @@ final class AgentRegistry {
             ),
             surfaceID: surfaceID
         )
+        recordEditedFiles(of: event, surfaceID: surfaceID, now: now)
         // A child is only ever tracked under a live row: read the row
         // AFTER apply() above so this decision uses its post-event state,
         // mirroring AgentStateResolver.resolveHookRow's own
@@ -330,6 +333,28 @@ final class AgentRegistry {
         guard event.isSubagentEvent else { return }
         guard let row = entries[surfaceID], row.state != .done else { return }
         subagentRegistry.handleHookEvent(event, parentSurfaceID: surfaceID, now: now)
+    }
+
+    /// Records the files `event` is about to write into
+    /// `AgentEditedFileLog` for Mission Map's conflict lines. Runs for a
+    /// parent and a subagent event alike, and whether or not the
+    /// resolver accepted the event for the row: a child editing a file
+    /// edits it in the parent's pane all the same, and a file write the
+    /// row's state machine ignored still happened.
+    ///
+    /// A relative path (Codex `apply_patch` names files relative to its
+    /// cwd) is resolved here, against the event's own `cwd` or else the
+    /// row's -- Grok strips `cwd` from a child's events -- because the
+    /// log's consumers see no cwd at all. With neither, the path is kept
+    /// as the tool named it.
+    private func recordEditedFiles(of event: AgentEvent, surfaceID: UUID, now: Date) {
+        guard !event.editedFilePaths.isEmpty, let toolName = event.toolName else { return }
+        let baseDirectory = event.cwd ?? entries[surfaceID]?.cwd
+        let paths = event.editedFilePaths.map { path -> String in
+            guard !(path as NSString).isAbsolutePath, let baseDirectory else { return path }
+            return (baseDirectory as NSString).appendingPathComponent(path)
+        }
+        AgentEditedFileLog.shared.record(surfaceID: surfaceID, paths: paths, toolName: toolName, at: now)
     }
 
     // MARK: - Pane Command Lifecycle (Shell Integration)
@@ -851,6 +876,22 @@ final class AgentRegistry {
         surfaceToPeer[surfaceID]
     }
 
+    /// The surface currently bound to `peerID`, or `nil` if none is --
+    /// `boundPeerID(for:)`'s reverse. Mission Map resolves an IPC
+    /// message's sender and recipient peers to the panes it draws the
+    /// message's line between.
+    func surfaceID(boundTo peerID: UUID) -> UUID? {
+        peerToSurface[peerID]
+    }
+
+    /// A read-only copy of every peer -> surface binding, for building a
+    /// whole Mission Map snapshot in one read instead of one lookup per
+    /// peer. `peerToSurface` itself stays private so `bindSurface`
+    /// remains the only writer of the bijection.
+    var peerToSurfaceMap: [UUID: UUID] {
+        peerToSurface
+    }
+
     // MARK: - Unread Message Badges
 
     /// Every peer ID currently bound to a surface. `CalyxMCPServer`
@@ -913,6 +954,7 @@ final class AgentRegistry {
         evidence.removeValue(forKey: surfaceID)
         calyxShellIntegrationReportedSurfaces.remove(surfaceID)
         subagentRegistry.handleSurfaceDestroyed(parentSurfaceID: surfaceID)
+        AgentEditedFileLog.shared.removeAll(for: surfaceID)
     }
 
     // MARK: - Sorting Helpers

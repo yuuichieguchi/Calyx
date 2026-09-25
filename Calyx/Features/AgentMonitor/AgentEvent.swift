@@ -69,6 +69,17 @@ struct AgentEntry: Identifiable, Sendable, Equatable {
     /// existing call site
     /// is unaffected.
     var focusSurfaceID: UUID? = nil
+    /// The tool the agent's own (parent, never subagent) turn most
+    /// recently started, from its `PreToolUse` event's `toolName`, and
+    /// that call's `AgentEvent.toolSummary`. Kept through `PostToolUse`
+    /// (the call finished, but it is still the last thing the turn did)
+    /// and cleared by `Stop` / `SessionEnd` / `UserPromptSubmit`, after
+    /// which no tool call is in flight -- see
+    /// `AgentResolution.withCurrentTool(from:)`. Mission Map's card shows
+    /// these as its tool line. Defaulted so every existing call site is
+    /// unaffected.
+    var currentToolName: String? = nil
+    var currentToolSummary: String? = nil
 }
 
 extension AgentEntry {
@@ -184,6 +195,14 @@ struct AgentEvent: Sendable, Equatable {
     /// string -- never an empty string, which a row would render as a
     /// bare separator.
     var toolSummary: String? = nil
+    /// The file paths a `PreToolUse` event's tool call is about to
+    /// write (`AgentEditedFileExtractor.paths(toolName:toolInput:)`),
+    /// which `AgentRegistry.handleHookEvent` records into
+    /// `AgentEditedFileLog` for Mission Map's conflict lines. Always
+    /// empty for every other event: a `PostToolUse` names a call that
+    /// already ran, so recording it would only duplicate the edit its
+    /// own `PreToolUse` already recorded.
+    var editedFilePaths: [String] = []
 
     /// Whether this event fired inside a subagent rather than the main
     /// thread. The ONLY subagent predicate in the codebase: `agentType`
@@ -223,7 +242,12 @@ struct AgentEvent: Sendable, Equatable {
             agentID: object["agent_id"] as? String,
             agentType: object["agent_type"] as? String,
             toolName: object["tool_name"] as? String,
-            toolSummary: toolSummary(toolName: object["tool_name"] as? String, toolInput: object["tool_input"])
+            toolSummary: toolSummary(toolName: object["tool_name"] as? String, toolInput: object["tool_input"]),
+            editedFilePaths: editedFilePaths(
+                hookEventName: hookEventName,
+                toolName: object["tool_name"] as? String,
+                toolInput: object["tool_input"]
+            )
         )
     }
 
@@ -239,6 +263,16 @@ struct AgentEvent: Sendable, Equatable {
         )
         let line = AgentToolSummary.singleLineSummary(derived)
         return line.isEmpty ? nil : line
+    }
+
+    /// `AgentEditedFileExtractor.paths` for a `PreToolUse` event, `[]`
+    /// for every other event. `hookEventName` is the already-normalized
+    /// name, so Grok's `pre_tool_use` qualifies through the same check.
+    private static func editedFilePaths(hookEventName: String, toolName: String?, toolInput: Any?) -> [String] {
+        guard hookEventName == "PreToolUse", let toolName, let toolInput = toolInput as? [String: Any] else {
+            return []
+        }
+        return AgentEditedFileExtractor.paths(toolName: toolName, toolInput: toolInput)
     }
 
     /// Grok's `stop` `reason` for a genuine turn end. Grok fires an extra
@@ -294,9 +328,10 @@ struct AgentEvent: Sendable, Equatable {
             : nil
         let hasIdentity = subagentType != nil && agentID != nil
 
+        let mappedEventName = hasIdentity || subagentType == nil
+            ? grokEventName(rawEventName, object: object) : rawEventName
         return AgentEvent(
-            hookEventName: hasIdentity || subagentType == nil
-                ? grokEventName(rawEventName, object: object) : rawEventName,
+            hookEventName: mappedEventName,
             sessionID: subagentType != nil ? nil : object["sessionId"] as? String,
             cwd: subagentType != nil ? nil : object["cwd"] as? String,
             message: object["message"] as? String,
@@ -304,7 +339,12 @@ struct AgentEvent: Sendable, Equatable {
             agentID: agentID,
             agentType: subagentType,
             toolName: object["toolName"] as? String,
-            toolSummary: toolSummary(toolName: object["toolName"] as? String, toolInput: object["toolInput"])
+            toolSummary: toolSummary(toolName: object["toolName"] as? String, toolInput: object["toolInput"]),
+            editedFilePaths: editedFilePaths(
+                hookEventName: mappedEventName,
+                toolName: object["toolName"] as? String,
+                toolInput: object["toolInput"]
+            )
         )
     }
 

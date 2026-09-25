@@ -671,4 +671,123 @@ final class AgentStateResolverSubagentTests: XCTestCase {
                            "A rejected (session-mismatched) parent-scoped \(name) must never retire children")
         }
     }
+
+    // MARK: - currentToolName / currentToolSummary (Mission Map)
+    //
+    // AgentEntry.currentToolName / currentToolSummary: set on a PARENT's
+    // own PreToolUse via AgentResolution.withCurrentTool(from:), retained
+    // across PostToolUse, and cleared on Stop / SessionEnd /
+    // UserPromptSubmit. A subagent (child) PreToolUse must never change
+    // the parent row's own currentToolName/currentToolSummary -- only the
+    // parent's own event may.
+
+    /// A parent's own PreToolUse must set both fields from the event's
+    /// own toolName/toolSummary.
+    func test_parentPreToolUse_setsCurrentToolNameAndSummary() throws {
+        let surfaceID = UUID()
+        let existing = hooksEntry(surfaceID: surfaceID, state: .idle)
+
+        let resolution = resolve(
+            AgentEvent(
+                hookEventName: "PreToolUse", sessionID: "parent-session", cwd: "/Users/dev/project",
+                message: nil, agentID: nil, agentType: nil, toolName: "Write",
+                toolSummary: "main.swift"
+            ),
+            current: existing
+        )
+
+        let updated = try XCTUnwrap(writtenEntry(resolution))
+        XCTAssertEqual(updated.currentToolName, "Write")
+        XCTAssertEqual(updated.currentToolSummary, "main.swift")
+    }
+
+    /// PostToolUse must retain whatever the preceding PreToolUse set --
+    /// it does not carry a fresh toolName of its own into the row.
+    func test_parentPostToolUse_retainsCurrentTool() throws {
+        let surfaceID = UUID()
+        var existing = hooksEntry(surfaceID: surfaceID, state: .working)
+        existing.currentToolName = "Write"
+        existing.currentToolSummary = "main.swift"
+
+        let resolution = resolve(
+            event("PostToolUse", agentID: nil, agentType: nil), current: existing
+        )
+
+        let updated = try XCTUnwrap(writtenEntry(resolution))
+        XCTAssertEqual(updated.currentToolName, "Write")
+        XCTAssertEqual(updated.currentToolSummary, "main.swift")
+    }
+
+    /// Stop must clear both fields -- the turn is over, so there is no
+    /// "current tool" any more.
+    func test_parentStop_clearsCurrentTool() throws {
+        let surfaceID = UUID()
+        var existing = hooksEntry(surfaceID: surfaceID, state: .working)
+        existing.currentToolName = "Write"
+        existing.currentToolSummary = "main.swift"
+
+        let resolution = resolve(
+            event("Stop", agentID: nil, agentType: nil), current: existing
+        )
+
+        let updated = try XCTUnwrap(writtenEntry(resolution))
+        XCTAssertNil(updated.currentToolName)
+        XCTAssertNil(updated.currentToolSummary)
+    }
+
+    /// SessionEnd must clear both fields -- same reasoning as Stop.
+    func test_parentSessionEnd_clearsCurrentTool() throws {
+        let surfaceID = UUID()
+        var existing = hooksEntry(surfaceID: surfaceID, state: .working)
+        existing.currentToolName = "Write"
+        existing.currentToolSummary = "main.swift"
+
+        let resolution = resolve(
+            event("SessionEnd", agentID: nil, agentType: nil), current: existing
+        )
+
+        let updated = try XCTUnwrap(writtenEntry(resolution))
+        XCTAssertNil(updated.currentToolName)
+        XCTAssertNil(updated.currentToolSummary)
+    }
+
+    /// UserPromptSubmit must clear both fields -- a fresh prompt means
+    /// no tool call is in flight yet.
+    func test_parentUserPromptSubmit_clearsCurrentTool() throws {
+        let surfaceID = UUID()
+        var existing = hooksEntry(surfaceID: surfaceID, state: .working)
+        existing.currentToolName = "Write"
+        existing.currentToolSummary = "main.swift"
+
+        let resolution = resolve(
+            event("UserPromptSubmit", agentID: nil, agentType: nil), current: existing
+        )
+
+        let updated = try XCTUnwrap(writtenEntry(resolution))
+        XCTAssertNil(updated.currentToolName)
+        XCTAssertNil(updated.currentToolSummary)
+    }
+
+    /// A subagent's own PreToolUse must not change the parent row's
+    /// currentToolName/currentToolSummary at all -- the parent row is
+    /// only ever updated (state/lastEventAt) by resolveHookRow's shared
+    /// child-scoped branch, which withCurrentTool(from:) must not touch.
+    func test_subagentPreToolUse_doesNotChangeParentCurrentTool() throws {
+        let surfaceID = UUID()
+        var existing = hooksEntry(surfaceID: surfaceID, state: .working)
+        existing.currentToolName = "Write"
+        existing.currentToolSummary = "main.swift"
+
+        let resolution = resolve(
+            event("PreToolUse", agentID: "sub-1", agentType: "explore", toolName: "Bash"),
+            current: existing
+        )
+
+        let updated = try XCTUnwrap(writtenEntry(resolution),
+                                    "Precondition: a subagent PreToolUse on an existing .hooks row still " +
+                                    "updates state/lastEventAt")
+        XCTAssertEqual(updated.currentToolName, "Write",
+                       "A subagent's own tool call must never overwrite the parent's currentToolName")
+        XCTAssertEqual(updated.currentToolSummary, "main.swift")
+    }
 }

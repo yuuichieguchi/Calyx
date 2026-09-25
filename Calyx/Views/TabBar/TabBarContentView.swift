@@ -13,6 +13,7 @@ struct TabBarContentView: View {
     var onCloseTab: ((UUID) -> Void)?
     var onCloseOtherTabs: ((UUID) -> Void)?
     var onCloseTabsToTheRight: ((UUID) -> Void)?
+    var onShowAllTabs: (() -> Void)?
     var onMoveTab: ((Int, Int) -> Void)?
     var onTabRenamed: (() -> Void)?
     var activeGroupID: UUID? = nil
@@ -35,6 +36,7 @@ struct TabBarContentView: View {
                                 onClose: { onCloseTab?(tab.id) },
                                 onCloseOtherTabs: { onCloseOtherTabs?(tab.id) },
                                 onCloseTabsToTheRight: { onCloseTabsToTheRight?(tab.id) },
+                                onShowAllTabs: onShowAllTabs,
                                 onTabRenamed: onTabRenamed,
                                 onDragChanged: { translation in
                                     // Tab reorder: equivalent to the
@@ -356,6 +358,7 @@ private struct TabItemButton: View {
     var onClose: (() -> Void)?
     var onCloseOtherTabs: (() -> Void)?
     var onCloseTabsToTheRight: (() -> Void)?
+    var onShowAllTabs: (() -> Void)?
     var onTabRenamed: (() -> Void)?
     var onDragChanged: ((CGSize) -> Void)?
     var onDragEnded: (() -> Void)?
@@ -412,6 +415,7 @@ private struct TabItemButton: View {
                         close: { onClose?() },
                         closeOthers: { onCloseOtherTabs?() },
                         closeToTheRight: { onCloseTabsToTheRight?() },
+                        showAllTabs: { onShowAllTabs?() },
                         rename: {
                             isEditing = true
                         }

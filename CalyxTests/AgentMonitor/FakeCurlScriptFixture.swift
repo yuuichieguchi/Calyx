@@ -9,7 +9,11 @@
 //  ApprovalHookScriptHerdrGuardTests, AgentHookScriptHerdrGuardTests each
 //  carried their own fake-curl generator and script-runner) that each had
 //  to independently reimplement the real script's own contract: draining
-//  stdin to match `--data-binary @-`, prepending PATH so the fake curl
+//  whatever stdin it's given (harmless either way -- calyx-agent-hook
+//  still forwards the caller's own stdin to curl via `--data-binary @-`;
+//  calyx-approval-hook's curl instead reads a temp file and its
+//  backgrounded stdin is /dev/null under POSIX job control, so this fake
+//  curl's own stdin is empty for it), prepending PATH so the fake curl
 //  resolves ahead of the real one, and building a HOME whose
 //  `Library/Application Support/Calyx` layout matches exactly what the
 //  script itself reads at invocation time. Without this, a future change
@@ -70,8 +74,9 @@ func makeFakeCurlScriptFixture(
 }
 
 /// Writes a fake `curl` executable at `<dir>/curl` that drains its own
-/// stdin (matching the real script's `--data-binary @-`, so nothing is
-/// ever left unread), optionally appends one "invoked" line to
+/// stdin (whatever it is -- see this file's header comment for why that
+/// differs between calyx-agent-hook and calyx-approval-hook -- so nothing
+/// is ever left unread), optionally appends one "invoked" line to
 /// `recordPath` per call, and exits with `exitCode` (0 by default).
 func makeFakeCurl(atDirectory dir: String, exitCode: Int32 = 0, recordingTo recordPath: String? = nil) throws {
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)

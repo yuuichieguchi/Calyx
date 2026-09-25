@@ -11,6 +11,7 @@
 // - Rename via context menu while a sidebar rename editor is already open ->
 //   the tab bar editor opens with the typed (uncommitted) title, proving the
 //   sidebar editor was committed first
+// - Right-click a tab bar tab, choose "Show All Tabs" -> Mission Map opens
 
 import XCTest
 
@@ -121,5 +122,24 @@ final class TabContextMenuUITests: CalyxUITestCase {
 
         tabBarField.typeKey(.escape, modifierFlags: [])
         waitForNonExistence(tabBarField)
+    }
+
+    func test_rightClickTabBarTab_showAllTabs_opensMissionMap() {
+        let firstTab = tabBarTabsQuery().element(boundBy: 0)
+        XCTAssertTrue(firstTab.exists, "First tab bar tab should exist")
+
+        firstTab.rightClick()
+
+        let showAllTabsItem = app.menuItems["Show All Tabs"]
+        XCTAssertTrue(waitFor(showAllTabsItem, timeout: 3), "Show All Tabs menu item should appear")
+        showAllTabsItem.click()
+
+        let missionMap = app.descendants(matching: .any)
+            .matching(identifier: "calyx.missionMap")
+            .firstMatch
+        XCTAssertTrue(waitFor(missionMap, timeout: 5), "Mission Map should appear after choosing Show All Tabs")
+
+        app.typeKey(.escape, modifierFlags: [])
+        waitForNonExistence(missionMap)
     }
 }

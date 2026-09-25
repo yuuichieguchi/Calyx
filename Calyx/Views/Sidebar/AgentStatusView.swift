@@ -964,7 +964,9 @@ enum AgentRowDisplay {
     /// trims a copy to decide, but the returned string is always the
     /// original, untrimmed `title` -- a title with real content keeps
     /// its exact bytes, including any leading/trailing padding.
-    static func primaryLabel(title: String?) -> String {
+    /// `nonisolated`: pure string work, so `MissionMapSnapshotBuilder`
+    /// can reuse it off the main actor.
+    nonisolated static func primaryLabel(title: String?) -> String {
         guard let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "N/A" }
         return title
     }
@@ -1028,7 +1030,9 @@ enum AgentRowDisplay {
     /// placeholder. The name alone when there is no summary or it is
     /// empty: never a trailing separator. The separator is plain
     /// punctuation because VoiceOver speaks this string as-is.
-    static func toolLine(toolName: String?, toolSummary: String?) -> String? {
+    /// `nonisolated` (like `primaryLabel(title:)`): pure string work, so
+    /// `MissionMapSnapshotBuilder` can reuse it off the main actor.
+    nonisolated static func toolLine(toolName: String?, toolSummary: String?) -> String? {
         guard let toolName, !toolName.isEmpty else { return nil }
         guard let toolSummary, !toolSummary.isEmpty else { return toolName }
         return "\(toolName): \(toolSummary)"
