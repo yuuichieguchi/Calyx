@@ -54,6 +54,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 - **Approval Inbox** -- one opt-in queue across every pane for Claude Code and Codex permission prompts, for the tool calls of always-approve Grok sessions, and for every pi tool call, shown in a notification-style panel at the top-right of the screen with a primary action and an Options pull-down for every other choice (the CLI's own always-allow suggestions, or per-pane session-scoped approval when the CLI offers none, and No), or an inline option list when the question allows several answers at once or carries a preview; Claude Code and Codex queue a request only where the CLI would have prompted you itself and fall back to the agent's own prompt, while an unanswered Grok or pi request is denied
 - **Approval Queue Navigation** -- inspect and decide pending requests in any order, with a preview menu on the position label for jumping straight to one, and automatic navigation to the nearest remaining request
 - **Dismiss** -- the panel's own × is offered only when the CLI's own prompt, or the calling MCP agent, can still decide the request without Calyx: it hands a Claude Code or Codex tool call back to that CLI's own confirmation prompt, or reports a no-decision result to a Calyx MCP tool's own caller. Grok and pi requests must be answered in Calyx -- its own decision is their only gate, so the × is disabled for them
+- **Mission Map** -- `Cmd+Shift+M` (or **Show All Tabs** in a tab's context menu) lays every pane in the window out as a card with its agent's state, working directory, Git branch, current tool, subagents, and pending approval with an inline Allow; AI Agent IPC messages draw lines routed around the cards that disappear two minutes after the last message and list their messages on click, a red line joins two panes whose agents edited the same file in the last five minutes, a double-click jumps to a card's pane, and dragged card positions are saved with the layout
 - **Agent Cockpit** -- MCP tools for listing, creating, and splitting panes; commands and keystrokes remain approval-gated unless auto-approve is enabled
 - **Command Log** -- structured commands, working directories, exit status, and captured output exposed to agents through MCP; known secret patterns are redacted before exposure
 
@@ -78,7 +79,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 
 - **libghostty Engine** -- Metal GPU-accelerated rendering powered by Ghostty v1.3.1
 - **Tab Groups and Split Panes** -- color-coded collapsible groups, tab renaming and reordering, horizontal and vertical splits, directional focus, and split zoom
-- **Tab Context Menu** -- right-click or Ctrl+click a tab in the tab bar or sidebar to close it, close the other tabs or the tabs to its right in its group, or rename it, without switching to it
+- **Tab Context Menu** -- right-click or Ctrl+click a tab in the tab bar or sidebar to close it, close the other tabs or the tabs to its right in its group, rename it, or open Mission Map with **Show All Tabs**, without switching to it
 - **Group Context Menu** -- right-click or Ctrl+click a group header in the sidebar to close it, close the other groups or the groups below it, rename it, or pick its color, without switching to it
 - **Command Palette** -- search and run operations with `Cmd+Shift+P`
 - **Ghostty Compatibility** -- read `~/.config/ghostty/config`, hot-reload most settings, and bind Calyx operations through Ghostty keybind actions
@@ -147,6 +148,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 | `Cmd+Shift+P` | Command palette |
 | `Cmd+Shift+E` | Toggle compose overlay |
 | `Cmd+Shift+B` | Session Browser |
+| `Cmd+Shift+M` | Toggle Mission Map |
 | `Cmd+?` | Calyx Help (opens the help center) |
 | `Cmd+Enter` / `Ctrl+Cmd+F` | Toggle full screen |
 
