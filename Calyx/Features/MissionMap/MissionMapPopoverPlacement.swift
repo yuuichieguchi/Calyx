@@ -12,6 +12,7 @@
 // Pure geometry.
 
 import CoreGraphics
+import Foundation
 
 enum MissionMapPopoverPlacement {
     /// The default distance between the anchor and the bubble.
@@ -91,4 +92,8 @@ struct MissionMapPopoverPlacementInfo: Sendable, Equatable {
     let edge: MissionMapEdge
     let rect: CGRect
     let emphasized: Bool
+
+    /// The line this placement belongs to, so a report for a previously
+    /// selected line is not taken for the current one's.
+    var edgeID: UUID { edge.id }
 }

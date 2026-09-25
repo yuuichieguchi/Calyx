@@ -74,6 +74,14 @@ class Tab: Identifiable {
     /// `renameRequest` below): production writers mutate it directly,
     /// the same way `tab.sessionRefs[surfaceID] = ...` is set today.
     var herdrPaneRefs: [UUID: HerdrPaneRef] = [:]
+    /// Mission Map card drag offsets for this tab's leaves, keyed by leaf
+    /// (surface) UUID: how far the user dragged each card from its
+    /// computed layout position. Empty for a tab whose cards were never
+    /// moved. Mirrored to `TabSnapshot.missionMapCardOffsets` by
+    /// `Tab.snapshot()` (as `nil` when empty) and restored back by
+    /// `Tab.init(snapshot:)`. Not a designated-init parameter (mirrors
+    /// `herdrPaneRefs`): written through `setMissionMapCardOffset(_:for:)`.
+    var missionMapCardOffsets: [UUID: CGSize] = [:]
     /// Set by `CalyxWindowController.processPromptTitle(surfaceView:scope:)`
     /// (`GHOSTTY_ACTION_PROMPT_TITLE`) to request that `host`'s inline
     /// rename editor open for this tab. Purely transient UI-routing state:
@@ -135,5 +143,26 @@ extension Tab {
     /// remapped, so the kept set cannot be derived from `splitTree`.
     func pruneHerdrPaneRefs(keeping: Set<UUID>) {
         herdrPaneRefs = herdrPaneRefs.filter { keeping.contains($0.key) }
+    }
+
+    /// Sets `leafID`'s Mission Map card offset. `nil` or `.zero` (a card
+    /// back at its computed layout position) removes the entry, so an
+    /// unmoved card never persists an offset.
+    func setMissionMapCardOffset(_ offset: CGSize?, for leafID: UUID) {
+        guard let offset, offset != .zero else {
+            missionMapCardOffsets[leafID] = nil
+            return
+        }
+        missionMapCardOffsets[leafID] = offset
+    }
+
+    /// The Mission Map counterpart of `pruneSessionRefs()`: drops any
+    /// `missionMapCardOffsets` entries whose key is not a leaf currently
+    /// present in `splitTree` -- call after the tree loses a leaf (pane
+    /// close), so a closed pane's offset is not written back out by the
+    /// next snapshot.
+    func pruneMissionMapCardOffsets() {
+        let liveLeafIDs = Set(splitTree.allLeafIDs())
+        missionMapCardOffsets = missionMapCardOffsets.filter { liveLeafIDs.contains($0.key) }
     }
 }

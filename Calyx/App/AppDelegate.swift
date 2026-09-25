@@ -3495,6 +3495,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
             // match this tab again, and the next snapshot would persist an
             // orphaned key.
             tab.herdrPaneRefs = tab.herdrPaneRefs.remappingKeys(mapping)
+            // Mission Map card offsets are keyed by the same leaf UUIDs,
+            // so they follow the leaves to their new surface IDs too.
+            tab.missionMapCardOffsets = tab.missionMapCardOffsets.remappingKeys(mapping)
             adoptRestoredHerdrTabIfNeeded(tab)
             return true
         }
@@ -3594,6 +3597,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // Identical orphaned-ref reasoning for herdrPaneRefs
         // (Tab.swift's own header, "parallel side-channel to sessionRefs").
         tab.pruneHerdrPaneRefs(keeping: Set(tab.splitTree.allLeafIDs()))
+        // Same for Mission Map card offsets: no old leaf survives.
+        tab.pruneMissionMapCardOffsets()
         return true
     }
 

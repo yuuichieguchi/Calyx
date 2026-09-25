@@ -66,12 +66,17 @@ struct MainContentView: View {
     let missionMapSelection: MissionMapSelection
     /// This window's panes for Mission Map, in window order.
     let missionMapPanes: () -> [CockpitPaneInfo]
+    /// This window's persisted Mission Map card offsets. A closure read in
+    /// `body`, so SwiftUI observes the tabs' offsets and re-renders the
+    /// map when a committed drag lands on a tab.
+    let missionMapCardOffsets: () -> [UUID: CGSize]
     var onMissionMapFocusSurface: ((UUID) -> Void)?
     var onDismissMissionMap: (() -> Void)?
     var onMissionMapAllow: ((UUID) -> Void)?
     var onMissionMapOpenApproval: ((UUID) -> Void)?
     var onMissionMapKeyCatcherReady: ((NSView) -> Void)?
     var onMissionMapPopoverPlacementChange: ((MissionMapPopoverPlacementInfo?) -> Void)?
+    var onMissionMapCardOffsetChange: ((UUID, CGSize) -> Void)?
     var totalReviewCommentCount: Int = 0
     var reviewFileCount: Int = 0
 
@@ -351,6 +356,8 @@ extension MainContentView {
                 panes: missionMapPanes,
                 gitPoller: missionMapGitPoller,
                 selection: missionMapSelection,
+                cardOffsets: missionMapCardOffsets(),
+                onCardOffsetChange: { surfaceID, offset in onMissionMapCardOffsetChange?(surfaceID, offset) },
                 onFocusSurface: onMissionMapFocusSurface,
                 onDismiss: onDismissMissionMap,
                 onAllow: onMissionMapAllow,

@@ -19,6 +19,13 @@ struct MissionMapView: View {
     /// The selected line. Owned by the window controller, which also
     /// clears it when the popover (drawn outside this view) is tapped.
     let selection: MissionMapSelection
+    /// Committed per-card drag offsets, keyed by card (leaf surface) id.
+    /// Owned by the tabs (`Tab.missionMapCardOffsets`), so a reopened map
+    /// -- or a restored layout -- keeps the cards where they were dragged.
+    let cardOffsets: [UUID: CGSize]
+    /// Reports a card's new committed offset (existing + drag
+    /// translation) when a drag ends.
+    let onCardOffsetChange: (UUID, CGSize) -> Void
     var onFocusSurface: ((UUID) -> Void)?
     var onDismiss: (() -> Void)?
     var onAllow: ((UUID) -> Void)?
@@ -47,9 +54,7 @@ struct MissionMapView: View {
     /// linearly across the remainder -- see that type's own `draw(_:in:at:)`.
     static let ipcEdgeFullOpacityDuration: TimeInterval = 10
 
-    /// Committed per-card drag offsets. Memory only: a reopened map
-    /// starts from the computed layout again.
-    @State private var dragOffsets: [UUID: CGSize] = [:]
+    /// The drag in progress, if any; committed offsets live in `cardOffsets`.
     @State private var activeDrag: ActiveDrag?
     /// The selected line's popover placement in the scroll content's
     /// coordinates, as `MissionMapContentView` reports it.
@@ -217,11 +222,11 @@ struct MissionMapView: View {
                 activeDrag = ActiveDrag(cardID: cardID, translation: translation)
             },
             onDragEnded: { cardID, translation in
-                let committed = dragOffsets[cardID] ?? .zero
-                dragOffsets[cardID] = CGSize(
+                let committed = cardOffsets[cardID] ?? .zero
+                onCardOffsetChange(cardID, CGSize(
                     width: committed.width + translation.width,
                     height: committed.height + translation.height
-                )
+                ))
                 activeDrag = nil
             }
         )
@@ -252,7 +257,7 @@ struct MissionMapView: View {
 
     /// The committed offset of `cardID` plus any drag in progress.
     private func offset(for cardID: UUID) -> CGSize {
-        let committed = dragOffsets[cardID] ?? .zero
+        let committed = cardOffsets[cardID] ?? .zero
         guard let activeDrag, activeDrag.cardID == cardID else { return committed }
         return CGSize(
             width: committed.width + activeDrag.translation.width,
