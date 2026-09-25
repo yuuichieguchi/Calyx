@@ -374,13 +374,15 @@ actor StreamableHTTPMCPTransport: MCPMessageTransport {
         let readerID = UUID()
         let isEventStream = exchange.head.isEventStream
         let body = exchange.body
+        let maxEventBytes = requester.session.maxBodyBytes
         let task = Task { [weak self] in
             do {
                 if isEventStream {
-                    var parser = SSEEventParser()
+                    var parser = SSEEventParser(maxEventBytes: maxEventBytes)
                     for try await chunk in body {
                         guard let self else { return }
-                        await self.deliver(parser.feed(chunk))
+                        let events = try parser.feed(chunk)
+                        await self.deliver(events)
                     }
                 } else {
                     var collected = Data()
@@ -502,11 +504,11 @@ actor StreamableHTTPMCPTransport: MCPMessageTransport {
                 return
             }
 
-            var parser = SSEEventParser()
+            var parser = SSEEventParser(maxEventBytes: requester.session.maxBodyBytes)
             var streamError: (any Error)?
             do {
                 for try await chunk in exchange.body {
-                    receiveEventStream(parser.feed(chunk))
+                    receiveEventStream(try parser.feed(chunk))
                 }
             } catch {
                 streamError = error
@@ -616,17 +618,5 @@ struct MCPHTTPAuthorizingRequester: Sendable {
             for try await _ in body {}
         }
         reader.cancel()
-    }
-}
-
-extension MCPHTTPSession.Response {
-
-    /// The value of the header `name`, matched case-insensitively.
-    func headerValue(_ name: String) -> String? {
-        headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
-    }
-
-    var isEventStream: Bool {
-        headerValue("Content-Type")?.lowercased().hasPrefix("text/event-stream") == true
     }
 }

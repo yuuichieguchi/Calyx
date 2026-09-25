@@ -49,10 +49,12 @@ final class StreamableHTTPMCPTransportLegacyTests: XCTestCase {
         super.tearDown()
     }
 
-    private func session() -> MCPHTTPSession { MCPHTTPSession(urlSession: urlSession) }
+    private func session(maxBodyBytes: Int = MCPHTTPSession.defaultMaxBodyBytes) -> MCPHTTPSession {
+        MCPHTTPSession(urlSession: urlSession, maxBodyBytes: maxBodyBytes)
+    }
 
-    private func transport(clock: any MCPClock = SystemMCPClock()) -> StreamableHTTPMCPTransport {
-        StreamableHTTPMCPTransport(endpoint: endpoint, session: session(), protocolVersion: .v2025_11_25, clock: clock)
+    private func transport(clock: any MCPClock = SystemMCPClock(), maxBodyBytes: Int = MCPHTTPSession.defaultMaxBodyBytes) -> StreamableHTTPMCPTransport {
+        StreamableHTTPMCPTransport(endpoint: endpoint, session: session(maxBodyBytes: maxBodyBytes), protocolVersion: .v2025_11_25, clock: clock)
     }
 
     private func initializeBody(id: Int = 0) -> Data {
@@ -188,6 +190,40 @@ final class StreamableHTTPMCPTransportLegacyTests: XCTestCase {
 
         try await waitForRequestCount(4)
         XCTAssertEqual(recorder.requests.count, 4, "GET, then a reconnect GET carrying Last-Event-ID")
+    }
+
+    // MARK: - Standalone GET stream is exempt from the session's total-body cap
+
+    func test_standaloneStream_totalBytesExceedingSessionCap_keepsDeliveringFrames() async throws {
+        // 6 events of ~200 bytes each (1200 bytes total), well over the
+        // 1024-byte session cap, on the standalone GET stream.
+        let payloads = (0..<6).map { index in
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":\(index),\"pad\":\"\(String(repeating: "a", count: 180))\"}}"
+        }
+        recorder.enqueue { _ in
+            .json(status: 200, headers: ["Mcp-Session-Id": "sess-1"],
+                  body: Data(#"{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":"2025-11-25"}}"#.utf8))
+        }
+        recorder.enqueue { _ in .empty(status: 202) } // notifications/initialized
+        recorder.enqueue { _ in
+            .sse(status: 200, chunks: payloads.map { Data("data: \($0)\n\n".utf8) }, thenClose: false)
+        }
+
+        let transport = transport(maxBodyBytes: 1024)
+        var iterator = transport.inbound.makeAsyncIterator()
+        try await transport.send(initializeBody(), kind: .request())
+        _ = await iterator.next() // consume the initialize response frame
+
+        let notified: [String: Any] = ["jsonrpc": "2.0", "method": "notifications/initialized", "params": [String: Any]()]
+        try await transport.send(try! JSONSerialization.data(withJSONObject: notified), kind: .notification)
+
+        for (index, payload) in payloads.enumerated() {
+            let inbound = await iterator.next()
+            guard case .frame(let data) = inbound else {
+                return XCTFail("expected .frame #\(index), got \(String(describing: inbound))")
+            }
+            XCTAssertEqual(data, Data(payload.utf8))
+        }
     }
 
     // MARK: - 404 on a session re-initializes once and retries the request
