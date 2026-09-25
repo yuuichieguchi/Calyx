@@ -6,7 +6,7 @@
 import Foundation
 
 struct SessionSnapshot: Codable, Equatable {
-    static let currentSchemaVersion = 6
+    static let currentSchemaVersion = 7
 
     let schemaVersion: Int
     let windows: [WindowSnapshot]
@@ -168,8 +168,13 @@ struct TabSnapshot: Codable, Equatable {
     /// and absent-or-null-decodes-to-nil read shape, so no custom
     /// Codable is needed here either.
     let herdrPaneRefs: [UUID: HerdrPaneRef]?
+    /// Schema v7: Mission Map card drag offsets keyed by leaf surface
+    /// UUID, mirroring `sessionRefs`/`herdrPaneRefs`: `nil` for a
+    /// v6-and-earlier snapshot or a tab with no moved cards, with the
+    /// same nil-when-empty write and absent-decodes-to-nil read.
+    let missionMapCardOffsets: [UUID: CGSize]?
 
-    init(id: UUID = UUID(), title: String = "Terminal", titleOverride: String? = nil, pwd: String? = nil, splitTree: SplitTree = SplitTree(), browserURL: URL? = nil, sessionRefs: [UUID: SessionRef]? = nil, herdrPaneRefs: [UUID: HerdrPaneRef]? = nil) {
+    init(id: UUID = UUID(), title: String = "Terminal", titleOverride: String? = nil, pwd: String? = nil, splitTree: SplitTree = SplitTree(), browserURL: URL? = nil, sessionRefs: [UUID: SessionRef]? = nil, herdrPaneRefs: [UUID: HerdrPaneRef]? = nil, missionMapCardOffsets: [UUID: CGSize]? = nil) {
         self.id = id
         self.title = title
         self.titleOverride = titleOverride
@@ -178,6 +183,7 @@ struct TabSnapshot: Codable, Equatable {
         self.browserURL = browserURL
         self.sessionRefs = sessionRefs
         self.herdrPaneRefs = herdrPaneRefs
+        self.missionMapCardOffsets = missionMapCardOffsets
     }
 }
 
@@ -190,7 +196,8 @@ extension Dictionary where Key == UUID {
     /// `[UUID: HerdrPaneRef]` -- `tab.herdrPaneRefs.remappingKeys(mapping)`
     /// alongside `tab.sessionRefs.remappingKeys(mapping)` -- rather than
     /// duplicating this loop for a second value type). Used directly on
-    /// the runtime `Tab.sessionRefs`/`Tab.herdrPaneRefs` dictionaries by
+    /// the runtime `Tab.sessionRefs`/`Tab.herdrPaneRefs`/
+    /// `Tab.missionMapCardOffsets` dictionaries by
     /// both `AppDelegate.restoreTabSurfaces` (full-restore success) and
     /// `CalyxWindowController.performReconnect` (surface swap) -- there
     /// is no `TabSnapshot`-level equivalent; restore/reconnect always
@@ -256,13 +263,14 @@ extension Tab {
     func snapshot(browserURLOverride: URL? = nil) -> TabSnapshot? {
         let refs = sessionRefs.isEmpty ? nil : sessionRefs
         let herdrRefs = herdrPaneRefs.isEmpty ? nil : herdrPaneRefs
+        let cardOffsets = missionMapCardOffsets.isEmpty ? nil : missionMapCardOffsets
         switch content {
         case .diff:
             return nil  // Diff tabs are not persisted
         case .terminal:
-            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: nil, sessionRefs: refs, herdrPaneRefs: herdrRefs)
+            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: nil, sessionRefs: refs, herdrPaneRefs: herdrRefs, missionMapCardOffsets: cardOffsets)
         case .browser(let url):
-            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: browserURLOverride ?? url, sessionRefs: refs, herdrPaneRefs: herdrRefs)
+            return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: browserURLOverride ?? url, sessionRefs: refs, herdrPaneRefs: herdrRefs, missionMapCardOffsets: cardOffsets)
         }
     }
 
@@ -285,6 +293,7 @@ extension Tab {
         // never routed through the Tab designated init (see Tab.swift's
         // own herdrPaneRefs doc comment).
         self.herdrPaneRefs = snapshot.herdrPaneRefs ?? [:]
+        self.missionMapCardOffsets = snapshot.missionMapCardOffsets ?? [:]
     }
 }
 

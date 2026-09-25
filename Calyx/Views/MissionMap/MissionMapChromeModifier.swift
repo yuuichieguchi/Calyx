@@ -12,9 +12,9 @@ import SwiftUI
 
 struct MissionMapChromeModifier: ViewModifier {
     let reduceTransparency: Bool
-    @AppStorage("terminalGlassOpacity") private var glassOpacity = 0.7
-    @AppStorage("themeColorPreset") private var themePreset = "original"
-    @AppStorage("themeColorCustomHex") private var customHex = "#050D1C"
+    @AppStorage("terminalGlassOpacity") private var glassOpacity = Self.defaultGlassOpacity
+    @AppStorage("themeColorPreset") private var themePreset = Self.defaultThemePreset
+    @AppStorage("themeColorCustomHex") private var customHex = Self.defaultCustomHex
     @State private var ghosttyProvider = GhosttyThemeProvider.shared
 
     /// Backdrop alpha: opaque enough that cards read cleanly over the
@@ -22,20 +22,40 @@ struct MissionMapChromeModifier: ViewModifier {
     /// shows through.
     private static let backdropAlpha: CGFloat = 0.88
 
-    private var themeColor: NSColor {
-        ThemeColorPreset.resolve(
+    /// The `@AppStorage` defaults, shared with the other Mission Map
+    /// surfaces that read the theme (`MissionMapEdgePopover`).
+    static let defaultGlassOpacity = 0.7
+    static let defaultThemePreset = "original"
+    static let defaultCustomHex = "#050D1C"
+
+    /// The theme's chrome tint: the backdrop's color here, and the
+    /// emphasized popover's glass tint.
+    static func chromeTint(
+        themePreset: String, customHex: String, ghosttyBackground: NSColor, glassOpacity: Double
+    ) -> NSColor {
+        let themeColor = ThemeColorPreset.resolve(
             preset: themePreset,
             customHex: customHex,
-            ghosttyBackground: ghosttyProvider.ghosttyBackground
+            ghosttyBackground: ghosttyBackground
         )
+        return GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)
     }
 
     private var chromeTint: NSColor {
-        GlassTheme.chromeTint(for: themeColor, glassOpacity: glassOpacity)
+        Self.chromeTint(
+            themePreset: themePreset, customHex: customHex,
+            ghosttyBackground: ghosttyProvider.ghosttyBackground, glassOpacity: glassOpacity
+        )
     }
 
     private var chromeScheme: ColorScheme {
-        ColorLuminance.prefersDarkText(for: chromeTint) ? .light : .dark
+        Self.chromeScheme(for: chromeTint)
+    }
+
+    /// The color scheme text over `tint` uses: light or dark from the
+    /// tint's luminance.
+    static func chromeScheme(for tint: NSColor) -> ColorScheme {
+        ColorLuminance.prefersDarkText(for: tint) ? .light : .dark
     }
 
     func body(content: Content) -> some View {

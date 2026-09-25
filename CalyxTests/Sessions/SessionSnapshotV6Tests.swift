@@ -112,7 +112,10 @@ final class SessionSnapshotV6Tests: XCTestCase {
         let migrated = SessionSnapshot.migrate(decodedV5)
 
         XCTAssertEqual(migrated.schemaVersion, SessionSnapshot.currentSchemaVersion)
-        XCTAssertEqual(SessionSnapshot.currentSchemaVersion, 6, "Schema version must be 6 after the sessionRefs addition")
+        // Schema version 7 as of the missionMapCardOffsets addition
+        // (SessionSnapshotV7Tests.swift) -- was 6 when this test was
+        // originally written for the sessionRefs addition alone.
+        XCTAssertEqual(SessionSnapshot.currentSchemaVersion, 7, "Schema version must be 7 after the missionMapCardOffsets addition")
         XCTAssertEqual(migrated.windows, decodedV5.windows,
                        "migrate(_:) must carry every window/group/tab field through unchanged — only the " +
                        "schemaVersion number itself changes")

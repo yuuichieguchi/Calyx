@@ -266,6 +266,20 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// `MissionMapKeyCatcherView` each time the map is shown. Weak: the
     /// view hierarchy owns it and drops it when the map closes.
     private weak var missionMapKeyCatcher: NSView?
+    /// Mission Map's selected line, cleared on dismiss and by a tap on
+    /// its popover.
+    /// Not `private`: pinned by `CalyxWindowControllerMissionMapPopoverStackingTests`.
+    let missionMapSelection = MissionMapSelection()
+    /// The selected line's popover, drawn above the main hosting view
+    /// (see `MissionMapPopoverHost` for why it is not in the SwiftUI
+    /// tree). Shown only while the map is open with a line selected.
+    let missionMapPopoverHost = MissionMapPopoverHost()
+    /// UNIT TEST ONLY: a fabricated map (`MissionMapFixture.make(now:)`)
+    /// the Mission Map shows instead of this window's panes, so a test
+    /// can select a line that is actually on the map. Set before opening
+    /// the map. `nil` in the app; the UI-test launch-argument fixture
+    /// (`MissionMapFixture.uiTestLaunchArgument`) is separate.
+    var missionMapFixtureOverride: MissionMapFixture?
     /// Decides reconnect vs. close for this window's persistent-session
     /// surfaces on `GHOSTTY_ACTION_SHOW_CHILD_EXITED` (wired in
     /// `handleShowChildExitedNotification`). One instance per window
@@ -1452,12 +1466,24 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             onDismissComposeOverlay: { [weak self] in self?.dismissComposeOverlay() },
             onComposeOverlayEscapePressed: { [weak self] in self?.forwardEscapeToTerminal() },
             missionMapGitPoller: missionMapGitPoller,
+            missionMapSelection: missionMapSelection,
             missionMapPanes: { [weak self] in self?.missionMapPanes() ?? [] },
-            onMissionMapFocusSurface: { [weak self] surfaceID in self?.focusSurfaceFromMissionMap(surfaceID) },
-            onDismissMissionMap: { [weak self] in self?.dismissMissionMap() },
+            missionMapCardOffsets: { [weak self] in self?.missionMapCardOffsets() ?? [:] },
+            missionMapFixtureOverride: missionMapFixtureOverride,
+            onMissionMapFocusSurface: { [weak self] surfaceID in self?.missionMapCardDoubleClicked(surfaceID: surfaceID) },
+            onMissionMapSelectCard: { [weak self] surfaceID in self?.missionMapCardClicked(surfaceID: surfaceID) },
+            onMissionMapBackgroundClick: { [weak self] in self?.missionMapBackgroundClicked() },
+            onMissionMapEscape: { [weak self] in self?.missionMapEscapePressed() },
+            onMissionMapSelectableIDsChange: { [weak self] ids in self?.missionMapSelectableIDsChanged(ids) },
             onMissionMapAllow: { [weak self] requestID in self?.allowApprovalFromMissionMap(requestID) },
             onMissionMapOpenApproval: { [weak self] requestID in self?.openApprovalFromMissionMap(requestID) },
             onMissionMapKeyCatcherReady: { [weak self] view in self?.missionMapKeyCatcherReady(view) },
+            onMissionMapPopoverPlacementChange: { [weak self] placement in
+                self?.missionMapPopoverPlacementChanged(placement)
+            },
+            onMissionMapCardOffsetChange: { [weak self] surfaceID, offset in
+                self?.missionMapCardOffsetChanged(surfaceID: surfaceID, offset: offset)
+            },
             totalReviewCommentCount: totalReviewCommentCount,
             reviewFileCount: reviewFileCount
         )
@@ -1478,7 +1504,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         refreshHostingView()
     }
 
-    private func recreateHostingView() {
+    /// Not `private`: pinned by `CalyxWindowControllerToggleMissionMapTests`.
+    func recreateHostingView() {
         guard let contentView = window?.contentView else { return }
         let mainContent = buildMainContentView()
         let newHosting = NSHostingView(rootView: mainContent)
@@ -1488,6 +1515,11 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         newHosting.layoutSubtreeIfNeeded()
         hostingView?.removeFromSuperview()
         self.hostingView = newHosting
+        // The new hosting view was added on top; the map's popover must
+        // stay above it.
+        if missionMapPopoverHost.isShown {
+            missionMapPopoverHost.restack(above: newHosting)
+        }
     }
 
     // MARK: - Split Container Management
@@ -2282,13 +2314,15 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     /// Hides Mission Map. `restoresFocus: false` is for callers that move
-    /// focus somewhere themselves right after (a card click, another
+    /// focus somewhere themselves right after (a card opened, another
     /// overlay opening).
     func dismissMissionMap(restoresFocus: Bool = true) {
         guard windowSession.showMissionMap else { return }
         windowSession.showMissionMap = false
         missionMapGitPoller.stop()
         missionMapKeyCatcher = nil
+        missionMapSelection.clear()
+        missionMapPopoverHost.hide()
         refreshHostingView()
         guard restoresFocus, let tab = activeTab else { return }
         // Same per-content restore as `dismissCommandPalette()`: unlike
@@ -2313,6 +2347,115 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         return LiveCockpitAppAccess().listPanes().filter { $0.windowID == windowID }
     }
 
+    /// Shows, moves or hides the selected line's popover as the map
+    /// reports its placement (in the main hosting view's coordinates).
+    /// Not `private`: pinned by `CalyxWindowControllerToggleMissionMapTests`.
+    ///
+    /// A `nil` placement hides the popover only once no line is selected:
+    /// while one is, `nil` just means the (re-identified) map has not
+    /// measured that line's popover yet -- e.g. right after switching the
+    /// selection from one line to another -- so the popover stays where it
+    /// is until the next placement moves it. A placement for a line other
+    /// than the selected one is a stale report and is ignored. Closing the
+    /// map hides the popover in `dismissMissionMap`.
+    func missionMapPopoverPlacementChanged(_ placement: MissionMapPopoverPlacementInfo?) {
+        guard windowSession.showMissionMap, let contentView = window?.contentView, let hostingView else {
+            missionMapPopoverHost.hide()
+            return
+        }
+        guard let placement else {
+            if missionMapSelection.edgeID == nil {
+                missionMapPopoverHost.hide()
+            }
+            return
+        }
+        guard placement.edgeID == missionMapSelection.edgeID else { return }
+        missionMapPopoverHost.show(placement, in: contentView, above: hostingView) { [weak self] in
+            self?.missionMapPopoverCloseClicked()
+        }
+    }
+
+    /// Every tab's persisted Mission Map card offsets in this window,
+    /// merged (leaf UUIDs are unique across tabs). Not `private`: pinned
+    /// by `CalyxWindowControllerMissionMapCardOffsetsTests`.
+    func missionMapCardOffsets() -> [UUID: CGSize] {
+        var merged: [UUID: CGSize] = [:]
+        for group in windowSession.groups {
+            for tab in group.tabs {
+                merged.merge(tab.missionMapCardOffsets) { _, new in new }
+            }
+        }
+        return merged
+    }
+
+    /// Stores a card's committed drag offset on the tab owning that leaf
+    /// and schedules a session save. A card with no owning tab (the UI
+    /// test fixture's fabricated cards) has nowhere to persist to.
+    /// Not `private`: pinned by `CalyxWindowControllerMissionMapCardOffsetsTests`.
+    func missionMapCardOffsetChanged(surfaceID: UUID, offset: CGSize) {
+        guard let tab = findTab(bySplitLeaf: surfaceID) else { return }
+        tab.setMissionMapCardOffset(offset, for: surfaceID)
+        requestSave()
+    }
+
+    /// The popover's close button closes it. The click may have moved
+    /// first responder into the popover's hosting view, so the map's key
+    /// catcher takes it back for Escape.
+    private func missionMapPopoverCloseClicked() {
+        missionMapSelection.clear()
+        missionMapPopoverHost.hide()
+        reclaimMissionMapKeyFocus()
+    }
+
+    /// Gives first responder back to the map's key catcher after a click
+    /// on the map, which may have moved it into a hosting view, so Escape
+    /// still reaches the catcher.
+    private func reclaimMissionMapKeyFocus() {
+        if let catcher = missionMapKeyCatcher, catcher.window === window {
+            window?.makeFirstResponder(catcher)
+        }
+    }
+
+    /// Escape on the map: clears a selection (line or card) if there is
+    /// one, leaving the map open; otherwise closes the map.
+    /// Not `private`: pinned by `CalyxWindowControllerToggleMissionMapTests`.
+    func missionMapEscapePressed() {
+        guard missionMapSelection.target != nil else {
+            dismissMissionMap()
+            return
+        }
+        missionMapSelection.clear()
+        missionMapPopoverHost.hide()
+    }
+
+    /// A click on space the map leaves unhandled (its tap-catcher):
+    /// clears a selection (line or card). The map stays open; Escape
+    /// closes it.
+    /// Not `private`: pinned by `CalyxWindowControllerToggleMissionMapTests`.
+    func missionMapBackgroundClicked() {
+        missionMapSelection.clear()
+        missionMapPopoverHost.hide()
+        reclaimMissionMapKeyFocus()
+    }
+
+    /// The map's cards and lines changed: a selection whose target is
+    /// gone (its pane closed, its line expired) is cleared, hiding the
+    /// popover of a line that left.
+    /// Not `private`: pinned by `CalyxWindowControllerToggleMissionMapTests`.
+    func missionMapSelectableIDsChanged(_ ids: MissionMapSelectableIDs) {
+        guard missionMapSelection.prune(cards: ids.cards, edges: ids.edges) else { return }
+        missionMapPopoverHost.hide()
+    }
+
+    /// A single click on a card selects it, replacing a selected line, so
+    /// that line's popover closes. The map stays open.
+    /// Not `private`: pinned by `CalyxWindowControllerToggleMissionMapTests`.
+    func missionMapCardClicked(surfaceID: UUID) {
+        missionMapSelection.selectCard(surfaceID)
+        missionMapPopoverHost.hide()
+        reclaimMissionMapKeyFocus()
+    }
+
     /// Takes first responder for the map's key catcher so Escape reaches
     /// it. Called once the catcher is in a window; the claim itself waits
     /// one runloop turn so it lands after the SwiftUI update in flight.
@@ -2325,12 +2468,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    /// A card click: closes the map and focuses the card's pane. A pane
-    /// in this window gets the goto-split sequence (which also clears
-    /// split zoom, so a zoomed-away pane actually shows); a pane in
-    /// another window is handed to that window's controller through
-    /// `.calyxFocusSurface`.
-    private func focusSurfaceFromMissionMap(_ surfaceID: UUID) {
+    /// A card double click (or its open button): closes the map and
+    /// focuses the card's pane. A pane in this window gets the goto-split
+    /// sequence (which also clears split zoom, so a zoomed-away pane
+    /// actually shows); a pane in another window is handed to that
+    /// window's controller through `.calyxFocusSurface`.
+    /// Not `private`: pinned by `CalyxWindowControllerToggleMissionMapTests`.
+    func missionMapCardDoubleClicked(surfaceID: UUID) {
         dismissMissionMap(restoresFocus: false)
         guard let tab = findTab(bySplitLeaf: surfaceID) else {
             NotificationCenter.default.post(name: .calyxFocusSurface, object: nil, userInfo: ["surfaceID": surfaceID])
@@ -2858,6 +3002,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         let (newTree, focusTarget) = tab.splitTree.remove(surfaceID)
         tab.registry.destroySurface(surfaceID)
         tab.splitTree = newTree
+        tab.pruneMissionMapCardOffsets()
 
         // Below runs only for process-initiated closes (e.g. `exit` command)
         if tab.splitTree.isEmpty {
@@ -4171,6 +4316,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         let mapping = [oldSurfaceID: newSurfaceID]
         tab.splitTree = tab.splitTree.remapLeafIDs(mapping)
         tab.sessionRefs = tab.sessionRefs.remappingKeys(mapping)
+        tab.missionMapCardOffsets = tab.missionMapCardOffsets.remappingKeys(mapping)
         SessionSurfaceMap.shared.replaceSurface(old: oldSurfaceID, new: newSurfaceID)
         CommandLogStore.shared.remapSurface(old: oldSurfaceID, new: newSurfaceID)
         // Before `destroySurface`: the store tears down the views of a
@@ -5156,6 +5302,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
         screenPollTask?.cancel()
         missionMapGitPoller.stop()
+        missionMapPopoverHost.hide()
 
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.removeWindowController(self)
