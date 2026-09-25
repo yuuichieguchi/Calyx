@@ -119,7 +119,9 @@ struct MissionMapContentView: View {
             }
 
             if let selectedEdgeID, let segment = segments.first(where: { $0.id == selectedEdgeID }) {
-                MissionMapEdgePopover(edge: segment.edge, onTap: onPopoverTap)
+                MissionMapEdgePopover(
+                    edge: segment.edge, onTap: onPopoverTap, frozenDate: animatesEdges ? nil : now
+                )
                     .onGeometryChange(for: CGSize.self, of: \.size) { popoverSize = $0 }
                     .position(segment.labelCenter(extent: popoverSize, obstacles: labelObstacles))
             }

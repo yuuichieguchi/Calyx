@@ -113,11 +113,11 @@ struct MissionMapView: View {
         ))
     }
 
+    /// See `MissionMapSnapshot.nextIPCExpiry(in:lifetime:)`: the tick
+    /// fires when the oldest live message expires, so the rebuild drops
+    /// it from its line.
     private func nextIPCExpiry(in snapshot: MissionMapSnapshot) -> Date? {
-        snapshot.edges.compactMap { edge -> Date? in
-            guard case .ipc(let event) = edge.kind else { return nil }
-            return event.sentAt.addingTimeInterval(Self.ipcEdgeLifetime)
-        }.min()
+        MissionMapSnapshot.nextIPCExpiry(in: snapshot.edges, lifetime: Self.ipcEdgeLifetime)
     }
 
     // MARK: - Content

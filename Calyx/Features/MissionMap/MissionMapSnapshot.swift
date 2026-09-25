@@ -19,6 +19,22 @@ struct MissionMapSnapshot: Sendable, Equatable {
     let edges: [MissionMapEdge]
     /// The tab groups `cards` belong to, in window order.
     let groups: [MissionMapGroup]
+
+    /// The most messages one IPC line shows: its pulse dots on the canvas
+    /// and its rows in the popover, newest first.
+    static let maxShownIPCMessages = 8
+
+    /// When the next live IPC message in `edges` reaches `lifetime`: the
+    /// earliest expiry among every message, not each line's newest, so a
+    /// rebuild then drops that message from its line (and its line, once
+    /// it was the last).
+    static func nextIPCExpiry(in edges: [MissionMapEdge], lifetime: TimeInterval) -> Date? {
+        edges.compactMap { edge -> Date? in
+            guard case .ipc(let messages) = edge.kind else { return nil }
+            // Newest first, so the oldest is last.
+            return messages.last?.sentAt.addingTimeInterval(lifetime)
+        }.min()
+    }
 }
 
 struct MissionMapGroup: Identifiable, Sendable, Equatable {
@@ -93,11 +109,27 @@ struct MissionMapGitBadge: Sendable, Equatable {
 
 struct MissionMapEdge: Identifiable, Sendable, Equatable {
     enum Kind: Sendable, Equatable {
-        /// An IPC message from `from`'s peer to `to`'s peer.
-        case ipc(IPCMessageEvent)
+        /// The live IPC messages sent from `from`'s pane to `to`'s pane,
+        /// one direction only, sorted newest first. Never empty: the
+        /// builder draws no line for a pair with no live message.
+        case ipc(messages: [IPCMessageEvent])
         /// Both panes recently wrote `fullPath`; `file` is its last path
         /// component, the label drawn on the line.
         case conflict(file: String, fullPath: String)
+
+        /// When the newest message on an `.ipc` line was sent; `nil` for
+        /// a conflict line.
+        var newestSentAt: Date? {
+            guard case .ipc(let messages) = self else { return nil }
+            return messages.first?.sentAt
+        }
+
+        /// How many messages an `.ipc` line carries; 0 for a conflict
+        /// line.
+        var messageCount: Int {
+            guard case .ipc(let messages) = self else { return 0 }
+            return messages.count
+        }
     }
 
     let id: UUID
@@ -105,6 +137,11 @@ struct MissionMapEdge: Identifiable, Sendable, Equatable {
     let from: UUID
     let to: UUID
     let kind: Kind
+
+    /// See `Kind.newestSentAt`.
+    var newestSentAt: Date? { kind.newestSentAt }
+    /// See `Kind.messageCount`.
+    var messageCount: Int { kind.messageCount }
 }
 
 // MARK: - Input
@@ -141,8 +178,8 @@ struct MissionMapInput: Sendable {
 // MARK: - Stable IDs
 
 /// Deterministic UUIDs for snapshot identities that have no UUID of
-/// their own (a tab group known only by name, one recipient's line of a
-/// broadcast, a conflict pair). A fresh `UUID()` per build would give
+/// their own (a tab group known only by name, one direction's IPC line
+/// between two panes, a conflict pair). A fresh `UUID()` per build would give
 /// the same line or group a new identity on every redraw, restarting its
 /// animation and breaking selection. Same SHA-256 prefix construction as
 /// `HerdrStableID`, under a Mission Map namespace.

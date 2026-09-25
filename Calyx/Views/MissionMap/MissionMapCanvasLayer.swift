@@ -2,8 +2,9 @@
 // Calyx
 //
 // Every Mission Map line, drawn into one Canvas. Lines come and go --
-// an IPC line lives up to `MissionMapView.ipcEdgeLifetime` (2 minutes),
-// fading out after its own full-opacity window -- so drawing them
+// an IPC line lives up to `MissionMapView.ipcEdgeLifetime` (2 minutes)
+// past its newest message, fading out after its own full-opacity window,
+// with one pulse dot per message -- so drawing them
 // immediate-mode avoids giving each its own view identity and
 // animation lifetime. The layer takes no hits: `MissionMapView` matches
 // taps against the routed polylines with `MissionMapEdgeHitTester`.
@@ -37,7 +38,7 @@ struct MissionMapCanvasLayer: View {
     let segments: [MissionMapEdgeSegment]
     let ipcEdgeLifetime: TimeInterval
     /// The leading slice of `ipcEdgeLifetime` an IPC line draws at full
-    /// opacity before `draw(_:in:at:)` starts fading it linearly across
+    /// opacity before `alpha(forAge:)` starts fading it linearly across
     /// the remainder -- see `MissionMapView.ipcEdgeFullOpacityDuration`'s
     /// own doc comment.
     let ipcEdgeFullOpacityDuration: TimeInterval
@@ -87,29 +88,27 @@ struct MissionMapCanvasLayer: View {
         let stroke = StrokeStyle(lineWidth: lineWidth, lineJoin: .round)
 
         switch segment.edge.kind {
-        case .ipc(let event):
-            let age = date.timeIntervalSince(event.sentAt)
-            // Full opacity for the leading `ipcEdgeFullOpacityDuration`,
-            // then a linear fade across the remainder of `ipcEdgeLifetime`
-            // -- a line that just appeared must not already look half
-            // gone, but it still needs to visibly age out rather than
-            // vanish abruptly at the cutoff.
-            let alpha: Double
-            if age <= ipcEdgeFullOpacityDuration {
-                alpha = 1
-            } else {
-                let fadeWindow = ipcEdgeLifetime - ipcEdgeFullOpacityDuration
-                let fadeProgress = fadeWindow > 0 ? (age - ipcEdgeFullOpacityDuration) / fadeWindow : 1
-                alpha = max(0, 1 - fadeProgress)
+        case .ipc(let messages):
+            // The line itself ages with its newest message: it stays solid
+            // while messages keep arriving.
+            guard let newest = messages.first else { return }
+            let lineAlpha = alpha(forAge: date.timeIntervalSince(newest.sentAt))
+            guard lineAlpha > 0 else { return }
+            context.stroke(line, with: .color(Color.accentColor.opacity(lineAlpha)), style: stroke)
+            // One dot per message, each travelling and fading on its own
+            // clock; `messages` is newest first, so the cap keeps the
+            // newest.
+            for message in messages.prefix(MissionMapSnapshot.maxShownIPCMessages) {
+                let age = date.timeIntervalSince(message.sentAt)
+                let dotAlpha = alpha(forAge: age)
+                guard dotAlpha > 0 else { continue }
+                let progress = max(0, age).truncatingRemainder(dividingBy: Self.pulseTravelTime) / Self.pulseTravelTime
+                let dot = MissionMapPolyline.point(along: segment.points, t: progress)
+                context.fill(
+                    Path(ellipseIn: CGRect(x: dot.x - 4, y: dot.y - 4, width: 8, height: 8)),
+                    with: .color(Color.accentColor.opacity(dotAlpha))
+                )
             }
-            guard alpha > 0 else { return }
-            context.stroke(line, with: .color(Color.accentColor.opacity(alpha)), style: stroke)
-            let progress = max(0, age).truncatingRemainder(dividingBy: Self.pulseTravelTime) / Self.pulseTravelTime
-            let dot = MissionMapPolyline.point(along: segment.points, t: progress)
-            context.fill(
-                Path(ellipseIn: CGRect(x: dot.x - 4, y: dot.y - 4, width: 8, height: 8)),
-                with: .color(Color.accentColor.opacity(alpha))
-            )
 
         case .conflict(let file, _):
             context.stroke(line, with: .color(.red), style: stroke)
@@ -126,5 +125,17 @@ struct MissionMapCanvasLayer: View {
             context.fill(Path(roundedRect: box, cornerRadius: box.height / 2), with: .color(.red))
             context.draw(label, at: mid)
         }
+    }
+
+    /// Opacity for something `age` seconds after its message was sent:
+    /// full for the leading `ipcEdgeFullOpacityDuration`, then a linear
+    /// fade across the remainder of `ipcEdgeLifetime` -- a line that just
+    /// appeared must not already look half gone, but it still needs to
+    /// visibly age out rather than vanish abruptly at the cutoff.
+    private func alpha(forAge age: TimeInterval) -> Double {
+        guard age > ipcEdgeFullOpacityDuration else { return 1 }
+        let fadeWindow = ipcEdgeLifetime - ipcEdgeFullOpacityDuration
+        let fadeProgress = fadeWindow > 0 ? (age - ipcEdgeFullOpacityDuration) / fadeWindow : 1
+        return max(0, 1 - fadeProgress)
     }
 }

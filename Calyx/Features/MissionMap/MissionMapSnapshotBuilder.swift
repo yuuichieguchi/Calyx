@@ -106,41 +106,78 @@ enum MissionMapSnapshotBuilder {
 
     // MARK: - IPC Edges
 
-    /// One line per message still within `ipcEdgeLifetime`, between the
-    /// panes its peers are bound to. A message is dropped when either
-    /// end is Calyx's own app peer, is bound to no pane, or is bound to
-    /// a pane outside this window; a broadcast (whose own `to` is just
-    /// its first recipient) instead draws one line to every other bound
-    /// pane in this window.
+    /// One line per direction between two panes, carrying every message
+    /// still within `ipcEdgeLifetime` sent that way, newest first. A
+    /// message is dropped when either end is Calyx's own app peer, is
+    /// bound to no pane, is bound to a pane outside this window, or both
+    /// ends are the same pane; a broadcast (whose own `to` is just its
+    /// first recipient) instead counts toward the line to every other
+    /// bound pane in this window. The line's id derives from its
+    /// (from, to) pair, so it keeps its route and selection as new
+    /// messages arrive. Lines are ordered by `from`, then `to`.
     private static func ipcEdges(input: MissionMapInput, cardIDs: Set<UUID>) -> [MissionMapEdge] {
-        var edges: [MissionMapEdge] = []
+        var groups: [IPCPair: [IPCMessageEvent]] = [:]
+        var seen: Set<IPCPairMessage> = []
+        func add(_ event: IPCMessageEvent, from: UUID, to: UUID) {
+            let pair = IPCPair(from: from, to: to)
+            // Several peers can be bound to one pane, so a broadcast can
+            // reach the same pair more than once.
+            guard seen.insert(IPCPairMessage(pair: pair, messageID: event.id)).inserted else { return }
+            groups[pair, default: []].append(event)
+        }
+
         for event in input.ipcEvents where input.now.timeIntervalSince(event.sentAt) <= input.ipcEdgeLifetime {
             guard event.from != input.appPeerID,
                   let fromSurface = input.peerToSurface[event.from], cardIDs.contains(fromSurface)
             else { continue }
 
             if event.isBroadcast {
-                let recipients = input.peerToSurface
-                    .filter { peer, surface in
-                        peer != event.from && peer != input.appPeerID
-                            && surface != fromSurface && cardIDs.contains(surface)
-                    }
-                    .sorted { $0.key.uuidString < $1.key.uuidString }
-                for (peer, surface) in recipients {
-                    edges.append(MissionMapEdge(
-                        id: MissionMapStableID.make("ipc:\(event.id.uuidString):\(peer.uuidString)"),
-                        from: fromSurface, to: surface, kind: .ipc(event)
-                    ))
+                let recipients = input.peerToSurface.filter { peer, surface in
+                    peer != event.from && peer != input.appPeerID
+                        && surface != fromSurface && cardIDs.contains(surface)
+                }
+                for surface in recipients.values {
+                    add(event, from: fromSurface, to: surface)
                 }
             } else {
                 guard event.to != input.appPeerID,
                       let toSurface = input.peerToSurface[event.to], cardIDs.contains(toSurface),
                       toSurface != fromSurface
                 else { continue }
-                edges.append(MissionMapEdge(id: event.id, from: fromSurface, to: toSurface, kind: .ipc(event)))
+                add(event, from: fromSurface, to: toSurface)
             }
         }
-        return edges
+
+        return groups
+            .sorted { lhs, rhs in
+                let lhsFrom = lhs.key.from.uuidString
+                let rhsFrom = rhs.key.from.uuidString
+                return lhsFrom != rhsFrom ? lhsFrom < rhsFrom : lhs.key.to.uuidString < rhs.key.to.uuidString
+            }
+            .map { pair, messages in
+                MissionMapEdge(
+                    id: MissionMapStableID.make("ipc:\(pair.from.uuidString):\(pair.to.uuidString)"),
+                    from: pair.from, to: pair.to,
+                    kind: .ipc(messages: messages.sorted(by: isNewer))
+                )
+            }
+    }
+
+    /// Newest first; a tie falls back to the message id so the order
+    /// never depends on the feed's.
+    private static func isNewer(_ lhs: IPCMessageEvent, _ rhs: IPCMessageEvent) -> Bool {
+        lhs.sentAt != rhs.sentAt ? lhs.sentAt > rhs.sentAt : lhs.id.uuidString < rhs.id.uuidString
+    }
+
+    /// One direction between two panes, by surface ID.
+    private struct IPCPair: Hashable {
+        let from: UUID
+        let to: UUID
+    }
+
+    private struct IPCPairMessage: Hashable {
+        let pair: IPCPair
+        let messageID: UUID
     }
 
     // MARK: - Conflict Edges

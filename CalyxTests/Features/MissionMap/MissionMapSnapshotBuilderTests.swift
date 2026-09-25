@@ -20,6 +20,14 @@
 //  - A pending `.mcpTool` approval targeting a surface -> `.allowable`
 //  - A pending `.agentQuestion` approval targeting a surface -> `.openOnly`
 //  - An IPC event between two bound surfaces resolves to a `.ipc` edge
+//    carrying that one message
+//  - Repeated messages in one direction between the same pair merge into
+//    one edge, messages newest first; the opposite direction is its own
+//    edge; a message past `ipcEdgeLifetime` leaves its group, and a group
+//    with no live message draws no edge; edge ids are stable per
+//    (from, to) across rebuilds
+//  - MissionMapSnapshot.nextIPCExpiry(in:lifetime:) is the earliest
+//    expiry among every live message, not each line's newest
 //  - An IPC event involving the app's own peer ID is excluded
 //  - An IPC event whose peer has no surface binding is dropped
 //  - A broadcast event expands into one edge per OTHER bound peer,
@@ -249,6 +257,218 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
         XCTAssertEqual(ipcEdges.count, 1)
         XCTAssertEqual(ipcEdges.first?.from, paneA.surfaceID)
         XCTAssertEqual(ipcEdges.first?.to, paneB.surfaceID)
+        XCTAssertEqual(ipcEdges.first?.messageCount, 1)
+        XCTAssertEqual(ipcEdges.first.flatMap { ipcMessages(of: $0) }?.map(\.id), [message.id])
+    }
+
+    /// The messages an `.ipc` edge carries, or `nil` for any other kind.
+    private func ipcMessages(of edge: MissionMapEdge) -> [IPCMessageEvent]? {
+        guard case .ipc(let messages) = edge.kind else { return nil }
+        return messages
+    }
+
+    private func ipcEdges(in snapshot: MissionMapSnapshot) -> [MissionMapEdge] {
+        snapshot.edges.filter { ipcMessages(of: $0) != nil }
+    }
+
+    private func directMessage(
+        from: UUID, to: UUID, content: String, sentAt: Date
+    ) -> IPCMessageEvent {
+        IPCMessageEvent(id: UUID(), from: from, to: to, content: content, sentAt: sentAt, isBroadcast: false)
+    }
+
+    func test_build_threeMessagesSameDirection_mergeIntoOneEdgeNewestFirst() {
+        let paneA = pane()
+        let paneB = pane()
+        let peerA = UUID()
+        let peerB = UUID()
+        let now = Date()
+        // Fed oldest first, the way IPCMessageEventFeed stores them.
+        let events = [
+            directMessage(from: peerA, to: peerB, content: "first", sentAt: now.addingTimeInterval(-2)),
+            directMessage(from: peerA, to: peerB, content: "second", sentAt: now.addingTimeInterval(-1)),
+            directMessage(from: peerA, to: peerB, content: "third", sentAt: now),
+        ]
+
+        let snapshot = MissionMapSnapshotBuilder.build(
+            input: input(
+                panes: [paneA, paneB], ipcEvents: events,
+                peerToSurface: [peerA: paneA.surfaceID, peerB: paneB.surfaceID],
+                now: now, ipcEdgeLifetime: 30
+            )
+        )
+
+        let edges = ipcEdges(in: snapshot)
+        XCTAssertEqual(edges.count, 1, "Repeated A->B messages must share one line")
+        XCTAssertEqual(edges.first?.from, paneA.surfaceID)
+        XCTAssertEqual(edges.first?.to, paneB.surfaceID)
+        XCTAssertEqual(edges.first?.messageCount, 3)
+        XCTAssertEqual(edges.first?.newestSentAt, now)
+        XCTAssertEqual(edges.first.flatMap { ipcMessages(of: $0) }?.map(\.content), ["third", "second", "first"])
+    }
+
+    func test_build_messagesInBothDirections_produceTwoEdges() {
+        let paneA = pane()
+        let paneB = pane()
+        let peerA = UUID()
+        let peerB = UUID()
+        let now = Date()
+        let events = [
+            directMessage(from: peerA, to: peerB, content: "ping", sentAt: now.addingTimeInterval(-1)),
+            directMessage(from: peerB, to: peerA, content: "pong", sentAt: now),
+        ]
+
+        let snapshot = MissionMapSnapshotBuilder.build(
+            input: input(
+                panes: [paneA, paneB], ipcEvents: events,
+                peerToSurface: [peerA: paneA.surfaceID, peerB: paneB.surfaceID],
+                now: now, ipcEdgeLifetime: 30
+            )
+        )
+
+        let edges = ipcEdges(in: snapshot)
+        XCTAssertEqual(edges.count, 2, "A->B and B->A are separate lines")
+        let aToB = edges.first { $0.from == paneA.surfaceID && $0.to == paneB.surfaceID }
+        let bToA = edges.first { $0.from == paneB.surfaceID && $0.to == paneA.surfaceID }
+        XCTAssertEqual(aToB.flatMap { ipcMessages(of: $0) }?.map(\.content), ["ping"])
+        XCTAssertEqual(bToA.flatMap { ipcMessages(of: $0) }?.map(\.content), ["pong"])
+        XCTAssertNotEqual(aToB?.id, bToA?.id)
+    }
+
+    func test_build_messageOlderThanLifetime_isExcludedFromItsGroup() {
+        let paneA = pane()
+        let paneB = pane()
+        let peerA = UUID()
+        let peerB = UUID()
+        let now = Date()
+        let events = [
+            directMessage(from: peerA, to: peerB, content: "stale", sentAt: now.addingTimeInterval(-60)),
+            directMessage(from: peerA, to: peerB, content: "live", sentAt: now.addingTimeInterval(-5)),
+        ]
+
+        let snapshot = MissionMapSnapshotBuilder.build(
+            input: input(
+                panes: [paneA, paneB], ipcEvents: events,
+                peerToSurface: [peerA: paneA.surfaceID, peerB: paneB.surfaceID],
+                now: now, ipcEdgeLifetime: 30
+            )
+        )
+
+        let edges = ipcEdges(in: snapshot)
+        XCTAssertEqual(edges.count, 1)
+        XCTAssertEqual(edges.first?.messageCount, 1)
+        XCTAssertEqual(edges.first.flatMap { ipcMessages(of: $0) }?.map(\.content), ["live"])
+    }
+
+    func test_build_groupWithOnlyExpiredMessages_producesNoEdge() {
+        let paneA = pane()
+        let paneB = pane()
+        let peerA = UUID()
+        let peerB = UUID()
+        let now = Date()
+        let events = [
+            directMessage(from: peerA, to: peerB, content: "old", sentAt: now.addingTimeInterval(-90)),
+            directMessage(from: peerA, to: peerB, content: "older", sentAt: now.addingTimeInterval(-60)),
+        ]
+
+        let snapshot = MissionMapSnapshotBuilder.build(
+            input: input(
+                panes: [paneA, paneB], ipcEvents: events,
+                peerToSurface: [peerA: paneA.surfaceID, peerB: paneB.surfaceID],
+                now: now, ipcEdgeLifetime: 30
+            )
+        )
+
+        XCTAssertTrue(snapshot.edges.isEmpty, "A pair whose messages have all expired must draw no line")
+    }
+
+    /// Two broadcasts from one sender still fan out to one line per
+    /// recipient pane, each carrying both broadcasts.
+    func test_build_repeatedBroadcasts_fanOutToOneEdgePerRecipientPair() {
+        let paneSender = pane()
+        let paneB = pane()
+        let paneC = pane()
+        let peerSender = UUID()
+        let peerB = UUID()
+        let peerC = UUID()
+        let now = Date()
+        let events = [
+            IPCMessageEvent(
+                id: UUID(), from: peerSender, to: UUID(), content: "one",
+                sentAt: now.addingTimeInterval(-1), isBroadcast: true
+            ),
+            IPCMessageEvent(id: UUID(), from: peerSender, to: UUID(), content: "two", sentAt: now, isBroadcast: true),
+        ]
+
+        let snapshot = MissionMapSnapshotBuilder.build(
+            input: input(
+                panes: [paneSender, paneB, paneC], ipcEvents: events,
+                peerToSurface: [peerSender: paneSender.surfaceID, peerB: paneB.surfaceID, peerC: paneC.surfaceID],
+                now: now, ipcEdgeLifetime: 30
+            )
+        )
+
+        let edges = ipcEdges(in: snapshot)
+        XCTAssertEqual(edges.count, 2, "One line per recipient pane, not per broadcast")
+        XCTAssertEqual(Set(edges.map(\.to)), Set([paneB.surfaceID, paneC.surfaceID]))
+        XCTAssertTrue(edges.allSatisfy { $0.from == paneSender.surfaceID })
+        for edge in edges {
+            XCTAssertEqual(ipcMessages(of: edge)?.map(\.content), ["two", "one"])
+        }
+    }
+
+    func test_build_ipcEdgeID_isStableAcrossRebuildsWhenAMessageIsAdded() {
+        let paneA = pane()
+        let paneB = pane()
+        let peerA = UUID()
+        let peerB = UUID()
+        let now = Date()
+        let first = directMessage(from: peerA, to: peerB, content: "first", sentAt: now.addingTimeInterval(-2))
+        let second = directMessage(from: peerA, to: peerB, content: "second", sentAt: now)
+        let peers = [peerA: paneA.surfaceID, peerB: paneB.surfaceID]
+
+        let before = MissionMapSnapshotBuilder.build(
+            input: input(panes: [paneA, paneB], ipcEvents: [first], peerToSurface: peers, now: now, ipcEdgeLifetime: 30)
+        )
+        let after = MissionMapSnapshotBuilder.build(
+            input: input(
+                panes: [paneA, paneB], ipcEvents: [first, second], peerToSurface: peers, now: now, ipcEdgeLifetime: 30
+            )
+        )
+
+        let expectedID = MissionMapStableID.make("ipc:\(paneA.surfaceID.uuidString):\(paneB.surfaceID.uuidString)")
+        XCTAssertEqual(ipcEdges(in: before).map(\.id), [expectedID])
+        XCTAssertEqual(ipcEdges(in: after).map(\.id), [expectedID])
+        XCTAssertEqual(ipcEdges(in: after).first?.messageCount, 2)
+    }
+
+    /// IPC edges come out ordered by `from.uuidString`, then
+    /// `to.uuidString`, whatever order their messages arrived in.
+    func test_build_ipcEdges_areOrderedByFromThenTo() {
+        let panes = (0..<3).map { _ in pane() }
+        let peers = panes.map { _ in UUID() }
+        let now = Date()
+        var events: [IPCMessageEvent] = []
+        for (i, from) in peers.enumerated() {
+            for (j, to) in peers.enumerated() where i != j {
+                events.append(directMessage(from: from, to: to, content: "\(i)->\(j)", sentAt: now))
+            }
+        }
+        var peerToSurface: [UUID: UUID] = [:]
+        for (peer, pane) in zip(peers, panes) {
+            peerToSurface[peer] = pane.surfaceID
+        }
+
+        let snapshot = MissionMapSnapshotBuilder.build(
+            input: input(
+                panes: panes, ipcEvents: events.reversed(), peerToSurface: peerToSurface,
+                now: now, ipcEdgeLifetime: 30
+            )
+        )
+
+        let pairs = ipcEdges(in: snapshot).map { [$0.from.uuidString, $0.to.uuidString] }
+        XCTAssertEqual(pairs.count, 6)
+        XCTAssertEqual(pairs, pairs.sorted { $0.lexicographicallyPrecedes($1) })
     }
 
     func test_build_ipcEvent_involvingAppPeer_isExcluded() {
@@ -381,6 +601,34 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
             return false
         }
         XCTAssertEqual(ipcEdges.count, 1, "A 30s-old message must still draw its pulse line under the real lifetime")
+    }
+
+    // MARK: - Next IPC expiry
+
+    /// The expiry tick must fire when the OLDEST live message expires, so
+    /// the rebuild drops it from its line: messages at t=0 and t=100 with
+    /// a 120 s lifetime expire first at t=120, not t=220.
+    func test_nextIPCExpiry_isEarliestExpiryAmongAllMessages() {
+        let base = Date(timeIntervalSince1970: 1_000)
+        let peer = UUID()
+        func message(at offset: TimeInterval) -> IPCMessageEvent {
+            directMessage(from: peer, to: peer, content: "m", sentAt: base.addingTimeInterval(offset))
+        }
+        let edges = [
+            MissionMapEdge(id: UUID(), from: UUID(), to: UUID(), kind: .ipc(messages: [message(at: 100), message(at: 0)])),
+            MissionMapEdge(id: UUID(), from: UUID(), to: UUID(), kind: .ipc(messages: [message(at: 50)])),
+            MissionMapEdge(id: UUID(), from: UUID(), to: UUID(), kind: .conflict(file: "a", fullPath: "/a")),
+        ]
+
+        XCTAssertEqual(
+            MissionMapSnapshot.nextIPCExpiry(in: edges, lifetime: 120), base.addingTimeInterval(120)
+        )
+    }
+
+    func test_nextIPCExpiry_noIPCEdges_isNil() {
+        let edges = [MissionMapEdge(id: UUID(), from: UUID(), to: UUID(), kind: .conflict(file: "a", fullPath: "/a"))]
+
+        XCTAssertNil(MissionMapSnapshot.nextIPCExpiry(in: edges, lifetime: 120))
     }
 
     // MARK: - focusTarget

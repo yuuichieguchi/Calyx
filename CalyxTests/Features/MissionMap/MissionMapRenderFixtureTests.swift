@@ -59,8 +59,9 @@ final class MissionMapRenderFixtureTests: XCTestCase {
 
     /// Band A: 4 cards (3 per row at width 1000, so a4 wraps to row 2;
     /// a2 has two subagents and is taller). Band B: 2 cards. Edges: an
-    /// adjacent round trip a1<->a2, a cross-row a2->a4, a cross-band
-    /// a4->b1, and a conflict a1-a3.
+    /// adjacent round trip a1<->a2 (a1->a2 carrying three messages sent
+    /// 0.4 s apart, so its one line shows three pulse dots), a cross-row
+    /// a2->a4, a cross-band a4->b1, and a conflict a1-a3.
     private func makeFixture() -> Fixture {
         let groupA = UUID()
         let groupB = UUID()
@@ -82,14 +83,18 @@ final class MissionMapRenderFixtureTests: XCTestCase {
         let b2 = card(groupID: groupB, groupName: "Band B", title: "Shell", state: .idle)
         let cards = [a1, a2, a3, a4, b1, b2]
 
-        func message(_ content: String) -> IPCMessageEvent {
-            IPCMessageEvent(id: UUID(), from: UUID(), to: UUID(), content: content, sentAt: now, isBroadcast: false)
+        func message(_ content: String, secondsAgo: TimeInterval = 0) -> IPCMessageEvent {
+            IPCMessageEvent(
+                id: UUID(), from: UUID(), to: UUID(), content: content,
+                sentAt: now.addingTimeInterval(-secondsAgo), isBroadcast: false
+            )
         }
+        let pings = [message("ping 3"), message("ping 2", secondsAgo: 0.4), message("ping 1", secondsAgo: 0.8)]
         let edges = [
-            MissionMapEdge(id: UUID(), from: a1.id, to: a2.id, kind: .ipc(message("ping"))),
-            MissionMapEdge(id: UUID(), from: a2.id, to: a1.id, kind: .ipc(message("pong"))),
-            MissionMapEdge(id: UUID(), from: a2.id, to: a4.id, kind: .ipc(message("cross-row"))),
-            MissionMapEdge(id: UUID(), from: a4.id, to: b1.id, kind: .ipc(message("cross-band"))),
+            MissionMapEdge(id: UUID(), from: a1.id, to: a2.id, kind: .ipc(messages: pings)),
+            MissionMapEdge(id: UUID(), from: a2.id, to: a1.id, kind: .ipc(messages: [message("pong")])),
+            MissionMapEdge(id: UUID(), from: a2.id, to: a4.id, kind: .ipc(messages: [message("cross-row")])),
+            MissionMapEdge(id: UUID(), from: a4.id, to: b1.id, kind: .ipc(messages: [message("cross-band")])),
             MissionMapEdge(id: UUID(), from: a1.id, to: a3.id, kind: .conflict(file: "main.swift", fullPath: "/projects/app/main.swift")),
         ]
         return Fixture(
