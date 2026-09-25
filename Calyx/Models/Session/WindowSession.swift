@@ -19,6 +19,9 @@ class WindowSession: Identifiable {
     var showSidebar: Bool
     var showCommandPalette: Bool = false
     var showComposeOverlay: Bool = false
+    /// Mission Map (the all-panes overview). Transient like the two
+    /// overlays above: never serialized, always starts hidden.
+    var showMissionMap: Bool = false
     var composeOverlayHeight: CGFloat = 120
     var composeOverlayText: String = ""
     var sidebarMode: SidebarMode = .tabs

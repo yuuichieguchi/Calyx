@@ -325,6 +325,46 @@ final class AppDelegateKeyMonitorTests: XCTestCase {
         )
     }
 
+    // ==================== Mission Map (Cmd+Shift+M) ====================
+
+    /// Cmd+Shift+M must resolve to .missionMap, so the key monitor can
+    /// toggle Mission Map even while a text-consuming responder is
+    /// focused.
+    func test_matchKeyEvent_cmdShiftM_returnsMissionMap() {
+        guard let event = makeKeyEvent(
+            modifiers: [.command, .shift],
+            keyCode: 46, // kVK_ANSI_M
+            characters: "M",
+            charactersIgnoringModifiers: "M"
+        ) else {
+            XCTFail("Failed to create synthetic NSEvent for Cmd+Shift+M")
+            return
+        }
+
+        let result = AppDelegate.matchKeyEvent(event, isUITesting: false)
+
+        XCTAssertEqual(result, .missionMap, "Cmd+Shift+M must resolve to .missionMap")
+    }
+
+    /// Cmd+M alone (no Shift) is the standard "Minimize" shortcut and
+    /// must NOT be claimed by the key monitor -- it must resolve to nil
+    /// so it flows through to the main menu.
+    func test_matchKeyEvent_cmdM_returnsNil() {
+        guard let event = makeKeyEvent(
+            modifiers: [.command],
+            keyCode: 46, // kVK_ANSI_M
+            characters: "m",
+            charactersIgnoringModifiers: "m"
+        ) else {
+            XCTFail("Failed to create synthetic NSEvent for Cmd+M")
+            return
+        }
+
+        let result = AppDelegate.matchKeyEvent(event, isUITesting: false)
+
+        XCTAssertNil(result, "Cmd+M (Minimize) must not be claimed by the key monitor")
+    }
+
     // ==================== Negative tests (no match -> nil) ====================
 
     /// A bare "]" with no modifiers must not be intercepted — it should

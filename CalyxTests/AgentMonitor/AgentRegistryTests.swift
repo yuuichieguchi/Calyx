@@ -3783,4 +3783,102 @@ final class AgentRegistryConversationEndedTests: XCTestCase {
 
         XCTAssertEqual(recorder.surfaceIDs, [surfaceID])
     }
+
+    // MARK: - AgentEditedFileLog recording (Mission Map)
+    //
+    // AgentEditedFileLog.shared is a process-wide singleton, so every
+    // test below seeds surfaces it must retire via handleSurfaceDestroyed
+    // in its own body (mirrors AppDelegateAgentRegistryObserverTests'
+    // tearDown convention) rather than a shared tearDown, since each test
+    // also owns its own local `AgentRegistry()` instance.
+
+    /// A PreToolUse Write event must be recorded into AgentEditedFileLog
+    /// under the event's own surfaceID, with the extracted path and tool
+    /// name.
+    func test_handleHookEvent_preToolUseWrite_recordsIntoEditedFileLog() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        AgentEditedFileLog.shared.removeAll(for: surfaceID)
+
+        registry.handleHookEvent(
+            AgentEvent(
+                hookEventName: "PreToolUse", sessionID: "session-1", cwd: "/Users/dev/project",
+                message: nil, toolName: "Write",
+                editedFilePaths: ["/Users/dev/project/main.swift"]
+            ),
+            surfaceID: surfaceID
+        )
+
+        let records = AgentEditedFileLog.shared.records.filter { $0.surfaceID == surfaceID }
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?.toolName, "Write")
+
+        registry.handleSurfaceDestroyed(surfaceID: surfaceID)
+        AgentEditedFileLog.shared.removeAll(for: surfaceID)
+    }
+
+    /// handleSurfaceDestroyed must remove every record AgentEditedFileLog
+    /// holds for that surface, leaving records for other surfaces intact.
+    func test_handleSurfaceDestroyed_removesEditedFileLogRecordsForThatSurfaceOnly() {
+        let registry = AgentRegistry()
+        let destroyedSurface = UUID()
+        let survivingSurface = UUID()
+        AgentEditedFileLog.shared.removeAll(for: destroyedSurface)
+        AgentEditedFileLog.shared.removeAll(for: survivingSurface)
+
+        registry.handleHookEvent(
+            AgentEvent(
+                hookEventName: "PreToolUse", sessionID: "session-1", cwd: "/Users/dev/project",
+                message: nil, toolName: "Write",
+                editedFilePaths: ["/Users/dev/project/main.swift"]
+            ),
+            surfaceID: destroyedSurface
+        )
+        registry.handleHookEvent(
+            AgentEvent(
+                hookEventName: "PreToolUse", sessionID: "session-2", cwd: "/Users/dev/project",
+                message: nil, toolName: "Write",
+                editedFilePaths: ["/Users/dev/project/main.swift"]
+            ),
+            surfaceID: survivingSurface
+        )
+
+        registry.handleSurfaceDestroyed(surfaceID: destroyedSurface)
+
+        XCTAssertTrue(AgentEditedFileLog.shared.records.contains { $0.surfaceID == destroyedSurface } == false,
+                      "The destroyed surface's records must be removed")
+        XCTAssertTrue(AgentEditedFileLog.shared.records.contains { $0.surfaceID == survivingSurface },
+                      "A different, still-live surface's records must not be touched")
+
+        registry.handleSurfaceDestroyed(surfaceID: survivingSurface)
+        AgentEditedFileLog.shared.removeAll(for: survivingSurface)
+    }
+
+    // MARK: - surfaceID(boundTo:) (Mission Map)
+
+    /// After bindSurface (learned via a hook's self-reported peer ID),
+    /// surfaceID(boundTo:) must resolve the peer back to the bound
+    /// surface.
+    func test_surfaceIDBoundToPeer_afterBinding_resolvesToTheBoundSurface() {
+        let registry = AgentRegistry()
+        let surfaceID = UUID()
+        let peerID = UUID()
+
+        registry.handleHookEvent(
+            AgentEvent(
+                hookEventName: "PreToolUse", sessionID: "session-a", cwd: nil, message: nil,
+                ipcSelfPeerID: peerID.uuidString
+            ),
+            surfaceID: surfaceID
+        )
+
+        XCTAssertEqual(registry.surfaceID(boundTo: peerID), surfaceID)
+    }
+
+    /// A peer nothing has ever bound must resolve to nil.
+    func test_surfaceIDBoundToPeer_unboundPeer_returnsNil() {
+        let registry = AgentRegistry()
+
+        XCTAssertNil(registry.surfaceID(boundTo: UUID()))
+    }
 }

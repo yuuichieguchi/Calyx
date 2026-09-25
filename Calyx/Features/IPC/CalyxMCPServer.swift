@@ -2140,6 +2140,10 @@ final class CalyxMCPServer {
 
         do {
             let message = try await store.sendMessage(from: fromUUID, to: toUUID, content: content)
+            IPCMessageEventFeed.shared.record(IPCMessageEvent(
+                id: message.id, from: message.from, to: message.to, content: message.content,
+                sentAt: message.timestamp, isBroadcast: false
+            ))
             // The recipient's unread badge (if a pane has learned a
             // binding to this peer — see AgentEvent.ipcSelfPeerID) is
             // refreshed once, after this handler returns, by
@@ -2165,6 +2169,17 @@ final class CalyxMCPServer {
 
         do {
             let messages = try await store.broadcast(from: fromUUID, content: content)
+            // ONE feed event per broadcast, not one per recipient: Mission
+            // Map fans a broadcast out to every other bound peer itself
+            // (`MissionMapSnapshotBuilder`), so a per-recipient record
+            // would draw every line once per recipient. A broadcast that
+            // reached nobody has no message to record and draws nothing.
+            if let first = messages.first {
+                IPCMessageEventFeed.shared.record(IPCMessageEvent(
+                    id: first.id, from: first.from, to: first.to, content: first.content,
+                    sentAt: first.timestamp, isBroadcast: true
+                ))
+            }
             // Every recipient's unread badge is refreshed once, after
             // this handler returns, by `handleToolCall`'s
             // `syncBoundPeerInboxCounts` — not with a per-recipient

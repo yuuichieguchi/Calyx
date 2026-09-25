@@ -258,6 +258,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     private var reviewStores: [UUID: DiffReviewStore] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
     private var composeOverlayTargetSurfaceID: UUID?
+    /// Git badges for Mission Map's cards. Polls only while the map is
+    /// shown: started by `showMissionMap()`, stopped by
+    /// `dismissMissionMap(restoresFocus:)` and `windowWillClose`.
+    private let missionMapGitPoller = MissionMapGitPoller()
+    /// The Mission Map's Escape-catching view, handed back by
+    /// `MissionMapKeyCatcherView` each time the map is shown. Weak: the
+    /// view hierarchy owns it and drops it when the map closes.
+    private weak var missionMapKeyCatcher: NSView?
     /// Decides reconnect vs. close for this window's persistent-session
     /// surfaces on `GHOSTTY_ACTION_SHOW_CHILD_EXITED` (wired in
     /// `handleShowChildExitedNotification`). One instance per window
@@ -738,6 +746,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             category: "Edit"
         ) { [weak self] in
             self?.toggleComposeOverlay()
+        })
+        commandRegistry.register(PaletteCommand(
+            id: "view.missionMap",
+            title: "Mission Map",
+            shortcut: "Cmd+Shift+M",
+            category: "View"
+        ) { [weak self] in
+            self?.toggleMissionMap()
         })
         commandRegistry.register(PaletteCommand(id: "browser.open", title: "Open Browser Tab", category: "Browser") { [weak self] in
             self?.promptAndOpenBrowserTab()
@@ -1434,6 +1450,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             onComposeOverlaySend: { [weak self] text in self?.sendComposeText(text) ?? false },
             onDismissComposeOverlay: { [weak self] in self?.dismissComposeOverlay() },
             onComposeOverlayEscapePressed: { [weak self] in self?.forwardEscapeToTerminal() },
+            missionMapGitPoller: missionMapGitPoller,
+            missionMapPanes: { [weak self] in self?.missionMapPanes() ?? [] },
+            onMissionMapFocusSurface: { [weak self] surfaceID in self?.focusSurfaceFromMissionMap(surfaceID) },
+            onDismissMissionMap: { [weak self] in self?.dismissMissionMap() },
+            onMissionMapAllow: { [weak self] requestID in self?.allowApprovalFromMissionMap(requestID) },
+            onMissionMapOpenApproval: { [weak self] requestID in self?.openApprovalFromMissionMap(requestID) },
+            onMissionMapKeyCatcherReady: { [weak self] view in self?.missionMapKeyCatcherReady(view) },
             totalReviewCommentCount: totalReviewCommentCount,
             reviewFileCount: reviewFileCount
         )
@@ -2164,6 +2187,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         if windowSession.showCommandPalette {
             dismissCommandPalette()
         } else {
+            // Mission Map covers the whole content area, so a palette
+            // opened under it would be invisible yet hold focus.
+            dismissMissionMap(restoresFocus: false)
             windowSession.showCommandPalette = true
         }
     }
@@ -2189,6 +2215,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             dismissComposeOverlay()
         } else {
             guard let tab = activeTab, case .terminal = tab.content else { return }
+            // Same exclusivity as `toggleCommandPalette()`: the overlay
+            // would sit hidden under Mission Map.
+            dismissMissionMap(restoresFocus: false)
             composeOverlayTargetSurfaceID = focusedController?.id
             windowSession.showComposeOverlay = true
             refreshHostingView()
@@ -2208,6 +2237,136 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         if case .terminal = activeTab?.content {
             restoreFocus()
         }
+    }
+
+    // MARK: - Mission Map
+
+    /// View menu / Cmd+Shift+M key monitor / palette entry point.
+    @objc func toggleMissionMap() {
+        processToggleMissionMap()
+    }
+
+    /// Shared by `toggleMissionMap()` and `.ghosttyToggleTabOverview`.
+    func processToggleMissionMap() {
+        if windowSession.showMissionMap {
+            dismissMissionMap()
+        } else {
+            showMissionMap()
+        }
+    }
+
+    private func showMissionMap() {
+        guard !windowSession.showMissionMap else { return }
+        dismissCommandPalette()
+        dismissComposeOverlay()
+        // Both dismissals above can queue a `restoreFocus()` that would
+        // pull first responder back to the terminal after the map's key
+        // catcher takes it; advancing the request ID after them turns
+        // that queued attempt into a no-op.
+        focusRequestID &+= 1
+        focusedController?.setFocus(false)
+        windowSession.showMissionMap = true
+        missionMapGitPoller.start { [weak self] in
+            self?.missionMapPanes().compactMap(\.cwd) ?? []
+        }
+        refreshHostingView()
+    }
+
+    /// Hides Mission Map. `restoresFocus: false` is for callers that move
+    /// focus somewhere themselves right after (a card click, another
+    /// overlay opening).
+    func dismissMissionMap(restoresFocus: Bool = true) {
+        guard windowSession.showMissionMap else { return }
+        windowSession.showMissionMap = false
+        missionMapGitPoller.stop()
+        missionMapKeyCatcher = nil
+        refreshHostingView()
+        guard restoresFocus, let tab = activeTab else { return }
+        // Same per-content restore as `dismissCommandPalette()`: unlike
+        // the Compose overlay, the map opens over any tab kind.
+        switch tab.content {
+        case .terminal:
+            restoreFocus()
+        case .browser:
+            if let bv = activeBrowserController?.browserView {
+                window?.makeFirstResponder(bv)
+            }
+        case .diff:
+            break
+        }
+    }
+
+    /// This window's panes, in window order -- the Cockpit pane listing
+    /// (the same pane identity `list_panes` reports), narrowed to this
+    /// window.
+    private func missionMapPanes() -> [CockpitPaneInfo] {
+        let windowID = windowSession.id
+        return LiveCockpitAppAccess().listPanes().filter { $0.windowID == windowID }
+    }
+
+    /// Takes first responder for the map's key catcher so Escape reaches
+    /// it. Called once the catcher is in a window; the claim itself waits
+    /// one runloop turn so it lands after the SwiftUI update in flight.
+    private func missionMapKeyCatcherReady(_ view: NSView) {
+        missionMapKeyCatcher = view
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.windowSession.showMissionMap,
+                  let catcher = self.missionMapKeyCatcher, catcher.window === self.window else { return }
+            self.window?.makeFirstResponder(catcher)
+        }
+    }
+
+    /// A card click: closes the map and focuses the card's pane. A pane
+    /// in this window gets the goto-split sequence (which also clears
+    /// split zoom, so a zoomed-away pane actually shows); a pane in
+    /// another window is handed to that window's controller through
+    /// `.calyxFocusSurface`.
+    private func focusSurfaceFromMissionMap(_ surfaceID: UUID) {
+        dismissMissionMap(restoresFocus: false)
+        guard let tab = findTab(bySplitLeaf: surfaceID) else {
+            NotificationCenter.default.post(name: .calyxFocusSurface, object: nil, userInfo: ["surfaceID": surfaceID])
+            return
+        }
+        switchToTab(id: tab.id)
+        tab.splitTree = tab.splitTree.settingFocus(surfaceID)
+        splitContainerView?.updateLayout(tree: tab.splitTree)
+        if let view = tab.registry.view(for: surfaceID) {
+            window?.makeFirstResponder(view)
+        }
+    }
+
+    /// A card's inline Allow button.
+    private func allowApprovalFromMissionMap(_ requestID: UUID) {
+        (NSApp.delegate as? AppDelegate)?.approvalBannerModel.allow(id: requestID)
+    }
+
+    /// A card's Open button: selects the request in the app-wide approval
+    /// panel (whose `.calyxApprovalInboxChanged` re-render orders the
+    /// panel front) and closes the map so the panel is in view.
+    private func openApprovalFromMissionMap(_ requestID: UUID) {
+        (NSApp.delegate as? AppDelegate)?.approvalBannerModel.select(id: requestID)
+        dismissMissionMap()
+    }
+
+    /// Approval requests are not read through @Observable tracking in
+    /// this hosting view (the established convention), so the map's
+    /// Allow/Open buttons follow the inbox through this notification.
+    @objc private func handleApprovalInboxChangedForMissionMap(_ notification: Notification) {
+        guard windowSession.showMissionMap else { return }
+        refreshHostingView()
+    }
+
+    /// `.ghosttyToggleTabOverview` (`GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW`)
+    /// receiver. With a triggering surface, only the window owning it
+    /// acts; with none (an app-targeted action), only the key window.
+    @objc private func handleToggleTabOverviewNotification(_ notification: Notification) {
+        if notification.object == nil {
+            guard window?.isKeyWindow == true else { return }
+        } else {
+            guard let surfaceView = notification.object as? SurfaceView,
+                  findTab(for: surfaceView) != nil else { return }
+        }
+        processToggleMissionMap()
     }
 
     private func forwardEscapeToTerminal() {
@@ -2288,6 +2447,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     private func attemptFocusRestore(requestID: UInt64, startTime: Double) {
         guard requestID == focusRequestID else { return }
+        // Mission Map holds first responder while shown (e.g. a hosting
+        // view recreated on de-occlusion queues a restore under it).
+        guard !windowSession.showMissionMap else { return }
 
         let elapsed = CACurrentMediaTime() - startTime
 
@@ -2429,6 +2591,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         // "MARK: - Split Zoom" / processToggleSplitZoom's own doc comment.
         center.addObserver(self, selector: #selector(handleToggleSplitZoomNotification(_:)),
                            name: .ghosttyToggleSplitZoom, object: nil)
+        // Mission Map: Ghostty's `toggle_tab_overview` keybind opens it,
+        // and its approval buttons follow the inbox.
+        center.addObserver(self, selector: #selector(handleToggleTabOverviewNotification(_:)),
+                           name: .ghosttyToggleTabOverview, object: nil)
+        center.addObserver(self, selector: #selector(handleApprovalInboxChangedForMissionMap(_:)),
+                           name: .calyxApprovalInboxChanged, object: nil)
     }
 
     // MARK: - Screen State Polling (Herdr Layer 2)
@@ -4489,6 +4657,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         #selector(toggleSidebar),
         #selector(toggleCommandPalette),
         #selector(toggleComposeOverlay),
+        #selector(toggleMissionMap),
         #selector(findNext(_:)),
         #selector(findPrevious(_:)),
     ]
@@ -4866,7 +5035,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     func windowDidBecomeKey(_ notification: Notification) {
         GhosttyAppController.shared.setFocus(true)
-        if case .browser = activeTab?.content {
+        if windowSession.showMissionMap {
+            // The map keeps keyboard focus while shown; the terminal gets
+            // it back when the map is dismissed.
+            if let catcher = missionMapKeyCatcher {
+                window?.makeFirstResponder(catcher)
+            }
+        } else if case .browser = activeTab?.content {
             if let bv = activeBrowserController?.browserView {
                 window?.makeFirstResponder(bv)
             }
@@ -4971,6 +5146,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             await pool.stopAll()
         }
         screenPollTask?.cancel()
+        missionMapGitPoller.stop()
 
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.removeWindowController(self)

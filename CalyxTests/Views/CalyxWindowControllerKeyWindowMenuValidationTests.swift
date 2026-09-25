@@ -257,6 +257,15 @@ final class CalyxWindowControllerKeyWindowMenuValidationTests: XCTestCase {
         XCTAssertFalse(result, "Find Next must be disabled while this window is not the key window")
     }
 
+    func test_validateMenuItem_toggleMissionMap_disabledWhenNotKeyWindow() {
+        let controller = makeFixture(tabCount: 1)
+        controller._isKeyWindowOverrideForTesting = false
+
+        let result = controller.validateMenuItem(menuItem(action: #selector(CalyxWindowController.toggleMissionMap)))
+
+        XCTAssertFalse(result, "Toggle Mission Map must be disabled while this window is not the key window")
+    }
+
     func test_validateMenuItem_findPrevious_disabledWhenNotKeyWindow() {
         let controller = makeFixture(tabCount: 1)
         controller._isKeyWindowOverrideForTesting = false
@@ -421,6 +430,15 @@ final class CalyxWindowControllerKeyWindowMenuValidationTests: XCTestCase {
         let result = controller.validateMenuItem(menuItem(action: #selector(CalyxWindowController.toggleComposeOverlay)))
 
         XCTAssertTrue(result, "Toggle Compose Overlay must stay enabled while this window IS the key window")
+    }
+
+    func test_validateMenuItem_toggleMissionMap_enabledWhenKeyWindow() {
+        let controller = makeFixture(tabCount: 1)
+        controller._isKeyWindowOverrideForTesting = true
+
+        let result = controller.validateMenuItem(menuItem(action: #selector(CalyxWindowController.toggleMissionMap)))
+
+        XCTAssertTrue(result, "Toggle Mission Map must stay enabled while this window IS the key window")
     }
 
     /// Unlike every other selector in this section, `findNext:`'s own

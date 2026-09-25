@@ -17,9 +17,13 @@
 //
 // Only `GHOSTTY_TARGET_APP` is exercised here, with a fake, never-
 // dereferenced `ghostty_app_t` (`void*` per ghostty.h) — sound only
-// because none of these three handlers ever calls `surfaceView(from:)` or
-// otherwise dereferences `app`/`target`; each returns `true`
-// unconditionally, regardless of target. Do not add other actions to this
+// because none of these three handlers dereferences `app` or a surface
+// pointer; each returns `true` unconditionally, regardless of target.
+// TOGGLE_TAB_OVERVIEW is no longer a no-op -- it now posts
+// `.ghosttyToggleTabOverview` to open Mission Map -- but its
+// `surfaceView(from:)` call returns `nil` for an app target without
+// reading the union, and it still always returns `true`, so it stays
+// here as the consumed-keybind guard. Do not add other actions to this
 // suite: e.g. `GHOSTTY_ACTION_CHECK_FOR_UPDATES` would construct
 // `UpdateController.shared`, whose `init` starts Sparkle.
 //
