@@ -64,6 +64,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 - **Diff Review Comments** -- comment on individual lines and submit a complete review directly to an agent pane ([demo video](https://www.youtube.com/watch?v=_O2Lr4oFf4c))
 - **AI Agent IPC** -- built-in MCP messaging lets agents discover and communicate with peers across tabs and panes ([demo video](https://www.youtube.com/watch?v=Xty0ad9gGcM))
 - **LSP Proxy MCP** -- hover, definition, references, rename, diagnostics, and other language-server features for agents; missing servers can be installed from Settings
+- **MCP Apps** -- add MCP servers (stdio or HTTP, with OAuth sign-in) in Settings -> **MCP Apps** and Calyx republishes their tools to every agent CLI as `calyx-mcp`; a tool that declares an MCP Apps view renders it docked to the right of the calling pane, with Open Link and Send Message consent routed through the approval panel
 
 ### Sessions and remote work
 
@@ -165,9 +166,9 @@ AI agent instances (Claude Code, Codex CLI, OpenCode, Hermes, Grok, pi) running 
 2. Start agents (Claude Code, Codex, OpenCode, Hermes, Grok, or pi) in two or more terminal panes
 3. Each instance automatically registers as a peer and can send/receive messages
 
-Config is auto-written to `~/.claude.json`, `~/.codex/config.toml`, `~/.config/opencode/{opencode.json,AGENTS.md}`, `~/.hermes/config.yaml`, and `~/.grok/config.toml` when the respective tool is installed. Restart running agent instances to pick up the new MCP server. If you install a supported agent later, click **Refresh** under the switch to write its config and hooks. It never restarts a server that is already running, so agents already connected keep working. Calyx remembers the switch: while it is on, every launch starts the server and rewrites these entries, changing only Calyx's own entry in each file.
+Config is auto-written to `~/.claude.json`, `~/.codex/config.toml`, `~/.config/opencode/{opencode.json,AGENTS.md}`, `~/.hermes/config.yaml`, and `~/.grok/config.toml` when the respective tool is installed, as a `calyx-ipc` entry plus a `calyx-mcp` entry that republishes the servers configured in Settings -> **MCP Apps**. Restart running agent instances to pick up the new MCP server. If you install a supported agent later, click **Refresh** under the switch to write its config and hooks. It never restarts a server that is already running, so agents already connected keep working. Calyx remembers the switch: while it is on, every launch starts the server and rewrites these entries, changing only Calyx's own entry in each file.
 
-pi has no MCP client configuration file at all, so it reaches Calyx through a single TypeScript extension written to `~/.pi/agent/extensions/calyx.ts`, which pi auto-loads. It carries the whole integration: the sidebar row, the approval gate, and a `calyx` tool that bridges the MCP tools above (call it with `{"tool": "list"}` to enumerate them). A pi started outside Calyx, or inside a herdr pane, registers nothing.
+pi has no MCP client configuration file at all, so it reaches Calyx through a single TypeScript extension written to `~/.pi/agent/extensions/calyx.ts`, which pi auto-loads. It carries the whole integration: the sidebar row, the approval gate, a `calyx` tool that bridges the MCP tools above (call it with `{"tool": "list"}` to enumerate them), and a `calyx_mcp` tool that does the same for the MCP Apps servers. A pi started outside Calyx, or inside a herdr pane, registers only `calyx_mcp`.
 
 Available MCP tools: `register_peer`, `list_peers`, `send_message`, `broadcast`, `receive_messages`, `get_peer_status`. `receive_messages` deletes each message from the inbox as it returns it, so a message is only ever delivered once.
 
