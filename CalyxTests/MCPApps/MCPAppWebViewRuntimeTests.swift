@@ -10,15 +10,27 @@
 //  `ui/message` fails with -32000 when the pane's conversation ends, and a
 //  mount that finishes after the store dropped the view builds no web view.
 //  Inline sizing (K55): `ui/notifications/size-changed` does not resize
-//  the dock, and the host context reports the dock's size. The reported
-//  height leaves out a shown consent prompt, and showing or hiding one
-//  sends `host-context-changed` (K60). A `ui/open-link` the user allows
-//  "Always Allow for This View" opens later links from that view without
-//  a prompt, while another view still prompts. The "Always" grants of
-//  `ui/open-link` and `ui/message` survive a Reload of the view and end
-//  when the view is closed; a prompt pending at a Reload resolves as
-//  denied, and an answer that arrives after the Reload unmounted the
-//  document opens nothing and allows nothing.
+//  the dock, and the host context reports the dock's size.
+//
+//  Consent prompts (`ui/open-link` / `ui/message`) no longer show inline
+//  in the card: the runtime submits an `ApprovalRequest` (`.mcpApp`) to
+//  its `MCPAppRuntimeEnvironment.consentPresenter`, here a dedicated
+//  `ApprovalInboxStore` wired through `ApprovalInboxConsentPresenter` --
+//  `FakeRuntimeEnvironment.inbox` (never `.shared`, so tests never leak
+//  into one another). Tests find a view's pending prompt through
+//  `pendingConsent(for:)` and answer it via `inbox.decide(id:_:)`,
+//  exactly like a real approval-panel click. A `ui/open-link` the user
+//  allows "Always Allow for This View" (`.allowedForView`) opens later
+//  links from that view without a new submission, while another view
+//  still prompts. The "Always" grants of `ui/open-link` and `ui/message`
+//  survive a Reload of the view and end when the view is closed; a
+//  prompt pending at a Reload/close/unmount/`expireForSurface` resolves
+//  denied with no grant recorded, and an answer that arrives after the
+//  Reload unmounted the document opens nothing and allows nothing. A
+//  second prompt for the same view expires the first. An unanswered
+//  prompt times out after `consentTimeoutMs`. A pane-less `ui/message`
+//  submits a `.copyMessage` request instead of showing the card's old
+//  copy-only prompt; `.allowed` pastes the text to `NSPasteboard.general`.
 //
 
 import AppKit
@@ -31,6 +43,11 @@ private final class FakeRuntimeEnvironment: MCPAppRuntimeEnvironment {
     var containers: [UUID: SplitContainerView] = [:]
     let recordingDelivery = RecordingInputDelivery()
     var cockpitInputDelivery: any MCPAppInputDelivering { recordingDelivery }
+
+    /// A dedicated inbox, never `.shared` -- each test gets its own
+    /// isolated queue of `.mcpApp` consent requests.
+    let inbox = ApprovalInboxStore()
+    lazy var consentPresenter: any MCPAppConsentPresenting = ApprovalInboxConsentPresenter(store: inbox)
 
     func splitContainer(owningSurface surfaceID: UUID) -> SplitContainerView? { containers[surfaceID] }
     func herdrPaneRef(forSurface surfaceID: UUID) -> HerdrPaneRef? { nil }
@@ -54,46 +71,6 @@ private final class RecordingInputDelivery: MCPAppInputDelivering {
     }
 }
 
-/// Records every message the store sends to a view, then passes it to
-/// the web view runtime.
-@MainActor
-private final class SendRecordingRuntime: MCPAppViewRuntime {
-    let inner: MCPAppWebViewRuntime
-    private(set) var sent: [(viewID: UUID, message: JSONRPCMessage)] = []
-
-    init(inner: MCPAppWebViewRuntime) {
-        self.inner = inner
-    }
-
-    func mount(viewID: UUID, document: MCPAppViewDocument) async throws {
-        try await inner.mount(viewID: viewID, document: document)
-    }
-
-    func send(_ message: JSONRPCMessage, to viewID: UUID) async throws -> JSONRPCMessage? {
-        sent.append((viewID, message))
-        return try await inner.send(message, to: viewID)
-    }
-
-    func unmount(viewID: UUID) {
-        inner.unmount(viewID: viewID)
-    }
-
-    func requestTeardown(viewID: UUID) async {
-        await inner.requestTeardown(viewID: viewID)
-    }
-
-    /// The `containerDimensions.height` of each `host-context-changed` sent to `viewID`, in order.
-    func hostContextChangedHeights(viewID: UUID) -> [Double?] {
-        sent.compactMap { entry -> Double?? in
-            guard entry.viewID == viewID,
-                  case .notification(let method, let params) = entry.message,
-                  method == "ui/notifications/host-context-changed",
-                  let dimensions = params?["containerDimensions"] else { return nil }
-            return .some(dimensions["height"]?.doubleValue)
-        }
-    }
-}
-
 @MainActor
 private final class NoPaneResolver: MCPPaneResolving {
     func paneHost(owningSurface surfaceID: UUID) -> MCPPaneHost? { nil }
@@ -102,14 +79,6 @@ private final class NoPaneResolver: MCPPaneResolving {
 @MainActor
 private final class Box<Value> {
     var value: Value?
-}
-
-/// The prompt buttons under `view`, in view order.
-@MainActor
-private func actionButtons(in view: NSView) -> [MCPAppActionButton] {
-    view.subviews.flatMap { subview -> [MCPAppActionButton] in
-        (subview as? MCPAppActionButton).map { [$0] } ?? actionButtons(in: subview)
-    }
 }
 
 private struct WaitTimedOut: Error, CustomStringConvertible {
@@ -131,16 +100,6 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         let store = MCPAppHostStore(paneResolver: NoPaneResolver(), runtime: runtime, appToolRegistry: FakeAppToolRegistry())
         runtime.store = store
         return Harness(runtime: runtime, store: store, environment: environment)
-    }
-
-    /// A harness whose store sends through a `SendRecordingRuntime`.
-    private func makeRecordingHarness() -> (harness: Harness, recorder: SendRecordingRuntime) {
-        let environment = FakeRuntimeEnvironment()
-        let runtime = MCPAppWebViewRuntime(environment: environment)
-        let recorder = SendRecordingRuntime(inner: runtime)
-        let store = MCPAppHostStore(paneResolver: NoPaneResolver(), runtime: recorder, appToolRegistry: FakeAppToolRegistry())
-        runtime.store = store
-        return (Harness(runtime: runtime, store: store, environment: environment), recorder)
     }
 
     private func makeContainer(leaves: [UUID]) -> (container: SplitContainerView, registry: SurfaceRegistry) {
@@ -190,7 +149,7 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
     }
 
     /// A view whose resource read fails: it gets a card but no web view.
-    private func startCardOnlyView(_ harness: Harness, surfaceID: UUID) async throws -> UUID {
+    private func startCardOnlyView(_ harness: Harness, surfaceID: UUID?) async throws -> UUID {
         let session = FakeMCPAppServerSession(readResourceResult: .failure(FakeSessionError(message: "unreadable")))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
         await harness.store.uiToolInvocationDidStart(inv, session: session)
@@ -198,8 +157,9 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         return inv.id.rawValue
     }
 
-    /// A view whose web view loaded its document.
-    private func startMountedView(_ harness: Harness, surfaceID: UUID) async throws -> UUID {
+    /// A view whose web view loaded its document. `surfaceID: nil` mounts
+    /// a pane-less view, shown in a standalone panel instead of a dock.
+    private func startMountedView(_ harness: Harness, surfaceID: UUID?) async throws -> UUID {
         let session = FakeMCPAppServerSession(readResourceResult: .success(validResource()))
         let inv = try invocation(serverID: session.serverID, surfaceID: surfaceID)
         await harness.store.uiToolInvocationDidStart(inv, session: session)
@@ -384,7 +344,7 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         try await waitUntil("the view is removed") { harness.store.snapshot(viewID: viewID) == nil }
     }
 
-    // MARK: - ui/open-link: "Always Allow for This View"
+    // MARK: - ui/open-link and ui/message consent, through the approval inbox
 
     private func requestOpenLink(_ harness: Harness, viewID: UUID, url: String) throws -> Box<Result<AnyCodable, JSONRPCError>> {
         let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
@@ -395,12 +355,115 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         return box
     }
 
-    private func promptButton(_ harness: Harness, viewID: UUID, identifier: String) -> MCPAppActionButton? {
-        guard let pane = harness.runtime.views[viewID]?.pane else { return nil }
-        return actionButtons(in: pane).first { $0.accessibilityIdentifier() == identifier }
+    private func requestMessage(_ harness: Harness, viewID: UUID, text: String) throws -> Box<Result<AnyCodable, JSONRPCError>> {
+        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
+        let box = Box<Result<AnyCodable, JSONRPCError>>()
+        Task { @MainActor in
+            box.value = await harness.runtime.bridge(bridge, didReceiveRequest: "ui/message", params: [
+                "role": AnyCodable("user"),
+                "content": AnyCodable([AnyCodable(["type": AnyCodable("text"), "text": AnyCodable(text)])]),
+            ])
+        }
+        return box
     }
 
-    func test_openLink_alwaysAllowForThisView_opensLaterLinksWithoutAPrompt_andAnotherViewStillPrompts() async throws {
+    /// `viewID`'s own pending `.mcpApp` request in the fake environment's
+    /// dedicated inbox, or nil if there is none.
+    private func pendingConsent(_ harness: Harness, viewID: UUID) -> ApprovalRequest? {
+        harness.environment.inbox.pending.first { request in
+            guard case .mcpApp(let requestViewID, _, _) = request.source else { return false }
+            return requestViewID == viewID
+        }
+    }
+
+    /// Reloads a view from `.waitingForApp` and waits for its new web view
+    /// to load its document.
+    private func reloadMountedView(_ harness: Harness, viewID: UUID) async throws {
+        let oldBridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
+        await harness.store.reload(viewID: viewID)
+        try await waitUntil(timeout: 10, "the reloaded view document loads") {
+            harness.store.snapshot(viewID: viewID)?.status == .waitingForApp
+                && harness.runtime.views[viewID]?.mounted?.bridge != nil
+                && harness.runtime.views[viewID]?.mounted?.bridge !== oldBridge
+        }
+    }
+
+    func test_openLink_pendingConsent_carriesTheViewsTitleAndTheURL_targetsItsSurface() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+        let url = URL(string: "https://example.com/whatever")!
+
+        let request = try requestOpenLink(harness, viewID: viewID, url: url.absoluteString)
+        try await waitUntil("the open-link consent request is submitted") { self.pendingConsent(harness, viewID: viewID) != nil }
+
+        let pending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        XCTAssertEqual(pending.targetSurfaceID, surfaceID, "the request targets the view's own surface")
+        guard case .mcpApp(let requestViewID, let title, let kind) = pending.source else {
+            return XCTFail("expected .mcpApp source, got \(pending.source)")
+        }
+        XCTAssertEqual(requestViewID, viewID)
+        XCTAssertEqual(title, "Weather", "title is the invocation's serverDisplayName")
+        XCTAssertEqual(kind, .openLink(url))
+
+        harness.environment.inbox.decide(id: pending.id, .denied(.userRejected))
+        try await waitUntil("the request ends") { request.value != nil }
+        await harness.store.close(viewID: viewID)
+    }
+
+    func test_paneless_uiMessage_pendingConsent_isCopyMessageWithNewlinesKept_andTargetsNoSurface() async throws {
+        let harness = makeHarness()
+        let viewID = try await startMountedView(harness, surfaceID: nil)
+        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
+        let box = Box<Result<AnyCodable, JSONRPCError>>()
+        Task { @MainActor in
+            box.value = await harness.runtime.bridge(bridge, didReceiveRequest: "ui/message", params: [
+                "role": AnyCodable("user"),
+                "content": AnyCodable([AnyCodable(["type": AnyCodable("text"), "text": AnyCodable("line one\nline two")])]),
+            ])
+        }
+        try await waitUntil("the message consent request is submitted") { self.pendingConsent(harness, viewID: viewID) != nil }
+
+        let pending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        XCTAssertNil(pending.targetSurfaceID, "a pane-less view's request targets no surface")
+        guard case .mcpApp(_, _, let kind) = pending.source else {
+            return XCTFail("expected .mcpApp source, got \(pending.source)")
+        }
+        // A pane-less view has no pane to send to: this is the copy-only
+        // kind, not .sendMessage -- its own newline-folding is covered by
+        // test_paneless_uiMessage_submitsCopyMessageRequest below.
+        XCTAssertEqual(kind, .copyMessage(text: "line one\nline two"))
+
+        harness.environment.inbox.decide(id: pending.id, .denied(.userRejected))
+        try await waitUntil("the request ends") { box.value != nil }
+        await harness.store.close(viewID: viewID)
+    }
+
+    func test_message_pendingConsent_sendMessageKind_foldsNewlinesInThePreview() async throws {
+        let harness = makeHarness()
+        let viewID = try await startMountedView(harness, surfaceID: UUID())
+        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
+        let box = Box<Result<AnyCodable, JSONRPCError>>()
+        Task { @MainActor in
+            box.value = await harness.runtime.bridge(bridge, didReceiveRequest: "ui/message", params: [
+                "role": AnyCodable("user"),
+                "content": AnyCodable([AnyCodable(["type": AnyCodable("text"), "text": AnyCodable("line one\nline two")])]),
+            ])
+        }
+        try await waitUntil("the message consent request is submitted") { self.pendingConsent(harness, viewID: viewID) != nil }
+
+        let pending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        guard case .mcpApp(_, _, let kind) = pending.source, case .sendMessage(let preview) = kind else {
+            return XCTFail("expected .mcpApp(.sendMessage) source, got \(pending.source)")
+        }
+        XCTAssertEqual(preview, "line one line two", "newlines in the preview must be folded to spaces")
+
+        harness.environment.inbox.decide(id: pending.id, .denied(.userRejected))
+        try await waitUntil("the request ends") { box.value != nil }
+        await harness.store.close(viewID: viewID)
+    }
+
+    func test_openLink_allowedForView_opensLaterLinksWithoutANewSubmission_andAnotherViewStillPrompts() async throws {
         let harness = makeHarness()
         let viewID = try await startMountedView(harness, surfaceID: UUID())
         let otherViewID = try await startMountedView(harness, surfaceID: UUID())
@@ -408,11 +471,10 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         let second = URL(string: "https://www.notion.so/pricing")!
 
         let firstRequest = try requestOpenLink(harness, viewID: viewID, url: first.absoluteString)
-        try await waitUntil("the open-link prompt shows") {
-            self.promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton) != nil
-        }
-        XCTAssertTrue(harness.environment.openedLinks.isEmpty, "nothing opens before the user chooses")
-        try XCTUnwrap(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton)).performClick(nil)
+        try await waitUntil("the open-link request is pending") { self.pendingConsent(harness, viewID: viewID) != nil }
+        XCTAssertTrue(harness.environment.openedLinks.isEmpty, "nothing opens before the user decides")
+        let firstPending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        harness.environment.inbox.decide(id: firstPending.id, .allowedForView)
         try await waitUntil("the first request ends") { firstRequest.value != nil }
         guard case .success(let firstResult)? = firstRequest.value else {
             return XCTFail("expected success, got \(String(describing: firstRequest.value))")
@@ -420,24 +482,25 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         XCTAssertNil(firstResult["isError"], "the link opened")
         XCTAssertEqual(harness.environment.openedLinks, [first])
 
+        let notifyCountBeforeSecond = harness.environment.inbox._testNotifyCount
         let secondRequest = try requestOpenLink(harness, viewID: viewID, url: second.absoluteString)
-        try await waitUntil("the second request ends without a prompt") { secondRequest.value != nil }
+        try await waitUntil("the second request ends without a new submission") { secondRequest.value != nil }
         XCTAssertEqual(harness.environment.openedLinks, [first, second])
-        XCTAssertNil(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptPrimaryButton),
-                     "no prompt shows for an allowed view")
+        XCTAssertEqual(harness.environment.inbox._testNotifyCount, notifyCountBeforeSecond,
+                       "an already-allowed-for-view link must never submit a new consent request")
+        XCTAssertNil(pendingConsent(harness, viewID: viewID), "no request shows for an allowed view")
 
         let otherRequest = try requestOpenLink(harness, viewID: otherViewID, url: second.absoluteString)
-        try await waitUntil("the other view prompts") {
-            self.promptButton(harness, viewID: otherViewID, identifier: AccessibilityID.MCPApps.promptPrimaryButton) != nil
-        }
+        try await waitUntil("the other view prompts") { self.pendingConsent(harness, viewID: otherViewID) != nil }
         XCTAssertNil(otherRequest.value, "the other view's request waits for the user")
         XCTAssertEqual(harness.environment.openedLinks, [first, second])
-        try XCTUnwrap(promptButton(harness, viewID: otherViewID, identifier: AccessibilityID.MCPApps.promptCancelButton)).performClick(nil)
+        let otherPending = try XCTUnwrap(pendingConsent(harness, viewID: otherViewID))
+        harness.environment.inbox.decide(id: otherPending.id, .denied(.userRejected))
         try await waitUntil("the other request ends") { otherRequest.value != nil }
         guard case .success(let otherResult)? = otherRequest.value else {
             return XCTFail("expected success, got \(String(describing: otherRequest.value))")
         }
-        XCTAssertEqual(otherResult["isError"]?.boolValue, true, "Cancel opens nothing")
+        XCTAssertEqual(otherResult["isError"]?.boolValue, true, "denial opens nothing")
         XCTAssertEqual(harness.environment.openedLinks, [first, second])
 
         await harness.store.close(viewID: viewID)
@@ -454,31 +517,59 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         XCTAssertTrue(harness.runtime.openLinkPolicy.requiresPrompt(viewID: viewID))
     }
 
+    func test_openLink_secondPromptForSameView_expiresTheFirst() async throws {
+        let harness = makeHarness()
+        let viewID = try await startMountedView(harness, surfaceID: UUID())
+        let first = URL(string: "https://example.com/first")!
+        let second = URL(string: "https://example.com/second")!
+
+        let firstRequest = try requestOpenLink(harness, viewID: viewID, url: first.absoluteString)
+        try await waitUntil("the first request is pending") { self.pendingConsent(harness, viewID: viewID) != nil }
+
+        let secondRequest = try requestOpenLink(harness, viewID: viewID, url: second.absoluteString)
+
+        try await waitUntil("the first request ends") { firstRequest.value != nil }
+        guard case .success(let firstResult)? = firstRequest.value else {
+            return XCTFail("expected success, got \(String(describing: firstRequest.value))")
+        }
+        XCTAssertEqual(firstResult["isError"]?.boolValue, true, "the superseded first prompt resolves denied")
+        XCTAssertTrue(harness.environment.openedLinks.isEmpty)
+
+        let stillPending = harness.environment.inbox.pending.filter { request in
+            guard case .mcpApp(let requestViewID, _, _) = request.source else { return false }
+            return requestViewID == viewID
+        }
+        XCTAssertEqual(stillPending.count, 1, "only the second prompt remains pending")
+        guard case .mcpApp(_, _, let kind) = stillPending.first?.source else {
+            return XCTFail("expected .mcpApp source")
+        }
+        XCTAssertEqual(kind, .openLink(second))
+
+        harness.environment.inbox.decide(id: stillPending[0].id, .denied(.userRejected))
+        try await waitUntil("the second request ends") { secondRequest.value != nil }
+        await harness.store.close(viewID: viewID)
+    }
+
+    func test_openLink_timesOutAfterConsentTimeoutMs_resolvesCancel_recordsNoGrant() async throws {
+        let harness = makeHarness()
+        harness.runtime.consentTimeoutMs = 50
+        let viewID = try await startMountedView(harness, surfaceID: UUID())
+
+        let request = try requestOpenLink(harness, viewID: viewID, url: "https://example.com/timeout")
+        try await waitUntil("the prompt is pending") { self.pendingConsent(harness, viewID: viewID) != nil }
+
+        try await waitUntil(timeout: 5, "the request times out") { request.value != nil }
+        guard case .success(let result)? = request.value else {
+            return XCTFail("expected success, got \(String(describing: request.value))")
+        }
+        XCTAssertEqual(result["isError"]?.boolValue, true, "a timed-out prompt opens nothing")
+        XCTAssertTrue(harness.environment.openedLinks.isEmpty)
+        XCTAssertNil(pendingConsent(harness, viewID: viewID))
+        XCTAssertTrue(harness.runtime.openLinkPolicy.requiresPrompt(viewID: viewID), "no grant is recorded")
+        await harness.store.close(viewID: viewID)
+    }
+
     // MARK: - "Always" grants last as long as the view, across a Reload
-
-    private func requestMessage(_ harness: Harness, viewID: UUID, text: String) throws -> Box<Result<AnyCodable, JSONRPCError>> {
-        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
-        let box = Box<Result<AnyCodable, JSONRPCError>>()
-        Task { @MainActor in
-            box.value = await harness.runtime.bridge(bridge, didReceiveRequest: "ui/message", params: [
-                "role": AnyCodable("user"),
-                "content": AnyCodable([AnyCodable(["type": AnyCodable("text"), "text": AnyCodable(text)])]),
-            ])
-        }
-        return box
-    }
-
-    /// Reloads a view from `.waitingForApp` and waits for its new web view
-    /// to load its document.
-    private func reloadMountedView(_ harness: Harness, viewID: UUID) async throws {
-        let oldBridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
-        await harness.store.reload(viewID: viewID)
-        try await waitUntil(timeout: 10, "the reloaded view document loads") {
-            harness.store.snapshot(viewID: viewID)?.status == .waitingForApp
-                && harness.runtime.views[viewID]?.mounted?.bridge != nil
-                && harness.runtime.views[viewID]?.mounted?.bridge !== oldBridge
-        }
-    }
 
     func test_openLink_alwaysAllowForThisView_survivesAReloadOfTheView() async throws {
         let harness = makeHarness()
@@ -487,10 +578,9 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         let second = URL(string: "https://example.com/second")!
 
         let firstRequest = try requestOpenLink(harness, viewID: viewID, url: first.absoluteString)
-        try await waitUntil("the open-link prompt shows") {
-            self.promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton) != nil
-        }
-        try XCTUnwrap(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton)).performClick(nil)
+        try await waitUntil("the open-link request is pending") { self.pendingConsent(harness, viewID: viewID) != nil }
+        let firstPending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        harness.environment.inbox.decide(id: firstPending.id, .allowedForView)
         try await waitUntil("the first request ends") { firstRequest.value != nil }
         XCTAssertEqual(harness.environment.openedLinks, [first])
 
@@ -498,14 +588,13 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         XCTAssertFalse(harness.runtime.openLinkPolicy.requiresPrompt(viewID: viewID), "a reload keeps the view's allowance")
 
         let secondRequest = try requestOpenLink(harness, viewID: viewID, url: second.absoluteString)
-        try await waitUntil("the second request ends without a prompt") { secondRequest.value != nil }
+        try await waitUntil("the second request ends without a new submission") { secondRequest.value != nil }
         guard case .success(let secondResult)? = secondRequest.value else {
             return XCTFail("expected success, got \(String(describing: secondRequest.value))")
         }
         XCTAssertNil(secondResult["isError"], "the link opened")
         XCTAssertEqual(harness.environment.openedLinks, [first, second])
-        XCTAssertNil(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptPrimaryButton),
-                     "no prompt shows for an allowed view")
+        XCTAssertNil(pendingConsent(harness, viewID: viewID), "no request shows for an allowed view")
         await harness.store.close(viewID: viewID)
     }
 
@@ -514,10 +603,9 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         let viewID = try await startMountedView(harness, surfaceID: UUID())
 
         let firstRequest = try requestMessage(harness, viewID: viewID, text: "first")
-        try await waitUntil("the message prompt shows") {
-            self.promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton) != nil
-        }
-        try XCTUnwrap(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton)).performClick(nil)
+        try await waitUntil("the message request is pending") { self.pendingConsent(harness, viewID: viewID) != nil }
+        let firstPending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        harness.environment.inbox.decide(id: firstPending.id, .allowedForView)
         try await waitUntil("the first request ends") { firstRequest.value != nil }
         XCTAssertEqual(harness.environment.recordingDelivery.deliveredTexts.count, 1, "the first message reached the pane")
 
@@ -525,13 +613,12 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         XCTAssertFalse(harness.runtime.consentGate.requiresPrompt(viewID: viewID), "a reload keeps the view's approval")
 
         let secondRequest = try requestMessage(harness, viewID: viewID, text: "second")
-        try await waitUntil("the second request ends without a prompt") { secondRequest.value != nil }
+        try await waitUntil("the second request ends without a new submission") { secondRequest.value != nil }
         guard case .success? = secondRequest.value else {
             return XCTFail("expected success, got \(String(describing: secondRequest.value))")
         }
         XCTAssertEqual(harness.environment.recordingDelivery.deliveredTexts.count, 2, "the second message reached the pane")
-        XCTAssertNil(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptPrimaryButton),
-                     "no prompt shows for an approved view")
+        XCTAssertNil(pendingConsent(harness, viewID: viewID), "no request shows for an approved view")
         await harness.store.close(viewID: viewID)
     }
 
@@ -550,32 +637,30 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
 
         let newViewID = try await startMountedView(harness, surfaceID: surfaceID)
         let linkRequest = try requestOpenLink(harness, viewID: newViewID, url: "https://example.com/again")
-        try await waitUntil("the new view's open-link prompt shows") {
-            self.promptButton(harness, viewID: newViewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton) != nil
-        }
+        try await waitUntil("the new view's open-link request is pending") { self.pendingConsent(harness, viewID: newViewID) != nil }
         XCTAssertNil(linkRequest.value, "the new view's link waits for the user")
         XCTAssertTrue(harness.environment.openedLinks.isEmpty)
-        try XCTUnwrap(promptButton(harness, viewID: newViewID, identifier: AccessibilityID.MCPApps.promptCancelButton)).performClick(nil)
+        let linkPending = try XCTUnwrap(pendingConsent(harness, viewID: newViewID))
+        harness.environment.inbox.decide(id: linkPending.id, .denied(.userRejected))
         try await waitUntil("the link request ends") { linkRequest.value != nil }
 
         let messageRequest = try requestMessage(harness, viewID: newViewID, text: "again")
-        try await waitUntil("the new view's message prompt shows") {
-            harness.runtime.consentGate.isPending(viewID: newViewID)
-        }
+        try await waitUntil("the new view's message request is pending") { self.pendingConsent(harness, viewID: newViewID) != nil }
         XCTAssertNil(messageRequest.value, "the new view's message waits for the user")
         XCTAssertTrue(harness.environment.recordingDelivery.deliveredTexts.isEmpty)
-        try XCTUnwrap(promptButton(harness, viewID: newViewID, identifier: AccessibilityID.MCPApps.promptCancelButton)).performClick(nil)
+        let messagePending = try XCTUnwrap(pendingConsent(harness, viewID: newViewID))
+        harness.environment.inbox.decide(id: messagePending.id, .denied(.userRejected))
         try await waitUntil("the message request ends") { messageRequest.value != nil }
         await harness.store.close(viewID: newViewID)
     }
+
+    // MARK: - reload / close / unmount / expireForSurface each deny a pending prompt
 
     func test_openLinkPromptPendingAtAReload_resolvesAsDenied() async throws {
         let harness = makeHarness()
         let viewID = try await startMountedView(harness, surfaceID: UUID())
         let request = try requestOpenLink(harness, viewID: viewID, url: "https://example.com/pending")
-        try await waitUntil("the open-link prompt shows") {
-            self.promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton) != nil
-        }
+        try await waitUntil("the open-link request is pending") { self.pendingConsent(harness, viewID: viewID) != nil }
 
         try await reloadMountedView(harness, viewID: viewID)
 
@@ -585,8 +670,7 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         }
         XCTAssertEqual(result["isError"]?.boolValue, true, "the prompt of the unloaded document opens nothing")
         XCTAssertTrue(harness.environment.openedLinks.isEmpty)
-        XCTAssertNil(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton),
-                     "the prompt is gone")
+        XCTAssertNil(pendingConsent(harness, viewID: viewID), "the request is gone")
         XCTAssertTrue(harness.runtime.openLinkPolicy.requiresPrompt(viewID: viewID), "nothing was allowed")
         await harness.store.close(viewID: viewID)
     }
@@ -598,13 +682,12 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         let viewID = try await startMountedView(harness, surfaceID: UUID())
         let oldBridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
         let request = try requestOpenLink(harness, viewID: viewID, url: "https://example.com/stale")
-        try await waitUntil("the open-link prompt shows") {
-            self.promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton) != nil
-        }
+        try await waitUntil("the open-link request is pending") { self.pendingConsent(harness, viewID: viewID) != nil }
 
-        // No suspension between the click and the Reload's unmount: the
+        // No suspension between the decision and the Reload's unmount: the
         // handler resumes only after the document is gone.
-        try XCTUnwrap(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton)).performClick(nil)
+        let pending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        harness.environment.inbox.decide(id: pending.id, .allowedForView)
         XCTAssertNil(request.value, "precondition: the handler has not resumed yet")
         await harness.store.reload(viewID: viewID)
 
@@ -622,12 +705,11 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
                 && harness.runtime.views[viewID]?.mounted?.bridge !== oldBridge
         }
         let later = try requestOpenLink(harness, viewID: viewID, url: "https://example.com/later")
-        try await waitUntil("the later link prompts") {
-            self.promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptPrimaryButton) != nil
-        }
+        try await waitUntil("the later link prompts") { self.pendingConsent(harness, viewID: viewID) != nil }
         XCTAssertNil(later.value, "the later link waits for the user")
         XCTAssertTrue(harness.environment.openedLinks.isEmpty)
-        try XCTUnwrap(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptCancelButton)).performClick(nil)
+        let laterPending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        harness.environment.inbox.decide(id: laterPending.id, .denied(.userRejected))
         try await waitUntil("the later request ends") { later.value != nil }
         await harness.store.close(viewID: viewID)
     }
@@ -647,9 +729,168 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         XCTAssertEqual(error.code, -32000)
         XCTAssertEqual(error.message, "Message sending denied")
         XCTAssertTrue(harness.environment.recordingDelivery.deliveredTexts.isEmpty, "nothing reaches the pane")
-        XCTAssertNil(promptButton(harness, viewID: viewID, identifier: AccessibilityID.MCPApps.promptAllowForViewButton),
-                     "the prompt is gone")
+        XCTAssertNil(pendingConsent(harness, viewID: viewID), "the request is gone")
         XCTAssertTrue(harness.runtime.consentGate.requiresPrompt(viewID: viewID), "nothing was approved")
+        await harness.store.close(viewID: viewID)
+    }
+
+    private enum Teardown: CustomStringConvertible {
+        case close, unmount, expireForSurface
+        var description: String {
+            switch self {
+            case .close: return "close"
+            case .unmount: return "unmount"
+            case .expireForSurface: return "expireForSurface"
+            }
+        }
+    }
+
+    /// close/unmount/expireForSurface each deny a pending `ui/open-link`
+    /// prompt without opening anything or recording a grant. All three
+    /// resolve `.success({isError:true})`: close/unmount go through
+    /// `denyPendingPrompts` (which bumps `documentGeneration`, so
+    /// `isCurrentDocument` fails once the handler resumes); expireForSurface
+    /// does not bump it, but its `.expired` decision maps to `.cancel`,
+    /// which the handler turns into the same success/isError result.
+    func test_closeUnmountExpireForSurface_eachDenyThePendingOpenLinkPrompt_recordingNoGrant() async throws {
+        for teardown in [Teardown.close, .unmount, .expireForSurface] {
+            let harness = makeHarness()
+            let surfaceID = UUID()
+            let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+            let request = try requestOpenLink(harness, viewID: viewID, url: "https://example.com/\(teardown)")
+            try await waitUntil("[\(teardown)] the open-link prompt is pending") {
+                self.pendingConsent(harness, viewID: viewID) != nil
+            }
+
+            switch teardown {
+            case .close:
+                await harness.store.close(viewID: viewID)
+            case .unmount:
+                harness.runtime.unmount(viewID: viewID)
+            case .expireForSurface:
+                harness.environment.inbox.expireForSurface(surfaceID)
+            }
+
+            try await waitUntil("[\(teardown)] the request ends") { request.value != nil }
+            guard case .success(let result)? = request.value else {
+                XCTFail("[\(teardown)] expected success, got \(String(describing: request.value))")
+                continue
+            }
+            XCTAssertEqual(result["isError"]?.boolValue, true, "[\(teardown)] opens nothing")
+            XCTAssertTrue(harness.environment.openedLinks.isEmpty, "[\(teardown)]")
+            XCTAssertNil(pendingConsent(harness, viewID: viewID), "[\(teardown)] no pending request remains")
+            XCTAssertTrue(harness.runtime.openLinkPolicy.requiresPrompt(viewID: viewID), "[\(teardown)] no grant recorded")
+
+            await harness.store.close(viewID: viewID)
+        }
+    }
+
+    /// close/unmount deny a pending `ui/message` prompt the same way an
+    /// unloading Reload does: `denyPendingPrompts` bumps `documentGeneration`
+    /// before the handler resumes, so `isCurrentDocument` fails and the
+    /// handler fails with -32000, same as `test_messagePromptPendingAtAReload_resolvesAsDenied`.
+    func test_closeUnmount_eachDenyThePendingMessagePrompt() async throws {
+        for teardown in [Teardown.close, .unmount] {
+            let harness = makeHarness()
+            let surfaceID = UUID()
+            let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+            let request = try requestMessage(harness, viewID: viewID, text: "pending-\(teardown)")
+            try await waitUntil("[\(teardown)] the message prompt is pending") { harness.runtime.consentGate.isPending(viewID: viewID) }
+
+            switch teardown {
+            case .close:
+                await harness.store.close(viewID: viewID)
+            case .unmount:
+                harness.runtime.unmount(viewID: viewID)
+            case .expireForSurface:
+                XCTFail("expireForSurface has its own, separate test: it behaves differently")
+            }
+
+            try await waitUntil("[\(teardown)] the request ends") { request.value != nil }
+            guard case .failure(let error)? = request.value else {
+                XCTFail("[\(teardown)] expected failure, got \(String(describing: request.value))")
+                continue
+            }
+            XCTAssertEqual(error.code, -32000, "[\(teardown)]")
+            XCTAssertEqual(error.message, "Message sending denied", "[\(teardown)]")
+            XCTAssertTrue(harness.environment.recordingDelivery.deliveredTexts.isEmpty, "[\(teardown)]")
+            XCTAssertTrue(harness.runtime.consentGate.requiresPrompt(viewID: viewID), "[\(teardown)] nothing approved")
+
+            await harness.store.close(viewID: viewID)
+        }
+    }
+
+    /// Unlike close/unmount/Reload, `expireForSurface` does not unload the
+    /// document (`documentGeneration` is untouched) -- the handler's own
+    /// `.expired` -> `.dontSend` outcome resolves it, not the
+    /// `isCurrentDocument` guard, so the result is `.success({isError:true})`,
+    /// not the -32000 failure the other three produce.
+    func test_expireForSurface_deniesThePendingMessagePrompt_withoutBumpingGeneration() async throws {
+        let harness = makeHarness()
+        let surfaceID = UUID()
+        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
+        let request = try requestMessage(harness, viewID: viewID, text: "pending")
+        try await waitUntil("the message prompt is pending") { harness.runtime.consentGate.isPending(viewID: viewID) }
+
+        harness.environment.inbox.expireForSurface(surfaceID)
+
+        try await waitUntil("the request ends") { request.value != nil }
+        guard case .success(let result)? = request.value else {
+            return XCTFail("expected success, got \(String(describing: request.value))")
+        }
+        XCTAssertEqual(result["isError"]?.boolValue, true)
+        XCTAssertTrue(harness.environment.recordingDelivery.deliveredTexts.isEmpty)
+        XCTAssertTrue(harness.runtime.consentGate.requiresPrompt(viewID: viewID))
+        await harness.store.close(viewID: viewID)
+    }
+
+    // MARK: - Pane-less ui/message: a copy-only consent request
+
+    func test_paneless_uiMessage_submitsCopyMessageRequest_allowedWritesThePasteboard() async throws {
+        NSPasteboard.general.clearContents()
+        let harness = makeHarness()
+        let viewID = try await startMountedView(harness, surfaceID: nil)
+        let text = "hello copy"
+
+        let request = try requestMessage(harness, viewID: viewID, text: text)
+
+        try await waitUntil("the handler returns immediately, without waiting for a decision") { request.value != nil }
+        guard case .failure(let error)? = request.value else {
+            return XCTFail("expected failure, got \(String(describing: request.value))")
+        }
+        XCTAssertEqual(error.code, -32000)
+        XCTAssertEqual(error.message, "This view has no pane to send the message to.")
+
+        try await waitUntil("the copy-message consent request is submitted") { self.pendingConsent(harness, viewID: viewID) != nil }
+        let pending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+        XCTAssertNil(pending.targetSurfaceID, "a pane-less view's request targets no surface")
+        guard case .mcpApp(_, _, let kind) = pending.source, case .copyMessage(let pastedText) = kind else {
+            return XCTFail("expected .mcpApp(.copyMessage) source, got \(pending.source)")
+        }
+        XCTAssertEqual(pastedText, text)
+
+        harness.environment.inbox.decide(id: pending.id, .allowed)
+
+        try await waitUntil("the pasteboard receives the text") { NSPasteboard.general.string(forType: .string) == text }
+        await harness.store.close(viewID: viewID)
+    }
+
+    func test_paneless_uiMessage_denied_doesNotWriteThePasteboard() async throws {
+        NSPasteboard.general.clearContents()
+        let harness = makeHarness()
+        let viewID = try await startMountedView(harness, surfaceID: nil)
+
+        let request = try requestMessage(harness, viewID: viewID, text: "not copied")
+        try await waitUntil("the handler returns") { request.value != nil }
+        try await waitUntil("the copy-message consent request is submitted") { self.pendingConsent(harness, viewID: viewID) != nil }
+        let pending = try XCTUnwrap(pendingConsent(harness, viewID: viewID))
+
+        harness.environment.inbox.decide(id: pending.id, .denied(.userRejected))
+
+        try await waitUntil("the request is no longer pending") { self.pendingConsent(harness, viewID: viewID) == nil }
+        // Give the detached Task a moment to (not) write.
+        try await Task.sleep(for: .milliseconds(100))
+        XCTAssertNil(NSPasteboard.general.string(forType: .string), "a denied copy-message request must not write the pasteboard")
         await harness.store.close(viewID: viewID)
     }
 
@@ -751,70 +992,6 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
         XCTAssertEqual(dimensions.height, Double(600 - MCPAppDockView.switcherHeight - MCPAppViewPane.headerHeight))
     }
 
-    // MARK: - The consent prompt takes height from the web view
-
-    func test_hostContext_heightShrinksWhileAPromptShows_andReturnsAfterItHides() async throws {
-        let harness = makeHarness()
-        let surfaceID = UUID()
-        let (container, _) = makeContainer(leaves: [surfaceID])
-        harness.environment.containers[surfaceID] = container
-        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
-        container.layoutSubtreeIfNeeded()
-        let pane = try XCTUnwrap(harness.runtime.views[viewID]?.pane)
-        let webView = try XCTUnwrap(pane.webView)
-        let fullHeight = Double(600 - MCPAppViewPane.headerHeight)
-        XCTAssertEqual(try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions.height, fullHeight,
-                       "precondition: no prompt")
-
-        pane.showCopyOnly(text: "hello")
-
-        let promptHeight = try XCTUnwrap(try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions.height)
-        XCTAssertLessThan(promptHeight, fullHeight, "the prompt sits between the header and the web view")
-        container.layoutSubtreeIfNeeded()
-        XCTAssertEqual(Double(webView.frame.height), promptHeight, accuracy: 0.5, "the reported height is the web view's height")
-
-        pane.dismissPrompt()
-
-        XCTAssertEqual(try XCTUnwrap(harness.runtime.hostEnvironment(for: viewID)).containerDimensions.height, fullHeight)
-        container.layoutSubtreeIfNeeded()
-        XCTAssertEqual(Double(webView.frame.height), fullHeight, accuracy: 0.5)
-        await harness.store.close(viewID: viewID)
-    }
-
-    func test_showingAndHidingAPrompt_sendsHostContextChangedToAnInitializedView() async throws {
-        let (harness, recorder) = makeRecordingHarness()
-        let surfaceID = UUID()
-        let (container, _) = makeContainer(leaves: [surfaceID])
-        harness.environment.containers[surfaceID] = container
-        let viewID = try await startMountedView(harness, surfaceID: surfaceID)
-        let bridge = try XCTUnwrap(harness.runtime.views[viewID]?.mounted?.bridge)
-        _ = await harness.runtime.bridge(bridge, didReceiveRequest: "ui/initialize", params: [
-            "protocolVersion": AnyCodable("2026-01-26"),
-            "appCapabilities": AnyCodable([String: AnyCodable]()),
-        ])
-        harness.runtime.bridge(bridge, didReceiveNotification: "ui/notifications/initialized", params: nil)
-        container.layoutSubtreeIfNeeded()
-        let pane = try XCTUnwrap(harness.runtime.views[viewID]?.pane)
-        let fullHeight = Double(600 - MCPAppViewPane.headerHeight)
-        let before = recorder.hostContextChangedHeights(viewID: viewID).count
-
-        pane.showCopyOnly(text: "hello")
-
-        try await waitUntil("host-context-changed follows the prompt") {
-            recorder.hostContextChangedHeights(viewID: viewID).count == before + 1
-        }
-        let shownHeight = try XCTUnwrap(recorder.hostContextChangedHeights(viewID: viewID).last ?? nil)
-        XCTAssertLessThan(shownHeight, fullHeight)
-
-        pane.dismissPrompt()
-
-        try await waitUntil("host-context-changed follows the prompt's dismissal") {
-            recorder.hostContextChangedHeights(viewID: viewID).count == before + 2
-        }
-        XCTAssertEqual(recorder.hostContextChangedHeights(viewID: viewID).last, fullHeight)
-        await harness.store.close(viewID: viewID)
-    }
-
     // MARK: - Finding 1: a mount the store no longer wants builds nothing
 
     func test_mountOfAViewTheStoreDoesNotHave_throws_andRemovesItsRuleList() async throws {
@@ -843,143 +1020,12 @@ final class MCPAppWebViewRuntimeTests: XCTestCase {
     }
 }
 
-// MARK: - Finding 7: the ui/message consent prompt shows the whole message;
-// the ui/open-link prompt shows a lead line, the whole link, and three choices
+// MARK: - The card is just header + web view: no inline consent prompt
+// area survives (that moved to the approval panel -- see
+// MCPAppWebViewRuntimeTests above).
 
 @MainActor
 final class MCPAppViewPanePromptTests: XCTestCase {
-
-    private func textViews(in view: NSView) -> [NSTextView] {
-        view.subviews.flatMap { subview -> [NSTextView] in
-            (subview as? NSTextView).map { [$0] } ?? textViews(in: subview)
-        }
-    }
-
-    func test_messagePrompt_showsTheFullTextInAScrollableReadOnlyTextView() async throws {
-        let pane = MCPAppViewPane(viewID: UUID(), prefersBorder: nil)
-        let preview = (1...40).map { "line \($0) of the message" }.joined(separator: "\n")
-        let task = Task { @MainActor in await pane.promptForMessage(preview: preview) }
-
-        let deadline = Date().addingTimeInterval(2)
-        while textViews(in: pane).isEmpty, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        let textView = try XCTUnwrap(textViews(in: pane).first, "the prompt shows its text in a text view")
-        XCTAssertTrue(textView.string.hasSuffix(preview), "every line of the message is in the prompt")
-        XCTAssertFalse(textView.isEditable)
-        XCTAssertNotNil(textView.enclosingScrollView, "a long message scrolls inside the card")
-
-        pane.dismissPrompt()
-        let decision = await task.value
-        XCTAssertEqual(decision, .dontSend)
-    }
-
-    // MARK: - ui/open-link prompt
-
-    /// A Notion-style link: long enough to wrap over several lines in a card.
-    private let longLink = URL(string: "https://www.notion.so/help/guides/connect-your-tools-to-notion-with-mcp-apps?utm_source=notion-card&utm_medium=mcp-app&utm_campaign=connected-apps&utm_content=learn-more-link&n=learn_more")!
-
-    private func waitForTextView(in pane: MCPAppViewPane) async throws -> NSTextView {
-        let deadline = Date().addingTimeInterval(2)
-        while textViews(in: pane).isEmpty, Date() < deadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
-        return try XCTUnwrap(textViews(in: pane).first, "the prompt shows its text in a text view")
-    }
-
-    private func promptButtons(in view: NSView) -> [MCPAppActionButton] {
-        view.subviews.flatMap { subview -> [MCPAppActionButton] in
-            (subview as? MCPAppActionButton).map { [$0] } ?? promptButtons(in: subview)
-        }
-    }
-
-    /// Asserts the text view shows the link's head (scheme and host) inside
-    /// the scroll view's visible area, and no line is wider than that area.
-    private func assertLinkHeadIsVisible(_ textView: NSTextView, file: StaticString = #filePath, line: UInt = #line) throws {
-        let scrollView = try XCTUnwrap(textView.enclosingScrollView, file: file, line: line)
-        let layoutManager = try XCTUnwrap(textView.layoutManager, file: file, line: line)
-        let container = try XCTUnwrap(textView.textContainer, file: file, line: line)
-        layoutManager.ensureLayout(for: container)
-        let visibleWidth = scrollView.contentView.bounds.width
-        XCTAssertGreaterThan(visibleWidth, 0, file: file, line: line)
-        XCTAssertLessThanOrEqual(textView.frame.width, visibleWidth + 0.5,
-                                 "the text is not wider than the card", file: file, line: line)
-        XCTAssertLessThanOrEqual(layoutManager.usedRect(for: container).width, visibleWidth + 0.5,
-                                 "every line wraps inside the card", file: file, line: line)
-        let hostRange = (textView.string as NSString).range(of: "https://www.notion.so")
-        XCTAssertNotEqual(hostRange.location, NSNotFound, file: file, line: line)
-        let glyphs = layoutManager.glyphRange(forCharacterRange: hostRange, actualCharacterRange: nil)
-        let hostRect = layoutManager.boundingRect(forGlyphRange: glyphs, in: container)
-        XCTAssertTrue(scrollView.documentVisibleRect.insetBy(dx: -0.5, dy: -0.5).contains(hostRect),
-                      "the link's scheme and host are in view: host \(hostRect), visible \(scrollView.documentVisibleRect)",
-                      file: file, line: line)
-    }
-
-    func test_openLinkPrompt_showsTheLeadLine_theFullLink_andThreeButtons() async throws {
-        let pane = MCPAppViewPane(viewID: UUID(), prefersBorder: nil)
-        let task = Task { @MainActor in await pane.promptForLink(self.longLink) }
-
-        let textView = try await waitForTextView(in: pane)
-        XCTAssertEqual(textView.string, "The app wants to open this link:\n" + longLink.absoluteString)
-        XCTAssertFalse(textView.isEditable)
-        XCTAssertTrue(textView.isSelectable)
-        XCTAssertNotNil(textView.enclosingScrollView, "a long link scrolls inside the card")
-        let buttons = promptButtons(in: pane)
-        XCTAssertEqual(buttons.map(\.title), ["Open", "Always Allow for This View", "Cancel"])
-        XCTAssertEqual(buttons.map { $0.accessibilityIdentifier() }, [
-            AccessibilityID.MCPApps.promptPrimaryButton,
-            AccessibilityID.MCPApps.promptAllowForViewButton,
-            AccessibilityID.MCPApps.promptCancelButton,
-        ])
-
-        buttons[1].performClick(nil)
-        let decision = await task.value
-        XCTAssertEqual(decision, .alwaysForThisView)
-    }
-
-    func test_openLinkPrompt_openAndCancel_resolveTheirDecisions() async throws {
-        let pane = MCPAppViewPane(viewID: UUID(), prefersBorder: nil)
-        let openTask = Task { @MainActor in await pane.promptForLink(self.longLink) }
-        _ = try await waitForTextView(in: pane)
-        try XCTUnwrap(promptButtons(in: pane).first).performClick(nil)
-        let opened = await openTask.value
-        XCTAssertEqual(opened, .open)
-
-        let cancelTask = Task { @MainActor in await pane.promptForLink(self.longLink) }
-        _ = try await waitForTextView(in: pane)
-        try XCTUnwrap(promptButtons(in: pane).last).performClick(nil)
-        let cancelled = await cancelTask.value
-        XCTAssertEqual(cancelled, .cancel)
-    }
-
-    func test_openLinkPrompt_inALaidOutCard_showsTheLinksHost() async throws {
-        let pane = MCPAppViewPane(viewID: UUID(), prefersBorder: nil)
-        pane.frame = NSRect(x: 0, y: 0, width: 320, height: 600)
-        pane.layoutSubtreeIfNeeded()
-        let task = Task { @MainActor in await pane.promptForLink(self.longLink) }
-
-        let textView = try await waitForTextView(in: pane)
-        pane.layoutSubtreeIfNeeded()
-
-        try assertLinkHeadIsVisible(textView)
-        pane.dismissPrompt()
-        let decision = await task.value
-        XCTAssertEqual(decision, .cancel)
-    }
-
-    func test_openLinkPrompt_shownBeforeTheCardIsLaidOut_showsTheLinksHostOnceItIs() async throws {
-        let pane = MCPAppViewPane(viewID: UUID(), prefersBorder: nil)
-        let task = Task { @MainActor in await pane.promptForLink(self.longLink) }
-
-        let textView = try await waitForTextView(in: pane)
-        pane.frame = NSRect(x: 0, y: 0, width: 320, height: 600)
-        pane.layoutSubtreeIfNeeded()
-
-        try assertLinkHeadIsVisible(textView)
-        pane.dismissPrompt()
-        let decision = await task.value
-        XCTAssertEqual(decision, .cancel)
-    }
 
     func test_webView_fillsTheCardBelowTheHeader() {
         let pane = MCPAppViewPane(viewID: UUID(), prefersBorder: nil)
@@ -992,5 +1038,7 @@ final class MCPAppViewPanePromptTests: XCTestCase {
         XCTAssertEqual(webView.frame.width, 320, accuracy: 0.5)
         XCTAssertEqual(webView.frame.height, 600 - MCPAppViewPane.headerHeight, accuracy: 0.5,
             "the web view takes the whole card below the header")
+        XCTAssertEqual(pane.contentTopInset, MCPAppViewPane.headerHeight,
+            "contentTopInset is just the header's height -- there is no consent prompt area to add anymore")
     }
 }

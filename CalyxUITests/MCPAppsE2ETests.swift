@@ -127,8 +127,11 @@ class MCPAppsE2ETestCaseBase: CalyxUITestCase {
 
     static let fixtureAlias = "fx"
 
-    private static let promptContainerID = "calyx.mcpApps.prompt.container"
-    private static let promptPrimaryButtonID = "calyx.mcpApps.prompt.primaryButton"
+    // The consent prompt (ui/open-link, ui/message) no longer shows
+    // inline in the card: it is now the app-wide Cockpit approval
+    // banner, same container/allow-button IDs every other approval uses.
+    private static let promptContainerID = "calyx.approvalBanner.container"
+    private static let promptPrimaryButtonID = "calyx.approvalBanner.allowButton"
     private static let standalonePanelPrefix = "calyx.mcpApps.standalonePanel."
 
     // MARK: - Scoped launch + fixture pre-registration

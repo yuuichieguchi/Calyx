@@ -2,7 +2,8 @@
 // Calyx
 //
 // Cockpit approval-core data model: a pending gated action (e.g. an MCP
-// tool call) waiting on a human decision from the approval inbox. See
+// tool call, or an MCP Apps view's `ui/open-link`/`ui/message` consent
+// prompt) waiting on a human decision from the approval inbox. See
 // ApprovalInboxStore for the queueing/decision lifecycle and
 // ApprovalPolicy for whether a given action requires approval at all.
 
@@ -35,6 +36,15 @@ struct ApprovalRequest: Identifiable, Sendable {
         /// for a second field to carry that `displayToolName`'s own
         /// "Question" literal doesn't already say.
         case agentQuestion(kind: String, prompt: AgentQuestionPrompt)
+        /// An MCP Apps view's consent prompt (`MCPAppWebViewRuntime.
+        /// requestConsent(viewID:state:kind:)`): the view `viewID` asks to
+        /// open a link, to send a message to its pane, or -- having no
+        /// pane -- to have its message copied instead. `title` is the
+        /// invocation's `serverDisplayName` (e.g. "Notion"). The "Always Allow for This View" answer
+        /// (`ApprovalDecision.allowedForView`) is remembered by
+        /// `MCPAppOpenLinkPolicy`/`MCPAppMessageConsentGate`, never by
+        /// `ApprovalBannerModel.alwaysAllow(id:)`.
+        case mcpApp(viewID: UUID, title: String, kind: MCPAppConsentKind)
     }
 
     let id: UUID
@@ -42,6 +52,48 @@ struct ApprovalRequest: Identifiable, Sendable {
     let targetSurfaceID: UUID?
     let payload: String
     let createdAt: Date
+}
+
+/// What an `.mcpApp`-sourced request asks the human to consent to.
+enum MCPAppConsentKind: Sendable, Equatable {
+    /// `ui/open-link`: open `URL` in the default browser.
+    case openLink(URL)
+    /// `ui/message` to a view with a pane: send the message to it.
+    /// `preview` is the message's text with every newline already folded
+    /// to a space (`ControlCharacterDisplay` would otherwise show each
+    /// one as `^J`).
+    case sendMessage(preview: String)
+    /// `ui/message` from a pane-less (standalone) view: there is nothing
+    /// to send to, so the only offer is to copy `text` -- the formatted
+    /// message, newlines intact, exactly what lands on the pasteboard --
+    /// to the clipboard.
+    case copyMessage(text: String)
+
+    /// The body text the approval panel shows for this prompt, also the
+    /// request's own `payload`: the URL, the folded preview, or a
+    /// sentence explaining the missing pane followed by the message with
+    /// its newlines folded to spaces. RAW, unescaped -- see
+    /// `ApprovalRequest.displayPayload`.
+    var displayText: String {
+        switch self {
+        case .openLink(let url):
+            return url.absoluteString
+        case .sendMessage(let preview):
+            return preview
+        case .copyMessage(let text):
+            let folded = text.components(separatedBy: .newlines).joined(separator: " ")
+            return "The app wants to send a message, but this window has no pane. Copy it instead: \(folded)"
+        }
+    }
+
+    /// The action half of `ApprovalRequest.displayToolName`.
+    fileprivate var actionName: String {
+        switch self {
+        case .openLink: return "Open Link"
+        case .sendMessage: return "Send Message"
+        case .copyMessage: return "Copy Message"
+        }
+    }
 }
 
 /// What an `.agentHook`-sourced request may offer beyond the plain
@@ -88,6 +140,12 @@ enum InterruptReason: Sendable, Equatable {
 
 enum ApprovalDecision: Sendable, Equatable {
     case allowed
+    /// "Always Allow for This View" on an `.mcpApp`-sourced request
+    /// (`ApprovalBannerModel.allowForView(id:)`): allow this one and
+    /// every later prompt of the same kind from the same view, remembered
+    /// by `MCPAppOpenLinkPolicy`/`MCPAppMessageConsentGate` for as long
+    /// as the view lives. Never produced for any other source.
+    case allowedForView
     /// Accepting one of `AgentHookOffers.permissionUpdates` -- the CLI's
     /// own "always allow" choice, echoed back verbatim.
     case allowedWithPermissions(AgentPermissionOffer)
@@ -116,6 +174,8 @@ extension ApprovalRequest {
     /// semantics, unchanged); `.agentHook` combines the owning CLI's
     /// display label (`AgentEntry.displayName(forKind:)`) with the tool
     /// name, since an agent-hook call has no MCP tool name of its own.
+    /// `.mcpApp` combines the view's `title` with the prompt's action
+    /// ("Open Link"/"Send Message"/"Copy Message").
     var displayToolName: String {
         switch source {
         case .mcpTool(let name):
@@ -124,6 +184,8 @@ extension ApprovalRequest {
             return "\(AgentEntry.displayName(forKind: kind)) · \(toolName)"
         case .agentQuestion(let kind, _):
             return "\(AgentEntry.displayName(forKind: kind)) · Question"
+        case .mcpApp(_, let title, let kind):
+            return "\(title) · \(kind.actionName)"
         }
     }
 
@@ -132,7 +194,7 @@ extension ApprovalRequest {
     /// reuses `payload` unchanged (today's semantics); `.agentHook` uses
     /// the hook call's own `summary` instead -- `payload` there is the
     /// full (and possibly large) `tool_input` JSON, not what's meant for
-    /// display.
+    /// display. `.mcpApp` uses `MCPAppConsentKind.displayText`.
     var displayPayload: String {
         switch source {
         case .mcpTool:
@@ -141,6 +203,8 @@ extension ApprovalRequest {
             return summary
         case .agentQuestion(_, let prompt):
             return prompt.questions.map(\.text).joined(separator: "\n")
+        case .mcpApp(_, _, let kind):
+            return kind.displayText
         }
     }
 
@@ -173,10 +237,13 @@ extension ApprovalRequest {
     /// such fallback -- Calyx's gate is their only prompt (same header) --
     /// so a grok/pi request is never dismissible: `ApprovalPanelContentView
     /// .dismissButton(request:)` renders its × disabled for one, and
-    /// `ApprovalBannerModel.dismiss(id:)` no-ops.
+    /// `ApprovalBannerModel.dismiss(id:)` no-ops. `.mcpApp`: always true,
+    /// a dismissed consent prompt is answered like Cancel/Don't Send --
+    /// `.dismissed` grants nothing (`MCPAppOpenLinkPolicy.PromptDecision
+    /// .init(_:)`/`MCPAppMessageConsentGate.PromptDecision.init(_:)`).
     var isDismissible: Bool {
         switch source {
-        case .mcpTool:
+        case .mcpTool, .mcpApp:
             return true
         case .agentHook(_, let kind, _, _), .agentQuestion(let kind, _):
             return AgentHookPermissionResponse.cliKeepsOwnPrompt(kind: kind)

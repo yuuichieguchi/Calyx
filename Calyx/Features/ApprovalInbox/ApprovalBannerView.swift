@@ -37,21 +37,28 @@
 //   file's own "Yes" primary button and its menu items (one row per
 //   `AgentHookOffers.permissionUpdates` offer, Calyx's own pane-scoped
 //   Always-Allow row only when the CLI sent none of its own, "No").
+// - `.mcpApp` (an MCP Apps view's `ui/open-link`/`ui/message` consent
+//   prompt): the SAME `toolLeftColumn` (its body is the URL, the folded
+//   message preview, or the copy-only explanation) beside an
+//   `ApprovalActionColumn` fed by `mcpAppPrimaryButton(kind:)`/
+//   `mcpAppMenuItems(kind:)`: "Open"/"Send"/"Copy" primary; the menu
+//   lists "Always Allow for This View" and "Cancel"/"Don't Send" for a
+//   link/message, and only "Dismiss" for a pane-less copy.
 // - `.agentQuestion` (Claude Code's AskUserQuestion): `AgentQuestionBannerView`
 //   renders its OWN full two-column row (it owns `AgentQuestionFormState`
 //   and the free-text fields' focus state, which a stateless provider
 //   cannot safely expose to a separate render pass -- see that view's
 //   own file header), taking this shell's `headerRow` as its `header`
 //   parameter so the tool/target label and queue navigator still read
-//   identically across all three sources. The app icon sits in this
-//   shell's own root `HStack`, to the left of that two-column row, same
-//   as the other two sources.
+//   identically across every source. The app icon sits in this shell's
+//   own root `HStack`, to the left of that two-column row, same as the
+//   other sources.
 //
 // `AgentQuestionBannerView` is given `.id(request.id)`, so a different
 // request tears its whole subtree (and `form`) down and creates a fresh
 // one -- this shell keeps no request-specific `@State` of its own at
 // all: the tap-to-pin-expanded body toggle shared by `.mcpTool`/
-// `.agentHook` lives in `ExpandableBodyText` instead, reset by that same
+// `.agentHook`/`.mcpApp` lives in `ExpandableBodyText` instead, reset by that same
 // `.id(request.id)`. The dismiss button (`isPanelHovered`, its
 // show-on-hover state) lives in `ApprovalPanelContentView`, not here --
 // see that file's own header for why. Every action routes through plain
@@ -143,6 +150,12 @@ struct ApprovalBannerView: View {
                     agentHookMenuItems(toolName: toolName, offers: offers)
                 }
 
+            case .mcpApp(_, _, let kind):
+                toolLeftColumn
+                ApprovalActionColumn(primary: AnyView(mcpAppPrimaryButton(kind: kind))) {
+                    mcpAppMenuItems(kind: kind)
+                }
+
             case .agentQuestion(_, let prompt):
                 AgentQuestionBannerView(
                     prompt: prompt,
@@ -171,11 +184,12 @@ struct ApprovalBannerView: View {
             .accessibilityHidden(true)
     }
 
-    // MARK: - `.mcpTool`/`.agentHook`: shared left column
+    // MARK: - `.mcpTool`/`.agentHook`/`.mcpApp`: shared left column
 
     /// `headerRow`, the tappable 2-line body (`request.displayPayload`
     /// -- `payload` for `.mcpTool`, the hook call's own `summary` for
-    /// `.agentHook`), and the tap-to-pin-expanded payload
+    /// `.agentHook`, `MCPAppConsentKind.displayText` for `.mcpApp`), and
+    /// the tap-to-pin-expanded payload
     /// (`ExpandableBodyText`, shared with `AgentQuestionBannerView`'s own
     /// question text).
     private var toolLeftColumn: some View {
@@ -242,6 +256,41 @@ struct ApprovalBannerView: View {
 
         Button(Self.menuRowTitle("No")) {
             model.deny(id: request.id)
+        }
+    }
+
+    // MARK: - `.mcpApp`: primary button + menu items
+
+    /// Primary: "Open" for a link, "Send" for a message, "Copy" for a
+    /// pane-less message -- all `model.allow(id:)`, which the runtime maps
+    /// to opening, sending, or writing the pasteboard.
+    private func mcpAppPrimaryButton(kind: MCPAppConsentKind) -> some View {
+        let title: String
+        switch kind {
+        case .openLink: title = "Open"
+        case .sendMessage: title = "Send"
+        case .copyMessage: title = "Copy"
+        }
+        return Button(title) { model.allow(id: request.id) }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier(AccessibilityID.ApprovalBanner.allowButton)
+    }
+
+    /// Menu: "Always Allow for This View" (`model.allowForView(id:)`) and
+    /// "Cancel"/"Don't Send" (`model.deny(id:)`) for a link/message; only
+    /// "Dismiss" (`model.deny(id:)`) for a pane-less copy, which has no
+    /// view-scoped allowance to offer.
+    @ViewBuilder
+    private func mcpAppMenuItems(kind: MCPAppConsentKind) -> some View {
+        switch kind {
+        case .openLink:
+            Button(Self.menuRowTitle("Always Allow for This View")) { model.allowForView(id: request.id) }
+            Button(Self.menuRowTitle("Cancel")) { model.deny(id: request.id) }
+        case .sendMessage:
+            Button(Self.menuRowTitle("Always Allow for This View")) { model.allowForView(id: request.id) }
+            Button(Self.menuRowTitle("Don't Send")) { model.deny(id: request.id) }
+        case .copyMessage:
+            Button(Self.menuRowTitle("Dismiss")) { model.deny(id: request.id) }
         }
     }
 
@@ -387,7 +436,7 @@ struct ApprovalBannerView: View {
     /// Shared by `AgentQuestionBannerView` (in the same module, so
     /// `ApprovalBannerView.menuRowTitle(_:)` is a plain cross-file call,
     /// no protocol needed) as well as this file's own `.mcpTool`/
-    /// `.agentHook` menu items.
+    /// `.agentHook`/`.mcpApp` menu items.
     static func menuRowTitle(_ text: String) -> String {
         let rendered = ControlCharacterDisplay.render(text).replacingOccurrences(of: "\n", with: " ")
         return fittedToMenuWidth(rendered)

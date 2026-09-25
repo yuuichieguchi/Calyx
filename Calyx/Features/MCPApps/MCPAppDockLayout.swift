@@ -110,7 +110,7 @@ enum MCPAppDockLayout {
     /// the view fills it, and the host does not resize it on
     /// `ui/notifications/size-changed`. `contentTopInset` is the card's
     /// height above its content area (`MCPAppViewPane.contentTopInset`:
-    /// the header, and the prompt while it shows).
+    /// the header).
     static func containerDimensions(
         mode: String,
         dockSize: CGSize,

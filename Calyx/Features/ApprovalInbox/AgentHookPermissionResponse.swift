@@ -75,6 +75,12 @@
 // production, but answers it identically to `.expired` rather than
 // `nil`/a crash, should that guard ever be bypassed.
 //
+// `.allowedForView` is an MCP Apps-only decision (an `.mcpApp`-sourced
+// request's "Always Allow for This View") that never reaches a hook
+// response at all; it is mapped exactly like `.expired` for every kind
+// -- nil for claude-code/codex, the expiry deny body for grok/pi -- so
+// a stray one can never read as an allow.
+//
 // `.answered` is claude-code's own AskUserQuestion decision (see
 // `ApprovalDecision.answered(_:)`): `behavior: "allow"` plus
 // `updatedInput`, which is the ENTIRE original `tool_input` echoed back
@@ -217,7 +223,10 @@ enum AgentHookPermissionResponse {
             return envelope(decision: [
                 "behavior": "deny", "message": claudeCodeInterruptMessage(for: reason), "interrupt": true,
             ])
-        case .expired, .dismissed:
+        case .expired, .dismissed, .allowedForView:
+            // `.allowedForView` is an MCP Apps-only decision that never
+            // reaches a hook response; like `.expired`, it has no
+            // vocabulary here.
             return nil
         case .answered(let answers):
             return encodeAnswered(answers)
@@ -238,15 +247,15 @@ enum AgentHookPermissionResponse {
 
     /// codex's own vocabulary: `allow`/`deny` only, `message` always
     /// `deniedMessage`. Every decision codex fails closed on
-    /// (`.allowedWithPermissions`/`.interrupted`/`.answered`/`.dismissed`)
-    /// produces `nil`, exactly like `.expired`.
+    /// (`.allowedForView`/`.allowedWithPermissions`/`.interrupted`/
+    /// `.answered`/`.dismissed`) produces `nil`, exactly like `.expired`.
     private static func codexBody(for decision: ApprovalDecision) -> Data? {
         switch decision {
         case .allowed:
             return envelope(decision: ["behavior": "allow"])
         case .denied:
             return envelope(decision: ["behavior": "deny", "message": deniedMessage])
-        case .allowedWithPermissions, .interrupted, .expired, .answered, .dismissed:
+        case .allowedForView, .allowedWithPermissions, .interrupted, .expired, .answered, .dismissed:
             return nil
         }
     }
@@ -258,8 +267,8 @@ enum AgentHookPermissionResponse {
     /// keeps a confirmation prompt of its own to fall back to
     /// (`cliKeepsOwnPrompt(kind:)` is false for both), so every decision
     /// with no other representation here -- `.dismissed`, and every
-    /// decision neither kind has ANY vocabulary for
-    /// (`.allowedWithPermissions`/`.interrupted`/`.answered`) -- routes
+    /// decision neither kind has ANY vocabulary for (`.allowedForView`/
+    /// `.allowedWithPermissions`/`.interrupted`/`.answered`) -- routes
     /// back through `body(kind:decision:)` with `.expired`, producing
     /// bytes byte-identical to an actual expiry's own body rather than a
     /// second, separately-written deny that could drift from it.
@@ -274,7 +283,7 @@ enum AgentHookPermissionResponse {
                 "decision": "deny",
                 "reason": "No approval was given in the Calyx approval inbox before the request expired.",
             ])
-        case .allowedWithPermissions, .interrupted, .answered, .dismissed:
+        case .allowedForView, .allowedWithPermissions, .interrupted, .answered, .dismissed:
             return body(kind: kind, decision: .expired)
         }
     }

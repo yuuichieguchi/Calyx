@@ -257,6 +257,8 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
             XCTFail("expected .agentHook source, got .mcpTool")
         case .agentQuestion:
             XCTFail("expected .agentHook source, got .agentQuestion")
+        case .mcpApp:
+            XCTFail("expected .agentHook source, got .mcpApp")
         }
 
         approvalInbox.decide(id: request.id, .allowed)
@@ -528,6 +530,8 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
             XCTFail("expected .agentHook source, got .mcpTool")
         case .agentQuestion:
             XCTFail("expected .agentHook source, got .agentQuestion")
+        case .mcpApp:
+            XCTFail("expected .agentHook source, got .mcpApp")
         }
 
         approvalInbox.decide(id: request.id, .allowed)

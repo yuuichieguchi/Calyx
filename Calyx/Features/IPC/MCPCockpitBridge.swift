@@ -576,9 +576,10 @@ final class MCPCockpitBridge {
             return .proceed
         case .dismissed:
             return .respond(["status": "dismissed"])
-        case .allowedWithPermissions, .interrupted, .answered:
-            // Every one of these three is only ever produced for an
-            // `.agentHook`/`.agentQuestion`-sourced request (the approval
+        case .allowedForView, .allowedWithPermissions, .interrupted, .answered:
+            // Every one of these four is only ever produced for an
+            // `.mcpApp`/`.agentHook`/`.agentQuestion`-sourced request (an
+            // MCP Apps view's "Always Allow for This View", the approval
             // banner's own AskUserQuestion/permission-suggestion/chat-
             // about-this flows), which this gate never submits -- every
             // request it submits is `.mcpTool`. Unreachable in practice,
