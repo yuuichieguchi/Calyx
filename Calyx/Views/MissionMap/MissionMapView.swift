@@ -32,6 +32,12 @@ struct MissionMapView: View {
     /// linearly across the remainder -- see that type's own `draw(_:in:at:)`.
     static let ipcEdgeFullOpacityDuration: TimeInterval = 10
 
+    /// How far (pt) each IPC line is shifted to the right-hand side of its
+    /// travel direction, so A→B and B→A messages between the same two
+    /// cards draw as two parallel lines instead of one. Conflict lines
+    /// stay on the center line.
+    static let ipcEdgeOffset: CGFloat = 6
+
     private static let coordinateSpaceName = "calyx.missionMap.content"
 
     /// Committed per-card drag offsets. Memory only: a reopened map
@@ -135,7 +141,13 @@ struct MissionMapView: View {
         let segments = snapshot.edges.compactMap { edge -> MissionMapEdgeSegment? in
             guard let from = movedFrames[edge.from], let to = movedFrames[edge.to] else { return nil }
             let (a, b) = MissionMapLayout.edgeAnchors(from: from, to: to)
-            return MissionMapEdgeSegment(edge: edge, a: a, b: b)
+            switch edge.kind {
+            case .ipc:
+                let (offsetA, offsetB) = MissionMapLayout.offsetSegment(a, b, by: Self.ipcEdgeOffset)
+                return MissionMapEdgeSegment(edge: edge, a: offsetA, b: offsetB)
+            case .conflict:
+                return MissionMapEdgeSegment(edge: edge, a: a, b: b)
+            }
         }
         let contentHeight = (frames.values.map(\.maxY).max() ?? 0) + Self.spacing
 

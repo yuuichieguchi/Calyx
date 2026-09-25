@@ -89,6 +89,25 @@ enum MissionMapLayout {
         )
     }
 
+    /// The segment `a`→`b` shifted `distance` perpendicular to its
+    /// direction, toward the right-hand side of travel in screen
+    /// coordinates (y grows downward): moving +x shifts toward +y. So
+    /// `a`→`b` and `b`→`a` offset by the same distance land on opposite
+    /// sides of the original line. A zero-length segment has no
+    /// direction and is returned unchanged.
+    static func offsetSegment(_ a: CGPoint, _ b: CGPoint, by distance: CGFloat) -> (CGPoint, CGPoint) {
+        let dx = b.x - a.x
+        let dy = b.y - a.y
+        let length = hypot(dx, dy)
+        guard length > 0 else { return (a, b) }
+        let shiftX = -dy / length * distance
+        let shiftY = dx / length * distance
+        return (
+            CGPoint(x: a.x + shiftX, y: a.y + shiftY),
+            CGPoint(x: b.x + shiftX, y: b.y + shiftY)
+        )
+    }
+
     /// The point where the ray from `rect`'s center toward `target`
     /// leaves `rect`. `rect`'s center when `target` is that center.
     private static func borderPoint(of rect: CGRect, toward target: CGPoint) -> CGPoint {
