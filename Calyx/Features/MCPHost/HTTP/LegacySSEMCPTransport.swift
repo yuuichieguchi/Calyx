@@ -212,11 +212,11 @@ actor LegacySSEMCPTransport: MCPMessageTransport {
             return
         }
 
-        var parser = SSEEventParser()
+        var parser = SSEEventParser(maxEventBytes: requester.session.maxBodyBytes)
         var streamError: (any Error)?
         do {
             for try await chunk in exchange.body {
-                receive(parser.feed(chunk))
+                receive(try parser.feed(chunk))
             }
         } catch {
             streamError = error

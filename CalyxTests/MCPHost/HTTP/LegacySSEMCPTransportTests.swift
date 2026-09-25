@@ -60,10 +60,12 @@ final class LegacySSEMCPTransportTests: XCTestCase {
         super.tearDown()
     }
 
-    private func session() -> MCPHTTPSession { MCPHTTPSession(urlSession: urlSession) }
+    private func session(maxBodyBytes: Int = MCPHTTPSession.defaultMaxBodyBytes) -> MCPHTTPSession {
+        MCPHTTPSession(urlSession: urlSession, maxBodyBytes: maxBodyBytes)
+    }
 
-    private func transport(clock: any MCPClock = SystemMCPClock()) -> LegacySSEMCPTransport {
-        LegacySSEMCPTransport(sseEndpoint: sseEndpoint, session: session(), clock: clock)
+    private func transport(clock: any MCPClock = SystemMCPClock(), maxBodyBytes: Int = MCPHTTPSession.defaultMaxBodyBytes) -> LegacySSEMCPTransport {
+        LegacySSEMCPTransport(sseEndpoint: sseEndpoint, session: session(maxBodyBytes: maxBodyBytes), clock: clock)
     }
 
     private func requestBody(id: Int = 1, method: String = "tools/call") -> Data {
@@ -186,6 +188,62 @@ final class LegacySSEMCPTransportTests: XCTestCase {
             return XCTFail("expected the endpoint event to be skipped and the first frame to be the message event")
         }
         XCTAssertEqual(data, payload, "the endpoint event's own data must never surface as a .frame")
+    }
+
+    // MARK: - SSE responses are exempt from the session's total-body cap
+
+    func test_eventStream_totalBytesExceedingSessionCap_keepsDeliveringFrames() async throws {
+        // 8 events of ~100 bytes each (800 bytes total), well over the
+        // 512-byte session cap, delivered as separate chunks after the
+        // endpoint event. The cap must not apply cumulatively to an SSE
+        // connection.
+        let payloads = (0..<8).map { index in
+            Data(#"{"jsonrpc":"2.0","id":\#(index),"result":{"pad":""#.utf8) + Data(repeating: 0x61, count: 80) + Data(#""}}"#.utf8)
+        }
+        var chunks: [Data] = [endpointEventChunk()]
+        for payload in payloads {
+            chunks.append(Data("event: message\ndata: \(String(data: payload, encoding: .utf8)!)\n\n".utf8))
+        }
+        recorder.enqueue { _ in .sse(status: 200, chunks: chunks, thenClose: false) }
+        let transport = transport(maxBodyBytes: 512)
+        var iterator = transport.inbound.makeAsyncIterator()
+        try await transport.openStream()
+
+        for (index, payload) in payloads.enumerated() {
+            let inbound = await iterator.next()
+            guard case .frame(let data) = inbound else {
+                return XCTFail("expected .frame #\(index), got \(String(describing: inbound))")
+            }
+            XCTAssertEqual(data, payload)
+        }
+    }
+
+    func test_eventStream_singleEventExceedingSessionCap_yieldsClosed() async throws {
+        // Delivered via `.gatedSSE` (not two back-to-back `.sse` chunks) so
+        // URLSession cannot coalesce the endpoint event and the oversized
+        // event into one delegate callback: the endpoint event must be
+        // fully parsed and dispatched (resolving openStream()) before the
+        // oversized event's chunk arrives and throws.
+        let oversizedData = String(repeating: "a", count: 600)
+        let gate = MCPHTTPStubGate()
+        recorder.enqueue { _ in
+            .gatedSSE(
+                status: 200,
+                first: self.endpointEventChunk(),
+                second: Data("event: message\ndata: \(oversizedData)\n\n".utf8),
+                gate: gate
+            )
+        }
+        let transport = transport(maxBodyBytes: 512)
+        var iterator = transport.inbound.makeAsyncIterator()
+        try await transport.openStream()
+        gate.open()
+
+        let inbound = await iterator.next()
+        guard case .closed(let reason, _, _) = inbound else {
+            return XCTFail("expected .closed, got \(String(describing: inbound))")
+        }
+        XCTAssertTrue(reason.contains("event stream failed"), "reason was: \(reason)")
     }
 
     // MARK: - send() posts to the discovered endpoint
