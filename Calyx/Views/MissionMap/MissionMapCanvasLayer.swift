@@ -1,8 +1,9 @@
 // MissionMapCanvasLayer.swift
 // Calyx
 //
-// Every Mission Map line, drawn into one Canvas. Lines come and go by
-// the second (an IPC line lives a few seconds), so drawing them
+// Every Mission Map line, drawn into one Canvas. Lines come and go --
+// an IPC line lives up to `MissionMapView.ipcEdgeLifetime` (2 minutes),
+// fading out after its own full-opacity window -- so drawing them
 // immediate-mode avoids giving each its own view identity and
 // animation lifetime. The layer takes no hits: `MissionMapView` matches
 // taps against the segments with `MissionMapEdgeHitTester`.
@@ -25,6 +26,11 @@ struct MissionMapEdgeSegment: Identifiable {
 struct MissionMapCanvasLayer: View {
     let segments: [MissionMapEdgeSegment]
     let ipcEdgeLifetime: TimeInterval
+    /// The leading slice of `ipcEdgeLifetime` an IPC line draws at full
+    /// opacity before `draw(_:in:at:)` starts fading it linearly across
+    /// the remainder -- see `MissionMapView.ipcEdgeFullOpacityDuration`'s
+    /// own doc comment.
+    let ipcEdgeFullOpacityDuration: TimeInterval
     let selectedEdgeID: UUID?
 
     /// Seconds for a pulse dot to travel the length of an IPC line.
@@ -57,7 +63,19 @@ struct MissionMapCanvasLayer: View {
         switch segment.edge.kind {
         case .ipc(let event):
             let age = date.timeIntervalSince(event.sentAt)
-            let alpha = 1 - age / ipcEdgeLifetime
+            // Full opacity for the leading `ipcEdgeFullOpacityDuration`,
+            // then a linear fade across the remainder of `ipcEdgeLifetime`
+            // -- a line that just appeared must not already look half
+            // gone, but it still needs to visibly age out rather than
+            // vanish abruptly at the cutoff.
+            let alpha: Double
+            if age <= ipcEdgeFullOpacityDuration {
+                alpha = 1
+            } else {
+                let fadeWindow = ipcEdgeLifetime - ipcEdgeFullOpacityDuration
+                let fadeProgress = fadeWindow > 0 ? (age - ipcEdgeFullOpacityDuration) / fadeWindow : 1
+                alpha = max(0, 1 - fadeProgress)
+            }
             guard alpha > 0 else { return }
             context.stroke(
                 line,

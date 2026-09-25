@@ -10,6 +10,7 @@ enum TabContextMenu {
         var close: () -> Void
         var closeOthers: () -> Void
         var closeToTheRight: () -> Void
+        var showAllTabs: () -> Void
         var rename: () -> Void
     }
 
@@ -27,6 +28,10 @@ enum TabContextMenu {
         menu.addItem(ClosureMenuItem(
             title: "Close Tabs to the Right", symbolName: "xmark", isEnabled: tabIndex < tabCount - 1,
             handler: actions.closeToTheRight
+        ))
+
+        menu.addItem(ClosureMenuItem(
+            title: "Show All Tabs", symbolName: "square.grid.2x2", handler: actions.showAllTabs
         ))
 
         menu.addItem(.separator())

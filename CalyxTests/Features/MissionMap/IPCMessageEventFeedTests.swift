@@ -3,7 +3,7 @@
 //  CalyxTests
 //
 //  Pins IPCMessageEventFeed (@MainActor @Observable), the ring buffer of
-//  the most recent Mission Map IPC pulses: capacity 64, FIFO eviction of
+//  the most recent Mission Map IPC pulses: capacity 512, FIFO eviction of
 //  the OLDEST record once full, insertion order preserved, and reset()
 //  clearing everything.
 //
@@ -38,7 +38,7 @@ final class IPCMessageEventFeedTests: XCTestCase {
         XCTAssertEqual(feed.events.map(\.content), ["first", "second"])
     }
 
-    /// Recording past `capacity` (64) must drop the OLDEST record, not
+    /// Recording past `capacity` must drop the OLDEST record, not
     /// the newest, and must never exceed `capacity` entries.
     func test_record_beyondCapacity_dropsOldestFirst() {
         let feed = IPCMessageEventFeed.shared
@@ -55,8 +55,8 @@ final class IPCMessageEventFeedTests: XCTestCase {
         XCTAssertEqual(feed.events.last?.content, "msg-\(IPCMessageEventFeed.capacity + 4)")
     }
 
-    func test_capacity_is64() {
-        XCTAssertEqual(IPCMessageEventFeed.capacity, 64)
+    func test_capacity_is512() {
+        XCTAssertEqual(IPCMessageEventFeed.capacity, 512)
     }
 
     func test_reset_clearsAllEvents() {

@@ -22,7 +22,15 @@ struct MissionMapView: View {
 
     static let cardSize = CGSize(width: 260, height: 150)
     static let spacing: CGFloat = 16
-    static let ipcEdgeLifetime: TimeInterval = 6
+    /// How long an IPC pulse line stays on the map after its message was
+    /// sent -- long enough to still be there when the user notices the
+    /// notification, alt-tabs to Calyx, and presses Cmd+Shift+M, not just
+    /// for someone already staring at an open map.
+    static let ipcEdgeLifetime: TimeInterval = 120
+    /// The leading slice of `ipcEdgeLifetime` a line draws at full
+    /// opacity before `MissionMapCanvasLayer` starts fading it out
+    /// linearly across the remainder -- see that type's own `draw(_:in:at:)`.
+    static let ipcEdgeFullOpacityDuration: TimeInterval = 10
 
     private static let coordinateSpaceName = "calyx.missionMap.content"
 
@@ -141,6 +149,7 @@ struct MissionMapView: View {
             MissionMapCanvasLayer(
                 segments: segments,
                 ipcEdgeLifetime: Self.ipcEdgeLifetime,
+                ipcEdgeFullOpacityDuration: Self.ipcEdgeFullOpacityDuration,
                 selectedEdgeID: selectedEdgeID
             )
 

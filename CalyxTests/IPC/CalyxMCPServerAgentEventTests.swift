@@ -14,6 +14,9 @@
 //  - POST /mcp behavior is unchanged (initialize still returns 200)
 //  - GET / unknown paths → 404, and this is distinguished from a
 //    would-be-404 /agent-event miss
+//  - A Stop event that settles a surface to .idle expires any
+//    ApprovalRequest still pending for it (stale-approval cleanup)
+//  - That cleanup never touches a different surface's pending request
 //
 
 import XCTest
@@ -303,6 +306,93 @@ final class CalyxMCPServerAgentEventTests: XCTestCase {
             method: "POST", path: "/unknown", headers: [:], body: nil
         ))
         XCTAssertEqual(unknownPathResponse.statusCode, 404)
+    }
+
+    // MARK: - Stale approval request cleanup on Stop
+
+    /// Reproduces the user's own Mission Map report: an approval request
+    /// submitted while the surface was `.blocked`, then the CLI resolved
+    /// the underlying tool call some other way (its own fallback prompt,
+    /// answered directly, once `routeApprovalRequest`'s connection-drop
+    /// detection missed the hook process going away -- see that method's
+    /// own doc comment, invariant (c)) without Calyx ever deciding the
+    /// request. The surface settles to `.idle` via `Stop` regardless; the
+    /// stale request must not survive that settle -- see
+    /// `routeAgentEvent`'s own doc comment on why a `Stop`-driven `.idle`
+    /// always expires it.
+    func test_agentEventStop_settlesSurfaceToIdle_expiresStaleApprovalRequest() async {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let approvalInbox = ApprovalInboxStore()
+        server.approvalInbox = approvalInbox
+        let surfaceID = UUID()
+
+        let start = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString,
+            body: Data("""
+            {"hook_event_name":"SessionStart","session_id":"s1","cwd":"/Users/dev/repo"}
+            """.utf8)
+        ))
+        XCTAssertEqual(start.statusCode, 204)
+
+        let staleRequest = ApprovalRequest(
+            id: UUID(),
+            source: .agentHook(toolName: "Bash", kind: AgentEntry.claudeCodeKind, summary: "ls", offers: .none),
+            targetSurfaceID: surfaceID, payload: "", createdAt: Date()
+        )
+        approvalInbox.submit(staleRequest)
+        XCTAssertEqual(approvalInbox.pending.count, 1, "Precondition: the stale request is queued")
+
+        let stop = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString,
+            body: Data("""
+            {"hook_event_name":"Stop","session_id":"s1"}
+            """.utf8)
+        ))
+        XCTAssertEqual(stop.statusCode, 204)
+
+        XCTAssertEqual(registry.entries[surfaceID]?.state, .idle, "Precondition: Stop settled the row to idle")
+        XCTAssertTrue(approvalInbox.pending.isEmpty,
+                      "A Stop event that settles the surface to idle must expire any approval request " +
+                      "still pending for it -- the CLI already resolved the tool call some other way")
+    }
+
+    /// A pending request for a DIFFERENT surface must survive a Stop on
+    /// this one -- `expireForSurface`'s own scoping, exercised end-to-end
+    /// through the route.
+    func test_agentEventStop_neverExpiresAnotherSurfacesPendingRequest() async {
+        let registry = AgentRegistry()
+        server.agentRegistry = registry
+        let approvalInbox = ApprovalInboxStore()
+        server.approvalInbox = approvalInbox
+        let surfaceID = UUID()
+        let otherSurfaceID = UUID()
+
+        let start = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString,
+            body: Data("""
+            {"hook_event_name":"SessionStart","session_id":"s1","cwd":"/Users/dev/repo"}
+            """.utf8)
+        ))
+        XCTAssertEqual(start.statusCode, 204)
+
+        let otherRequest = ApprovalRequest(
+            id: UUID(),
+            source: .agentHook(toolName: "Bash", kind: AgentEntry.claudeCodeKind, summary: "ls", offers: .none),
+            targetSurfaceID: otherSurfaceID, payload: "", createdAt: Date()
+        )
+        approvalInbox.submit(otherRequest)
+
+        let stop = await server.route(request: agentEventRequest(
+            token: testToken, surfaceIDHeader: surfaceID.uuidString,
+            body: Data("""
+            {"hook_event_name":"Stop","session_id":"s1"}
+            """.utf8)
+        ))
+        XCTAssertEqual(stop.statusCode, 204)
+
+        XCTAssertEqual(approvalInbox.pending.map(\.id), [otherRequest.id],
+                       "A Stop on one surface must never expire a different surface's still-pending request")
     }
 
     // MARK: - Unread-badge wiring (route() binding + real tool calls)

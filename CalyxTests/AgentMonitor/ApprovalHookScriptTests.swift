@@ -120,8 +120,88 @@ final class ApprovalHookScriptTests: XCTestCase {
     }
 
     func test_scriptBody_forwardsStdinViaDataBinary() {
-        XCTAssertTrue(ApprovalHookScript.scriptBody.contains("--data-binary @-"),
-                     "Script must forward the hook's stdin JSON verbatim via --data-binary")
+        let body = ApprovalHookScript.scriptBody
+
+        // NOT --data-binary @-: curl runs backgrounded (see
+        // test_scriptBody_curlRunsBackgroundedWithTrapAndWait below), and a
+        // backgrounded command's stdin is NOT the script's own by default
+        // under POSIX sh job-control rules -- empirically confirmed to
+        // silently post an EMPTY body. Stdin is drained into its own temp
+        // file first (`cat > "$payload_file"`) and curl reads it back via
+        // `--data-binary @"$payload_file"` instead.
+        XCTAssertFalse(body.contains("--data-binary @-"),
+                       "Script must NOT use --data-binary @- once curl is backgrounded -- a backgrounded " +
+                       "command does not inherit the script's own stdin under POSIX sh job control, so this " +
+                       "would silently post an empty body")
+        XCTAssertTrue(body.contains("cat > \"$payload_file\""),
+                     "Script must drain stdin into its own temp file before backgrounding curl")
+        XCTAssertTrue(body.contains("--data-binary @\"$payload_file\""),
+                     "Backgrounded curl must forward the hook's stdin JSON verbatim via the drained temp file")
+    }
+
+    // MARK: - scriptBody: curl backgrounded with trap + wait (orphan-curl fix)
+
+    /// R-orphan-curl fix-pin: when Claude Code kills this script's own
+    /// `/bin/sh` process (e.g. SIGTERM, because the user answered the SAME
+    /// permission prompt directly in the CLI while this script was still
+    /// blocked in its long-poll), a FOREGROUNDED `curl` in
+    /// `response=$(curl ...)` is a child of a subshell the signal never
+    /// reaches -- it survives as an orphan (reparented to PID 1,
+    /// empirically confirmed) and keeps its long-poll connection to Calyx
+    /// open until curl's own `-m` deadline, up to 585s later, which is
+    /// invisible to `CalyxMCPServer.dispatchRoute`'s connection-drop
+    /// sentinel (it only ever notices a CLOSED socket). Backgrounding curl
+    /// (`&`) and trapping TERM/HUP/INT to kill its pid closes that gap: the
+    /// signal that kills this script also kills curl, closing the socket
+    /// promptly instead of leaving it open for up to 585s.
+    func test_scriptBody_curlRunsBackgroundedWithTrapAndWait() {
+        let body = ApprovalHookScript.scriptBody
+
+        XCTAssertTrue(
+            body.contains(#"trap 'signalled=1; if [ -n "$curl_pid" ]; then kill "$curl_pid" 2>/dev/null; rm -f "$payload_file" "$response_file"; exit 0; fi' TERM HUP INT"#),
+            "Script must trap TERM/HUP/INT, record the signal, and -- once curl's pid is known -- kill its " +
+            "own curl child, clean up its temp files, and exit 0, so the signal that kills this script also " +
+            "kills curl instead of leaving it orphaned"
+        )
+        XCTAssertTrue(body.contains("\nsignalled=0\ncurl_pid=\ntrap '"),
+                     "Script must initialize signalled/curl_pid right before installing the trap, so an " +
+                     "inherited environment value can't make the trap kill a foreign pid")
+        XCTAssertTrue(body.contains("curl_pid=$!"),
+                     "Script must capture the backgrounded curl's own pid for the trap to kill")
+        XCTAssertTrue(
+            body.contains(#"""
+            curl_pid=$!
+            if [ "$signalled" = 1 ]; then
+                kill "$curl_pid" 2>/dev/null
+                rm -f "$payload_file" "$response_file"
+                exit 0
+            fi
+            wait "$curl_pid"
+            """#),
+            "Script must re-check signalled immediately after curl_pid=$! -- a signal landing between " +
+            "curl's & and the assignment only set the flag (kill had no pid yet), so this re-check is " +
+            "what kills curl and exits 0 instead of orphaning it"
+        )
+        XCTAssertTrue(body.contains(#"wait "$curl_pid""#),
+                     "Script must wait on its backgrounded curl (interruptible by the same trap) before " +
+                     "reading its response file")
+        XCTAssertTrue(body.range(of: #"\"http://127\.0\.0\.1:\$port/approval-request\" > "\$response_file" &"#,
+                                 options: .regularExpression) != nil,
+                     "curl must run BACKGROUNDED (trailing &), writing its response to a temp file, not " +
+                     "foregrounded via response=$(curl ...)")
+    }
+
+    func test_scriptBody_usesSeparateTempFilesForPayloadAndResponse() {
+        let body = ApprovalHookScript.scriptBody
+
+        XCTAssertTrue(body.contains("payload_file=$(mktemp) || exit 0"),
+                     "Script must allocate a temp file for the drained stdin payload, failing safe (exit 0, " +
+                     "no output) if mktemp itself fails")
+        XCTAssertTrue(body.contains(#"response_file=$(mktemp) || { rm -f "$payload_file"; exit 0; }"#),
+                     "Script must allocate a separate temp file for curl's response, cleaning up the " +
+                     "payload file and failing safe if mktemp itself fails")
+        XCTAssertTrue(body.contains(#"rm -f "$payload_file" "$response_file""#),
+                     "Script must clean up both temp files on its normal (non-signal) exit path too")
     }
 
     // MARK: - scriptBody: curl timeout / fail flag / endpoint

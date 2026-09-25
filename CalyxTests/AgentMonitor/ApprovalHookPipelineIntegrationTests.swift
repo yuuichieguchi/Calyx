@@ -725,4 +725,75 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
                        "the script's own case statement ever prints anything), so stdout must be empty, " +
                        "never a fabricated allow/deny/ask body")
     }
+
+    /// R-orphan-curl fix-pin, the actual production repro this fix
+    /// addresses: unlike `test_curlKilledMidPoll_...` above (which kills
+    /// the script's curl CHILD directly, proving the server-side drop
+    /// detection itself works), this test kills the SCRIPT ITSELF
+    /// (`running.pid`, the `/bin/sh` process) with `SIGTERM` -- exactly
+    /// what Claude Code does to a still-running PermissionRequest hook
+    /// process when the user answers the SAME permission prompt directly
+    /// in the CLI instead of waiting on Calyx (Node's `child_process.kill()`
+    /// default signal). Before this fix, `curl` was a child of a
+    /// `response=$(curl ...)` command substitution subshell the SIGTERM
+    /// never reached, so it survived as an orphan (reparented to PID 1,
+    /// empirically confirmed) and kept its long-poll connection open for
+    /// up to its own 585s `-m` deadline -- invisible to
+    /// `dispatchRoute`'s connection-drop sentinel, which only notices a
+    /// CLOSED socket. This test proves both halves of the fix: SIGTERM to
+    /// the script also kills its curl child (no orphan survives), and
+    /// that closed connection is what lets `waitForPendingEmpty` observe
+    /// the pending request clearing well within this test's own 5s
+    /// bound, the same shape as the direct-curl-kill test above.
+    func test_scriptKilledMidPoll_alsoKillsCurlChild_andClearsPendingRequestPromptly() async throws {
+        CockpitSettings.agentHookApprovalEnabled = true
+        server.approvalRequestTimeoutMs = 30_000
+        let surfaceID = UUID()
+        let hookScriptPath = scriptPath!
+        let hookHome = tempHome!
+
+        let running = try Self.runHookScriptCapturingPID(
+            scriptPath: hookScriptPath, home: hookHome, stdinJSON: bashLsStdin, surfaceID: surfaceID
+        )
+
+        let pendingRequest = await waitForPendingRequest()
+        XCTAssertNotNil(pendingRequest,
+                        "the script's real POST must reach the injected approval inbox before the script " +
+                        "itself is killed")
+
+        let curlPID = await Self.findDescendantProcess(ofAncestor: running.pid, commandName: "curl")
+        let observedCurlPID = try XCTUnwrap(curlPID, "must locate the script's own curl child before killing the script")
+
+        XCTAssertEqual(kill(running.pid, SIGTERM), 0, "must be able to SIGTERM the script's own /bin/sh process")
+
+        let clearedPromptly = await waitForPendingEmpty(timeout: 5.0)
+        XCTAssertTrue(clearedPromptly,
+                      "SIGTERM to the script itself must clear the pending request within 5s -- well under " +
+                      "the 30s approvalRequestTimeoutMs above -- by also killing its curl child rather than " +
+                      "leaving it orphaned until curl's own 585s -m deadline")
+
+        // Poll rather than a single immediate check: the trap's `kill` and
+        // the OS actually reaping the process are not the same instant.
+        let curlGone = await Self.waitUntilProcessGone(pid: observedCurlPID, timeout: 3.0)
+        XCTAssertTrue(curlGone,
+                      "the script's own curl child must not survive as an orphan once the script itself is " +
+                      "killed -- the trap must kill it explicitly")
+
+        let (exitCode, stdout) = await running.result.value
+        XCTAssertEqual(exitCode, 0, "the hook script's own trap must still exit 0 on SIGTERM")
+        XCTAssertEqual(stdout, "",
+                       "no decision is ever made in this test, so a killed script must never print anything")
+    }
+
+    /// Polls until `pid` no longer identifies a live process (either
+    /// exited or reaped), used to confirm curl doesn't linger as an
+    /// orphan after the fix kills it.
+    private nonisolated static func waitUntilProcessGone(pid: Int32, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if kill(pid, 0) != 0 { return true }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return kill(pid, 0) != 0
+    }
 }

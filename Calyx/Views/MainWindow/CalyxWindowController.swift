@@ -1393,6 +1393,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             onCloseTabsToTheRight: { [weak self] tabID in
                 self?.closeTabs(relativeTo: tabID, mode: GHOSTTY_ACTION_CLOSE_TAB_MODE_RIGHT)
             },
+            onShowAllTabs: { [weak self] in self?.showMissionMap() },
             onGroupRenamed: { [weak self] in self?.requestSave() },
             onTabRenamed: { [weak self] in self?.requestSave() },
             onToggleSidebar: { [weak self] in self?.toggleSidebar() },
@@ -2255,7 +2256,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func showMissionMap() {
+    /// Opens Mission Map (no-op if already shown). Also the tab context
+    /// menu's "Show All Tabs" entry point, which opens rather than toggles.
+    func showMissionMap() {
         guard !windowSession.showMissionMap else { return }
         dismissCommandPalette()
         dismissComposeOverlay()

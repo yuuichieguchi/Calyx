@@ -25,6 +25,8 @@
 //  - A broadcast event expands into one edge per OTHER bound peer,
 //    excluding the sender and the app peer
 //  - An IPC event older than `ipcEdgeLifetime` is dropped
+//  - A 30s-old IPC event still resolves to an edge under the real
+//    `MissionMapView.ipcEdgeLifetime` (2 minutes)
 //  - focusTarget follows AgentRowFocusTarget.resolve(source:surfaceID:
 //    focusSurfaceID:) -- an explicit focusSurfaceID always wins over the
 //    pane's own surfaceID
@@ -322,6 +324,41 @@ final class MissionMapSnapshotBuilderTests: XCTestCase {
         )
 
         XCTAssertTrue(snapshot.edges.isEmpty, "An IPC event older than ipcEdgeLifetime must be dropped")
+    }
+
+    /// Reproduces the user's own flow: two Claude Code panes, both bound
+    /// to peers, one `send_message` 30 seconds ago -- well past the old
+    /// 6-second `MissionMapView.ipcEdgeLifetime`, but still comfortably
+    /// inside the real one (`MissionMapView.ipcEdgeLifetime`, 120s) a
+    /// human opening the map a few seconds after switching windows would
+    /// actually see. Pins the production constant directly (not a
+    /// test-local literal), so a future lifetime regression fails here
+    /// too, not just in `test_build_expiredIpcEvent_isDropped`'s own
+    /// shorter, test-local window.
+    func test_build_sendMessage30SecondsAgo_stillProducesOneIPCEdge() {
+        let paneA = pane()
+        let paneB = pane()
+        let peerA = UUID()
+        let peerB = UUID()
+        let now = Date()
+        let message = IPCMessageEvent(
+            id: UUID(), from: peerA, to: peerB, content: "hi", sentAt: now.addingTimeInterval(-30),
+            isBroadcast: false
+        )
+
+        let snapshot = MissionMapSnapshotBuilder.build(
+            input: input(
+                panes: [paneA, paneB], ipcEvents: [message],
+                peerToSurface: [peerA: paneA.surfaceID, peerB: paneB.surfaceID],
+                now: now, ipcEdgeLifetime: MissionMapView.ipcEdgeLifetime
+            )
+        )
+
+        let ipcEdges = snapshot.edges.filter {
+            if case .ipc = $0.kind { return true }
+            return false
+        }
+        XCTAssertEqual(ipcEdges.count, 1, "A 30s-old message must still draw its pulse line under the real lifetime")
     }
 
     // MARK: - focusTarget

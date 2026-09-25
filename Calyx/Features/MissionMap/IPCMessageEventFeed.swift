@@ -30,9 +30,17 @@ struct IPCMessageEvent: Identifiable, Sendable, Equatable {
 final class IPCMessageEventFeed {
     static let shared = IPCMessageEventFeed()
 
-    /// Lines fade out within seconds, so a short history covers every
-    /// line that can still be on screen.
-    static let capacity = 64
+    /// Count-bounded, not age-bounded: this feed never prunes by how old
+    /// an event is, only by how many have arrived since. 512 comfortably
+    /// covers `MissionMapView.ipcEdgeLifetime` (2 minutes) worth of
+    /// traffic for the send rates Mission Map actually sees -- IPC
+    /// messages between a handful of agent panes, not a firehose -- so
+    /// every line still on screen is still in here. A workload sending
+    /// messages fast enough to blow through 512 within that window (over
+    /// 4 messages per second sustained for the full 2 minutes) would
+    /// see its oldest, still-live lines evicted early; nothing here
+    /// currently guards against that.
+    static let capacity = 512
 
     private(set) var events: [IPCMessageEvent] = []
 
