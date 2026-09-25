@@ -63,6 +63,7 @@ struct MainContentView: View {
     var onDismissComposeOverlay: (() -> Void)?
     var onComposeOverlayEscapePressed: (() -> Void)?
     let missionMapGitPoller: MissionMapGitPoller
+    let missionMapSelection: MissionMapSelection
     /// This window's panes for Mission Map, in window order.
     let missionMapPanes: () -> [CockpitPaneInfo]
     var onMissionMapFocusSurface: ((UUID) -> Void)?
@@ -70,6 +71,7 @@ struct MainContentView: View {
     var onMissionMapAllow: ((UUID) -> Void)?
     var onMissionMapOpenApproval: ((UUID) -> Void)?
     var onMissionMapKeyCatcherReady: ((NSView) -> Void)?
+    var onMissionMapPopoverPlacementChange: ((MissionMapPopoverPlacementInfo?) -> Void)?
     var totalReviewCommentCount: Int = 0
     var reviewFileCount: Int = 0
 
@@ -348,11 +350,13 @@ extension MainContentView {
             MissionMapView(
                 panes: missionMapPanes,
                 gitPoller: missionMapGitPoller,
+                selection: missionMapSelection,
                 onFocusSurface: onMissionMapFocusSurface,
                 onDismiss: onDismissMissionMap,
                 onAllow: onMissionMapAllow,
                 onOpenApproval: onMissionMapOpenApproval,
-                onKeyCatcherReady: onMissionMapKeyCatcherReady
+                onKeyCatcherReady: onMissionMapKeyCatcherReady,
+                onPopoverPlacementChange: onMissionMapPopoverPlacementChange
             )
         }
     }

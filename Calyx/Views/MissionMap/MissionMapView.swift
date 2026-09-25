@@ -16,11 +16,21 @@ struct MissionMapView: View {
     /// This window's panes, in window order.
     let panes: () -> [CockpitPaneInfo]
     let gitPoller: MissionMapGitPoller
+    /// The selected line. Owned by the window controller, which also
+    /// clears it when the popover (drawn outside this view) is tapped.
+    let selection: MissionMapSelection
     var onFocusSurface: ((UUID) -> Void)?
     var onDismiss: (() -> Void)?
     var onAllow: ((UUID) -> Void)?
     var onOpenApproval: ((UUID) -> Void)?
     var onKeyCatcherReady: ((NSView) -> Void)?
+    /// Where the selected line's popover goes, in this view's `.global`
+    /// coordinates (the window's main hosting view), each time that
+    /// changes -- on selection, scroll, drag, resize and snapshot
+    /// changes; `nil` when the selection is cleared. The
+    /// popover is not drawn in this view: see
+    /// `MissionMapContentView.popoverLayer(mode:)`.
+    var onPopoverPlacementChange: ((MissionMapPopoverPlacementInfo?) -> Void)?
 
     static let cardSize = CGSize(width: 260, height: 150)
     /// Between cards, rows, bands and the map's edge: wide enough for
@@ -41,13 +51,25 @@ struct MissionMapView: View {
     /// starts from the computed layout again.
     @State private var dragOffsets: [UUID: CGSize] = [:]
     @State private var activeDrag: ActiveDrag?
-    @State private var selectedEdgeID: UUID?
+    /// The selected line's popover placement in the scroll content's
+    /// coordinates, as `MissionMapContentView` reports it.
+    @State private var contentPopoverPlacement: MissionMapPopoverPlacementInfo?
+    /// The scroll view's content offset and its frame in `.global`, to
+    /// turn `contentPopoverPlacement` into `.global` coordinates.
+    @State private var scrollOffset: CGPoint = .zero
+    @State private var mapFrame: CGRect = .zero
     /// Bumped when the oldest visible IPC line expires, so the snapshot
     /// is rebuilt and the line leaves (nothing observable changes then).
     @State private var expiryTick = 0
     /// Skips re-routing when a re-render leaves the geometry unchanged.
     @State private var routeCache = MissionMapRouteCache()
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    /// UI TEST ONLY: the fabricated map shown instead of live data when
+    /// launched with `MissionMapFixture.uiTestLaunchArgument` (made once,
+    /// so its ids -- and the selection -- stay stable across renders).
+    /// `nil` in every other launch.
+    @State private var uiTestFixture: MissionMapFixture? =
+        MissionMapFixture.isUITestLaunch ? MissionMapFixture.make(now: Date()) : nil
 
     private struct ActiveDrag: Equatable {
         let cardID: UUID
@@ -62,6 +84,10 @@ struct MissionMapView: View {
                 content(snapshot: snapshot, viewport: proxy.size)
             }
             .scrollIndicators(.automatic)
+            .onScrollGeometryChange(for: CGPoint.self, of: { $0.contentOffset }) { _, offset in
+                scrollOffset = offset
+            }
+            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .global) }) { mapFrame = $0 }
         }
         .modifier(MissionMapChromeModifier(reduceTransparency: reduceTransparency))
         .background {
@@ -72,6 +98,22 @@ struct MissionMapView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.MissionMap.container)
+        .onAppear {
+            // UI TEST ONLY: open with the fixture's a1->a2 line selected,
+            // so its popover shows without a click.
+            if let uiTestFixture {
+                selection.edgeID = uiTestFixture.selectedEdgeID
+            }
+        }
+        // Not `initial`, and nothing on disappear: when the window
+        // controller recreates its main hosting view, the old map
+        // disappearing and the new one starting unmeasured must not hide
+        // a popover that is still selected -- the new map's first measured
+        // placement moves it. Closing the map hides the popover in the
+        // controller (`dismissMissionMap`).
+        .onChange(of: popoverPlacement) { _, placement in
+            onPopoverPlacementChange?(placement)
+        }
         .task(id: nextIPCExpiry(in: snapshot)) {
             guard let expiry = nextIPCExpiry(in: snapshot) else { return }
             do {
@@ -85,9 +127,25 @@ struct MissionMapView: View {
         }
     }
 
+    /// `contentPopoverPlacement` in `.global` coordinates.
+    private var popoverPlacement: MissionMapPopoverPlacementInfo? {
+        contentPopoverPlacement.map { placement in
+            MissionMapPopoverPlacementInfo(
+                edge: placement.edge,
+                rect: MissionMapPopoverPlacement.windowRect(
+                    contentRect: placement.rect, scrollOffset: scrollOffset, mapFrame: mapFrame
+                ),
+                emphasized: placement.emphasized
+            )
+        }
+    }
+
     // MARK: - Snapshot
 
     private func makeSnapshot(now: Date) -> MissionMapSnapshot {
+        if let uiTestFixture {
+            return uiTestFixture.snapshot
+        }
         let registry = AgentRegistry.shared
         let paneList = panes()
         var children: [UUID: [SubagentEntry]] = [:]
@@ -148,10 +206,10 @@ struct MissionMapView: View {
             routes: routes,
             now: Date(),
             bandOrigins: bandOrigins,
-            selectedEdgeID: selectedEdgeID,
+            selectedEdgeID: selection.edgeID,
             animatesEdges: true,
             onBackgroundTap: { point, segments in handleBackgroundTap(at: point, segments: segments) },
-            onPopoverTap: { clearEdgeSelection() },
+            onPopoverPlacementChange: { contentPopoverPlacement = $0 },
             onFocusSurface: onFocusSurface,
             onAllow: onAllow,
             onOpenApproval: onOpenApproval,
@@ -210,17 +268,18 @@ struct MissionMapView: View {
             polylines: segments.map { (id: $0.id, points: $0.points) }
         )
         if let hit {
-            selectedEdgeID = hit
-        } else if selectedEdgeID != nil {
+            selection.edgeID = hit
+        } else if selection.edgeID != nil {
             clearEdgeSelection()
         } else {
             onDismiss?()
         }
     }
 
-    /// Closes the selected line's popover: a tap on empty space while a
-    /// line is selected, or a tap on the popover itself.
+    /// Closes the selected line's popover on a tap on empty space while a
+    /// line is selected. (A tap on the popover itself reaches the window
+    /// controller, which clears `selection` directly.)
     private func clearEdgeSelection() {
-        selectedEdgeID = nil
+        selection.edgeID = nil
     }
 }

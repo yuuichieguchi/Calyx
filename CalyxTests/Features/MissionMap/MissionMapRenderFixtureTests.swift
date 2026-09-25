@@ -34,79 +34,27 @@ final class MissionMapRenderFixtureTests: XCTestCase {
     private var draggedOutputPath: String {
         outputDirectory.appendingPathComponent("mission-map-fixture-dragged.png").path
     }
+    private var popoverOutputPath: String {
+        outputDirectory.appendingPathComponent("mission-map-fixture-popover.png").path
+    }
 
     private let viewport = CGSize(width: 1000, height: 700)
     private let cardSize = CGSize(width: 260, height: 150)
     private let spacing: CGFloat = 40
     private let now = Date(timeIntervalSince1970: 1_700_000_000)
 
-    private func card(
-        groupID: UUID, groupName: String, title: String, state: AgentState = .working,
-        toolLine: String? = nil, children: [MissionMapChildCard] = []
-    ) -> MissionMapCard {
-        let id = UUID()
-        return MissionMapCard(
-            id: id, groupID: groupID, groupName: groupName, tabID: UUID(), kindLabel: "Claude Code",
-            paneTitle: title, cwdLabel: "~/projects/app", state: state, toolLine: toolLine,
-            children: children, unreadCount: 0, approval: nil, git: nil, focusTarget: id
-        )
-    }
-
-    private struct Fixture {
-        let snapshot: MissionMapSnapshot
-        let cards: [String: MissionMapCard]
-    }
-
-    /// Band A: 4 cards (3 per row at width 1000, so a4 wraps to row 2;
-    /// a2 has two subagents and is taller). Band B: 2 cards. Edges: an
-    /// adjacent round trip a1<->a2 (a1->a2 carrying three messages sent
-    /// 0.4 s apart, so its one line shows three pulse dots), a cross-row
-    /// a2->a4, a cross-band a4->b1, and a conflict a1-a3.
-    private func makeFixture() -> Fixture {
-        let groupA = UUID()
-        let groupB = UUID()
-        let groups = [
-            MissionMapGroup(id: groupA, name: "Band A"),
-            MissionMapGroup(id: groupB, name: "Band B"),
-        ]
-        let a1 = card(groupID: groupA, groupName: "Band A", title: "API server", toolLine: "Edit: main.swift")
-        let a2 = card(
-            groupID: groupA, groupName: "Band A", title: "Refactor router",
-            children: [
-                MissionMapChildCard(id: "child-1", agentType: "Explore", state: .working, toolLine: "Grep: route"),
-                MissionMapChildCard(id: "child-2", agentType: "Plan", state: .idle, toolLine: nil),
-            ]
-        )
-        let a3 = card(groupID: groupA, groupName: "Band A", title: "Docs", state: .idle, toolLine: "Edit: main.swift")
-        let a4 = card(groupID: groupA, groupName: "Band A", title: "Test runner", toolLine: "Bash: swift test")
-        let b1 = card(groupID: groupB, groupName: "Band B", title: "Release notes", state: .idle)
-        let b2 = card(groupID: groupB, groupName: "Band B", title: "Shell", state: .idle)
-        let cards = [a1, a2, a3, a4, b1, b2]
-
-        func message(_ content: String, secondsAgo: TimeInterval = 0) -> IPCMessageEvent {
-            IPCMessageEvent(
-                id: UUID(), from: UUID(), to: UUID(), content: content,
-                sentAt: now.addingTimeInterval(-secondsAgo), isBroadcast: false
-            )
-        }
-        let pings = [message("ping 3"), message("ping 2", secondsAgo: 0.4), message("ping 1", secondsAgo: 0.8)]
-        let edges = [
-            MissionMapEdge(id: UUID(), from: a1.id, to: a2.id, kind: .ipc(messages: pings)),
-            MissionMapEdge(id: UUID(), from: a2.id, to: a1.id, kind: .ipc(messages: [message("pong")])),
-            MissionMapEdge(id: UUID(), from: a2.id, to: a4.id, kind: .ipc(messages: [message("cross-row")])),
-            MissionMapEdge(id: UUID(), from: a4.id, to: b1.id, kind: .ipc(messages: [message("cross-band")])),
-            MissionMapEdge(id: UUID(), from: a1.id, to: a3.id, kind: .conflict(file: "main.swift", fullPath: "/projects/app/main.swift")),
-        ]
-        return Fixture(
-            snapshot: MissionMapSnapshot(cards: cards, edges: edges, groups: groups),
-            cards: ["a1": a1, "a2": a2, "a3": a3, "a4": a4, "b1": b1, "b2": b2]
-        )
+    /// The shared fixture (see `MissionMapFixture`), as of `now`.
+    private func makeFixture() -> MissionMapFixture {
+        MissionMapFixture.make(now: now)
     }
 
     /// Lays out, applies `offsets`, routes the way MissionMapView does
     /// (obstacles = card frames + band header obstacles), renders `.flat`
     /// and writes the PNG to `path`.
-    private func render(_ fixture: Fixture, offsets: [UUID: CGSize], to path: String) throws {
+    private func render(
+        _ fixture: MissionMapFixture, offsets: [UUID: CGSize], to path: String,
+        selectedEdgeID: UUID? = nil, popoverOverlayEnabled: Bool = false
+    ) throws {
         let snapshot = fixture.snapshot
         let laidOut = MissionMapLayout.layout(
             cards: snapshot.cards, groups: snapshot.groups, in: viewport, cardSize: cardSize, spacing: spacing
@@ -128,7 +76,8 @@ final class MissionMapRenderFixtureTests: XCTestCase {
 
         let contentView = MissionMapContentView(
             snapshot: snapshot, frames: frames, routes: routes, now: now,
-            bandOrigins: bandOrigins, renderStyle: .flat
+            bandOrigins: bandOrigins, selectedEdgeID: selectedEdgeID,
+            popoverOverlayEnabled: popoverOverlayEnabled, renderStyle: .flat
         )
         .frame(width: viewport.width, height: viewport.height)
 
@@ -170,5 +119,24 @@ final class MissionMapRenderFixtureTests: XCTestCase {
             fixture.cards["b2"]!.id: CGSize(width: 0, height: 30),
         ]
         try render(fixture, offsets: offsets, to: draggedOutputPath)
+    }
+
+    /// Selects the adjacent round-trip edge (a1->a2, the fixture's first
+    /// edge) and enables the popover overlay layer. This is a
+    /// compile/pipeline pin, not a rendering assertion: the base fixture
+    /// already exceeds 10 KB regardless of whether the popover is drawn
+    /// (flat-style glass can render nearly invisibly), so this test only
+    /// confirms the new `selectedEdgeID` / `popoverOverlayEnabled`
+    /// parameters exist and the pipeline still produces a non-trivial
+    /// PNG -- it cannot by itself distinguish "popover drawn" from "not
+    /// drawn".
+    func test_renderFixture_selectedEdgePopover_writesANonTrivialPNG() throws {
+        let fixture = makeFixture()
+        let edgeID = fixture.snapshot.edges[0].id
+
+        try render(
+            fixture, offsets: [:], to: popoverOutputPath,
+            selectedEdgeID: edgeID, popoverOverlayEnabled: true
+        )
     }
 }

@@ -32,6 +32,12 @@ struct MissionMapEdgeSegment: Identifiable {
     }
 
     static let labelGap: CGFloat = 4
+
+    /// Where the line's popover is placed around (see
+    /// `MissionMapPopoverPlacement`): the middle of its longest segment.
+    var popoverAnchor: CGPoint {
+        MissionMapPolyline.labelAnchor(points)
+    }
 }
 
 struct MissionMapCanvasLayer: View {

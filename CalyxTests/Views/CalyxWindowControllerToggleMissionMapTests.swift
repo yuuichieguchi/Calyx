@@ -21,6 +21,7 @@
 
 import XCTest
 import AppKit
+import SwiftUI
 @testable import Calyx
 
 @MainActor
@@ -155,5 +156,48 @@ final class CalyxWindowControllerToggleMissionMapTests: XCTestCase {
         controller.dismissMissionMap(restoresFocus: false)
 
         XCTAssertFalse(controller.windowSession.showMissionMap, "dismissMissionMap must hide Mission Map")
+    }
+}
+
+// MARK: - Mission Map popover host stacking
+
+@MainActor
+final class CalyxWindowControllerMissionMapPopoverStackingTests: XCTestCase {
+
+    /// After the popover is shown and the main hosting view is recreated
+    /// (which adds the new one on top), the popover's view must sit
+    /// directly above the NEW main hosting view in the content view.
+    func test_recreateHostingView_restacksPopoverHostDirectlyAboveNewMainHostingView() throws {
+        let tab = Tab(title: "Shell")
+        let group = TabGroup(name: "Default", tabs: [tab], activeTabID: tab.id)
+        let session = WindowSession(groups: [group], activeGroupID: group.id)
+        let window = CalyxWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        let controller = CalyxWindowController(window: window, windowSession: session, restoring: true)
+        let contentView = try XCTUnwrap(window.contentView)
+        controller.processToggleMissionMap()
+
+        let edge = MissionMapEdge(
+            id: UUID(), from: UUID(), to: UUID(),
+            kind: .conflict(file: "main.swift", fullPath: "/projects/app/main.swift")
+        )
+        controller.missionMapPopoverPlacementChanged(MissionMapPopoverPlacementInfo(
+            edge: edge, rect: CGRect(x: 40, y: 60, width: 320, height: 80), emphasized: false
+        ))
+        let hostView = try XCTUnwrap(controller.missionMapPopoverHost.view)
+        let oldMain = try XCTUnwrap(contentView.subviews.first { $0 is NSHostingView<MainContentView> })
+        XCTAssertTrue(controller.missionMapPopoverHost.isShown, "Precondition: the popover is shown")
+
+        controller.recreateHostingView()
+
+        let subviews = contentView.subviews
+        let newMainIndex = try XCTUnwrap(subviews.firstIndex { $0 is NSHostingView<MainContentView> })
+        XCTAssertFalse(subviews[newMainIndex] === oldMain, "Precondition: the main hosting view was recreated")
+        let hostIndex = try XCTUnwrap(subviews.firstIndex(of: hostView))
+        XCTAssertEqual(hostIndex, newMainIndex + 1, "The popover host must sit directly above the new main hosting view")
     }
 }

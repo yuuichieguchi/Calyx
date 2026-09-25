@@ -137,4 +137,23 @@ final class MissionMapPolylineTests: XCTestCase {
     func test_length_singlePointPath_isZero() {
         XCTAssertEqual(MissionMapPolyline.length([CGPoint(x: 5, y: 5)]), 0, accuracy: 0.01)
     }
+
+    // MARK: - MissionMapEdgeSegment.popoverAnchor
+
+    /// A 4-point U route: (0,0)->(0,100) [length 100], (0,100)->(200,100)
+    /// [length 200, the longest], (200,100)->(200,0) [length 100]. The
+    /// popover anchor mirrors `labelAnchor`: the midpoint of the longest
+    /// segment, (100, 100).
+    func test_popoverAnchor_isTheLabelAnchorOfTheRoute() {
+        let uRoute: [CGPoint] = [
+            CGPoint(x: 0, y: 0), CGPoint(x: 0, y: 100), CGPoint(x: 200, y: 100), CGPoint(x: 200, y: 0),
+        ]
+        let edge = MissionMapEdge(
+            id: UUID(), from: UUID(), to: UUID(), kind: .conflict(file: "main.swift", fullPath: "/a/main.swift")
+        )
+        let segment = MissionMapEdgeSegment(edge: edge, points: uRoute)
+
+        XCTAssertEqual(segment.popoverAnchor.x, 100, accuracy: 0.01)
+        XCTAssertEqual(segment.popoverAnchor.y, 100, accuracy: 0.01)
+    }
 }

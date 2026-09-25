@@ -51,6 +51,7 @@ enum AccessibilityID {
     enum MissionMap {
         static let container = "calyx.missionMap"
         static let edgeCanvas = "calyx.missionMap.edgeCanvas"
+        static let popover = "calyx.missionMap.popover"
         static func card(_ id: UUID) -> String { "calyx.missionMap.card.\(id.uuidString)" }
         static func allowButton(_ id: UUID) -> String { "calyx.missionMap.allowButton.\(id.uuidString)" }
         static func openButton(_ id: UUID) -> String { "calyx.missionMap.openButton.\(id.uuidString)" }
