@@ -3,11 +3,15 @@
 //  Calyx
 //
 //  The HTTP primitive under every MCP host HTTP transport and the OAuth
-//  flow's own fetches. Applies three rules to every request, whether the
+//  flow's own fetches. Applies these rules to every request, whether the
 //  body is collected (`send`) or streamed (`stream`):
 //    - A 3xx response is an error and its target is never fetched, so an
 //      `Authorization` header cannot follow a redirect to another origin.
-//    - A response body larger than `maxBodyBytes` is an error.
+//    - A response body larger than `maxBodyBytes` is an error, except a
+//      2xx `text/event-stream` body read through `stream`. Such a body
+//      lives for the whole SSE connection, so it is unbounded as a whole
+//      and instead bounded per event by `SSEEventParser`. A collected
+//      (`send`) body is always capped.
 //    - Plain `http://` is refused unless the host is a loopback address.
 //
 
@@ -28,13 +32,18 @@ actor MCPHTTPSession {
         case insecureSchemeRefused(url: URL)
     }
 
+    /// The default cap on a collected (`send`) body and on a streamed body
+    /// that is not a 2xx `text/event-stream`. A 2xx `text/event-stream`
+    /// body read through `stream` is not capped as a whole; `SSEEventParser`
+    /// bounds each of its events by the same number of bytes.
     static let defaultMaxBodyBytes: Int = 64 * 1024 * 1024
 
     /// Hosts that may be reached over plain `http://`.
     private static let loopbackHosts: Set<String> = ["127.0.0.1", "localhost", "::1"]
 
     private let urlSession: URLSession
-    private let maxBodyBytes: Int
+    /// The body cap in bytes; see `defaultMaxBodyBytes` for what it applies to.
+    nonisolated let maxBodyBytes: Int
 
     // MARK: - Init
 
@@ -48,9 +57,10 @@ actor MCPHTTPSession {
 
     // MARK: - Requests
 
-    /// Sends `request` and collects the whole response body.
+    /// Sends `request` and collects the whole response body. The body is
+    /// capped at `maxBodyBytes` whatever its content type.
     func send(_ request: URLRequest) async throws -> Response {
-        let (head, body) = try await stream(request)
+        let (head, body) = try await stream(request, exemptsEventStreams: false)
         var collected = Data()
         for try await chunk in body {
             collected.append(chunk)
@@ -61,13 +71,29 @@ actor MCPHTTPSession {
     /// Sends `request` and returns once the response head arrives. `head.body`
     /// is empty; the body arrives on `body`, one element per chunk received.
     /// `body` is single-consumer. Ending its iteration early cancels the
-    /// underlying task.
+    /// underlying task. A 2xx `text/event-stream` body is not capped as a
+    /// whole; any other body is capped at `maxBodyBytes`.
     func stream(_ request: URLRequest) async throws -> (head: Response, body: AsyncThrowingStream<Data, Error>) {
+        try await stream(request, exemptsEventStreams: true)
+    }
+
+    // MARK: - Private
+
+    /// `exemptsEventStreams` lifts the body cap for a 2xx
+    /// `text/event-stream` response.
+    private func stream(
+        _ request: URLRequest,
+        exemptsEventStreams: Bool
+    ) async throws -> (head: Response, body: AsyncThrowingStream<Data, Error>) {
         guard let url = request.url else { throw URLError(.badURL) }
         try Self.requireAllowedScheme(url)
 
         let (body, bodyContinuation) = AsyncThrowingStream<Data, Error>.makeStream()
-        let delegate = MCPHTTPTaskDelegate(maxBodyBytes: maxBodyBytes, body: bodyContinuation)
+        let delegate = MCPHTTPTaskDelegate(
+            maxBodyBytes: maxBodyBytes,
+            exemptsEventStreams: exemptsEventStreams,
+            body: bodyContinuation
+        )
         let task = urlSession.dataTask(with: request)
         task.delegate = delegate
         bodyContinuation.onTermination = { _ in task.cancel() }
@@ -83,8 +109,6 @@ actor MCPHTTPSession {
         return (head, body)
     }
 
-    // MARK: - Private
-
     private static func requireAllowedScheme(_ url: URL) throws {
         guard url.scheme?.lowercased() == "http" else { return }
         guard let host = url.host(percentEncoded: false)?.lowercased(), loopbackHosts.contains(host) else {
@@ -93,22 +117,53 @@ actor MCPHTTPSession {
     }
 }
 
-/// Per-task delegate for one `MCPHTTPSession.stream(_:)` call. Resumes the
-/// head continuation exactly once and forwards body chunks to the body
-/// continuation, enforcing the size cap across chunks.
+extension MCPHTTPSession.Response {
+
+    /// The value of the header `name`, matched case-insensitively.
+    func headerValue(_ name: String) -> String? {
+        Self.headerValue(name, in: headers)
+    }
+
+    var isEventStream: Bool {
+        Self.isEventStream(headers: headers)
+    }
+
+    /// The value of the header `name` in `headers`, matched case-insensitively.
+    static func headerValue(_ name: String, in headers: [String: String]) -> String? {
+        headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+    }
+
+    /// True when `headers` has a `Content-Type` of `text/event-stream`,
+    /// with any parameters and in any case.
+    static func isEventStream(headers: [String: String]) -> Bool {
+        headerValue("Content-Type", in: headers)?.lowercased().hasPrefix("text/event-stream") == true
+    }
+}
+
+/// Per-task delegate for one `MCPHTTPSession` request. Resumes the head
+/// continuation exactly once and forwards body chunks to the body
+/// continuation, enforcing the size cap across chunks unless the response
+/// is an exempt event stream.
 private final class MCPHTTPTaskDelegate: NSObject, URLSessionDataDelegate, Sendable {
 
     private struct State: Sendable {
         var head: CheckedContinuation<MCPHTTPSession.Response, Error>?
         var receivedBytes = 0
+        /// Set when the response is a 2xx `text/event-stream` and
+        /// `exemptsEventStreams` is true; its body is then not capped.
+        var isExemptFromCap = false
     }
 
     private let maxBodyBytes: Int
+    private let exemptsEventStreams: Bool
     private let body: AsyncThrowingStream<Data, Error>.Continuation
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    init(maxBodyBytes: Int, body: AsyncThrowingStream<Data, Error>.Continuation) {
+    /// `exemptsEventStreams` lifts the body cap for a 2xx
+    /// `text/event-stream` response.
+    init(maxBodyBytes: Int, exemptsEventStreams: Bool, body: AsyncThrowingStream<Data, Error>.Continuation) {
         self.maxBodyBytes = maxBodyBytes
+        self.exemptsEventStreams = exemptsEventStreams
         self.body = body
     }
 
@@ -171,6 +226,11 @@ private final class MCPHTTPTaskDelegate: NSObject, URLSessionDataDelegate, Senda
             guard let name = key as? String, let text = value as? String else { continue }
             headers[name] = text
         }
+        if exemptsEventStreams,
+           (200..<300).contains(http.statusCode),
+           MCPHTTPSession.Response.isEventStream(headers: headers) {
+            state.withLock { $0.isExemptFromCap = true }
+        }
         takeHead()?.resume(returning: MCPHTTPSession.Response(statusCode: http.statusCode, headers: headers, body: Data()))
         completionHandler(.allow)
     }
@@ -178,6 +238,7 @@ private final class MCPHTTPTaskDelegate: NSObject, URLSessionDataDelegate, Senda
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         let limit = maxBodyBytes
         let withinLimit = state.withLock { state in
+            if state.isExemptFromCap { return true }
             state.receivedBytes += data.count
             return state.receivedBytes <= limit
         }

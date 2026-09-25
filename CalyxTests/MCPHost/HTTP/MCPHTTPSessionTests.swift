@@ -194,10 +194,14 @@ final class MCPHTTPSessionTests: XCTestCase {
 
     func test_stream_bodyExceedingCap_throwsBodyTooLarge() async throws {
         // Two chunks whose combined size crosses the cap; the cap applies
-        // to the streamed total, not to any single chunk.
+        // to the streamed total, not to any single chunk. Content-Type is
+        // forced to non-SSE so this asserts the cap applies to a plain
+        // streamed (non-event-stream) body.
         let chunkA = Data(repeating: 0x61, count: 60)
         let chunkB = Data(repeating: 0x62, count: 60)
-        recorder.enqueue { _ in .sse(status: 200, chunks: [chunkA, chunkB], thenClose: true) }
+        recorder.enqueue { _ in
+            .sse(status: 200, headers: ["Content-Type": "application/json"], chunks: [chunkA, chunkB], thenClose: true)
+        }
         let session = MCPHTTPSession(urlSession: urlSession, maxBodyBytes: 100)
 
         let (_, body) = try await session.stream(URLRequest(url: URL(string: "https://mcp.example.com/mcp")!))
@@ -210,14 +214,98 @@ final class MCPHTTPSessionTests: XCTestCase {
     }
 
     func test_stream_bodyAtExactlyCap_succeeds() async throws {
+        // Non-SSE content type: a streamed body right at the cap succeeds,
+        // and above it fails (previous test) -- the boundary check applies
+        // to any capped (non-event-stream) body.
         let chunk = Data(repeating: 0x61, count: 100)
-        recorder.enqueue { _ in .sse(status: 200, chunks: [chunk], thenClose: true) }
+        recorder.enqueue { _ in
+            .sse(status: 200, headers: ["Content-Type": "application/json"], chunks: [chunk], thenClose: true)
+        }
         let session = MCPHTTPSession(urlSession: urlSession, maxBodyBytes: 100)
 
         let (_, body) = try await session.stream(URLRequest(url: URL(string: "https://mcp.example.com/mcp")!))
         var total = 0
         for try await piece in body { total += piece.count }
         XCTAssertEqual(total, 100)
+    }
+
+    // MARK: - SSE responses are exempt from the total-body cap
+
+    func test_stream_2xxEventStreamBodyExceedingCap_isDeliveredInFull() async throws {
+        let chunkA = Data(repeating: 0x61, count: 60)
+        let chunkB = Data(repeating: 0x62, count: 60)
+        recorder.enqueue { _ in .sse(status: 200, chunks: [chunkA, chunkB], thenClose: true) }
+        let session = MCPHTTPSession(urlSession: urlSession, maxBodyBytes: 100)
+
+        let (head, body) = try await session.stream(URLRequest(url: URL(string: "https://mcp.example.com/mcp")!))
+        XCTAssertEqual(head.statusCode, 200)
+        var total = 0
+        for try await piece in body { total += piece.count }
+        XCTAssertEqual(total, 120, "a 2xx text/event-stream response must be exempt from the total-body cap")
+    }
+
+    func test_stream_2xxEventStreamWithCharsetParameter_isExempt() async throws {
+        let chunkA = Data(repeating: 0x61, count: 60)
+        let chunkB = Data(repeating: 0x62, count: 60)
+        recorder.enqueue { _ in
+            .sse(status: 200, headers: ["Content-Type": "text/event-stream; charset=utf-8"], chunks: [chunkA, chunkB], thenClose: true)
+        }
+        let session = MCPHTTPSession(urlSession: urlSession, maxBodyBytes: 100)
+
+        let (_, body) = try await session.stream(URLRequest(url: URL(string: "https://mcp.example.com/mcp")!))
+        var total = 0
+        for try await piece in body { total += piece.count }
+        XCTAssertEqual(total, 120, "; charset=... must not defeat the text/event-stream match")
+    }
+
+    func test_stream_2xxEventStreamMixedCase_isExempt() async throws {
+        let chunkA = Data(repeating: 0x61, count: 60)
+        let chunkB = Data(repeating: 0x62, count: 60)
+        recorder.enqueue { _ in
+            .sse(status: 200, headers: ["Content-Type": "Text/Event-Stream"], chunks: [chunkA, chunkB], thenClose: true)
+        }
+        let session = MCPHTTPSession(urlSession: urlSession, maxBodyBytes: 100)
+
+        let (_, body) = try await session.stream(URLRequest(url: URL(string: "https://mcp.example.com/mcp")!))
+        var total = 0
+        for try await piece in body { total += piece.count }
+        XCTAssertEqual(total, 120, "the Content-Type match must be case-insensitive")
+    }
+
+    func test_stream_non2xxEventStreamBodyExceedingCap_throwsBodyTooLarge() async throws {
+        let chunkA = Data(repeating: 0x61, count: 60)
+        let chunkB = Data(repeating: 0x62, count: 60)
+        recorder.enqueue { _ in .sse(status: 500, chunks: [chunkA, chunkB], thenClose: true) }
+        let session = MCPHTTPSession(urlSession: urlSession, maxBodyBytes: 100)
+
+        let (_, body) = try await session.stream(URLRequest(url: URL(string: "https://mcp.example.com/mcp")!))
+        do {
+            for try await _ in body {}
+            XCTFail("expected bodyTooLarge")
+        } catch let error as MCPHTTPSession.MCPHTTPSessionError {
+            XCTAssertEqual(error, .bodyTooLarge(limit: 100), "a non-2xx response, even with an event-stream Content-Type, must stay capped")
+        }
+    }
+
+    func test_send_2xxEventStreamBodyExceedingCap_throwsBodyTooLarge() async throws {
+        let chunkA = Data(repeating: 0x61, count: 60)
+        let chunkB = Data(repeating: 0x62, count: 60)
+        recorder.enqueue { _ in .sse(status: 200, chunks: [chunkA, chunkB], thenClose: true) }
+        let session = MCPHTTPSession(urlSession: urlSession, maxBodyBytes: 100)
+
+        do {
+            _ = try await session.send(URLRequest(url: URL(string: "https://mcp.example.com/mcp")!))
+            XCTFail("expected bodyTooLarge")
+        } catch let error as MCPHTTPSession.MCPHTTPSessionError {
+            XCTAssertEqual(error, .bodyTooLarge(limit: 100), "send() collects the whole body, so it is never exempt even for an event-stream response")
+        }
+    }
+
+    // MARK: - maxBodyBytes is readable
+
+    func test_maxBodyBytes_isReadable() {
+        let session = MCPHTTPSession(urlSession: urlSession, maxBodyBytes: 100)
+        XCTAssertEqual(session.maxBodyBytes, 100)
     }
 
     func test_stream_chunksDeliveredIncrementally_inOrder() async throws {

@@ -71,17 +71,20 @@ final class StreamableHTTPMCPTransportModernTests: XCTestCase {
         return try! JSONSerialization.data(withJSONObject: object)
     }
 
-    private func session() -> MCPHTTPSession { MCPHTTPSession(urlSession: urlSession) }
+    private func session(maxBodyBytes: Int = MCPHTTPSession.defaultMaxBodyBytes) -> MCPHTTPSession {
+        MCPHTTPSession(urlSession: urlSession, maxBodyBytes: maxBodyBytes)
+    }
 
     private func transport(
         headerProvider: (@Sendable () async throws -> String)? = nil,
         on401: (@Sendable () async throws -> Void)? = nil,
         on403InsufficientScope: (@Sendable (String?) async throws -> Void)? = nil,
-        clock: any MCPClock = SystemMCPClock()
+        clock: any MCPClock = SystemMCPClock(),
+        maxBodyBytes: Int = MCPHTTPSession.defaultMaxBodyBytes
     ) -> StreamableHTTPMCPTransport {
         StreamableHTTPMCPTransport(
             endpoint: endpoint,
-            session: session(),
+            session: session(maxBodyBytes: maxBodyBytes),
             protocolVersion: .v2026_07_28,
             headerProvider: headerProvider,
             on401: on401,
@@ -263,6 +266,50 @@ final class StreamableHTTPMCPTransportModernTests: XCTestCase {
         let second = await iterator.next()
         guard case .frame(let secondData) = second else { return XCTFail("expected final frame") }
         XCTAssertEqual(secondData, final)
+    }
+
+    // MARK: - SSE responses are exempt from the session's total-body cap
+
+    func test_send_sseResponse_totalBytesExceedingSessionCap_deliversAllFrames() async throws {
+        // 6 events of ~100 bytes each (600 bytes total), well over the
+        // 512-byte session cap, in one SSE response.
+        let payloads = (0..<6).map { index in
+            Data(#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":\#(index),"pad":""#.utf8)
+                + Data(repeating: 0x61, count: 60) + Data(#""}}"#.utf8)
+        }
+        recorder.enqueue { _ in
+            .sse(status: 200, chunks: payloads.map { Data("data: \(String(data: $0, encoding: .utf8)!)\n\n".utf8) }, thenClose: true)
+        }
+        let transport = transport(maxBodyBytes: 512)
+
+        var iterator = transport.inbound.makeAsyncIterator()
+        try await transport.send(toolCallBody(), kind: .request())
+
+        for (index, payload) in payloads.enumerated() {
+            let inbound = await iterator.next()
+            guard case .frame(let data) = inbound else {
+                return XCTFail("expected .frame #\(index), got \(String(describing: inbound))")
+            }
+            XCTAssertEqual(data, payload)
+        }
+    }
+
+    func test_send_sseResponse_singleEventExceedingSessionCap_deliversErrorSignal() async throws {
+        let oversizedData = String(repeating: "a", count: 600)
+        recorder.enqueue { _ in
+            .sse(status: 200, chunks: [Data("data: \(oversizedData)\n\n".utf8)], thenClose: true)
+        }
+        let transport = transport(maxBodyBytes: 512)
+
+        var iterator = transport.inbound.makeAsyncIterator()
+        try await transport.send(toolCallBody(), kind: .request())
+
+        let inbound = await iterator.next()
+        guard case .error(let signal) = inbound else {
+            return XCTFail("expected .error, got \(String(describing: inbound))")
+        }
+        XCTAssertNil(signal.httpStatus)
+        XCTAssertTrue(signal.message.contains("response stream failed"), "message was: \(signal.message)")
     }
 
     // MARK: - cancel() closes the in-flight stream without sending a notification

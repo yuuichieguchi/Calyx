@@ -6,6 +6,13 @@
 //  shared by the legacy HTTP+SSE transport and Streamable HTTP's SSE
 //  responses. Incremental: `feed` accepts chunks split at any byte.
 //
+//  `maxEventBytes` bounds the bytes retained for the event in progress:
+//  the unterminated line plus the `data`, `event`, and `id` values stored
+//  since the last dispatch. Comment lines and unknown fields release their
+//  bytes once complete; a blank line releases everything. Crossing the
+//  bound throws `ParseError.eventTooLarge`, after which every `feed`
+//  throws the same error.
+//
 
 import Foundation
 
@@ -22,6 +29,11 @@ struct SSEEvent: Sendable, Equatable {
 }
 
 struct SSEEventParser: Sendable {
+
+    enum ParseError: Error, Equatable {
+        /// The event in progress retained more than `limit` bytes.
+        case eventTooLarge(limit: Int)
+    }
 
     private static let lineFeed: UInt8 = 0x0A
     private static let carriageReturn: UInt8 = 0x0D
@@ -41,10 +53,25 @@ struct SSEEventParser: Sendable {
     private var retryMs: Int?
     private var lastEventID: String?
 
-    init() {}
+    private let maxEventBytes: Int
+    /// UTF-8 bytes of the `data`, `event`, and `id` values stored since
+    /// the last dispatch.
+    private var retainedFieldBytes = 0
+    /// UTF-8 bytes of the `id` value stored since the last dispatch, so a
+    /// repeated `id:` line replaces rather than adds to its count.
+    private var idBytesSinceDispatch = 0
+    /// Set once `eventTooLarge` is thrown; every later `feed` rethrows it.
+    private var failure: ParseError?
+
+    init(maxEventBytes: Int) {
+        self.maxEventBytes = maxEventBytes
+    }
 
     /// Consumes `chunk` and returns the events it completes, in order.
-    mutating func feed(_ chunk: Data) -> [SSEEvent] {
+    /// Throws `ParseError.eventTooLarge` when the event in progress
+    /// retains more than `maxEventBytes` bytes.
+    mutating func feed(_ chunk: Data) throws -> [SSEEvent] {
+        if let failure { throw failure }
         var events: [SSEEvent] = []
         for byte in chunk {
             if lastByteWasCarriageReturn {
@@ -59,6 +86,11 @@ struct SSEEventParser: Sendable {
                 if let event = completeLine() { events.append(event) }
             default:
                 lineBuffer.append(byte)
+            }
+            if lineBuffer.count + retainedFieldBytes > maxEventBytes {
+                let error = ParseError.eventTooLarge(limit: maxEventBytes)
+                failure = error
+                throw error
             }
         }
         return events
@@ -98,13 +130,17 @@ struct SSEEventParser: Sendable {
     private mutating func process(field: Substring, value: String) {
         switch field {
         case "event":
+            retainedFieldBytes += value.utf8.count - (eventType?.utf8.count ?? 0)
             eventType = value
         case "data":
+            retainedFieldBytes += value.utf8.count
             dataLines = (dataLines ?? []) + [value]
         case "id":
             // An id containing NULL is ignored. An empty id clears the
             // last event ID.
             guard !value.contains("\u{0}") else { return }
+            retainedFieldBytes += value.utf8.count - idBytesSinceDispatch
+            idBytesSinceDispatch = value.utf8.count
             lastEventID = value.isEmpty ? nil : value
         case "retry":
             guard !value.isEmpty, value.allSatisfy({ $0.isASCII && $0.isNumber }), let milliseconds = Int(value) else {
@@ -117,12 +153,14 @@ struct SSEEventParser: Sendable {
     }
 
     /// Dispatches the accumulated event, if any, and resets the per-event
-    /// fields. The last event ID is kept.
+    /// fields and the retained byte count. The last event ID is kept.
     private mutating func dispatch() -> SSEEvent? {
         defer {
             eventType = nil
             dataLines = nil
             retryMs = nil
+            retainedFieldBytes = 0
+            idBytesSinceDispatch = 0
         }
         guard eventType != nil || dataLines != nil || retryMs != nil else { return nil }
         return SSEEvent(
