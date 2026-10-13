@@ -17,8 +17,14 @@
 // the endpoint file and edit `~/.claude/settings.json`. Nothing here
 // helps against it.
 //
-// The proof is HMAC-SHA256 over a nonce the client chose for this one
-// poll and the note. The nonce binds a proof to one poll, so a proof
+// The proof is HMAC-SHA256 (`proof(over:)`) over a message that binds a
+// nonce the client chose for this one poll. Two domains share the key:
+// - wake (`POST /ipc-wake`): `<nonce>\n<note>` (`proof(nonce:note:)`)
+// - approval (`POST /approval-request`): `approval\n<nonce>\n<body>`
+//   (`ApprovalHookResponse.message(nonce:body:)`)
+// A wake message starts with an uppercase UUID and an approval message
+// with `approval\n`, so a proof from one domain never verifies in the
+// other. The nonce binds a proof to one poll, so a proof
 // cannot be replayed as the answer to another. The key is fresh on
 // every server start, so a proof obtained from a later server instance
 // does not verify against the blocks an earlier poll read.
@@ -52,8 +58,14 @@ struct IPCWakeProofKey: Sendable, Equatable {
     /// HMAC-SHA256 under `bytes` over the UTF-8 bytes of
     /// `nonce + "\n" + note`, as 64 lowercase hex digits.
     func proof(nonce: String, note: String) -> String {
-        let message = Data((nonce + "\n" + note).utf8)
-        return Self.hex(HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: bytes)))
+        proof(over: Data((nonce + "\n" + note).utf8))
+    }
+
+    /// HMAC-SHA256 under `bytes` over `message`, as 64 lowercase hex
+    /// digits. Callers build the domain-specific message (see the file
+    /// header).
+    func proof(over message: Data) -> String {
+        Self.hex(HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: bytes)))
     }
 
     /// HMAC's inner block, as 128 lowercase hex digits: the key, or its

@@ -44,6 +44,12 @@
 //  the server's own approval-request timeout, and the script must still
 //  exit 0.
 //
+//  Spec C.4 additions (slice 2): a fake responder on the endpoint port
+//  answering an unsigned allow prints nothing (claude-code and grok); an
+//  endpoint file with another key's blocks prints nothing while the
+//  server still consumes the decision; a correctly signed answer over the
+//  cap prints nothing (curl's --max-filesize).
+//
 
 import XCTest
 import Darwin
@@ -143,16 +149,19 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
     /// matching a plain (non-Calyx) terminal invocation. `kindArgument`,
     /// when non-nil, is passed as the script's `$1` (e.g. `"codex"`) --
     /// nil matches Claude Code's own installed hook entry, which invokes
-    /// the script with no arguments at all.
+    /// the script with no arguments at all. `pathPrefix`, when non-nil, is
+    /// put ahead of the inherited PATH (a fixed-nonce fake `uuidgen`).
     @discardableResult
     private nonisolated static func runHookScript(
         scriptPath: String,
         home: String,
         stdinJSON: String,
         surfaceID: UUID?,
-        kindArgument: String? = nil
+        kindArgument: String? = nil,
+        pathPrefix: String? = nil
     ) async throws -> (exitCode: Int32, stdout: String) {
-        let inheritedPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin"
+        let systemPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/local/bin"
+        let inheritedPath = pathPrefix.map { "\($0):\(systemPath)" } ?? systemPath
 
         var arguments = [scriptPath]
         if let kindArgument {
@@ -679,5 +688,89 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(exitCode, 0, "the hook script's own trap must still exit 0 on SIGTERM")
         XCTAssertEqual(stdout, "",
                        "no decision is ever made in this test, so a killed script must never print anything")
+    }
+
+    // MARK: - Unverifiable answers (spec C.1 item 3, C.4)
+
+    /// A process holding the endpoint port answers with an unsigned allow:
+    /// the script prints nothing, for claude-code (no argument) and grok.
+    /// The file keeps this server's token and key blocks; only the port
+    /// points at the fake responder.
+    func test_squatterAnsweringUnsignedAllow_printsNothing() async throws {
+        let blocks = try XCTUnwrap(IPCWakeTestCrypto.readEndpointBlocks(directory: appSupportDir))
+        let allow = Data(#"{"hookSpecificOutput":{"decision":{"behavior":"allow"}}}"#.utf8)
+        for kind in [String?.none, "grok"] {
+            let responder = try LoopbackOneShotResponder(body: allow)
+            responder.serveOnce()
+            try writeEndpointFile(port: responder.port, inner: blocks.inner, outer: blocks.outer)
+
+            let (exitCode, stdout) = try await Self.runHookScript(
+                scriptPath: scriptPath, home: tempHome, stdinJSON: bashLsStdin, surfaceID: UUID(), kindArgument: kind
+            )
+            let served = await responder.waitUntilServed(timeout: 10)
+
+            XCTAssertTrue(served, "[\(kind ?? "claude-code")] precondition: the script's curl reached the responder")
+            XCTAssertEqual(exitCode, 0)
+            XCTAssertEqual(stdout, "", "[\(kind ?? "claude-code")] an unsigned allow is never printed")
+        }
+    }
+
+    /// The endpoint file names this server's port and token but another
+    /// key's blocks (a stale or forged file): the server signs the user's
+    /// allow with its own key, the script cannot verify it and prints
+    /// nothing, and the request was still answered (the decision was
+    /// consumed on the server side).
+    func test_endpointFileWithAnotherKeysBlocks_printsNothing_requestStillAnswered() async throws {
+        CockpitSettings.agentHookApprovalEnabled = true
+        let other = IPCWakeTestCrypto.blocksHex(keyBytes: IPCWakeTestCrypto.randomKeyBytes())
+        try writeEndpointFile(port: server.port, inner: other.inner, outer: other.outer)
+        let hookScriptPath = scriptPath!
+        let hookHome = tempHome!
+
+        async let hookResult = Self.runHookScript(
+            scriptPath: hookScriptPath, home: hookHome, stdinJSON: bashLsStdin, surfaceID: UUID()
+        )
+
+        let pendingRequest = await waitForPendingRequest()
+        let request = try XCTUnwrap(pendingRequest, "the request reaches the real server")
+        approvalInbox.decide(id: request.id, .allowed)
+        let (exitCode, stdout) = try await hookResult
+
+        XCTAssertEqual(exitCode, 0)
+        XCTAssertEqual(stdout, "", "a proof under the server's key does not verify against another key's blocks")
+        XCTAssertTrue(approvalInbox.pending.isEmpty, "the user's allow was consumed: the request is answered")
+    }
+
+    /// A correctly signed answer over the cap (1.2 MB body): curl stops at
+    /// `--max-filesize 1048641` and the script prints nothing.
+    func test_signedAnswerOverTheCap_printsNothing() async throws {
+        let blocks = try XCTUnwrap(IPCWakeTestCrypto.readEndpointBlocks(directory: appSupportDir))
+        let nonceFile = tempHome + "/fixed-nonce-bin"
+        let nonce = "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112"
+        try makeFakeUuidgen(atDirectory: nonceFile, stdout: nonce + "\n")
+        let body = Data(repeating: UInt8(ascii: "x"), count: 1_200 * 1_024)
+        let message = Data(("approval\n" + nonce + "\n").utf8) + body
+        let proof = IPCWakeTestCrypto.hmacHex(keyBytes: server.wakeProofKey.bytes, message: message)
+        let responder = try LoopbackOneShotResponder(body: Data((proof + "\n").utf8) + body)
+        responder.serveOnce()
+        try writeEndpointFile(port: responder.port, inner: blocks.inner, outer: blocks.outer)
+
+        let (exitCode, stdout) = try await Self.runHookScript(
+            scriptPath: scriptPath, home: tempHome, stdinJSON: bashLsStdin, surfaceID: UUID(),
+            pathPrefix: nonceFile
+        )
+        let served = await responder.waitUntilServed(timeout: 10)
+
+        XCTAssertTrue(served, "precondition: the script's curl reached the responder")
+        XCTAssertEqual(exitCode, 0)
+        XCTAssertEqual(stdout, "", "an answer over 65 + 4 * 262144 bytes is never printed, even correctly signed")
+    }
+
+    /// Rewrites agent-endpoint.json by hand with `port`, this suite's token
+    /// and the given blocks.
+    private func writeEndpointFile(port: Int, inner: String, outer: String) throws {
+        let dict: [String: Any] = ["port": port, "token": testToken, "wakeProofInner": inner, "wakeProofOuter": outer]
+        let data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
+        try data.write(to: URL(fileURLWithPath: appSupportDir + "/agent-endpoint.json"))
     }
 }

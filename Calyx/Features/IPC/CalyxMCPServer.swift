@@ -102,7 +102,7 @@ final class CalyxMCPServer {
     /// both `routeCommandEvent` and `routeApprovalRequest` -- one 256 KiB
     /// ceiling for every event-ingestion route on this server, rather
     /// than two independently-maintained copies of the same literal.
-    private static let maxEventBodyBytes = 262_144
+    nonisolated static let maxEventBodyBytes = 262_144
 
     // MARK: - Init
 
@@ -576,7 +576,7 @@ final class CalyxMCPServer {
     /// 1 MiB) or never trigger (set at or above it) -- there is no useful
     /// value to pick.
     private func routeAgentEvent(request: HTTPRequest) async -> HTTPResponse {
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
@@ -702,7 +702,7 @@ final class CalyxMCPServer {
     /// live regardless; the shell-integration env injection is the only
     /// gate on whether events ever arrive here at all.
     private func routeCommandEvent(request: HTTPRequest) async -> HTTPResponse {
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
@@ -750,7 +750,22 @@ final class CalyxMCPServer {
     /// Handles `POST /approval-request`, the long-poll endpoint the
     /// `calyx-approval-hook` script blocks on from a CLI agent's
     /// PermissionRequest hook while a human decides whether to allow its
-    /// next tool call. Contract, in order: bearer auth (401) -> body
+    /// next tool call.
+    ///
+    /// Signing (J7/J8): an `X-Calyx-Approval-Nonce`
+    /// (`ApprovalHookResponse.nonceHeader`) that is not an uppercase
+    /// canonical UUID is answered 400 right after the bearer check,
+    /// before the body is read. With a valid nonce every 200 below leaves
+    /// through one exit as `text/plain; charset=utf-8`
+    /// `ApprovalHookResponse.signedBody`, a decision larger than
+    /// `ApprovalHookResponse.maxBodyBytes` becoming a signed empty body;
+    /// and when this start's key was never published
+    /// (`wakeProofKeyPublished == false`) the request is answered signed
+    /// empty right after the sole-authority check, before the setting and
+    /// the allow short-circuits, without entering the inbox. Without the
+    /// header every answer is unchanged (`application/json`).
+    ///
+    /// Contract, in order: bearer auth (401) -> nonce shape (400) -> body
     /// present (400) -> body.count <= maxEventBodyBytes, checked BEFORE
     /// decode (413, mirrors `routeCommandEvent`) -> `X-Calyx-Agent-Kind`
     /// read (no failure path, so reading it before decode does not
@@ -869,15 +884,60 @@ final class CalyxMCPServer {
     ///     process, driven entirely by whatever it read from its own
     ///     hook's stdout.
     private func routeApprovalRequest(request: HTTPRequest) async -> HTTPResponse {
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
-        guard let body = request.body else {
+        // J7: a malformed nonce is rejected before the body is looked at.
+        let nonce = header(named: ApprovalHookResponse.nonceHeader, in: request.headers)
+        if let nonce, !Self.isCanonicalNonce(nonce) {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
+
+        let outcome = await approvalOutcome(request: request, signed: nonce != nil)
+
+        // The single 200 exit (J8): with a nonce every 200 is signed.
+        let decisionBody: Data?
+        switch outcome {
+        case .status(let statusCode) where statusCode != 200:
+            return HTTPParser.response(statusCode: statusCode, body: nil)
+        case .status:
+            decisionBody = nil
+        case .decision(let body):
+            decisionBody = body
+        }
+        guard let nonce else {
+            return HTTPParser.response(statusCode: 200, body: decisionBody)
+        }
+        var body = decisionBody ?? Data()
+        if body.count > ApprovalHookResponse.maxBodyBytes {
+            NSLog("[CalyxMCPServer] approval decision body of \(body.count) bytes exceeds the signed cap; answering a signed empty body")
+            body = Data()
+        }
+        let proof = wakeProofKey.proof(over: ApprovalHookResponse.message(nonce: nonce, body: body))
+        return HTTPParser.response(
+            statusCode: 200,
+            body: ApprovalHookResponse.signedBody(proof: proof, body: body),
+            contentType: "text/plain; charset=utf-8"
+        )
+    }
+
+    /// The outcome of an `/approval-request` once bearer and nonce shape
+    /// have passed: a bodiless status, or a 200 decision body (`nil` for
+    /// no decision). `routeApprovalRequest` turns it into the response.
+    private enum ApprovalRouteOutcome {
+        case status(Int)
+        case decision(Data?)
+    }
+
+    /// Everything `routeApprovalRequest` decides after the bearer and
+    /// nonce checks. `signed` is whether the request carried a nonce.
+    private func approvalOutcome(request: HTTPRequest, signed: Bool) async -> ApprovalRouteOutcome {
+        guard let body = request.body else {
+            return .status(400)
+        }
         guard body.count <= Self.maxEventBodyBytes else {
-            return HTTPParser.response(statusCode: 413, body: nil)
+            return .status(413)
         }
 
         // Read before decode: `agentKind(from:)` has no failure path, so
@@ -885,11 +945,11 @@ final class CalyxMCPServer {
         // ordering for any existing guard below.
         let kind = agentKind(from: request.headers)
         guard let call = AgentHookToolCall.decode(from: body, kind: kind) else {
-            return HTTPParser.response(statusCode: 400, body: nil)
+            return .status(400)
         }
 
         guard let surfaceID = resolveSurfaceID(from: request.headers) else {
-            return HTTPParser.response(statusCode: 400, body: nil)
+            return .status(400)
         }
 
         guard kind == AgentEntry.claudeCodeKind || kind == AgentEntry.codexKind
@@ -897,7 +957,7 @@ final class CalyxMCPServer {
             // An agent CLI Calyx doesn't have a hook-response contract
             // for at all (see `AgentHookPermissionResponse`'s own
             // fail-safe contract) -- never submit to the inbox for one.
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
         }
 
         guard ApprovalHookEvent.isApprovalGate(call.hookEventName, kind: kind) else {
@@ -905,7 +965,7 @@ final class CalyxMCPServer {
             // see this method's own doc comment) or any other/missing
             // hook event name -- inert, same as the unrecognized-kind
             // guard above, never submitted to the inbox.
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
         }
 
         guard ApprovalHookEvent.gateIsSoleAuthority(kind: kind, permissionMode: call.permissionMode) else {
@@ -916,11 +976,17 @@ final class CalyxMCPServer {
             // with no decision at all leaves that pipeline deciding
             // exactly as it would without Calyx, rather than asking the
             // same human the same question in two places.
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
+        }
+
+        // D20 analog: this start's key never reached agent-endpoint.json,
+        // so no proof could verify; answer signed empty and queue nothing.
+        guard !signed || wakeProofKeyPublished else {
+            return .status(200)
         }
 
         guard CockpitSettings.agentHookApprovalEnabled else {
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
         }
 
         // An AskUserQuestion call must always ask a human: neither global
@@ -941,15 +1007,11 @@ final class CalyxMCPServer {
         // another.
         if !call.isQuestionTool {
             guard ApprovalPolicy.requiresApproval() else {
-                return HTTPParser.response(
-                    statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
-                )
+                return .decision(AgentHookPermissionResponse.body(kind: kind, decision: .allowed))
             }
 
             if agentHookApprovalMemory.isAutoAllowed(surfaceID: surfaceID, kind: kind, toolName: call.toolName) {
-                return HTTPParser.response(
-                    statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
-                )
+                return .decision(AgentHookPermissionResponse.body(kind: kind, decision: .allowed))
             }
         }
 
@@ -959,7 +1021,7 @@ final class CalyxMCPServer {
         // guard above, rather than queuing a request whose banner no
         // window could ever show.
         guard approvalSurfaceExists(surfaceID) else {
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
         }
 
         let requestID = UUID()
@@ -1007,10 +1069,7 @@ final class CalyxMCPServer {
         )
 
         let decision = await approvalInbox.awaitDecisionHonoringCancellation(id: requestID, timeoutMs: approvalRequestTimeoutMs)
-        return HTTPParser.response(
-            statusCode: 200,
-            body: AgentHookPermissionResponse.body(kind: kind, decision: decision)
-        )
+        return .decision(AgentHookPermissionResponse.body(kind: kind, decision: decision))
     }
 
     /// Handles `POST /ipc-wake`: a long-poll held open on behalf of a
@@ -1066,7 +1125,7 @@ final class CalyxMCPServer {
     /// `agent-endpoint.json`, and the nonce binds it to this poll, so it
     /// cannot be replayed as the answer to another one.
     private func routeIPCWake(request: HTTPRequest) async -> HTTPResponse {
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
@@ -1087,7 +1146,7 @@ final class CalyxMCPServer {
         }
 
         guard let nonce = header(named: IPCWakeResponse.nonceHeader, in: request.headers),
-              UUID(uuidString: nonce)?.uuidString == nonce
+              Self.isCanonicalNonce(nonce)
         else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
@@ -1167,7 +1226,7 @@ final class CalyxMCPServer {
         if let origin = header(named: "Origin", in: request.headers), !Self.isLoopbackOrigin(origin) {
             return HTTPParser.response(statusCode: 403, body: nil)
         }
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
         return nil
@@ -1264,6 +1323,20 @@ final class CalyxMCPServer {
                 watch.cancel()
             }
         }
+    }
+
+    /// The single bearer check every token route runs (J11): the
+    /// presented `Authorization: Bearer <token>` against this start's
+    /// token, compared in constant time.
+    func isAuthorized(_ request: HTTPRequest) -> Bool {
+        guard let presented = bearerToken(from: request.headers) else { return false }
+        return HTTPParser.constantTimeEquals(presented, token)
+    }
+
+    /// Whether `value` is an uppercase canonical UUID, the only nonce
+    /// shape the wake and approval routes accept.
+    private static func isCanonicalNonce(_ value: String) -> Bool {
+        UUID(uuidString: value)?.uuidString == value
     }
 
     /// Case-insensitive `Authorization: Bearer <token>` extraction, shared
@@ -2062,7 +2135,8 @@ final class CalyxMCPServer {
     }
 
     /// The body cap of the request whose header block is `headerString`:
-    /// 32 MiB for `/calyx-mcp` carrying this server's bearer token, 16 MiB
+    /// 32 MiB for `/calyx-mcp` carrying this server's bearer token
+    /// (compared in constant time, `HTTPParser.constantTimeEquals`), 16 MiB
     /// for `/usage/v1/metrics` carrying a token the usage route would
     /// accept (`UsageIngestEndpoint.accepts`, the route's own check), 1 MiB
     /// otherwise, so a larger cap is never available before
@@ -2080,7 +2154,7 @@ final class CalyxMCPServer {
             forHeaderString: headerString,
             isAuthorized: { authorization in
                 guard !token.isEmpty, let authorization, authorization.hasPrefix("Bearer ") else { return false }
-                return String(authorization.dropFirst(7)) == token
+                return HTTPParser.constantTimeEquals(String(authorization.dropFirst(7)), token)
             },
             isUsageAuthorized: { authorization in
                 guard let endpoint else { return false }
@@ -2208,7 +2282,8 @@ final class CalyxMCPServer {
     ) async -> (statusCode: Int, body: Data?) {
 
         // 1. Authentication
-        guard let authToken, authToken == token else {
+        // Same primitive as `isAuthorized`, for callers without an HTTPRequest.
+        guard let authToken, HTTPParser.constantTimeEquals(authToken, token) else {
             return unauthorizedResponse()
         }
 

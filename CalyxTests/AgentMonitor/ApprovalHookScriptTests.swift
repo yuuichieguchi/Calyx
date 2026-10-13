@@ -16,10 +16,10 @@
 //    unset, reads agent-endpoint.json, sends the required headers
 //  - curl is bounded by ApprovalHookTiming.curlTimeoutSeconds (585) and
 //    uses --fail so a non-2xx response is treated as a curl error
-//  - a successful response body is printed verbatim via printf '%s'
+//  - a successful, correctly signed response body is printed byte for
+//    byte (the body after the proof line)
 //  - every curl failure path (any exit code other than 0/success,
-//    including 7/connection-refused, which has its own dedicated case
-//    arm) produces NO stdout output at all, verified by running the
+//    including 7/connection-refused) produces NO stdout output at all, verified by running the
 //    installed script as a real child process against a fake curl on
 //    PATH -- PermissionRequest has no interactive fallback body the way
 //    the old PreToolUse "ask" contract did, so a lost connection or
@@ -31,6 +31,10 @@
 //  - every exit path in the script is exit 0
 //  - spec C.3 (G4), slice 1: `exec 2>/dev/null` first, one EXIT trap
 //    removing both templated temp files, the shared long-poll lines
+//  - spec C.3 (G3), slice 2: the nonce is sent as the fifth header,
+//    `--max-filesize 1048641`, and the verification tail of the spec
+//    listing replaces `response=$(cat ...)` and the `case`; stdout is
+//    written by the final `tail -c +66 "$response_file"` only
 //  - install(toDirectory:) writes the script at 0755 with scriptBody's
 //    exact content
 //
@@ -269,7 +273,7 @@ final class ApprovalHookScriptTests: XCTestCase {
                        "received during cat never starts curl")
     }
 
-    func test_scriptBody_readsBlocksAndComputesNonceButDoesNotSendItYet() throws {
+    func test_scriptBody_readsBlocksComputesNonceAndSendsItAsTheFifthHeader() throws {
         let lines = executableLines
         XCTAssertEqual(lines.filter { $0.hasPrefix("proof_inner=") || $0.hasPrefix("proof_outer=") }, [
             #"proof_inner=$(sed -n 's/.*"wakeProofInner"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$endpoint_file")"#,
@@ -279,8 +283,120 @@ final class ApprovalHookScriptTests: XCTestCase {
         XCTAssertTrue(lines.contains("nonce=$(uuidgen) || exit 0"))
         XCTAssertTrue(lines.contains(#"nonce=$(printf '%s' "$nonce" | tr 'abcdef' 'ABCDEF')"#))
         XCTAssertTrue(lines.contains(#"if [ -z "$nonce" ]; then"#))
-        XCTAssertFalse(lines.contains { $0.contains("Nonce") },
-                       "slice 1 computes the nonce but sends no nonce header yet")
+        XCTAssertEqual(lines.filter { $0.hasPrefix("-H ") }, [
+            #"-H "Authorization: Bearer $token" \"#,
+            #"-H "X-Calyx-Surface-ID: ${CALYX_SESSION_ID:-$CALYX_SURFACE_ID}" \"#,
+            #"-H "X-Calyx-Agent-Kind: $kind" \"#,
+            #"-H "Content-Type: application/json" \"#,
+            #"-H "X-Calyx-Approval-Nonce: $nonce" \"#,
+        ], "five headers, the nonce header fifth (spec C.3 G3)")
+    }
+
+    func test_scriptBody_curlCapsTheResponseAtTheSignedMaximum() throws {
+        let lines = executableLines
+        let curl = try firstIndex(of: "the curl line") { $0.hasPrefix("curl ") }
+        let url = try firstIndex(of: "the URL line") { $0.hasSuffix(#"> "$response_file" &"#) }
+        let maxFilesize = lines.indices.filter { lines[$0].contains("--max-filesize") }
+        XCTAssertEqual(maxFilesize.count, 1, "one --max-filesize option")
+        if let index = maxFilesize.first {
+            XCTAssertEqual(lines[index], #"--max-filesize 1048641 \"#,
+                           "65 + 4 * 262144 (spec C-D9), on its own continuation line")
+            XCTAssertTrue(curl < index && index < url, "the option belongs to the curl command")
+        }
+    }
+
+    /// The executable lines after afterCurl's final `curl_pid=` reset, as
+    /// listed in spec C.3 (G3), to the end of the script.
+    private let verificationTail: [String] = [
+        #"if [ "$curl_exit" != 0 ]; then"#,
+        "exit 0",
+        "fi",
+        #"proof=$(head -c 64 "$response_file")"#,
+        #"if ! printf '%s\n' "$proof" | LC_ALL=C grep -Eqx '[0-9a-f]{64}'; then"#,
+        "exit 0",
+        "fi",
+        #"if [ "$(head -c 65 "$response_file" | tail -c 1 | xxd -p)" != "0a" ]; then"#,
+        "exit 0",
+        "fi",
+        "computed=$(",
+        "{",
+        #"printf '%s' "$proof_outer" | xxd -r -p"#,
+        "{",
+        #"printf '%s' "$proof_inner" | xxd -r -p"#,
+        #"printf 'approval\n%s\n' "$nonce""#,
+        #"tail -c +66 "$response_file""#,
+        "} | openssl dgst -sha256 -binary",
+        "} | openssl dgst -sha256 -binary | xxd -p -c 64",
+        ")",
+        #"if ! printf '%s\n' "$computed" | LC_ALL=C grep -Eqx '[0-9a-f]{64}'; then"#,
+        "exit 0",
+        "fi",
+        #"if [ "$computed" != "$proof" ]; then"#,
+        "exit 0",
+        "fi",
+        #"tail -c +66 "$response_file""#,
+        "exit 0",
+    ]
+
+    func test_scriptBody_endsWithTheVerificationTail_rightAfterAfterCurl() throws {
+        let lines = executableLines
+        let reset = try XCTUnwrap(lines.lastIndex(of: "curl_pid="), "afterCurl's curl_pid= reset")
+        XCTAssertEqual(Array(lines[(reset + 1)...]), verificationTail,
+                       "spec C.3 (G3): the curl_exit check follows afterCurl at once, then the proof checks, " +
+                       "and the final tail is the only stdout write")
+    }
+
+    func test_scriptBody_responseNeverEntersAShellVariable() {
+        let body = ApprovalHookScript.scriptBody
+        XCTAssertFalse(body.contains("response=$(cat"), "C-D10: the body is never read into a variable")
+        XCTAssertFalse(body.contains(#"printf '%s' "$response""#))
+        XCTAssertFalse(body.contains(#"case "$curl_exit""#), "the case on curl_exit is gone")
+        XCTAssertFalse(executableLines.contains { $0.contains("$response\"") || $0.hasPrefix("response=") })
+        XCTAssertFalse(body.contains("sed -n '$='"), "C-D10: byte positions, not line counts")
+    }
+
+    func test_scriptBody_responseFileIsReadOnlyByHeadAndTail() {
+        let readers = executableLines.filter { $0.contains(#""$response_file""#) && !$0.hasPrefix("response_file=") }
+        for line in readers where !line.hasPrefix("trap ") && !line.hasSuffix(#"> "$response_file" &"#) {
+            XCTAssertTrue(line.contains(#"head -c"#) || line.contains(#"tail -c +66"#),
+                          "the response file is read only by head -c and tail -c +66. Found: \(line)")
+        }
+        XCTAssertEqual(executableLines.filter { $0 == #"tail -c +66 "$response_file""# }.count, 2,
+                       "one tail feeds the HMAC, the other is the final stdout write")
+    }
+
+    func test_scriptBody_everyGrepIsLocaleFixedExtendedQuietWholeLine() {
+        let greps = executableLines.filter { $0.contains("grep") }
+        XCTAssertEqual(greps.count, 2, "the proof and the computed HMAC are each checked once")
+        for line in greps {
+            XCTAssertTrue(line.contains("LC_ALL=C grep -Eqx '[0-9a-f]{64}'"), "found: \(line)")
+        }
+    }
+
+    func test_scriptBody_keyBlocksOnlyTravelThroughPrintfPipes() {
+        for variable in ["$proof_inner", "$proof_outer"] {
+            for line in executableLines where line.contains(variable) {
+                let allowed = line.hasPrefix(String(variable.dropFirst()) + "=$(sed ")
+                    || line == #"if [ -z "$proof_inner" ] || [ -z "$proof_outer" ]; then"#
+                    || line == "printf '%s' \"\(variable)\" | xxd -r -p"
+                XCTAssertTrue(allowed, "\(variable) may appear only after printf '%s' \" (or its sed read and " +
+                              "empty check). Found: \(line)")
+            }
+        }
+    }
+
+    func test_scriptBody_hasNoHeredocExportOrEval() {
+        for line in executableLines {
+            XCTAssertFalse(line.contains("<<"), "no heredoc. Found: \(line)")
+            XCTAssertFalse(line.hasPrefix("export ") || line.contains(" export "), "no export. Found: \(line)")
+            XCTAssertFalse(line.hasPrefix("eval ") || line.contains(" eval "), "no eval. Found: \(line)")
+        }
+    }
+
+    func test_scriptBody_hasNoExitTwo() {
+        XCTAssertFalse(executableLines.contains { $0.hasPrefix("exit") && $0 != "exit 0" },
+                       "the approval hook never exits with another status")
+        XCTAssertFalse(executableLines.contains("exit 2"))
     }
 
     func test_scriptBody_runsItsStepsInTheSpeccedOrder() throws {
@@ -304,8 +420,14 @@ final class ApprovalHookScriptTests: XCTestCase {
             ("wait", { $0 == #"wait "$curl_pid""# }),
             ("curl_exit=$?", { $0 == "curl_exit=$?" }),
             ("the curl_pid= reset", { $0 == "curl_pid=" }),
-            ("response=$(cat", { $0 == #"response=$(cat "$response_file")"# }),
-            ("case", { $0 == #"case "$curl_exit" in"# }),
+            ("the curl_exit check", { $0 == #"if [ "$curl_exit" != 0 ]; then"# }),
+            ("proof=$(head -c 64", { $0 == #"proof=$(head -c 64 "$response_file")"# }),
+            ("the proof grep", { $0.hasPrefix(#"if ! printf '%s\n' "$proof" | LC_ALL=C grep -Eqx"#) }),
+            ("the LF check", { $0.contains(#"| tail -c 1 | xxd -p)" != "0a" ]"#) }),
+            ("computed=$(", { $0 == "computed=$(" }),
+            ("the computed grep", { $0.hasPrefix(#"if ! printf '%s\n' "$computed" | LC_ALL=C grep -Eqx"#) }),
+            ("the HMAC comparison", { $0 == #"if [ "$computed" != "$proof" ]; then"# }),
+            ("the final tail", { $0 == #"tail -c +66 "$response_file""# }),
         ]
         var previous = -1
         var previousName = "start"
@@ -340,32 +462,38 @@ final class ApprovalHookScriptTests: XCTestCase {
 
     // MARK: - scriptBody: response handling
 
-    func test_scriptBody_printsResponseBodyVerbatim() {
-        XCTAssertTrue(ApprovalHookScript.scriptBody.contains("printf '%s'"),
-                     "The captured response body must be printed verbatim via printf '%s' -- echo can " +
-                     "mangle a body starting with '-' or containing backslash escape sequences")
+    func test_scriptBody_printsTheVerifiedBodyWithTailNotPrintf() {
+        XCTAssertFalse(executableLines.contains { $0.contains("echo") },
+                       "nothing is printed with echo, which can mangle a body starting with '-'")
+        XCTAssertEqual(Array(executableLines.suffix(2)), [#"tail -c +66 "$response_file""#, "exit 0"],
+                       "the verified body is copied byte for byte by the last command before exit 0")
     }
 
-    func test_scriptBody_theOnlyStdoutWriteIsTheCaseZeroArm() {
+    func test_scriptBody_noUnpipedPrintf_noStdoutBeforeTheCurlExitCheck() throws {
         let unpipedPrints = executableLines.filter {
             ($0.contains("printf") || $0.contains("echo")) && !$0.contains("|")
         }
-        XCTAssertEqual(unpipedPrints, [#"0) printf '%s' "$response" ;;"#],
-                       "slice 1: the case arm for curl exit 0 is the only line that writes to stdout; the " +
-                       "nonce's printf only feeds a pipe")
-        XCTAssertFalse(executableLines.contains { $0.contains("head -c") || $0.contains("tail -c") },
-                       "slice 1 does not yet verify a proof line")
+        XCTAssertEqual(unpipedPrints, [#"printf 'approval\n%s\n' "$nonce""#],
+                       "the only unpiped printf is the HMAC message prefix, inside the computed=$( group " +
+                       "whose output is piped into openssl")
+        let check = try firstIndex(of: "the curl_exit check") { $0 == #"if [ "$curl_exit" != 0 ]; then"# }
+        XCTAssertFalse(executableLines[..<check].contains { $0.contains("head -c") || $0.contains("tail -c") },
+                       "the response file is not read before curl's exit status is checked")
     }
 
     /// Success path by real execution: a one-line JSON body from curl
     /// (exit 0) is printed byte for byte, and both temp files are gone.
-    func test_run_curlSucceeds_printsTheBodyByteForByte() throws {
+    func test_run_curlSucceeds_signedBody_printsTheBodyByteForByte() throws {
         let body = #"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"a \\ b -n"}}}"#
+        let nonce = "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112"
         let fixture = try makeFakeCurlScriptFixture(
             rootDirectory: tempDir + "/success", port: 41_833, token: "success-path-test-token",
             install: ApprovalHookScript.install(toDirectory:)
         )
-        try makeFakeCurl(atDirectory: fixture.fakeBinDir, exitCode: 0, stdoutBody: body)
+        let keyBytes = try XCTUnwrap(fixture.wakeKeyBytes)
+        let proof = IPCWakeTestCrypto.hmacHex(keyBytes: keyBytes, message: Data(("approval\n" + nonce + "\n" + body).utf8))
+        try makeFakeCurl(atDirectory: fixture.fakeBinDir, exitCode: 0, stdoutBody: proof + "\n" + body)
+        try makeFakeUuidgen(atDirectory: fixture.fakeBinDir, stdout: nonce + "\n")
         let scriptTmp = fixture.rootDir + "/script-tmp"
         try FileManager.default.createDirectory(atPath: scriptTmp, withIntermediateDirectories: true)
 
@@ -375,28 +503,19 @@ final class ApprovalHookScriptTests: XCTestCase {
         )
 
         XCTAssertEqual(result.exitCode, 0)
-        XCTAssertEqual(result.stdout, body, "the body is printed verbatim, no newline added")
+        XCTAssertEqual(result.stdout, body, "the body after the proof line is printed verbatim, no newline added")
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: scriptTmp), [String](),
                        "both temp files are created under TMPDIR and removed on exit")
     }
 
-    func test_scriptBody_connectionRefused_isSilent() {
+    func test_scriptBody_noCaseOnCurlExit_everyNonZeroExitLeavesAtOnce() throws {
+        // Connection refused (7) has no arm of its own any more: every
+        // non-zero curl exit takes the same `exit 0` right after afterCurl.
         let body = ApprovalHookScript.scriptBody
-
-        // Isolate the case-branch keyed on curl's connection-refused exit
-        // code (7): its own case arm must never call printf. Execution-
-        // level confirmation that this branch actually produces no stdout
-        // lives in test_scriptBody_curlNonZeroExit_producesNoStdout below,
-        // whose own sweep includes exit code 7.
-        guard let branchRange = body.range(of: #"7\)[\s\S]*?;;"#, options: .regularExpression) else {
-            XCTFail("Script must have a case branch matching curl's connection-refused exit code (7)")
-            return
-        }
-        let branch = String(body[branchRange])
-
-        XCTAssertFalse(branch.contains("printf"),
-                       "curl exit 7 (connection refused / stale endpoint file after a crash) must " +
-                       "produce NO output")
+        XCTAssertNil(body.range(of: #"7\)[\s\S]*?;;"#, options: .regularExpression), "no case arm for exit 7")
+        XCTAssertFalse(executableLines.contains { $0.hasPrefix("case ") || $0 == "esac" })
+        let check = try firstIndex(of: "the curl_exit check") { $0 == #"if [ "$curl_exit" != 0 ]; then"# }
+        XCTAssertEqual(Array(executableLines.dropFirst(check + 1).prefix(2)), ["exit 0", "fi"])
     }
 
     // MARK: - scriptBody: fail-safe paths produce no output (execution-based)

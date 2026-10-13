@@ -73,11 +73,31 @@ final class ApprovalHookScriptLongPollBehaviourTests: XCTestCase {
             exitCode: curlExitCode, listDirectory: scriptTmp, listingPath: listingPath,
             startedPath: curlStartedPath
         )
-        try makeFakeUuidgen(atDirectory: fixture.fakeBinDir, stdout: "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112\n")
+        try makeFakeUuidgen(atDirectory: fixture.fakeBinDir, stdout: Self.fixedNonce + "\n")
         return Prepared(
             fixture: fixture, recordDirectory: recordDirectory, listingPath: listingPath, scriptTmp: scriptTmp,
             curlStartedPath: curlStartedPath
         )
+    }
+
+    private static let fixedNonce = "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112"
+
+    /// `prepare`, with the fake curl printing `proof LF body`: the proof is
+    /// HMAC-SHA256 under the fixture's key over "approval\n" + nonce + "\n"
+    /// + body. The fixture is built first so its key is known.
+    private func prepare(signedCurlBody body: String, curlExitCode: Int32) throws -> Prepared {
+        let prepared = try prepare(curlBody: "", curlExitCode: curlExitCode)
+        let keyBytes = try XCTUnwrap(prepared.fixture.wakeKeyBytes)
+        let proof = IPCWakeTestCrypto.hmacHex(
+            keyBytes: keyBytes, message: Data(("approval\n" + Self.fixedNonce + "\n" + body).utf8)
+        )
+        try makeRecordingFakeCurl(
+            atDirectory: prepared.fixture.fakeBinDir, recordDirectory: prepared.recordDirectory,
+            stdoutBody: Data((proof + "\n" + body).utf8), exitCode: curlExitCode,
+            listDirectory: prepared.scriptTmp, listingPath: prepared.listingPath,
+            startedPath: prepared.curlStartedPath
+        )
+        return prepared
     }
 
     private func entries(_ directory: String) -> [String] {
@@ -97,7 +117,9 @@ final class ApprovalHookScriptLongPollBehaviourTests: XCTestCase {
     func test_run_tempFilesLiveUnderTMPDIRWhileCurlRuns_andAreRemovedOnEveryCurlOutcome() throws {
         let body = #"{"hookSpecificOutput":{"decision":{"behavior":"deny"}}}"#
         for (label, exitCode, expectedStdout) in [("curl exit 0", Int32(0), body), ("curl exit 22", Int32(22), "")] {
-            let prepared = try prepare(curlBody: body, curlExitCode: exitCode)
+            // Signed for the fake uuidgen's nonce with the fixture's key
+            // (spec C.3 G3), so exit 0 prints the body after the proof line.
+            let prepared = try prepare(signedCurlBody: body, curlExitCode: exitCode)
             let result = try runFakeCurlHookScript(
                 prepared.fixture, stdinJSON: stdinJSON,
                 extraEnv: ["CALYX_SURFACE_ID": UUID().uuidString, "TMPDIR": prepared.scriptTmp]

@@ -1337,4 +1337,271 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
             "route's .interrupted response body must equal AgentHookPermissionResponse.body(kind:decision:) exactly"
         )
     }
+
+    // MARK: - Signed answers (spec C.2 J7, J8; C.3 G3)
+
+    /// A canonical uppercase UUID, the only nonce form the route accepts.
+    private static let approvalNonce = "6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112"
+    /// Spelled out instead of `ApprovalHookResponse.nonceHeader` so this
+    /// file keeps compiling before that type exists.
+    private static let approvalNonceHeader = "X-Calyx-Approval-Nonce"
+    /// 65 + 4 * 262_144 (spec C-D9).
+    private static let maxSignedResponseBytes = 1_048_641
+
+    private func signedRequest(
+        surfaceID: UUID = UUID(), body: Data?, kindHeader: String? = nil,
+        nonce: String = CalyxMCPServerApprovalRequestTests.approvalNonce, token: String? = nil
+    ) -> HTTPRequest {
+        var headers: [String: String] = ["Authorization": "Bearer \(token ?? testToken)"]
+        headers["X-Calyx-Surface-ID"] = surfaceID.uuidString
+        if let kindHeader { headers["X-Calyx-Agent-Kind"] = kindHeader }
+        headers[Self.approvalNonceHeader] = nonce
+        return HTTPRequest(method: "POST", path: "/approval-request", headers: headers, body: body)
+    }
+
+    private func headerValue(_ name: String, in response: HTTPResponse) -> String? {
+        response.headers.first { $0.key.caseInsensitiveCompare(name) == .orderedSame }?.value
+    }
+
+    /// Starts `server` so its wake proof key reaches agent-endpoint.json
+    /// (`wakeProofKeyPublished`), and returns the key bytes the signed
+    /// answers must use. Read after `start`, which draws a fresh key.
+    private func startServerPublishingKey() async throws -> Data {
+        try await server.start(token: testToken, preferredPort: 0)
+        let blocks = try XCTUnwrap(IPCWakeTestCrypto.readEndpointBlocks(directory: agentEndpointDir),
+                                   "precondition: start() publishes the key blocks")
+        let fileBlocks = IPCWakeTestCrypto.blocksHex(keyBytes: server.wakeProofKey.bytes)
+        XCTAssertEqual(blocks.inner, fileBlocks.inner, "precondition: the file carries this start's key")
+        return server.wakeProofKey.bytes
+    }
+
+    /// Checks a signed 200 answer (J7) and returns its decision body (the
+    /// bytes after the proof line). The proof is recomputed here with
+    /// CryptoKit over "approval\n" + nonce + "\n" + body.
+    @discardableResult
+    private func assertSignedAnswer(
+        _ response: HTTPResponse, keyBytes: Data, nonce: String = CalyxMCPServerApprovalRequestTests.approvalNonce,
+        _ label: String, file: StaticString = #filePath, line: UInt = #line
+    ) throws -> Data {
+        XCTAssertEqual(response.statusCode, 200, "[\(label)] status", file: file, line: line)
+        XCTAssertEqual(headerValue("Content-Type", in: response), "text/plain; charset=utf-8",
+                       "[\(label)] a signed answer is text/plain", file: file, line: line)
+        let signed = try XCTUnwrap(response.body, "[\(label)] a signed answer always has a body", file: file, line: line)
+        XCTAssertGreaterThanOrEqual(signed.count, 65, "[\(label)] proof line present", file: file, line: line)
+        XCTAssertLessThanOrEqual(signed.count, Self.maxSignedResponseBytes,
+                                 "[\(label)] a signed answer never exceeds 65 + 4 * 262144 bytes", file: file, line: line)
+        guard signed.count >= 65 else { return Data() }
+        let bytes = [UInt8](signed)
+        let proof = String(decoding: bytes[0..<64], as: UTF8.self)
+        XCTAssertEqual(bytes[64], 0x0A, "[\(label)] the 65th byte is LF", file: file, line: line)
+        let decision = Data(bytes[65...])
+        let message = Data(("approval\n" + nonce + "\n").utf8) + decision
+        XCTAssertEqual(proof, IPCWakeTestCrypto.hmacHex(keyBytes: keyBytes, message: message),
+                       "[\(label)] line 1 is HMAC-SHA256(key, \"approval\\n\" + nonce + \"\\n\" + body)",
+                       file: file, line: line)
+        return decision
+    }
+
+    private func assertSameJSON(
+        _ actual: Data, _ expected: Data?, _ label: String, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        let expectedData = try XCTUnwrap(expected, "[\(label)] expected body", file: file, line: line)
+        XCTAssertEqual(try responseJSON(actual) as NSDictionary, try responseJSON(expectedData) as NSDictionary,
+                       "[\(label)] the signed body is the unsigned answer for the same decision", file: file, line: line)
+    }
+
+    func test_signed_autoApproveShortCircuit_signsTheAllowBody() async throws {
+        let key = try await startServerPublishingKey()
+        CockpitSettings.agentHookApprovalEnabled = true
+        CockpitSettings.autoApproveEnabled = true
+        let response = await server.route(request: signedRequest(body: validToolCallBody()))
+        let body = try assertSignedAnswer(response, keyBytes: key, "auto-approve")
+        try assertSameJSON(body, AgentHookPermissionResponse.body(kind: AgentEntry.claudeCodeKind, decision: .allowed),
+                           "auto-approve")
+        XCTAssertTrue(server.approvalInbox.pending.isEmpty)
+    }
+
+    func test_signed_paneMemoryShortCircuit_signsTheAllowBody() async throws {
+        let key = try await startServerPublishingKey()
+        CockpitSettings.agentHookApprovalEnabled = true
+        let surfaceID = UUID()
+        server.agentHookApprovalMemory.rememberPane(surfaceID: surfaceID, kind: AgentEntry.claudeCodeKind, toolName: "Bash")
+        let response = await server.route(request: signedRequest(surfaceID: surfaceID, body: validToolCallBody()))
+        let body = try assertSignedAnswer(response, keyBytes: key, "pane memory")
+        try assertSameJSON(body, AgentHookPermissionResponse.body(kind: AgentEntry.claudeCodeKind, decision: .allowed),
+                           "pane memory")
+    }
+
+    func test_signed_inertShortCircuits_signTheEmptyBody() async throws {
+        let key = try await startServerPublishingKey()
+        server.approvalRequestTimeoutMs = 50
+        let cases: [(String, Bool, HTTPRequest, Bool)] = [
+            ("setting off", false, signedRequest(body: validToolCallBody()), true),
+            ("unknown kind", true, signedRequest(body: validToolCallBody(), kindHeader: "hermes"), true),
+            ("non-gate event", true, signedRequest(body: validToolCallBody(hookEventName: "PreToolUse")), true),
+            ("unknown surface", true, signedRequest(body: validToolCallBody()), false),
+        ]
+        for (label, enabled, request, surfaceExists) in cases {
+            CockpitSettings.agentHookApprovalEnabled = enabled
+            server.approvalSurfaceExists = { _ in surfaceExists }
+            let response = await server.route(request: request)
+            let body = try assertSignedAnswer(response, keyBytes: key, label)
+            XCTAssertEqual(body, Data(), "[\(label)] the decision body is empty")
+            XCTAssertEqual(response.body?.count, 65, "[\(label)] a signed empty answer is 65 bytes")
+            XCTAssertTrue(server.approvalInbox.pending.isEmpty, "[\(label)] nothing is submitted")
+        }
+    }
+
+    func test_signed_longPollAllowAndDeny_signTheDecisionBody() async throws {
+        let key = try await startServerPublishingKey()
+        CockpitSettings.agentHookApprovalEnabled = true
+        server.approvalSurfaceExists = { _ in true }
+        let inbox = server.approvalInbox
+        for (label, decision) in [("allow", ApprovalDecision.allowed), ("deny", .denied(.userRejected))] {
+            let request = signedRequest(body: validToolCallBody())
+            let task = Task { @MainActor in await self.server.route(request: request) }
+            await yieldToScheduler()
+            let pending = try XCTUnwrap(inbox.pending.first, "[\(label)] the request is pending")
+            inbox.decide(id: pending.id, decision)
+            let response = await task.value
+            let body = try assertSignedAnswer(response, keyBytes: key, label)
+            try assertSameJSON(body, AgentHookPermissionResponse.body(kind: AgentEntry.claudeCodeKind, decision: decision), label)
+        }
+    }
+
+    func test_signed_expiry_signsTheEmptyBody() async throws {
+        let key = try await startServerPublishingKey()
+        CockpitSettings.agentHookApprovalEnabled = true
+        server.approvalSurfaceExists = { _ in true }
+        server.approvalRequestTimeoutMs = 50
+        let response = await server.route(request: signedRequest(body: validToolCallBody()))
+        XCTAssertEqual(try assertSignedAnswer(response, keyBytes: key, "expiry"), Data())
+        XCTAssertTrue(server.approvalInbox.pending.isEmpty)
+    }
+
+    /// A 200 KiB tool_input is echoed whole by `.answered`; the signed
+    /// answer stays under the cap and carries it.
+    func test_signed_answeredWith200KiBToolInput_isSignedWithinTheCap() async throws {
+        let key = try await startServerPublishingKey()
+        CockpitSettings.agentHookApprovalEnabled = true
+        server.approvalSurfaceExists = { _ in true }
+        let pad = String(repeating: "p", count: 200 * 1024)
+        let requestBody = Data("""
+        {"tool_name":"AskUserQuestion","tool_input":{"questions":[{"question":"Which shell?","options":[{"label":"zsh"},{"label":"bash"}]}],"pad":"\(pad)"},"hook_event_name":"PermissionRequest"}
+        """.utf8)
+        XCTAssertLessThan(requestBody.count, 262_144, "precondition: the request is under the request cap")
+        let request = signedRequest(body: requestBody)
+        let task = Task { @MainActor in await self.server.route(request: request) }
+        await yieldToScheduler()
+        let pending = try XCTUnwrap(server.approvalInbox.pending.first)
+        guard case .agentQuestion(_, let prompt) = pending.source else {
+            XCTFail("expected .agentQuestion source")
+            server.approvalInbox.decide(id: pending.id, .expired)
+            _ = await task.value
+            return
+        }
+        let answers = AgentQuestionAnswers(prompt: prompt, entries: [.init(answer: .selectedOne("zsh"), notes: nil)])
+        server.approvalInbox.decide(id: pending.id, .answered(answers))
+        let response = await task.value
+        let body = try assertSignedAnswer(response, keyBytes: key, "answered 200 KiB")
+        XCTAssertGreaterThan(body.count, 200 * 1024, "the echoed tool_input is in the signed body")
+        try assertSameJSON(body, AgentHookPermissionResponse.body(kind: AgentEntry.claudeCodeKind, decision: .answered(answers)),
+                           "answered 200 KiB")
+    }
+
+    /// J8: a decision body over 4 * 262144 bytes is replaced by the signed
+    /// empty body. The request cap keeps tool_input under 256 KiB, so the
+    /// oversized body comes from the answer's notes, which `.answered`
+    /// encodes into `updatedInput.annotations`.
+    func test_signed_overCapDecisionBody_becomesTheSignedEmptyBody() async throws {
+        let key = try await startServerPublishingKey()
+        CockpitSettings.agentHookApprovalEnabled = true
+        server.approvalSurfaceExists = { _ in true }
+        let request = signedRequest(body: askUserQuestionBody())
+        let task = Task { @MainActor in await self.server.route(request: request) }
+        await yieldToScheduler()
+        let pending = try XCTUnwrap(server.approvalInbox.pending.first)
+        guard case .agentQuestion(_, let prompt) = pending.source else {
+            XCTFail("expected .agentQuestion source")
+            server.approvalInbox.decide(id: pending.id, .expired)
+            _ = await task.value
+            return
+        }
+        let notes = String(repeating: "n", count: 1_100_000)
+        let answers = AgentQuestionAnswers(prompt: prompt, entries: [.init(answer: .selectedOne("zsh"), notes: notes)])
+        let unsigned = try XCTUnwrap(AgentHookPermissionResponse.body(kind: AgentEntry.claudeCodeKind, decision: .answered(answers)))
+        XCTAssertGreaterThan(unsigned.count, 1_048_576, "precondition: the unsigned answer exceeds the body cap")
+        server.approvalInbox.decide(id: pending.id, .answered(answers))
+        let response = await task.value
+        XCTAssertEqual(try assertSignedAnswer(response, keyBytes: key, "over cap"), Data(), "over the cap: signed empty")
+        XCTAssertEqual(response.body?.count, 65)
+    }
+
+    /// J8 (D20 shape): with the key unpublished (this suite's setUp never
+    /// starts the server) a nonce request gets the signed empty body at
+    /// once and nothing reaches the inbox, even with auto-approve on: the
+    /// unpublished-key gate comes before the allow short-circuit.
+    func test_signed_keyUnpublished_signsTheEmptyBody_andSubmitsNothing() async throws {
+        XCTAssertFalse(server.wakeProofKeyPublished, "precondition: the server was never started")
+        let key = server.wakeProofKey.bytes
+        CockpitSettings.agentHookApprovalEnabled = true
+        server.approvalSurfaceExists = { _ in true }
+        server.approvalRequestTimeoutMs = 2_000
+        for autoApprove in [false, true] {
+            CockpitSettings.autoApproveEnabled = autoApprove
+            let request = signedRequest(body: validToolCallBody())
+            let task = Task { @MainActor in await self.server.route(request: request) }
+            await yieldToScheduler()
+            XCTAssertTrue(server.approvalInbox.pending.isEmpty,
+                          "[autoApprove \(autoApprove)] an unpublished key never submits to the inbox")
+            let response = await task.value
+            XCTAssertEqual(try assertSignedAnswer(response, keyBytes: key, "unpublished, autoApprove \(autoApprove)"), Data())
+        }
+    }
+
+    // MARK: - Nonce header validation (J7)
+
+    func test_malformedNonce_returns400_beforeTheBodyChecks() async throws {
+        CockpitSettings.agentHookApprovalEnabled = false
+        let malformed = [
+            "6f1c2a9e-0b7d-4e21-9a53-c4d8e7f00112",
+            "{6F1C2A9E-0B7D-4E21-9A53-C4D8E7F00112}",
+            "garbage",
+            "",
+        ]
+        for nonce in malformed {
+            // An oversized body would be 413 and a valid body with the
+            // setting off would be 200: 400 shows the nonce is checked first.
+            let oversized = await server.route(request: signedRequest(body: Data(repeating: 0x41, count: 262_145), nonce: nonce))
+            XCTAssertEqual(oversized.statusCode, 400, "[nonce \"\(nonce)\"] checked before the 413 size check")
+            let valid = await server.route(request: signedRequest(body: validToolCallBody(), nonce: nonce))
+            XCTAssertEqual(valid.statusCode, 400, "[nonce \"\(nonce)\"] a malformed nonce is never answered 200")
+            XCTAssertNil(valid.body, "[nonce \"\(nonce)\"] a 400 has no body")
+            let noBody = await server.route(request: signedRequest(body: nil, nonce: nonce))
+            XCTAssertEqual(noBody.statusCode, 400, "[nonce \"\(nonce)\"] no body")
+        }
+        XCTAssertTrue(server.approvalInbox.pending.isEmpty)
+    }
+
+    func test_malformedNonce_wrongBearer_isStill401() async {
+        let response = await server.route(request: signedRequest(body: validToolCallBody(), nonce: "garbage", token: "wrong"))
+        XCTAssertEqual(response.statusCode, 401, "the bearer check comes before the nonce check")
+    }
+
+    func test_validNonce_missingBody_isStill400() async {
+        let response = await server.route(request: signedRequest(body: nil))
+        XCTAssertEqual(response.statusCode, 400)
+    }
+
+    func test_noNonceHeader_answerStaysApplicationJSON() async throws {
+        CockpitSettings.agentHookApprovalEnabled = true
+        CockpitSettings.autoApproveEnabled = true
+        let response = await server.route(request: approvalRequestRequest(
+            token: testToken, surfaceIDHeader: UUID().uuidString, body: validToolCallBody()
+        ))
+        XCTAssertEqual(response.statusCode, 200)
+        XCTAssertEqual(headerValue("Content-Type", in: response), "application/json",
+                       "without the nonce header the answer is unchanged (J7)")
+        XCTAssertEqual(try permissionBehavior(fromResponseBody: response.body), "allow")
+    }
 }

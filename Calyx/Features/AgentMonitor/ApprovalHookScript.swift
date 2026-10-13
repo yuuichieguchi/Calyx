@@ -148,27 +148,37 @@ enum ApprovalHookScript {
     /// Stop-hook-settles-to-idle fallback stays in place as a last
     /// resort, not removed by this fix.
     ///
-    /// The curl exit code is then switched on:
-    /// - `0` (success): the server's response body is printed verbatim
-    ///   via `printf '%s'` -- never `echo`, which can mangle a body
-    ///   starting with `-` or containing backslash escape sequences.
-    /// - `7` (connection refused): silent, no output at all. After
-    ///   Calyx crashes, `agent-endpoint.json` is left behind pointing at
-    ///   a now-dead port, so every subsequent permission prompt would
-    ///   otherwise land in this branch -- producing no output leaves the
-    ///   hook inert, so the CLI's own confirmation prompt takes over
-    ///   exactly as it would with no Calyx hook installed at all, rather
-    ///   than a stale endpoint file silently degrading every tool call's
-    ///   UX.
-    /// - anything else (timeout, DNS failure, a non-2xx response
-    ///   rejected by `--fail`, etc.): also silent, no output at all.
-    ///   PermissionRequest, unlike the older PreToolUse contract, has no
-    ///   interactive-fallback body to fabricate here -- `"ask"` is not a
-    ///   valid `decision.behavior` under this hook. Producing no output
-    ///   IS the correct fail-safe: the CLI's own confirmation prompt
-    ///   takes over exactly as it would with no Calyx hook installed at
-    ///   all. This script must never print `"allow"` anywhere, on any
-    ///   path.
+    /// Nonce and verification: `AgentHookProof.nonce` makes a fresh
+    /// uppercase UUID, sent as `ApprovalHookResponse.nonceHeader`. A
+    /// nonce-carrying request is answered `<64 hex proof> LF <decision>`
+    /// (`ApprovalHookResponse.signedBody`), where the proof is
+    /// HMAC-SHA256 over `approval\n<nonce>\n<decision>` under this
+    /// Calyx start's key. After curl exits the script checks, in order:
+    /// curl's exit code is 0; the first 64 bytes are 64 lowercase hex
+    /// digits; byte 65 is LF; the HMAC computed through `openssl` from
+    /// the endpoint file's inner and outer blocks (passed only through
+    /// builtin `printf` pipes, never as arguments) equals the proof. Only
+    /// then is the decision written to stdout byte for byte with
+    /// `tail -c +66`; the body never enters a shell variable, so no byte
+    /// is lost or reinterpreted. Positions are bytes, not lines, because
+    /// a signed empty decision is exactly 65 bytes.
+    ///
+    /// Any failed check, and every curl failure (7 connection refused,
+    /// for example a dead port left in the endpoint file after a crash;
+    /// 22 a non-2xx answer rejected by `--fail`; 28 timeout; 63 a body
+    /// over `--max-filesize`), produces no output at all, for every CLI
+    /// kind. PermissionRequest has no interactive-fallback body to
+    /// fabricate (`"ask"` is not a valid `decision.behavior` there), and
+    /// Calyx never invents a decision: silence lets the CLI's own
+    /// confirmation prompt take over exactly as with no Calyx hook
+    /// installed. This script must never print `"allow"` from its own
+    /// text, on any path.
+    ///
+    /// `--max-filesize` is `ApprovalHookResponse.maxSignedResponseBytes`,
+    /// 65 + 4 * 262144: an `.answered` decision echoes the whole
+    /// `tool_input` back, so the decision may be up to four times the
+    /// request cap. It bounds the temp file a bogus responder can fill;
+    /// correctness rests on the HMAC.
     ///
     /// Every exit path is `exit 0`: whatever curl did or didn't return,
     /// this script itself must never exit nonzero and break the user's
@@ -181,13 +191,18 @@ enum ApprovalHookScript {
     #!/bin/sh
     #
     # calyx-approval-hook -- synchronously forwards a PermissionRequest
-    # hook's stdin JSON to Calyx's local Agent Monitor IPC endpoint and
-    # prints its response verbatim; the response body IS the CLI's
-    # permission decision. No output at all (any curl failure, Calyx
-    # unreachable, missing HMAC key blocks in the endpoint file, or
-    # uuidgen failing or printing nothing) is the correct fail-safe: it
-    # lets the CLI's own confirmation prompt take over. Installed and removed by
-    # ClaudeHooksConfigManager / CodexHooksConfigManager.
+    # hook's stdin JSON, with a fresh nonce, to Calyx's local Agent
+    # Monitor IPC endpoint. Calyx answers "<64 hex proof> LF <decision>";
+    # the decision is printed byte for byte (tail -c +66) only when the
+    # proof is HMAC-SHA256 over "approval\\n<nonce>\\n<decision>" under the
+    # key blocks in agent-endpoint.json, and it IS the CLI's permission
+    # decision. No output at all (any curl failure, Calyx unreachable, a
+    # proof line that is not 64 hex digits, no LF at byte 65, an HMAC
+    # mismatch, missing HMAC key blocks or tools, or uuidgen failing) is
+    # the correct fail-safe for every CLI kind: it lets the CLI's own
+    # confirmation prompt take over; Calyx never invents a decision.
+    # Installed and removed by ClaudeHooksConfigManager /
+    # CodexHooksConfigManager.
     #
     # curl runs backgrounded with a TERM/HUP/INT trap that kills it and
     # exits 0: if this script is killed (e.g. because the user answered
@@ -221,24 +236,44 @@ enum ApprovalHookScript {
     \(AgentHookProof.nonce)
     \(AgentHookLongPoll.guardBeforeCurl)
     curl -s -m \(ApprovalHookTiming.curlTimeoutSeconds) \\
+        --max-filesize \(ApprovalHookResponse.maxSignedResponseBytes) \\
         --fail \\
         -X POST \\
         -H "Authorization: Bearer $token" \\
         -H "X-Calyx-Surface-ID: ${CALYX_SESSION_ID:-$CALYX_SURFACE_ID}" \\
         -H "X-Calyx-Agent-Kind: $kind" \\
         -H "Content-Type: application/json" \\
+        -H "\(ApprovalHookResponse.nonceHeader): $nonce" \\
         --data-binary @"$payload_file" \\
         "http://127.0.0.1:$port/approval-request" > "$response_file" &
     \(AgentHookLongPoll.afterCurl)
-
-    response=$(cat "$response_file")
-
-    case "$curl_exit" in
-        0) printf '%s' "$response" ;;
-        7) exit 0 ;;
-        *) ;;
-    esac
-
+    if [ "$curl_exit" != 0 ]; then
+        exit 0
+    fi
+    proof=$(head -c 64 "$response_file")
+    if ! printf '%s\\n' "$proof" | LC_ALL=C grep -Eqx '[0-9a-f]{64}'; then
+        exit 0
+    fi
+    if [ "$(head -c 65 "$response_file" | tail -c 1 | xxd -p)" != "0a" ]; then
+        exit 0
+    fi
+    computed=$(
+        {
+            printf '%s' "$proof_outer" | xxd -r -p
+            {
+                printf '%s' "$proof_inner" | xxd -r -p
+                printf 'approval\\n%s\\n' "$nonce"
+                tail -c +66 "$response_file"
+            } | openssl dgst -sha256 -binary
+        } | openssl dgst -sha256 -binary | xxd -p -c 64
+    )
+    if ! printf '%s\\n' "$computed" | LC_ALL=C grep -Eqx '[0-9a-f]{64}'; then
+        exit 0
+    fi
+    if [ "$computed" != "$proof" ]; then
+        exit 0
+    fi
+    tail -c +66 "$response_file"
     exit 0
     """
 

@@ -255,13 +255,15 @@ func makeFailingTool(named name: String, atDirectory dir: String, exitCode: Int3
     )
 }
 
-/// The real tools the wake hook runs, by absolute path, for
+/// The real tools the wake hook and the approval hook run, by absolute path, for
 /// `installRecordingWrappers`. `curl` is not here: the fake curl stands in
 /// for it (`makeRecordingFakeCurl`).
 let wakeHookRealTools: [String: String] = [
     "sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "tr": "/usr/bin/tr",
     "uuidgen": "/usr/bin/uuidgen", "openssl": "/usr/bin/openssl", "xxd": "/usr/bin/xxd",
     "mktemp": "/usr/bin/mktemp", "cat": "/bin/cat", "rm": "/bin/rm",
+    // The approval hook's verification tail also runs head and tail.
+    "head": "/usr/bin/head", "tail": "/usr/bin/tail",
 ]
 
 /// Puts a recording wrapper for each of `names` into `dir`. Each wrapper
