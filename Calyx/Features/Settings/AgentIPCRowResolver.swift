@@ -97,8 +97,16 @@ enum AgentIPCRowResolver {
                 return "– \(axis.name): \(reason)"
             }
         }
-        return ([summary] + detailLines).joined(separator: "\n")
+        // J5: the rotation notice is always the last line.
+        let rotationLines = report.tokenRotated ? [tokenRenewedNotice] : []
+        return ([summary] + detailLines + rotationLines).joined(separator: "\n")
     }
+
+    /// Shown when the server switched to a new token because the previous
+    /// port was held by another process. README's IPC section mirrors it.
+    static let tokenRenewedNotice =
+        "IPC token renewed. Claude Code, Codex and Grok ≥ 1.0.52 follow automatically; " +
+        "Hermes reconnects within seconds; restart OpenCode and older Grok sessions started before this launch."
 
     private static func disabledStatusText(for report: IPCDeactivationReport) -> String {
         let axes = report.config.axes + report.hooks.axes

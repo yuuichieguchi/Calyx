@@ -33,6 +33,12 @@ private final class FakeIPCServerControl: IPCServerControlling {
 
     var startError: Error?
     var portAfterStart: Int?
+    /// When non-nil, start() ends with this token instead of the one it
+    /// was handed and reports a rotation (lastStartRotatedToken), as
+    /// LiveIPCServerControl does when the server bound a port other than
+    /// the previous one and switched to `tokenIfPortLost`.
+    var rotatedTokenAfterStart: String?
+    var lastStartRotatedToken = false
 
     func start(token: String) async throws {
         startCallCount += 1
@@ -48,8 +54,14 @@ private final class FakeIPCServerControl: IPCServerControlling {
         // on-disk token instead of the freshly generated one), so the
         // coordinator reads it back from `server.token` after start()
         // returns rather than trusting the token it passed in.
-        self.token = token
         isRunning = true
+        if let rotatedTokenAfterStart {
+            self.token = rotatedTokenAfterStart
+            lastStartRotatedToken = true
+            return
+        }
+        self.token = token
+        lastStartRotatedToken = false
     }
 
     func stop() {
@@ -326,6 +338,77 @@ final class IPCActivationCoordinatorTests: XCTestCase {
             return
         }
         XCTAssertEqual(report.port, 41830, "The reported port must be the port the server started on")
+    }
+
+    // MARK: - enable(): token rotation (J5)
+
+    func test_enable_serverStartRotatedToken_reportsRotationAndWritesReadBackToken() async {
+        let server = FakeIPCServerControl()
+        server.portAfterStart = 41831
+        server.rotatedTokenAfterStart = "rotated-9e8d"
+        let configInstaller = FakeIPCAgentConfigInstaller()
+        let tokenGenerator = FakeIPCTokenGenerator()
+        tokenGenerator.tokenToReturn = "generated-1a2b"
+        let coordinator = IPCActivationCoordinator(
+            server: server, configInstaller: configInstaller, hooksInstaller: FakeIPCAgentHooksInstaller(),
+            tokenGenerator: tokenGenerator, issueReporter: FakeIPCIssueReporter()
+        )
+
+        let outcome = await coordinator.enable()
+
+        XCTAssertEqual(configInstaller.receivedToken, "rotated-9e8d",
+                       "J5: the rotated token reaches the five configs through the existing enableIPC path")
+        XCTAssertEqual(configInstaller.receivedPort, 41831)
+        guard case .enabled(let report) = outcome else {
+            XCTFail("Expected .enabled after a rotating start")
+            return
+        }
+        XCTAssertTrue(report.tokenRotated, "start() reported a rotation, so the report must carry it")
+        XCTAssertEqual(report.port, 41831)
+    }
+
+    func test_enable_serverStartDidNotRotate_reportsNoRotation() async {
+        let server = FakeIPCServerControl()
+        server.portAfterStart = 41830
+        let configInstaller = FakeIPCAgentConfigInstaller()
+        let tokenGenerator = FakeIPCTokenGenerator()
+        tokenGenerator.tokenToReturn = "generated-3c4d"
+        let coordinator = IPCActivationCoordinator(
+            server: server, configInstaller: configInstaller, hooksInstaller: FakeIPCAgentHooksInstaller(),
+            tokenGenerator: tokenGenerator, issueReporter: FakeIPCIssueReporter()
+        )
+
+        let outcome = await coordinator.enable()
+
+        XCTAssertEqual(configInstaller.receivedToken, "generated-3c4d")
+        guard case .enabled(let report) = outcome else {
+            XCTFail("Expected .enabled for a clean fresh start")
+            return
+        }
+        XCTAssertFalse(report.tokenRotated, "start() reported no rotation, so none may be reported")
+    }
+
+    func test_enable_serverAlreadyRunning_reportsNoRotation() async {
+        let server = FakeIPCServerControl()
+        server.isRunning = true
+        server.port = 41835
+        server.token = "live-5f3c"
+        server.rotatedTokenAfterStart = "must-not-be-used"
+        let configInstaller = FakeIPCAgentConfigInstaller()
+        let coordinator = IPCActivationCoordinator(
+            server: server, configInstaller: configInstaller, hooksInstaller: FakeIPCAgentHooksInstaller(),
+            tokenGenerator: FakeIPCTokenGenerator(), issueReporter: FakeIPCIssueReporter()
+        )
+
+        let outcome = await coordinator.enable()
+
+        XCTAssertEqual(server.startCallCount, 0)
+        XCTAssertEqual(configInstaller.receivedToken, "live-5f3c")
+        guard case .enabled(let report) = outcome else {
+            XCTFail("Expected .enabled when reusing a running server")
+            return
+        }
+        XCTAssertFalse(report.tokenRotated, "Reusing a running server never rotates")
     }
 
     // MARK: - enable(): failure short-circuits

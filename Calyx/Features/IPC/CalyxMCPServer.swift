@@ -33,10 +33,25 @@ final class CalyxMCPServer {
     private(set) var token: String = "" {
         didSet { sessionBearerToken.value = token }
     }
+    /// Whether the latest `start` ended with its `tokenIfPortLost`
+    /// instead of its `token` (G2, J4: the previous port was held by
+    /// another process). `start` resets it to false; `finishStart` sets
+    /// it together with `token`.
+    private(set) var lastStartRotatedToken = false
+    /// The `token` argument of the most recent `start` call, recorded
+    /// before any bind is attempted and never reset by `stop()`.
+    /// `LiveIPCServerControl.stop()` keys its stale `agent-endpoint.json`
+    /// removal on it: after a `start` that threw before binding, `token`
+    /// still holds its previous value (it is assigned only in
+    /// `finishStart`), while the file on disk carries the token that
+    /// start attempted.
+    private(set) var lastStartAttemptedToken: String?
     /// `token`, readable off the main actor. The `/calyx-mcp` router keys
-    /// its session ids with it; `start` sets `token` before it binds the
-    /// listener, so the first request the listener accepts already sees
-    /// the token it was authenticated with.
+    /// its session ids with it. `finishStart` assigns `token` after the
+    /// bind, before it writes `agent-endpoint.json` and before it installs
+    /// the listener's `newConnectionHandler`, so the first request the
+    /// listener accepts already sees the token it was authenticated with.
+    /// A `start` that throws leaves `token` at its previous value.
     let sessionBearerToken = MCPSessionBearerToken()
     let store = IPCStore()
     private(set) var appPeerID: UUID?
@@ -1445,7 +1460,19 @@ final class CalyxMCPServer {
 
     // MARK: - Lifecycle
 
-    func start(token: String, preferredPort: Int = IPCEndpointReuse.defaultPort) async throws {
+    /// Binds the listener and publishes `agent-endpoint.json`.
+    ///
+    /// `tokenIfPortLost` (G2, J4, C-D2): when non-nil and `preferredPort`
+    /// itself cannot be bound, the server ends up with this token instead
+    /// of `token` and sets `lastStartRotatedToken`. A process can rebind
+    /// its own just-closed port (V3-1), so a failed bind of the previous
+    /// port means another process holds it. `preferredPort == 0`
+    /// (kernel-assigned) is never treated as lost.
+    func start(
+        token: String,
+        preferredPort: Int = IPCEndpointReuse.defaultPort,
+        tokenIfPortLost: String? = nil
+    ) async throws {
         // Capture the teardown Task scheduled by the prior `stop()` so
         // the new LSP startup can wait for it before installing a fresh
         // bridge. Without this chain the new `lspStartTask` and the
@@ -1466,8 +1493,10 @@ final class CalyxMCPServer {
         // the prior teardown has finished its `shutdownAll` and
         // identity check.
         let priorTeardown: Task<Void, Never>? = isRunning ? stop() : nil
+        self.lastStartAttemptedToken = token
 
-        self.token = token
+        // `token` itself is assigned by `finishStart`, after the bind.
+        self.lastStartRotatedToken = false
         // A fresh key per start, before `finishStart` publishes its
         // blocks in `agent-endpoint.json`.
         self.wakeProofKey = IPCWakeProofKey.random()
@@ -1485,6 +1514,8 @@ final class CalyxMCPServer {
         }
 
         var lastError: Error?
+        // Whether `preferredPort` itself (portOffset 0) failed to bind.
+        var preferredPortLost = false
 
         // Phase 1: canonical linear scan over `preferredPort..<preferredPort+10`.
         // If a port in that window is free we bind it and publish the port
@@ -1516,12 +1547,18 @@ final class CalyxMCPServer {
                             "Failed to bind to 127.0.0.1:\(tryPort)",
                     ]
                 )
+                if portOffset == 0 && preferredPort != 0 {
+                    preferredPortLost = true
+                }
                 continue
             }
             if resolvedPort != tryPort {
                 NSLog("[CalyxMCPServer] canonical scan requested port \(tryPort) but the listener resolved to \(resolvedPort); recording the resolved port")
             }
-            finishStart(listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown)
+            finishStart(
+                listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown,
+                token: Self.finalToken(token, tokenIfPortLost: tokenIfPortLost, preferredPortLost: preferredPortLost)
+            )
             return
         }
 
@@ -1533,7 +1570,10 @@ final class CalyxMCPServer {
         // URL published by `ClaudeConfigManager.enableIPC`) stays
         // consistent with the bind.
         if let (nl, resolvedPort) = await bindKernelAssignedListener() {
-            finishStart(listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown)
+            finishStart(
+                listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown,
+                token: Self.finalToken(token, tokenIfPortLost: tokenIfPortLost, preferredPortLost: preferredPortLost)
+            )
             return
         }
 
@@ -1545,6 +1585,18 @@ final class CalyxMCPServer {
                     "Failed to bind to any port in range \(preferredPort)-\(preferredPort + 9) and kernel-assigned fallback also failed",
             ]
         )
+    }
+
+    /// The token a start ends with, and whether it is the rotated one:
+    /// `tokenIfPortLost` only when the previous port was lost and an
+    /// alternative was supplied, `token` otherwise.
+    private static func finalToken(
+        _ token: String, tokenIfPortLost: String?, preferredPortLost: Bool
+    ) -> (value: String, rotated: Bool) {
+        if preferredPortLost, let tokenIfPortLost {
+            return (tokenIfPortLost, true)
+        }
+        return (token, false)
     }
 
     /// Asks the kernel for a free ephemeral loopback port and binds an
@@ -1602,8 +1654,13 @@ final class CalyxMCPServer {
     private func finishStart(
         listener nl: NWListener,
         boundPort: Int,
-        priorTeardown: Task<Void, Never>?
+        priorTeardown: Task<Void, Never>?,
+        token finalToken: (value: String, rotated: Bool)
     ) {
+        // The start's final token, assigned before the endpoint file is
+        // written and before `newConnectionHandler` is installed below.
+        self.token = finalToken.value
+        self.lastStartRotatedToken = finalToken.rotated
         if let liveness = EndpointLiveness.current() {
             do {
                 try AgentEndpointFile.write(

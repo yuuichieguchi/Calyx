@@ -33,6 +33,16 @@ protocol IPCServerControlling {
     var token: String { get }
     func start(token: String) async throws
     func stop()
+    /// Whether the latest `start(token:)` ended with a rotated token
+    /// rather than the one it decided to use (G2, J4: the previous port
+    /// was held by another process). The coordinator reads it right after
+    /// `start(token:)` returns.
+    var lastStartRotatedToken: Bool { get }
+}
+
+extension IPCServerControlling {
+    /// Conformers that never rotate report no rotation.
+    var lastStartRotatedToken: Bool { false }
 }
 
 /// Writes or removes the calyx-ipc entry in every supported agent CLI's
@@ -85,6 +95,13 @@ struct IPCActivationReport: Sendable {
     let port: Int
     let config: IPCConfigResult
     let hooks: AgentHooksResult
+    /// Whether this enable's server start switched to a new token because
+    /// the previous port was held by another process (G2, J4). Always
+    /// false when an already-running server was reused. The rotated token
+    /// reaches the five agent configs through the existing read-back of
+    /// `server.token` after `start` (J5); this flag only drives the
+    /// Settings notice.
+    let tokenRotated: Bool
 }
 
 /// Why a server-start attempt failed, in the one place both the sidebar
@@ -161,6 +178,7 @@ struct IPCActivationCoordinator {
     private func enableLocked() async -> IPCActivationOutcome {
         let port: Int
         let token: String
+        let tokenRotated: Bool
 
         if server.isRunning {
             // Reuse the live endpoint. CalyxMCPServer.start(token:)
@@ -171,6 +189,7 @@ struct IPCActivationCoordinator {
             // config/hooks install.
             port = server.port
             token = server.token
+            tokenRotated = false
         } else {
             let generatedToken: String
             do {
@@ -183,6 +202,7 @@ struct IPCActivationCoordinator {
             } catch {
                 return reportServerFailure(.start(error))
             }
+            tokenRotated = server.lastStartRotatedToken
             // Read BOTH back after start() returns: the server resolves
             // its own token and its actual listening port during start,
             // not before -- LiveIPCServerControl.start(token:) may pass
@@ -204,7 +224,7 @@ struct IPCActivationCoordinator {
         // this point.
         issueReporter.reportServerIssues([])
 
-        return .enabled(IPCActivationReport(port: port, config: config, hooks: hooks))
+        return .enabled(IPCActivationReport(port: port, config: config, hooks: hooks, tokenRotated: tokenRotated))
     }
 
     /// Reports `failure`'s description to the server-issue domain and
@@ -268,16 +288,21 @@ struct LiveIPCServerControl: IPCServerControlling {
     var isRunning: Bool { CalyxMCPServer.shared.isRunning }
     var port: Int { CalyxMCPServer.shared.port }
     var token: String { CalyxMCPServer.shared.token }
+    var lastStartRotatedToken: Bool { CalyxMCPServer.shared.lastStartRotatedToken }
 
     /// Reads the currently published endpoint (if any) and decides
     /// whether its token and port should be reused -- independently of
     /// each other, see `IPCEndpointReuse` -- so a persistent-session CLI
     /// that already holds the old token/URL keeps working across a
-    /// restart where possible.
+    /// restart where possible. `decision.tokenIfPortLost` lets the server
+    /// switch to the fresh token when the previous port turns out to be
+    /// held by another process (`IPCEndpointReuse.Policy.onLostPort`).
     func start(token: String) async throws {
         let existing = AgentEndpointFile.read(directory: CalyxMCPServer.shared.agentEndpointDirectory)
         let decision = IPCEndpointReuse.decide(existing: existing, freshToken: token)
-        try await CalyxMCPServer.shared.start(token: decision.token, preferredPort: decision.port)
+        try await CalyxMCPServer.shared.start(
+            token: decision.token, preferredPort: decision.port, tokenIfPortLost: decision.tokenIfPortLost
+        )
     }
 
     /// The server's own stop reports completion through a handle this
@@ -285,25 +310,26 @@ struct LiveIPCServerControl: IPCServerControlling {
     /// synchronous with respect to the server's own teardown.
     ///
     /// Additionally removes `agent-endpoint.json` when its on-disk token
-    /// matches this server's own `token`, using the on-disk PORT rather
-    /// than `server.port` -- `CalyxMCPServer.stop()` already removes the
-    /// file using the port and token it captured before resetting its
-    /// own `port` to `0`, so this second read-then-remove only ever
-    /// matters when that first removal's port did not match what is on
-    /// disk. That happens on a failed enable that adopted a reused
-    /// on-disk token via `IPCEndpointReuse` (`start(token:)` above) but
-    /// never got as far as binding a port (`port` stays `0`,
-    /// `finishStart` -- the only writer of `agent-endpoint.json` -- is
-    /// never reached): the file on disk still holds the OLD, non-zero
-    /// port from whoever published it, so `CalyxMCPServer.stop()`'s own
-    /// removal (port `0` vs. the file's real port) does not match, and
-    /// only this second attempt, matching on the reused token instead of
-    /// the never-bound port, actually clears it.
+    /// matches the token the latest `start` attempted
+    /// (`server.lastStartAttemptedToken`, falling back to `server.token`
+    /// when no start was ever attempted), using the on-disk PORT rather
+    /// than `server.port`. This matters on a failed enable that adopted
+    /// a reused on-disk token via `IPCEndpointReuse` (`start(token:)`
+    /// above) but never bound a port: `port` stays `0`, `finishStart`
+    /// -- the only writer of `agent-endpoint.json` and the only place
+    /// `token` is assigned -- is never reached, so the file still holds
+    /// the old, non-zero port and `CalyxMCPServer.stop()`'s own removal
+    /// (port `0` vs. the file's real port) does not match. `server.token`
+    /// is the wrong key there because the failed start left it at its
+    /// previous value; the attempted token is the one the file carries.
+    /// After a successful start, `CalyxMCPServer.stop()`'s own removal
+    /// already clears the file, so this second read finds nothing and is
+    /// a no-op.
     func stop() {
         let server = CalyxMCPServer.shared
         _ = server.stop()
         if let existing = AgentEndpointFile.read(directory: server.agentEndpointDirectory),
-           existing.token == server.token {
+           existing.token == (server.lastStartAttemptedToken ?? server.token) {
             AgentEndpointFile.remove(directory: server.agentEndpointDirectory, port: existing.port, token: existing.token)
         }
     }
