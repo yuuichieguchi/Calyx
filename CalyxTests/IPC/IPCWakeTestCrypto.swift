@@ -72,10 +72,17 @@ enum IPCWakeTestCrypto {
         SymmetricKey(size: SymmetricKeySize(bitCount: count * 8)).withUnsafeBytes { Data($0) }
     }
 
-    /// A one-line agent-endpoint.json with `port`, `token` and, when given,
-    /// the blocks of `keyBytes`.
-    static func endpointJSON(port: Int, token: String, keyBytes: Data?) throws -> Data {
+    /// A one-line agent-endpoint.json with `port`, `token`, the liveness
+    /// identifier `pid`/`pidStart` (default: the test host's own, see
+    /// TestHostLiveness.swift and spec C-D16; nil omits that key) and,
+    /// when given, the blocks of `keyBytes`.
+    static func endpointJSON(
+        port: Int, token: String, keyBytes: Data?,
+        pid: Int32? = TestHostLiveness.pid, pidStart: String? = TestHostLiveness.startText
+    ) throws -> Data {
         var dict: [String: Any] = ["port": port, "token": token]
+        if let pid { dict["pid"] = Int(pid) }
+        if let pidStart { dict["pidStart"] = pidStart }
         if let keyBytes {
             let blocks = blocksHex(keyBytes: keyBytes)
             dict["wakeProofInner"] = blocks.inner
@@ -86,10 +93,14 @@ enum IPCWakeTestCrypto {
 
     /// Writes `endpointJSON` to `<directory>/agent-endpoint.json` (0600),
     /// creating the directory.
-    static func writeEndpointFile(directory: String, port: Int, token: String, keyBytes: Data?) throws {
+    static func writeEndpointFile(
+        directory: String, port: Int, token: String, keyBytes: Data?,
+        pid: Int32? = TestHostLiveness.pid, pidStart: String? = TestHostLiveness.startText
+    ) throws {
         try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
         let path = directory + "/agent-endpoint.json"
-        try endpointJSON(port: port, token: token, keyBytes: keyBytes).write(to: URL(fileURLWithPath: path))
+        try endpointJSON(port: port, token: token, keyBytes: keyBytes, pid: pid, pidStart: pidStart)
+            .write(to: URL(fileURLWithPath: path))
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
     }
 

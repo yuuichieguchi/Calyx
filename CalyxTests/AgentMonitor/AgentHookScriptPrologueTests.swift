@@ -19,7 +19,9 @@
 //  - the prologue's executable lines (comments and blank lines dropped,
 //    indentation ignored) are exactly the surface/session guard, the
 //    herdr guard, the kind default, the Grok guard, the endpoint-file
-//    read, and the port/token extraction with its empty check, in order
+//    read, the port/token extraction with its empty check, and the
+//    liveness check (pid/pidStart extraction, `kill -0`, `ps -o lstart=`
+//    comparison; spec Feature C, C.3 G1), in order
 //  - AgentHookScript.scriptBody, ApprovalHookScript.scriptBody and
 //    IPCWakeHookScript.scriptBody each contain the prologue verbatim,
 //    exactly once
@@ -121,12 +123,26 @@ final class AgentHookScriptPrologueTests: XCTestCase {
             #"if [ -z "$port" ] || [ -z "$token" ]; then"#,
             "exit 0",
             "fi",
+            // Liveness check (spec Feature C, C.3 G1): only a live Calyx
+            // whose start time matches is ever sent the token.
+            #"pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "$endpoint_file")"#,
+            #"pid_start=$(sed -n 's/.*"pidStart"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$endpoint_file")"#,
+            #"if [ -z "$pid" ] || [ -z "$pid_start" ]; then"#,
+            "exit 0",
+            "fi",
+            #"if ! kill -0 "$pid" 2>/dev/null; then"#,
+            "exit 0",
+            "fi",
+            #"set -- $(TZ=UTC LC_ALL=C ps -p "$pid" -o lstart=)"#,
+            #"if [ "$*" != "$pid_start" ]; then"#,
+            "exit 0",
+            "fi",
         ]
 
         XCTAssertEqual(
             executableLines(of: AgentHookScriptPrologue.body), expected,
-            "The shared prologue must execute exactly the lines the hook scripts opened with " +
-            "before it was extracted, in the same order"
+            "The shared prologue must execute exactly the guards, the endpoint resolution and " +
+            "the liveness check, in this order"
         )
     }
 

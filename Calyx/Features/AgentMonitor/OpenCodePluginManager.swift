@@ -35,8 +35,11 @@ enum OpenCodePluginManager: Sendable {
     // endpoint. agent-endpoint.json (port/token) is cached by mtime and
     // only re-read/re-parsed when the file actually changes, so a Calyx
     // server restart or token rotation is still picked up without
-    // reinstalling this plugin.
+    // reinstalling this plugin. Before every POST, liveEndpoint() checks
+    // that the Calyx process named by the file's pid/pidStart is alive;
+    // otherwise nothing is sent.
 
+    import { spawnSync } from "node:child_process";
     import { stat } from "node:fs/promises";
 
     // opencode 1.18.18's plugin event vocabulary has no process-exit
@@ -127,6 +130,45 @@ enum OpenCodePluginManager: Sendable {
         return endpoint;
       }
 
+      // Liveness check (spec Feature C, G1): the token goes only to the
+      // Calyx process that wrote agent-endpoint.json. process.kill(pid, 0)
+      // throws ESRCH for a dead pid and EPERM for another user's; the start
+      // time from `ps -o lstart=` (UTC, C locale, whitespace collapsed, the
+      // same normalisation Calyx wrote pidStart with) rules out a reused pid.
+      // A verified (pid, pidStart) pair is cached for this process's lifetime
+      // and afterwards only process.kill(pid, 0) is re-checked: the residual
+      // is the pid being reused by another process with the same pidStart
+      // text, which needs the pid counter to wrap around within it.
+      let verifiedPid = null;
+      let verifiedPidStart = null;
+
+      function liveEndpoint(endpoint) {
+        const pid = endpoint["pid"];
+        const pidStart = endpoint["pidStart"];
+        if (typeof pid !== "number" || typeof pidStart !== "string" || !pidStart) {
+          return false;
+        }
+        try {
+          process.kill(pid, 0);
+        } catch {
+          return false;
+        }
+        if (pid === verifiedPid && pidStart === verifiedPidStart) {
+          return true;
+        }
+        const ps = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+          env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+          encoding: "utf8",
+        });
+        const liveStart = String(ps.stdout ?? "").split(/\\s+/).filter(Boolean).join(" ");
+        if (liveStart !== pidStart) {
+          return false;
+        }
+        verifiedPid = pid;
+        verifiedPidStart = pidStart;
+        return true;
+      }
+
       function resolveSessionID(properties) {
         const info = properties && properties.info;
         return (
@@ -141,6 +183,9 @@ enum OpenCodePluginManager: Sendable {
       async function postEvent(bodyJSON) {
         try {
           const endpoint = await loadEndpoint();
+          if (!liveEndpoint(endpoint)) {
+            return;
+          }
 
           await fetch(`http://127.0.0.1:${endpoint.port}/agent-event`, {
             method: "POST",

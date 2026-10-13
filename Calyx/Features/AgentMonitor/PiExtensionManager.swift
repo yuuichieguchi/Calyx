@@ -49,9 +49,13 @@ enum PiExtensionManager: Sendable {
     //
     // agent-endpoint.json (port and token) is cached by mtime and
     // re-parsed only when the file changes, so a Calyx restart or a token
-    // rotation is picked up without reinstalling this extension.
+    // rotation is picked up without reinstalling this extension. Before
+    // every request, liveEndpoint() checks that the Calyx process named by
+    // the file's pid/pidStart is alive; otherwise the request is treated
+    // exactly like an unreachable Calyx.
 
     import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+    import { spawnSync } from "node:child_process";
     import { readFile, stat } from "node:fs/promises";
 
     const EVENT_MAP = {
@@ -89,11 +93,53 @@ enum PiExtensionManager: Sendable {
         return endpoint;
       }
 
+      // Liveness check (spec Feature C, G1): the token goes only to the
+      // Calyx process that wrote agent-endpoint.json. process.kill(pid, 0)
+      // throws ESRCH for a dead pid and EPERM for another user's; the start
+      // time from `ps -o lstart=` (UTC, C locale, whitespace collapsed, the
+      // same normalisation Calyx wrote pidStart with) rules out a reused pid.
+      // A verified (pid, pidStart) pair is cached for this process's lifetime
+      // and afterwards only process.kill(pid, 0) is re-checked: the residual
+      // is the pid being reused by another process with the same pidStart
+      // text, which needs the pid counter to wrap around within it.
+      let verifiedPid = null;
+      let verifiedPidStart = null;
+
+      function liveEndpoint(endpoint) {
+        const pid = endpoint["pid"];
+        const pidStart = endpoint["pidStart"];
+        if (typeof pid !== "number" || typeof pidStart !== "string" || !pidStart) {
+          return false;
+        }
+        try {
+          process.kill(pid, 0);
+        } catch {
+          return false;
+        }
+        if (pid === verifiedPid && pidStart === verifiedPidStart) {
+          return true;
+        }
+        const ps = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+          env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+          encoding: "utf8",
+        });
+        const liveStart = String(ps.stdout ?? "").split(/\\s+/).filter(Boolean).join(" ");
+        if (liveStart !== pidStart) {
+          return false;
+        }
+        verifiedPid = pid;
+        verifiedPidStart = pidStart;
+        return true;
+      }
+
       // The tools of the MCP servers configured in Calyx, reached through
       // /calyx-mcp without a session. The herdr headers let Calyx find
       // the herdr pane; the pane headers find an ordinary one.
       async function callCalyxMCP(method, params, signal) {
         const endpoint = await loadEndpoint();
+        if (!liveEndpoint(endpoint)) {
+          throw new Error("Calyx is not running");
+        }
         const response = await fetch(`http://127.0.0.1:${endpoint.port}/calyx-mcp`, {
           method: "POST",
           headers: {
@@ -188,6 +234,9 @@ enum PiExtensionManager: Sendable {
       async function postState(hookEventName, ctx) {
         try {
           const endpoint = await loadEndpoint();
+          if (!liveEndpoint(endpoint)) {
+            return;
+          }
           await fetch(`http://127.0.0.1:${endpoint.port}/agent-event`, {
             method: "POST",
             headers: calyxHeaders(endpoint),
@@ -206,6 +255,9 @@ enum PiExtensionManager: Sendable {
 
       async function callCalyx(method, params, signal) {
         const endpoint = await loadEndpoint();
+        if (!liveEndpoint(endpoint)) {
+          throw new Error("Calyx is not running");
+        }
         const response = await fetch(`http://127.0.0.1:${endpoint.port}/mcp`, {
           method: "POST",
           headers: calyxHeaders(endpoint),
@@ -242,6 +294,9 @@ enum PiExtensionManager: Sendable {
         let answer;
         try {
           const endpoint = await loadEndpoint();
+          if (!liveEndpoint(endpoint)) {
+            throw new Error("Calyx is not running");
+          }
           const response = await fetch(`http://127.0.0.1:${endpoint.port}/approval-request`, {
             method: "POST",
             headers: calyxHeaders(endpoint),

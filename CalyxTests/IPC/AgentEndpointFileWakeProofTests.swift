@@ -59,7 +59,7 @@ final class AgentEndpointFileWakeProofTests: XCTestCase {
     }
 
     func test_write_storesBothBlocks_nextToPortAndToken() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
 
         let json = try readJSONObject()
         XCTAssertEqual(json["wakeProofInner"] as? String, onesInnerHex)
@@ -68,12 +68,35 @@ final class AgentEndpointFileWakeProofTests: XCTestCase {
         XCTAssertEqual(json["wakeProofOuter"] as? String, onesKey.outerBlockHex)
         XCTAssertEqual(json["port"] as? Int, 41830)
         XCTAssertEqual(json["token"] as? String, "test-token-abc")
-        XCTAssertEqual(Set(json.keys), ["port", "token", "wakeProofInner", "wakeProofOuter"])
+        XCTAssertEqual(Set(json.keys), ["port", "token", "wakeProofInner", "wakeProofOuter", "pid", "pidStart"])
+    }
+
+    // MARK: - Liveness identifier (spec Feature C, J1)
+
+    func test_write_storesTheLivenessPidAsANumberAndPidStartAsAString() throws {
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
+
+        let json = try readJSONObject()
+        XCTAssertEqual(json["pid"] as? Int, Int(getpid()), "pid must be the writing process's own pid, as a JSON number")
+        XCTAssertNil(json["pid"] as? String, "pid must not be a JSON string")
+        XCTAssertFalse(TestHostLiveness.startText.isEmpty, "precondition: ps reported the test host's start time")
+        XCTAssertEqual(json["pidStart"] as? String, TestHostLiveness.startText,
+                       "pidStart must be the normalised UTC `ps -o lstart=` text of the writing process")
+    }
+
+    func test_write_readAndRemoveIgnoreTheLivenessKeys() throws {
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
+        XCTAssertNotNil(try readJSONObject()["pidStart"], "precondition: the file carries pidStart")
+
+        XCTAssertEqual(AgentEndpointFile.read(directory: tempDir),
+                       AgentEndpointFile.Endpoint(port: 41830, token: "test-token-abc"))
+        AgentEndpointFile.remove(directory: tempDir, port: 41830, token: "test-token-abc")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: filePath))
     }
 
     func test_write_doesNotStoreTheKeyItself() throws {
         let keyBytes = Data((0..<32).map { UInt8(0xA0 + $0) })
-        try AgentEndpointFile.write(
+        try writeTestEndpointFile(
             port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey(bytes: keyBytes), directory: tempDir
         )
 
@@ -86,7 +109,7 @@ final class AgentEndpointFileWakeProofTests: XCTestCase {
     }
 
     func test_write_fileModeIs0600() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
 
         let attrs = try FileManager.default.attributesOfItem(atPath: filePath)
         XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.uint16Value, 0o600)
@@ -94,7 +117,7 @@ final class AgentEndpointFileWakeProofTests: XCTestCase {
     }
 
     func test_write_readReturnsThePortAndToken() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
 
         XCTAssertNotNil(try readJSONObject()["wakeProofOuter"], "precondition: the file carries the blocks")
         XCTAssertEqual(AgentEndpointFile.read(directory: tempDir),
@@ -102,7 +125,7 @@ final class AgentEndpointFileWakeProofTests: XCTestCase {
     }
 
     func test_remove_stillRequiresMatchingPortAndToken() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
 
         AgentEndpointFile.remove(directory: tempDir, port: 41831, token: "test-token-abc")
         XCTAssertTrue(FileManager.default.fileExists(atPath: filePath))
@@ -114,8 +137,8 @@ final class AgentEndpointFileWakeProofTests: XCTestCase {
 
     func test_write_replacesAnEarlierKeysBlocks() throws {
         let earlier = IPCWakeProofKey(bytes: Data(repeating: 0x02, count: 32))
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: earlier, directory: tempDir)
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: earlier, directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
 
         let json = try readJSONObject()
         XCTAssertEqual(json["wakeProofInner"] as? String, onesInnerHex)
@@ -155,7 +178,7 @@ final class AgentEndpointFileWakeProofTests: XCTestCase {
 
     func test_prologueSedExpressions_extractTheSamePortAndToken() throws {
         let token = "7B0D1F5C-2E44-4C0A-9D1B-6A5E3C2F1A00"
-        try AgentEndpointFile.write(
+        try writeTestEndpointFile(
             port: 41830, token: token, wakeProofKey: IPCWakeProofKey(bytes: Data((0..<32).map { UInt8($0) })),
             directory: tempDir
         )
@@ -163,5 +186,18 @@ final class AgentEndpointFileWakeProofTests: XCTestCase {
 
         XCTAssertEqual(try runSed(try prologueSedExpression(assigning: "port")), "41830")
         XCTAssertEqual(try runSed(try prologueSedExpression(assigning: "token")), token)
+    }
+
+    /// J1/J15: the liveness sed lines extract exactly the pid and pidStart
+    /// the writer stored, and the pid expression is not fooled by the
+    /// `"pidStart"` key that shares its prefix.
+    func test_prologueSedExpressions_extractThePidAndPidStart() throws {
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: onesKey, directory: tempDir)
+        XCTAssertNotNil(try readJSONObject()["pidStart"], "precondition: the file carries pidStart")
+
+        XCTAssertEqual(try runSed(try prologueSedExpression(assigning: "pid")), String(getpid()))
+        XCTAssertEqual(try runSed(try prologueSedExpression(assigning: "pid_start")), TestHostLiveness.startText)
+        XCTAssertEqual(try runSed(try prologueSedExpression(assigning: "port")), "41830",
+                       "the port extraction must be unaffected by the new keys")
     }
 }

@@ -1579,7 +1579,12 @@ final class CalyxMCPServer {
     /// The listener arrives here already started (on its probe queue)
     /// and in `.ready` state, so we only need to replace the
     /// `stateUpdateHandler` / `newConnectionHandler` with the
-    /// production wiring.
+    /// production wiring. The handler used to be dropped (set to nil)
+    /// here, since nothing past `.ready` was observed; it now stays
+    /// installed so a listener that fails or is cancelled after `.ready`
+    /// stops the server with `stop()`'s full teardown (spec Feature C,
+    /// J3): endpoint file removal, waiting `/ipc-wake` polls released,
+    /// pending approvals expired.
     ///
     /// Writes `agent-endpoint.json` (port/token for the calyx-agent-hook
     /// script, and `wakeProofKey`'s two blocks for calyx-ipc-wake-hook)
@@ -1591,24 +1596,46 @@ final class CalyxMCPServer {
     /// previous file may remain and still name a valid port and token
     /// but the previous key's blocks, which is why `routeIPCWake`
     /// withholds wakes until this write succeeds and sets
-    /// `wakeProofKeyPublished` (D20).
+    /// `wakeProofKeyPublished` (D20). The file also carries this
+    /// process's `EndpointLiveness`; when `EndpointLiveness.current()` is
+    /// nil the file is not written, handled exactly like a write failure.
     private func finishStart(
         listener nl: NWListener,
         boundPort: Int,
         priorTeardown: Task<Void, Never>?
     ) {
-        do {
-            try AgentEndpointFile.write(
-                port: boundPort, token: token, wakeProofKey: wakeProofKey, directory: agentEndpointDirectory
-            )
-            wakeProofKeyPublished = true
-        } catch {
-            NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: \(error)")
+        if let liveness = EndpointLiveness.current() {
+            do {
+                try AgentEndpointFile.write(
+                    port: boundPort, token: token, wakeProofKey: wakeProofKey,
+                    liveness: liveness, directory: agentEndpointDirectory
+                )
+                wakeProofKeyPublished = true
+            } catch {
+                NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: \(error)")
+            }
+        } else {
+            NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: proc_pidinfo gave no start time for this process")
         }
 
-        // Drop the probe handler — from here on we don't need to
-        // observe further state transitions.
-        nl.stateUpdateHandler = nil
+        // Replace the probe handler (which only waited for `.ready` or a
+        // bind failure) with the J3 one: a listener that fails or is
+        // cancelled after `.ready` while it is still this server's
+        // listener tears the server down exactly as `stop()` does, so
+        // agent-endpoint.json never keeps naming a port nobody serves.
+        // `stop()`'s own `listener?.cancel()` also lands here as
+        // `.cancelled`, after `stop()` has already cleared `listener`,
+        // so the identity check turns it into a no-op.
+        nl.stateUpdateHandler = { [weak self, weak nl] state in
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor in
+                    self?.handleListenerEnded(nl)
+                }
+            default:
+                break
+            }
+        }
         nl.newConnectionHandler = { [weak self] connection in
             Task { @MainActor in
                 self?.handleConnection(connection)
@@ -1640,6 +1667,26 @@ final class CalyxMCPServer {
             await self.startLSP()
         }
     }
+
+    /// J3: `finishStart`'s listener reached `.failed` or `.cancelled`.
+    /// Stops the server only when `ended` is still the current listener
+    /// and the server is running; a superseded or already-stopped
+    /// listener changes nothing.
+    private func handleListenerEnded(_ ended: NWListener?) {
+        guard let ended, listener === ended, isRunning else { return }
+        NSLog("[CalyxMCPServer] listener ended after .ready; stopping the server")
+        stop()
+    }
+
+    #if DEBUG
+    /// Test seam: cancels the current listener, which drives its
+    /// `.cancelled` state through the production `stateUpdateHandler`
+    /// installed by `finishStart` (the J3 path). DO NOT use from
+    /// production code.
+    func _testSimulateListenerFailure() {
+        listener?.cancel()
+    }
+    #endif
 
     @discardableResult
     func stop() -> Task<Void, Never> {

@@ -491,7 +491,7 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         // reconstructs explicitly.
         let stalePort = server.port
         server.stop()
-        try AgentEndpointFile.write(port: stalePort, token: testToken, wakeProofKey: IPCWakeProofKey.random(), directory: appSupportDir)
+        try writeTestEndpointFile(port: stalePort, token: testToken, wakeProofKey: IPCWakeProofKey.random(), directory: appSupportDir)
 
         let (exitCode, stdout) = try await Self.runHookScript(
             scriptPath: scriptPath, home: tempHome, stdinJSON: bashLsStdin, surfaceID: UUID()
@@ -766,10 +766,15 @@ final class ApprovalHookPipelineIntegrationTests: XCTestCase {
         XCTAssertEqual(stdout, "", "an answer over 65 + 4 * 262144 bytes is never printed, even correctly signed")
     }
 
-    /// Rewrites agent-endpoint.json by hand with `port`, this suite's token
-    /// and the given blocks.
+    /// Rewrites agent-endpoint.json by hand with `port`, this suite's token,
+    /// the test host's liveness identifier and the given blocks.
     private func writeEndpointFile(port: Int, inner: String, outer: String) throws {
-        let dict: [String: Any] = ["port": port, "token": testToken, "wakeProofInner": inner, "wakeProofOuter": outer]
+        // pid/pidStart: the test host's own liveness identifier (C-D16), so
+        // the prologue's liveness check passes and the case under test runs.
+        let dict: [String: Any] = [
+            "port": port, "token": testToken, "wakeProofInner": inner, "wakeProofOuter": outer,
+            "pid": Int(TestHostLiveness.pid), "pidStart": TestHostLiveness.startText,
+        ]
         let data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
         try data.write(to: URL(fileURLWithPath: appSupportDir + "/agent-endpoint.json"))
     }

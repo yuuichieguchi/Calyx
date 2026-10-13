@@ -659,7 +659,10 @@ final class IPCWakeHookScriptTests: XCTestCase {
     func test_run_endpointFileWithOnlyOneBlock_neverRunsCurl() throws {
         let key = C.randomKeyBytes()
         let blocks = C.blocksHex(keyBytes: key)
-        let base = #""port":41834,"token":"ipc-wake-hook-script-test-token""#
+        // pid/pidStart: the test host's own (C-D16), so the prologue's
+        // liveness check passes and the missing block is what stops curl.
+        let base = #""port":41834,"token":"ipc-wake-hook-script-test-token","pid":"#
+            + String(TestHostLiveness.pid) + #","pidStart":""# + TestHostLiveness.startText + "\""
         for (label, text) in [
             ("only inner", "{" + base + #","wakeProofInner":""# + blocks.inner + "\"}"),
             ("only outer", "{" + base + #","wakeProofOuter":""# + blocks.outer + "\"}"),

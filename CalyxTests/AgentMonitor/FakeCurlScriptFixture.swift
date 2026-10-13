@@ -90,19 +90,25 @@ struct FakeCurlScriptFixture {
 /// distinct-enough values will do. The file is written by hand
 /// (`IPCWakeTestCrypto.writeEndpointFile`, 0600) with the two wake proof
 /// blocks of `wakeKeyBytes`, a fresh random 32-byte key unless given; pass
-/// nil for a file with port and token only.
+/// nil for a file without the blocks. `pid`/`pidStart` default to the test
+/// host's own liveness identifier (spec C-D16), so the prologue's liveness
+/// check passes; nil omits that key.
 func makeFakeCurlScriptFixture(
     rootDirectory: String = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString).path,
     port: Int,
     token: String,
     wakeKeyBytes: Data? = IPCWakeTestCrypto.randomKeyBytes(),
+    pid: Int32? = TestHostLiveness.pid,
+    pidStart: String? = TestHostLiveness.startText,
     install: (String) throws -> String
 ) throws -> FakeCurlScriptFixture {
     let home = rootDirectory + "/home"
     let appSupportDir = home + "/Library/Application Support/Calyx"
     let fakeBinDir = rootDirectory + "/fakebin"
-    try IPCWakeTestCrypto.writeEndpointFile(directory: appSupportDir, port: port, token: token, keyBytes: wakeKeyBytes)
+    try IPCWakeTestCrypto.writeEndpointFile(
+        directory: appSupportDir, port: port, token: token, keyBytes: wakeKeyBytes, pid: pid, pidStart: pidStart
+    )
     let scriptPath = try install(appSupportDir + "/bin")
     return FakeCurlScriptFixture(
         rootDir: rootDirectory, home: home, appSupportDir: appSupportDir,
