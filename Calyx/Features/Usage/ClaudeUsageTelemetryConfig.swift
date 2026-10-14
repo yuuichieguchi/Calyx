@@ -57,19 +57,27 @@ enum ClaudeUsageTelemetryConfig {
         ]
     }
 
-    private static let helperPrefix = "cat '"
-    /// The fallback makes the command succeed when the headers file is
-    /// missing: a failing helper makes Claude Code send nothing at all.
-    private static let helperSuffix = "' 2>/dev/null || printf '{}'"
-    /// How a `'` inside the single-quoted path is written for the shell.
-    private static let escapedQuote = "'\\''"
-
-    /// The command Claude Code runs for its headers. `headersFilePath`
-    /// must be absolute (Calyx's credential file always is): a path
-    /// starting with `-` would be read by `cat` as an option.
-    static func helperCommand(headersFilePath: String) -> String {
-        helperPrefix + headersFilePath.replacingOccurrences(of: "'", with: escapedQuote) + helperSuffix
+    /// The command Claude Code runs for its headers: the helper script's
+    /// path in double quotes (it contains a space, `Application Support`),
+    /// one space, then the port the endpoint names. The script prints the
+    /// usage token only while agent-endpoint.json's writer is alive and
+    /// serves that same port, so a session that kept an old endpoint URL
+    /// after the port moved never hands the token to another process (G5).
+    static func helperCommand(helperPath: String, port: Int) -> String {
+        "\"\(helperPath)\" \(port)"
     }
+
+    /// The last path component of the helper script the new form names.
+    private static let helperScriptName = "calyx-usage-headers"
+
+    // The legacy form, `cat '<path>' 2>/dev/null || printf '{}'`, is what
+    // earlier Calyx versions wrote. It is no longer written; it is kept only
+    // so `state` and `removing` still treat such a helper as Calyx's, and
+    // `installing` replaces it.
+    private static let legacyHelperPrefix = "cat '"
+    private static let legacyHelperSuffix = "' 2>/dev/null || printf '{}'"
+    /// How a `'` inside the legacy single-quoted path is written for the shell.
+    private static let legacyEscapedQuote = "'\\''"
 
     /// The port of a string that is exactly a Calyx endpoint (`http://127.0.0.1:<1...65535, no leading zero>/usage/v1/metrics`), else nil.
     static func port(ofEndpoint value: String) -> Int? {
@@ -90,19 +98,44 @@ enum ClaudeUsageTelemetryConfig {
         return port
     }
 
-    /// Whether a string is exactly a helper command Calyx writes (for any
-    /// non-empty headers file path): the quoted path may hold a `'` only
-    /// in its escaped form, so nothing can follow the closing quote.
+    /// Whether a string is exactly a helper command Calyx writes or wrote:
+    /// the new form (`isNewHelperCommand`) or the legacy form
+    /// (`isLegacyHelperCommand`).
     static func isHelperCommand(_ value: String) -> Bool {
+        isNewHelperCommand(value) || isLegacyHelperCommand(value)
+    }
+
+    /// `"<path>" <digits>`: a double-quoted path with no `"` inside whose
+    /// last path component is `calyx-usage-headers`, one space, then one or
+    /// more ASCII digits, and nothing else.
+    private static func isNewHelperCommand(_ value: String) -> Bool {
         let bytes = Array(value.utf8)
-        let prefix = Array(helperPrefix.utf8)
-        let suffix = Array(helperSuffix.utf8)
+        let quote = UInt8(ascii: "\"")
+        guard bytes.first == quote,
+              let closing = bytes.dropFirst().firstIndex(of: quote)
+        else { return false }
+        let path = String(decoding: bytes[1..<closing], as: UTF8.self)
+        let suffix = "/" + helperScriptName
+        guard path.hasSuffix(suffix) else { return false }
+        let rest = bytes[(closing + 1)...]
+        guard rest.first == UInt8(ascii: " ") else { return false }
+        let digits = rest.dropFirst()
+        return !digits.isEmpty && digits.allSatisfy { $0 >= UInt8(ascii: "0") && $0 <= UInt8(ascii: "9") }
+    }
+
+    /// The legacy `cat '<path>' 2>/dev/null || printf '{}'` (for any
+    /// non-empty path): the quoted path may hold a `'` only in its escaped
+    /// form, so nothing can follow the closing quote.
+    private static func isLegacyHelperCommand(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        let prefix = Array(legacyHelperPrefix.utf8)
+        let suffix = Array(legacyHelperSuffix.utf8)
         guard bytes.count > prefix.count + suffix.count,
               bytes.starts(with: prefix),
               Array(bytes.suffix(suffix.count)) == suffix
         else { return false }
         let path = Array(bytes[prefix.count..<(bytes.count - suffix.count)])
-        let escape = Array(escapedQuote.utf8)
+        let escape = Array(legacyEscapedQuote.utf8)
         var i = 0
         while i < path.count {
             if path[i] == UInt8(ascii: "'") {
@@ -190,8 +223,9 @@ enum ClaudeUsageTelemetryConfig {
 
     /// The document with Calyx's block in it, or the reason nothing was changed.
     /// A member that already holds exactly its value is not touched, so a
-    /// repeated install returns the same bytes.
-    static func installing(port: Int, headersFilePath: String, into document: Data?) throws -> (document: Data?, result: InstallResult) {
+    /// repeated install returns the same bytes. A legacy helper command is
+    /// replaced by the new one.
+    static func installing(port: Int, helperPath: String, into document: Data?) throws -> (document: Data?, result: InstallResult) {
         if case .foreign(let keys) = try state(of: document) {
             return (document, .blocked(keys: keys))
         }
@@ -199,7 +233,7 @@ enum ClaudeUsageTelemetryConfig {
         for member in envValues(port: port) {
             bytes = try settingString(member.value, at: [envKeyName, member.key], in: bytes)
         }
-        bytes = try settingString(helperCommand(headersFilePath: headersFilePath), at: [helperKey], in: bytes)
+        bytes = try settingString(helperCommand(helperPath: helperPath, port: port), at: [helperKey], in: bytes)
         return (bytes, bytes == document ? .unchanged : .written)
     }
 
@@ -281,14 +315,14 @@ struct ClaudeUsageTelemetryConfigManager: Sendable {
         case claudeNotFound
     }
 
-    static func install(port: Int, headersFilePath: String, settingsPath: String? = nil) throws -> Outcome {
+    static func install(port: Int, helperPath: String, settingsPath: String? = nil) throws -> Outcome {
         let path = settingsPath ?? AgentToolPaths.claudeSettingsPath
         guard directoryExists(for: path) else { return .claudeNotFound }
 
         var result: ClaudeUsageTelemetryConfig.InstallResult = .unchanged
         // mode: nil keeps the user's mode; the block carries no secret.
         try ConfigFileUtils.withExclusiveConfig(path: path, mode: nil) { current in
-            let edit = try ClaudeUsageTelemetryConfig.installing(port: port, headersFilePath: headersFilePath, into: current)
+            let edit = try ClaudeUsageTelemetryConfig.installing(port: port, helperPath: helperPath, into: current)
             result = edit.result
             return edit.document
         }

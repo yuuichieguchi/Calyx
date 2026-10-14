@@ -2390,7 +2390,7 @@ final class ConfigEditingContractTests: XCTestCase {
             enable: { root in
                 let outcome = try ClaudeUsageTelemetryConfigManager.install(
                     port: 41830,
-                    headersFilePath: "/opt/calyx/usage-headers.json",
+                    helperPath: "/opt/calyx/bin/calyx-usage-headers",
                     settingsPath: root + "/settings.json"
                 )
                 XCTAssertEqual(outcome, .installed(port: 41830), "enable must actually install for [\(fixture.label)]")

@@ -38,6 +38,12 @@ final class CalyxMCPServer {
     /// another process). `start` resets it to false; `finishStart` sets
     /// it together with `token`.
     private(set) var lastStartRotatedToken = false
+    /// How many starts have succeeded in this process (`finishStart` adds
+    /// one each time; `stop()` never resets it). The usage credential
+    /// holder renews the usage token once per start whose IPC token
+    /// rotated, keyed by this number, so reconcile re-runs for the same
+    /// start do not renew it again (G5, C-D19).
+    private(set) var startGeneration = 0
     /// The `token` argument of the most recent `start` call, recorded
     /// before any bind is attempted and never reset by `stop()`.
     /// `LiveIPCServerControl.stop()` keys its stale `agent-endpoint.json`
@@ -1661,6 +1667,7 @@ final class CalyxMCPServer {
         // written and before `newConnectionHandler` is installed below.
         self.token = finalToken.value
         self.lastStartRotatedToken = finalToken.rotated
+        self.startGeneration += 1
         if let liveness = EndpointLiveness.current() {
             do {
                 try AgentEndpointFile.write(

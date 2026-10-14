@@ -24,7 +24,6 @@ final class UsageTelemetryActivationTests: XCTestCase {
 
     private let waitSeconds: TimeInterval = 30
     private let port = 41830
-    private let path = UsageTelemetryFakeEffects.headersFilePath
 
     private var fakeInputs: UsageTelemetryFakeInputs!
     private var fakeEffects: UsageTelemetryFakeEffects!
@@ -76,7 +75,7 @@ final class UsageTelemetryActivationTests: XCTestCase {
 
     // MARK: - Installed
 
-    func test_installed_syncsThenLoadsWithCreateThenInstalls_withTheCredentialsHelperPath() async throws {
+    func test_installed_syncsThenLoadsWithCreateThenInstalls_withThePort() async throws {
         let activation = try activation()
         setBothOn(port: 41830)
 
@@ -84,11 +83,12 @@ final class UsageTelemetryActivationTests: XCTestCase {
 
         XCTAssertEqual(
             fakeEffects.calls,
-            [.syncTracking, .loadCredential(create: true), .install(port: 41830, headersFilePath: path)])
+            [.syncTracking, .loadCredential(create: true), .install(port: 41830)])
         XCTAssertEqual(activation.status, .installed(port: 41830))
     }
 
-    func test_installed_usesTheHeadersPathOfTheLoadedCredential_notAFixedOne() async throws {
+    /// G5: install takes only the port (the helper reads the credential file itself).
+    func test_installed_installGetsTheTargetPort() async throws {
         let activation = try activation()
         setBothOn(port: 50000)
         fakeEffects.setLoadResult(
@@ -96,8 +96,96 @@ final class UsageTelemetryActivationTests: XCTestCase {
 
         await activation.reconcile()
 
-        XCTAssertEqual(fakeEffects.calls.last, .install(port: 50000, headersFilePath: "/tmp/other path/h.json"))
+        XCTAssertEqual(fakeEffects.calls.last, .install(port: 50000))
         XCTAssertEqual(activation.status, .installed(port: 50000))
+    }
+
+    // MARK: - G5: usage token rotation generation
+
+    func test_installed_rotationGeneration_isPassedToLoadCredential() async throws {
+        let activation = try activation()
+        setBothOn(port: 41830)
+        fakeInputs.rotationGeneration = 3
+
+        await activation.reconcile()
+
+        XCTAssertEqual(fakeEffects.calls, [.syncTracking, .loadCredential(create: true), .install(port: 41830)])
+        XCTAssertEqual(fakeEffects.loadGenerations, [3])
+        XCTAssertEqual(activation.status, .installed(port: 41830))
+    }
+
+    func test_installed_noRotation_passesNilToLoadCredential() async throws {
+        let activation = try activation()
+        setBothOn(port: 41830)
+        fakeInputs.rotationGeneration = nil
+
+        await activation.reconcile()
+
+        XCTAssertEqual(fakeEffects.loadGenerations, [nil])
+    }
+
+    // Spec note 23(d): only the install path renews; a pending rotation
+    // generation never reaches the remove or untouched (syncAndLoad) loads.
+
+    func test_removed_trackingOff_passesNilGeneration_evenWithARotation() async throws {
+        let activation = try activation()
+        setBothOn(port: 41830)
+        fakeInputs.trackingOn = false
+        fakeInputs.rotationGeneration = 5
+
+        await activation.reconcile()
+
+        XCTAssertEqual(fakeEffects.calls, [.remove, .syncTracking, .loadCredential(create: false)])
+        XCTAssertEqual(fakeEffects.loadGenerations, [nil])
+    }
+
+    func test_removed_ipcOff_passesNilGeneration_evenWithARotation() async throws {
+        let activation = try activation()
+        setBothOn(port: 41830)
+        fakeInputs.ipcEnabled = false
+        fakeInputs.rotationGeneration = 5
+
+        await activation.reconcile()
+
+        XCTAssertEqual(fakeEffects.calls, [.remove, .syncTracking, .loadCredential(create: false)])
+        XCTAssertEqual(fakeEffects.loadGenerations, [nil])
+    }
+
+    func test_untouched_syncAndLoad_passesNilGeneration_evenWithARotation() async throws {
+        let activation = try activation()
+        setBothOn(port: nil)
+        fakeInputs.rotationGeneration = 5
+
+        await activation.reconcile()
+
+        XCTAssertEqual(fakeEffects.calls, [.syncTracking, .loadCredential(create: true)])
+        XCTAssertEqual(fakeEffects.loadGenerations, [nil])
+    }
+
+    // MARK: - rotationGeneration (production input)
+
+    func test_rotationGeneration_runningAndRotated_isTheGeneration() {
+        XCTAssertEqual(UsageTelemetryActivation.rotationGeneration(isRunning: true, rotated: true, generation: 7), 7)
+    }
+
+    func test_rotationGeneration_runningButNotRotated_isNil() {
+        XCTAssertNil(UsageTelemetryActivation.rotationGeneration(isRunning: true, rotated: false, generation: 7))
+    }
+
+    func test_rotationGeneration_notRunning_isNil() {
+        XCTAssertNil(UsageTelemetryActivation.rotationGeneration(isRunning: false, rotated: true, generation: 7))
+        XCTAssertNil(UsageTelemetryActivation.rotationGeneration(isRunning: false, rotated: false, generation: 7))
+    }
+
+    func test_installed_rotationGeneration_isReadEachRun() async throws {
+        let activation = try activation()
+        setBothOn(port: 41830)
+        fakeInputs.rotationGeneration = 1
+        await activation.reconcile()
+        fakeInputs.rotationGeneration = 2
+        await activation.reconcile()
+
+        XCTAssertEqual(fakeEffects.loadGenerations, [1, 2])
     }
 
     func test_installed_blockedOutcome_isBlockedStatus() async throws {
@@ -237,7 +325,7 @@ final class UsageTelemetryActivationTests: XCTestCase {
 
         XCTAssertEqual(
             fakeEffects.calls,
-            [.syncTracking, .loadCredential(create: true), .install(port: 41830, headersFilePath: path),
+            [.syncTracking, .loadCredential(create: true), .install(port: 41830),
              .syncTracking, .loadCredential(create: true)])
         XCTAssertEqual(activation.status, .installed(port: 41830))
     }
@@ -311,7 +399,7 @@ final class UsageTelemetryActivationTests: XCTestCase {
 
         XCTAssertEqual(
             fakeEffects.calls,
-            [.syncTracking, .loadCredential(create: true), .install(port: 41830, headersFilePath: path)])
+            [.syncTracking, .loadCredential(create: true), .install(port: 41830)])
         XCTAssertEqual(activation.status, .installed(port: 41830))
     }
 
@@ -368,7 +456,7 @@ final class UsageTelemetryActivationTests: XCTestCase {
         XCTAssertEqual(
             fakeEffects.calls,
             [.remove, .syncTracking, .loadCredential(create: false),
-             .syncTracking, .loadCredential(create: true), .install(port: 50000, headersFilePath: path)])
+             .syncTracking, .loadCredential(create: true), .install(port: 50000)])
         XCTAssertEqual(seenOnReturn, [6, 6, 6], "each later caller returns only after the run that started after its call")
         XCTAssertEqual(counter.count, 2)
         XCTAssertEqual(activation.status, .installed(port: 50000))
@@ -425,7 +513,7 @@ final class UsageTelemetryActivationTests: XCTestCase {
             fakeEffects.calls,
             [.remove, .syncTracking, .loadCredential(create: false),
              .remove, .syncTracking, .loadCredential(create: false),
-             .syncTracking, .loadCredential(create: true), .install(port: 41830, headersFilePath: path)])
+             .syncTracking, .loadCredential(create: true), .install(port: 41830)])
         XCTAssertEqual(counter.count, 3)
     }
 
@@ -489,7 +577,7 @@ final class UsageTelemetryActivationTests: XCTestCase {
 
         XCTAssertEqual(
             fakeEffects.calls,
-            [.syncTracking, .loadCredential(create: true), .install(port: 41830, headersFilePath: path),
+            [.syncTracking, .loadCredential(create: true), .install(port: 41830),
              .syncTracking, .loadCredential(create: true)])
         XCTAssertEqual(activation.status, .installed(port: 41830))
         XCTAssertEqual(counter.count, 2)

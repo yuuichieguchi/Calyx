@@ -65,6 +65,8 @@ final class UsageIngestCredentialHolder {
     static let shared = UsageIngestCredentialHolder()
 
     private(set) var credential: UsageIngestCredential?
+    /// The server start generation the token was last renewed for.
+    private(set) var lastRotatedGeneration: Int?
 
     init() {}
 
@@ -82,20 +84,44 @@ final class UsageIngestCredentialHolder {
     /// the main actor and the concurrency pool (`loadOrCreate` may wait
     /// for a file lock). A load that throws leaves the held credential as it
     /// was and the error reaches the caller.
+    ///
+    /// `rotateForGeneration` (with `create: true`) renews the token when
+    /// it differs from the generation last renewed for: one renewal per
+    /// server start whose IPC token rotated, idempotent across reconcile
+    /// re-runs for the same start (G5, C-D19). nil never renews. The
+    /// generation is recorded only after the renewal succeeded.
+    ///
+    /// Whether to renew is decided before the `await`, and the generation
+    /// recorded after it. Nothing here stops two concurrent loads for the
+    /// same generation from both renewing; only `UsageTelemetryActivation`'s
+    /// single-flight `reconcile()`, the sole production caller, prevents it.
+    ///
+    /// `makeToken` makes a new token; production uses the default
+    /// (`SecureRandomTokenGenerator`), tests inject failures.
     @discardableResult
-    func load(create: Bool, directory: String) async throws -> UsageIngestCredential? {
-        let loaded = try await Self.readCredential(create: create, directory: directory)
+    func load(
+        create: Bool,
+        directory: String,
+        rotateForGeneration: Int? = nil,
+        makeToken: @escaping @Sendable () throws -> String = { try SecureRandomTokenGenerator().makeToken() }
+    ) async throws -> UsageIngestCredential? {
+        let rotate = create && rotateForGeneration != nil && rotateForGeneration != lastRotatedGeneration
+        let loaded = try await Self.readCredential(
+            create: create, directory: directory, replaceExisting: rotate, makeToken: makeToken)
         credential = loaded
+        if rotate { lastRotatedGeneration = rotateForGeneration }
         return loaded
     }
 
     private nonisolated static func readCredential(
-        create: Bool, directory: String
+        create: Bool, directory: String, replaceExisting: Bool,
+        makeToken: @escaping @Sendable () throws -> String
     ) async throws -> UsageIngestCredential? {
         try await UsageFileWork.run {
             guard create else { return UsageIngestCredentialStore.read(directory: directory) }
             return try UsageIngestCredentialStore.loadOrCreate(
-                directory: directory, makeToken: { try SecureRandomTokenGenerator().makeToken() })
+                directory: directory, makeToken: makeToken,
+                replaceExisting: replaceExisting)
         }
     }
 }
