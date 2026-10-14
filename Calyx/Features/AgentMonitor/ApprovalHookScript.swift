@@ -108,41 +108,77 @@ enum ApprovalHookScript {
     /// silently posts an EMPTY body), the trap kills curl's pid and
     /// exits 0 on TERM/HUP/INT, and `wait` blocks for curl's own exit
     /// (interruptible by the same trap) before the response file is
-    /// read. The trap always sets `signalled=1` but only kills and exits
-    /// once `curl_pid` is non-empty (both are initialized empty/0 first,
-    /// so an inherited environment value can't leak in): a signal landing
-    /// after `curl ... &` but before `curl_pid=$!` would otherwise run
-    /// `kill ""` (a no-op), exit, and orphan curl. Instead the script
-    /// carries on to the assignment, and an `if [ "$signalled" = 1 ]`
-    /// re-check immediately after it kills the now-known curl, removes
-    /// both temp files, and exits 0. A `SIGKILL` to this script bypasses
-    /// the trap entirely (no process can catch it) and still orphans curl
-    /// exactly as before --
+    /// read. These long-poll lines are shared with `calyx-ipc-wake-hook`
+    /// and live in `AgentHookLongPoll` (`setup`, `guardBeforeCurl`,
+    /// `afterCurl`); the endpoint file's HMAC block read and the nonce
+    /// come from `AgentHookProof` (`readBlocks`, `nonce`). The trap always
+    /// sets `signalled=1` but only kills and exits once `curl_pid` is
+    /// non-empty (both are initialized empty/0 first, so an inherited
+    /// environment value can't leak in): a signal landing after
+    /// `curl ... &` but before `curl_pid=$!` would otherwise run `kill ""`
+    /// (a no-op), exit, and orphan curl. Instead the script carries on to
+    /// the assignment, and an `if [ "$signalled" = 1 ]` re-check
+    /// immediately after it kills the now-known curl and exits 0. A
+    /// signal that lands before curl is started at all (for example
+    /// while stdin is still being drained) is caught by the same check on
+    /// the lines right before `curl`, so curl never starts. Once `wait`
+    /// returns, `curl_pid=` empties the pid again, so a late signal
+    /// cannot `kill` a pid that is no longer curl's.
+    ///
+    /// Temp files: `payload_file` and `response_file` are emptied first,
+    /// then one EXIT trap removes whichever of them exists, on every exit
+    /// path. The TERM/HUP/INT trap removes no file itself: its `exit 0`
+    /// runs the EXIT trap. The trap is written as `if ...; then rm -f`
+    /// rather than `[ ... ] && rm -f` so its own status can never replace
+    /// the script's exit status. Both traps are set before either file
+    /// is created, and each file comes from a templated
+    /// `mktemp "${TMPDIR:-/tmp}/calyx-approval-<payload|response>.XXXXXX"`
+    /// (honouring `TMPDIR`), each failing safe with `|| exit 0`: the EXIT
+    /// trap removes whatever was already created. No path removes the
+    /// files explicitly.
+    ///
+    /// The first executable line is `exec 2>/dev/null`: this script's
+    /// stderr is never meaningful to the CLI, so tool noise and the
+    /// shell's own "command not found" messages (for example a missing
+    /// `uuidgen`) are discarded rather than shown to the user.
+    ///
+    /// A `SIGKILL` to this script bypasses the trap entirely (no process
+    /// can catch it) and still orphans curl exactly as before --
     /// that residual path is why `CalyxMCPServer.routeAgentEvent`'s
     /// Stop-hook-settles-to-idle fallback stays in place as a last
     /// resort, not removed by this fix.
     ///
-    /// The curl exit code is then switched on:
-    /// - `0` (success): the server's response body is printed verbatim
-    ///   via `printf '%s'` -- never `echo`, which can mangle a body
-    ///   starting with `-` or containing backslash escape sequences.
-    /// - `7` (connection refused): silent, no output at all. After
-    ///   Calyx crashes, `agent-endpoint.json` is left behind pointing at
-    ///   a now-dead port, so every subsequent permission prompt would
-    ///   otherwise land in this branch -- producing no output leaves the
-    ///   hook inert, so the CLI's own confirmation prompt takes over
-    ///   exactly as it would with no Calyx hook installed at all, rather
-    ///   than a stale endpoint file silently degrading every tool call's
-    ///   UX.
-    /// - anything else (timeout, DNS failure, a non-2xx response
-    ///   rejected by `--fail`, etc.): also silent, no output at all.
-    ///   PermissionRequest, unlike the older PreToolUse contract, has no
-    ///   interactive-fallback body to fabricate here -- `"ask"` is not a
-    ///   valid `decision.behavior` under this hook. Producing no output
-    ///   IS the correct fail-safe: the CLI's own confirmation prompt
-    ///   takes over exactly as it would with no Calyx hook installed at
-    ///   all. This script must never print `"allow"` anywhere, on any
-    ///   path.
+    /// Nonce and verification: `AgentHookProof.nonce` makes a fresh
+    /// uppercase UUID, sent as `ApprovalHookResponse.nonceHeader`. A
+    /// nonce-carrying request is answered `<64 hex proof> LF <decision>`
+    /// (`ApprovalHookResponse.signedBody`), where the proof is
+    /// HMAC-SHA256 over `approval\n<nonce>\n<decision>` under this
+    /// Calyx start's key. After curl exits the script checks, in order:
+    /// curl's exit code is 0; the first 64 bytes are 64 lowercase hex
+    /// digits; byte 65 is LF; the HMAC computed through `openssl` from
+    /// the endpoint file's inner and outer blocks (passed only through
+    /// builtin `printf` pipes, never as arguments) equals the proof. Only
+    /// then is the decision written to stdout byte for byte with
+    /// `tail -c +66`; the body never enters a shell variable, so no byte
+    /// is lost or reinterpreted. Positions are bytes, not lines, because
+    /// a signed empty decision is exactly 65 bytes.
+    ///
+    /// Any failed check, and every curl failure (7 connection refused,
+    /// for example a dead port left in the endpoint file after a crash;
+    /// 22 a non-2xx answer rejected by `--fail`; 28 timeout; 63 a body
+    /// over `--max-filesize`), produces no output at all, for every CLI
+    /// kind. PermissionRequest has no interactive-fallback body to
+    /// fabricate (`"ask"` is not a valid `decision.behavior` there), and
+    /// Calyx never invents a decision: silence lets the CLI's own
+    /// confirmation prompt take over exactly as with no Calyx hook
+    /// installed. This script must never print `"allow"` from its own
+    /// text, on any path.
+    ///
+    /// `--max-filesize` is `ApprovalHookResponse.maxSignedResponseBytes`,
+    /// 65 + 4 * 262144: an `.answered` decision echoes the whole
+    /// `tool_input` back, so the decision may be up to four times the
+    /// request cap. It bounds the temp file a bogus responder can fill;
+    /// correctness rests on the HMAC.
     ///
     /// Every exit path is `exit 0`: whatever curl did or didn't return,
     /// this script itself must never exit nonzero and break the user's
@@ -155,12 +191,18 @@ enum ApprovalHookScript {
     #!/bin/sh
     #
     # calyx-approval-hook -- synchronously forwards a PermissionRequest
-    # hook's stdin JSON to Calyx's local Agent Monitor IPC endpoint and
-    # prints its response verbatim; the response body IS the CLI's
-    # permission decision. No output at all (any curl failure, or Calyx
-    # unreachable) is the correct fail-safe: it lets the CLI's own
-    # confirmation prompt take over. Installed and removed by
-    # ClaudeHooksConfigManager / CodexHooksConfigManager.
+    # hook's stdin JSON, with a fresh nonce, to Calyx's local Agent
+    # Monitor IPC endpoint. Calyx answers "<64 hex proof> LF <decision>";
+    # the decision is printed byte for byte (tail -c +66) only when the
+    # proof is HMAC-SHA256 over "approval\\n<nonce>\\n<decision>" under the
+    # key blocks in agent-endpoint.json, and it IS the CLI's permission
+    # decision. No output at all (any curl failure, Calyx unreachable, a
+    # proof line that is not 64 hex digits, no LF at byte 65, an HMAC
+    # mismatch, missing HMAC key blocks or tools, or uuidgen failing) is
+    # the correct fail-safe for every CLI kind: it lets the CLI's own
+    # confirmation prompt take over; Calyx never invents a decision.
+    # Installed and removed by ClaudeHooksConfigManager /
+    # CodexHooksConfigManager.
     #
     # curl runs backgrounded with a TERM/HUP/INT trap that kills it and
     # exits 0: if this script is killed (e.g. because the user answered
@@ -168,53 +210,70 @@ enum ApprovalHookScript {
     # on Calyx), a FOREGROUNDED curl would survive as an orphan and keep
     # its long-poll connection open for up to its own -m deadline. A
     # signal arriving before curl_pid is assigned only sets signalled=1;
-    # the re-check right after curl_pid=$! then kills curl and exits. Only
-    # SIGKILL bypasses this (no process can trap it) -- see
-    # ApprovalHookScript's own doc comment for the full empirical
+    # the checks right before curl and right after curl_pid=$! then exit
+    # (killing curl if it runs). One EXIT trap removes both temp files on
+    # every path. Only SIGKILL bypasses this (no process can trap it) --
+    # see ApprovalHookScript's own doc comment for the full empirical
     # writeup and the residual-path fallback that covers it.
+
+    # stderr is discarded so tool noise never reaches the CLI.
+    exec 2>/dev/null
 
     \(AgentHookScriptPrologue.body)
 
-    payload_file=$(mktemp) || exit 0
-    response_file=$(mktemp) || { rm -f "$payload_file"; exit 0; }
-    # The trap only kills and exits once curl_pid is known; a signal
-    # arriving earlier -- including between curl's `&` and the
-    # `curl_pid=$!` assignment, when kill would have no pid to target --
-    # just records signalled=1, and the re-check right after that
-    # assignment kills the now-known curl and exits instead.
-    signalled=0
-    curl_pid=
-    trap 'signalled=1; if [ -n "$curl_pid" ]; then kill "$curl_pid" 2>/dev/null; rm -f "$payload_file" "$response_file"; exit 0; fi' TERM HUP INT
+    payload_file=
+    response_file=
+    # One EXIT trap removes both temp files on every path, including the
+    # TERM trap's exit 0.
+    trap 'if [ -n "$payload_file" ]; then rm -f "$payload_file"; fi; if [ -n "$response_file" ]; then rm -f "$response_file"; fi' EXIT
+    \(AgentHookLongPoll.setup)
+    payload_file=$(mktemp "${TMPDIR:-/tmp}/calyx-approval-payload.XXXXXX") || exit 0
+    response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-approval-response.XXXXXX") || exit 0
 
     cat > "$payload_file"
 
+    \(AgentHookProof.readBlocks)
+    \(AgentHookProof.nonce)
+    \(AgentHookLongPoll.guardBeforeCurl)
     curl -s -m \(ApprovalHookTiming.curlTimeoutSeconds) \\
+        --max-filesize \(ApprovalHookResponse.maxSignedResponseBytes) \\
         --fail \\
         -X POST \\
         -H "Authorization: Bearer $token" \\
         -H "X-Calyx-Surface-ID: ${CALYX_SESSION_ID:-$CALYX_SURFACE_ID}" \\
         -H "X-Calyx-Agent-Kind: $kind" \\
         -H "Content-Type: application/json" \\
+        -H "\(ApprovalHookResponse.nonceHeader): $nonce" \\
         --data-binary @"$payload_file" \\
         "http://127.0.0.1:$port/approval-request" > "$response_file" &
-    curl_pid=$!
-    if [ "$signalled" = 1 ]; then
-        kill "$curl_pid" 2>/dev/null
-        rm -f "$payload_file" "$response_file"
+    \(AgentHookLongPoll.afterCurl)
+    if [ "$curl_exit" != 0 ]; then
         exit 0
     fi
-    wait "$curl_pid"
-    curl_exit=$?
-
-    response=$(cat "$response_file")
-    rm -f "$payload_file" "$response_file"
-
-    case "$curl_exit" in
-        0) printf '%s' "$response" ;;
-        7) exit 0 ;;
-        *) ;;
-    esac
-
+    proof=$(head -c 64 "$response_file")
+    if ! printf '%s\\n' "$proof" | LC_ALL=C grep -Eqx '[0-9a-f]{64}'; then
+        exit 0
+    fi
+    if [ "$(head -c 65 "$response_file" | tail -c 1 | xxd -p)" != "0a" ]; then
+        exit 0
+    fi
+    computed=$(
+        {
+            printf '%s' "$proof_outer" | xxd -r -p
+            {
+                printf '%s' "$proof_inner" | xxd -r -p
+                printf 'approval\\n%s\\n' "$nonce"
+                tail -c +66 "$response_file"
+            } | openssl dgst -sha256 -binary
+        } | openssl dgst -sha256 -binary | xxd -p -c 64
+    )
+    if ! printf '%s\\n' "$computed" | LC_ALL=C grep -Eqx '[0-9a-f]{64}'; then
+        exit 0
+    fi
+    if [ "$computed" != "$proof" ]; then
+        exit 0
+    fi
+    tail -c +66 "$response_file"
     exit 0
     """
 

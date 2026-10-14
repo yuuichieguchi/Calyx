@@ -126,7 +126,7 @@ final class AgentHookScriptTests: XCTestCase {
     // MARK: - AgentEndpointFile
 
     func test_agentEndpointFile_write_createsFileWithPortTokenAnd0600Permissions() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
 
         let filePath = tempDir + "/agent-endpoint.json"
         XCTAssertTrue(FileManager.default.fileExists(atPath: filePath),
@@ -148,8 +148,8 @@ final class AgentHookScriptTests: XCTestCase {
         // concurrent reader (calyx-agent-hook, invoked from every active
         // pane's hooks) never observes a partially-written file, and a
         // re-write doesn't leave a stray `.tmp` sibling behind.
-        try AgentEndpointFile.write(port: 41830, token: "token-one", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
-        try AgentEndpointFile.write(port: 41831, token: "token-two", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "token-one", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 41831, token: "token-two", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
 
         let filePath = tempDir + "/agent-endpoint.json"
         let data = try Data(contentsOf: URL(fileURLWithPath: filePath))

@@ -131,11 +131,14 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
                 trackingOn: { ledger.isTracking },
                 ipcEnabled: { true },
                 serverPort: { nil },
-                mayTouchAgentFiles: { true }),
+                mayTouchAgentFiles: { true },
+                rotationGeneration: { nil }),
             effects: UsageTelemetryActivation.Effects(
                 syncTracking: { await ledger.syncTracking() },
-                loadCredential: { create in try await holder.load(create: create, directory: credentialDirectory) },
-                install: { port, _ in
+                loadCredential: { create, rotateForGeneration in
+                    try await holder.load(create: create, directory: credentialDirectory, rotateForGeneration: rotateForGeneration)
+                },
+                install: { port in
                     XCTFail("the server never runs in these tests: nothing may be installed")
                     return .installed(port: port)
                 },
@@ -841,7 +844,7 @@ final class AppDelegateUsageLedgerWiringTests: XCTestCase {
             effects.calls,
             [.remove, .syncTracking, .loadCredential(create: false),
              .syncTracking, .loadCredential(create: true),
-             .install(port: 41830, headersFilePath: UsageTelemetryFakeEffects.headersFilePath)])
+             .install(port: 41830)])
         XCTAssertEqual(activation.status, .installed(port: 41830))
     }
 

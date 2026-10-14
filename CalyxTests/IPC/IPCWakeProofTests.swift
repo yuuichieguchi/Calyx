@@ -192,6 +192,22 @@ final class IPCWakeProofTests: XCTestCase {
         }
     }
 
+    /// J9 (spec C.2): the approval proof is HMAC over "approval\n" + nonce +
+    /// "\n" + body under the same key. Computed here with CryptoKit so this
+    /// file needs no planned API: no wake proof equals the approval proof
+    /// for the same nonce and text, so neither verifies as the other.
+    func test_proof_neverEqualsTheApprovalDomainProof_forTheSameNonceAndText() {
+        for (label, key) in [("ones", onesKey), ("counting", countingKey)] {
+            for nonce in nonces {
+                for note in notes {
+                    let approval = C.hmacHex(keyBytes: key.bytes, message: Data(("approval\n" + nonce + "\n" + note).utf8))
+                    XCTAssertNotEqual(key.proof(nonce: nonce, note: note), approval,
+                                      "[\(label) key, nonce \(nonce)] a wake proof is not an approval proof")
+                }
+            }
+        }
+    }
+
     func test_proof_changesWithTheNonce_theNote_andTheKey() {
         let base = onesKey.proof(nonce: nonces[0], note: notes[0])
         XCTAssertNotEqual(base, onesKey.proof(nonce: nonces[1], note: notes[0]), "the nonce is authenticated")

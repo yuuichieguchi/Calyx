@@ -29,13 +29,16 @@ struct UsageTelemetryFakeError: LocalizedError, CustomStringConvertible, Sendabl
     var ipcEnabled = true
     var serverPort: Int? = 41830
     var mayTouchAgentFiles = true
+    /// G5: the server start generation whose IPC token rotated, or nil.
+    var rotationGeneration: Int?
 
     var inputs: UsageTelemetryActivation.Inputs {
         UsageTelemetryActivation.Inputs(
             trackingOn: { self.trackingOn },
             ipcEnabled: { self.ipcEnabled },
             serverPort: { self.serverPort },
-            mayTouchAgentFiles: { self.mayTouchAgentFiles })
+            mayTouchAgentFiles: { self.mayTouchAgentFiles },
+            rotationGeneration: { self.rotationGeneration })
     }
 }
 
@@ -74,7 +77,7 @@ final class UsageTelemetryFakeEffects: Sendable {
     enum Call: Equatable, Sendable {
         case syncTracking
         case loadCredential(create: Bool)
-        case install(port: Int, headersFilePath: String)
+        case install(port: Int)
         case remove
     }
 
@@ -82,6 +85,8 @@ final class UsageTelemetryFakeEffects: Sendable {
     // touched under the lock.
     private struct State {
         var calls: [Call] = []
+        /// One entry per `loadCredential` call: its `rotateForGeneration`.
+        var loadGenerations: [Int?] = []
         var offMain: [Bool] = []
         var loadResult: Result<UsageIngestCredential?, any Error> = .success(
             UsageIngestCredential(
@@ -95,11 +100,13 @@ final class UsageTelemetryFakeEffects: Sendable {
     }
 
     /// The headers file path of the credential the fake loads by default.
-    static let headersFilePath = "/nonexistent/calyx-tests/usage-otel-headers.json"
+    static let headersFilePath = "/nonexistent/calyx-tests/usage-otel-credential.json"
 
     private let state = OSAllocatedUnfairLock(uncheckedState: State())
 
     var calls: [Call] { state.withLockUnchecked { $0.calls } }
+    /// G5: the `rotateForGeneration` argument of every `loadCredential` call, in order.
+    var loadGenerations: [Int?] { state.withLockUnchecked { $0.loadGenerations } }
     /// One entry per call: whether it ran off the main thread.
     var ranOffMain: [Bool] { state.withLockUnchecked { $0.offMain } }
 
@@ -153,12 +160,13 @@ final class UsageTelemetryFakeEffects: Sendable {
                 record(.syncTracking)
                 if let gate = state.withLockUnchecked({ $0.syncGate }) { await gate.wait() }
             },
-            loadCredential: { [self] create in
+            loadCredential: { [self] create, rotateForGeneration in
+                state.withLockUnchecked { $0.loadGenerations.append(rotateForGeneration) }
                 record(.loadCredential(create: create))
                 return try state.withLockUnchecked { $0.loadResult }.get()
             },
-            install: { [self] port, path in
-                record(.install(port: port, headersFilePath: path))
+            install: { [self] port in
+                record(.install(port: port))
                 guard let result = state.withLockUnchecked({ $0.installResult }) else { return .installed(port: port) }
                 return try result.get()
             },

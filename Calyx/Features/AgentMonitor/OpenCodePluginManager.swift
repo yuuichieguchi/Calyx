@@ -35,8 +35,11 @@ enum OpenCodePluginManager: Sendable {
     // endpoint. agent-endpoint.json (port/token) is cached by mtime and
     // only re-read/re-parsed when the file actually changes, so a Calyx
     // server restart or token rotation is still picked up without
-    // reinstalling this plugin.
+    // reinstalling this plugin. Before every POST, liveEndpoint() checks
+    // that the Calyx process named by the file's pid/pidStart is alive;
+    // otherwise nothing is sent.
 
+    import { spawnSync } from "node:child_process";
     import { stat } from "node:fs/promises";
 
     // opencode 1.18.18's plugin event vocabulary has no process-exit
@@ -127,6 +130,8 @@ enum OpenCodePluginManager: Sendable {
         return endpoint;
       }
 
+      \(AgentEndpointFile.javascriptLiveEndpoint)
+
       function resolveSessionID(properties) {
         const info = properties && properties.info;
         return (
@@ -141,6 +146,9 @@ enum OpenCodePluginManager: Sendable {
       async function postEvent(bodyJSON) {
         try {
           const endpoint = await loadEndpoint();
+          if (!liveEndpoint(endpoint)) {
+            return;
+          }
 
           await fetch(`http://127.0.0.1:${endpoint.port}/agent-event`, {
             method: "POST",

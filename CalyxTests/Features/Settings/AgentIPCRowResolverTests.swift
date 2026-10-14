@@ -79,7 +79,7 @@ final class AgentIPCRowResolverTests: XCTestCase {
 
     func test_idle_enabled_allAxesSucceed_summaryOnlyNoDetailLines() {
         let outcome = IPCActivationOutcome.enabled(
-            IPCActivationReport(port: 41830, config: allSuccessConfig(), hooks: allSuccessHooks())
+            IPCActivationReport(port: 41830, config: allSuccessConfig(), hooks: allSuccessHooks(), tokenRotated: false)
         )
 
         let state = AgentIPCRowResolver.resolve(settingEnabled: true, inFlight: .none, lastActivation: .enable(outcome))
@@ -106,7 +106,7 @@ final class AgentIPCRowResolverTests: XCTestCase {
             pi: .skipped(reason: "not installed")
         )
         let outcome = IPCActivationOutcome.enabled(
-            IPCActivationReport(port: 41830, config: config, hooks: hooks)
+            IPCActivationReport(port: 41830, config: config, hooks: hooks, tokenRotated: false)
         )
 
         let state = AgentIPCRowResolver.resolve(settingEnabled: true, inFlight: .none, lastActivation: .enable(outcome))
@@ -137,13 +137,66 @@ final class AgentIPCRowResolverTests: XCTestCase {
             pi: .skipped(reason: "not installed")
         )
         let outcome = IPCActivationOutcome.enabled(
-            IPCActivationReport(port: 41830, config: config, hooks: hooks)
+            IPCActivationReport(port: 41830, config: config, hooks: hooks, tokenRotated: false)
         )
 
         let state = AgentIPCRowResolver.resolve(settingEnabled: true, inFlight: .none, lastActivation: .enable(outcome))
 
         XCTAssertTrue(state.statusText.hasPrefix("Running on port 41830 · no agents configured\n"))
         XCTAssertEqual(state.statusText.components(separatedBy: "\n").count, 11, "one summary line plus 10 detail lines")
+    }
+
+    // MARK: - Idle status: token rotated (J5, c4-spec-notes item 9)
+
+    private let tokenRenewedLine =
+        "IPC token renewed because another process held the previous port. " +
+        "CLI config files no longer store the token; new agent sessions need no change. " +
+        "Sessions started before this launch keep the old port and must be restarted."
+
+    func test_tokenRenewedNotice_isTheSlice4cWording() {
+        XCTAssertEqual(AgentIPCRowResolver.tokenRenewedNotice, tokenRenewedLine)
+    }
+
+    func test_idle_enabled_tokenRotated_allAxesSucceed_appendsRenewedLineAfterSummary() {
+        let outcome = IPCActivationOutcome.enabled(
+            IPCActivationReport(port: 41832, config: allSuccessConfig(), hooks: allSuccessHooks(), tokenRotated: true)
+        )
+
+        let state = AgentIPCRowResolver.resolve(settingEnabled: true, inFlight: .none, lastActivation: .enable(outcome))
+
+        XCTAssertEqual(state.statusText, "Running on port 41832 · all agents configured\n" + tokenRenewedLine)
+    }
+
+    func test_idle_enabled_tokenRotated_withDetailLines_renewedLineIsLast() {
+        let config = IPCConfigResult(
+            claudeCode: .success,
+            codex: .failed(error("The ~/.codex/ directory does not exist")),
+            openCode: .success,
+            hermes: .success,
+            grok: .success
+        )
+        let outcome = IPCActivationOutcome.enabled(
+            IPCActivationReport(port: 41830, config: config, hooks: allSuccessHooks(), tokenRotated: true)
+        )
+
+        let state = AgentIPCRowResolver.resolve(settingEnabled: true, inFlight: .none, lastActivation: .enable(outcome))
+
+        XCTAssertEqual(
+            state.statusText,
+            "Running on port 41830 · 9 of 10 configured\n" +
+            "✗ Codex config: The ~/.codex/ directory does not exist\n" +
+            tokenRenewedLine
+        )
+    }
+
+    func test_idle_enabled_notRotated_hasNoRenewedLine() {
+        let outcome = IPCActivationOutcome.enabled(
+            IPCActivationReport(port: 41830, config: allSuccessConfig(), hooks: allSuccessHooks(), tokenRotated: false)
+        )
+
+        let state = AgentIPCRowResolver.resolve(settingEnabled: true, inFlight: .none, lastActivation: .enable(outcome))
+
+        XCTAssertEqual(state.statusText, "Running on port 41830 · all agents configured")
     }
 
     // MARK: - Idle status: hard enable failures

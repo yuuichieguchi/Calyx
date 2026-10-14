@@ -20,9 +20,14 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
     // MARK: - Fixtures (expected values written by hand from section A)
 
     private static let port = 41830
-    private static let headersPath = "/Users/test/Library/Application Support/Calyx/usage-headers.json"
+    private static let helperPath = "/Users/test/Library/Application Support/Calyx/bin/calyx-usage-headers"
     private static let endpoint41830 = "http://127.0.0.1:41830/usage/v1/metrics"
-    private static let helper = "cat '/Users/test/Library/Application Support/Calyx/usage-headers.json' 2>/dev/null || printf '{}'"
+    /// G5 (spec note 22): the quoted helper path, one space, the port.
+    private static let helper = "\"/Users/test/Library/Application Support/Calyx/bin/calyx-usage-headers\" 41830"
+    /// `helper` as it appears in the JSON text of the settings file.
+    private static let helperJSONText = "\\\"/Users/test/Library/Application Support/Calyx/bin/calyx-usage-headers\\\" 41830"
+    /// The pre-G5 form Calyx wrote; still recognised as Calyx's so it can be cleaned up.
+    private static let legacyHelper = "cat '/Users/test/Library/Application Support/Calyx/usage-otel-headers.json' 2>/dev/null || printf '{}'"
 
     private static let expectedEnv: [String: String] = [
         "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
@@ -94,7 +99,7 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
     }
 
     private func install(_ document: Data?, port: Int = ClaudeUsageTelemetryConfigTests.port) throws -> (document: Data?, result: Config.InstallResult) {
-        try Config.installing(port: port, headersFilePath: Self.headersPath, into: document)
+        try Config.installing(port: port, helperPath: Self.helperPath, into: document)
     }
 
     // MARK: - Constants
@@ -161,17 +166,20 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
     // MARK: - helperCommand / isHelperCommand
 
     func test_helperCommand_ordinaryPath() {
-        XCTAssertEqual(Config.helperCommand(headersFilePath: "/tmp/h.json"),
-                       "cat '/tmp/h.json' 2>/dev/null || printf '{}'")
+        XCTAssertEqual(Config.helperCommand(helperPath: "/tmp/bin/calyx-usage-headers", port: 5001),
+                       "\"/tmp/bin/calyx-usage-headers\" 5001")
     }
 
     func test_helperCommand_pathWithSpaces() {
-        XCTAssertEqual(Config.helperCommand(headersFilePath: Self.headersPath), Self.helper)
+        XCTAssertEqual(Config.helperCommand(helperPath: Self.helperPath, port: 41830), Self.helper)
     }
 
-    func test_helperCommand_singleQuoteInPathIsWrittenAsQuoteBackslashQuoteQuote() {
-        XCTAssertEqual(Config.helperCommand(headersFilePath: "/tmp/it's/h.json"),
-                       "cat '/tmp/it'\\''s/h.json' 2>/dev/null || printf '{}'")
+    func test_helperCommand_carriesNoToken_onlyPathAndPort() {
+        // J17: the settings file holds the helper path and the port, nothing else.
+        let command = Config.helperCommand(helperPath: Self.helperPath, port: 41830)
+        XCTAssertEqual(command, "\"" + Self.helperPath + "\" " + "41830")
+        XCTAssertFalse(command.contains("usage-otel-headers.json"))
+        XCTAssertFalse(command.contains("Bearer"))
     }
 
     func test_isHelperCommand_acceptsCommandsCalyxWrites() {
@@ -384,7 +392,7 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
             "OTEL_METRICS_INCLUDE_SESSION_ID": "true",
             "OTEL_METRICS_INCLUDE_ACCOUNT_UUID": "false"
           },
-          "otelHeadersHelper": "cat '/Users/test/Library/Application Support/Calyx/usage-headers.json' 2>/dev/null || printf '{}'"
+          "otelHeadersHelper": "\\"/Users/test/Library/Application Support/Calyx/bin/calyx-usage-headers\\" 41830"
         }
 
         """
@@ -396,7 +404,7 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
         let written = try XCTUnwrap(text(document))
         XCTAssertTrue(written.contains("\"http://127.0.0.1:41830/usage/v1/metrics\""), written)
         XCTAssertTrue(written.contains("\"http/json\""), written)
-        XCTAssertTrue(written.contains("2>/dev/null"), written)
+        XCTAssertTrue(written.contains("/Calyx/bin/calyx-usage-headers"), written)
         XCTAssertFalse(written.contains("\\/"), written)
     }
 
@@ -449,15 +457,20 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
         }
     }
 
-    func test_installing_withAnotherPort_changesOnlyTheEndpointMember_forEveryLayout() throws {
+    /// G5: a port change rewrites the endpoint AND the helper's port argument, and nothing else.
+    func test_installing_withAnotherPort_changesOnlyTheEndpointAndHelperPort_forEveryLayout() throws {
         for layout in Self.layouts {
             let first = try XCTUnwrap(try install(data(layout.content)).document, layout.label)
             let (second, result) = try install(first, port: 41831)
             XCTAssertEqual(result, .written, layout.label)
-            let expected = try XCTUnwrap(text(first)).replacingOccurrences(
-                of: "\"http://127.0.0.1:41830/usage/v1/metrics\"", with: "\"http://127.0.0.1:41831/usage/v1/metrics\""
-            )
+            let expected = try XCTUnwrap(text(first))
+                .replacingOccurrences(
+                    of: "\"http://127.0.0.1:41830/usage/v1/metrics\"", with: "\"http://127.0.0.1:41831/usage/v1/metrics\"")
+                .replacingOccurrences(of: "calyx-usage-headers\\\" 41830\"", with: "calyx-usage-headers\\\" 41831\"")
+            XCTAssertNotEqual(expected, text(first), "\(layout.label): test setup, both replacements apply")
             XCTAssertEqual(text(second), expected, layout.label)
+            XCTAssertEqual(try decodedRoot(second)["otelHeadersHelper"] as? String,
+                           "\"" + Self.helperPath + "\" 41831", layout.label)
         }
     }
 
@@ -589,7 +602,7 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
     }
 
     func test_removing_withAChangedHelper_removesNothing_andTheNextInstallIsBlocked() throws {
-        let edited = try installedThenEdited(Self.helper, "/usr/local/bin/my-headers.sh")
+        let edited = try installedThenEdited(Self.helperJSONText, "/usr/local/bin/my-headers.sh")
         let (document, result) = try Config.removing(from: edited)
         XCTAssertEqual(result, .nothingToRemove)
         XCTAssertEqual(document, edited)
@@ -659,28 +672,27 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
 
     // MARK: - Written values (review W2)
 
+    /// G5: paths a real `bin` directory can have. Paths holding `"`, `\\`,
+    /// `$` or a backquote are not covered: inside the double quotes of the
+    /// new form the shell would interpret them, and spec note 22 does not
+    /// say how such a path is written (reported as a spec gap).
     private static let unusualHeadersPaths = [
-        "/tmp/it's/h.json",
-        "/tmp/a\"b/h.json",
-        "/tmp/a\\b/h.json",
-        "/tmp/a\nb/h.json",
-        "/tmp/a\u{1}b\tc/h.json",
-        "/tmp/\u{FC}/h.json",
-        "/tmp/$HOME/h.json",
-        "/tmp/`x`/h.json",
+        "/tmp/it's/bin/calyx-usage-headers",
+        "/tmp/a b/bin/calyx-usage-headers",
+        "/tmp/\u{FC}/bin/calyx-usage-headers",
     ]
 
     func test_installing_unusualHeadersPaths_decodeToTheHelperCommand() throws {
         for path in Self.unusualHeadersPaths {
-            let document = try Config.installing(port: 41830, headersFilePath: path, into: data("{}")).document
+            let document = try Config.installing(port: 41830, helperPath: path, into: data("{}")).document
             let helper = try decodedRoot(document)["otelHeadersHelper"] as? String
-            XCTAssertEqual(helper, Config.helperCommand(headersFilePath: path), path.debugDescription)
+            XCTAssertEqual(helper, Config.helperCommand(helperPath: path, port: 41830), path.debugDescription)
         }
     }
 
     func test_isHelperCommand_acceptsTheHelperForUnusualHeadersPaths() throws {
         for path in Self.unusualHeadersPaths {
-            let document = try Config.installing(port: 41830, headersFilePath: path, into: data("{}")).document
+            let document = try Config.installing(port: 41830, helperPath: path, into: data("{}")).document
             let helper = try XCTUnwrap(try decodedRoot(document)["otelHeadersHelper"] as? String, path.debugDescription)
             XCTAssertTrue(Config.isHelperCommand(helper), path.debugDescription)
             XCTAssertEqual(try Config.state(of: document), .installed(port: 41830), path.debugDescription)
@@ -689,8 +701,8 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
 
     func test_installing_twice_withUnusualHeadersPaths_isUnchanged() throws {
         for path in Self.unusualHeadersPaths {
-            let first = try Config.installing(port: 41830, headersFilePath: path, into: data("{}")).document
-            let (second, result) = try Config.installing(port: 41830, headersFilePath: path, into: first)
+            let first = try Config.installing(port: 41830, helperPath: path, into: data("{}")).document
+            let (second, result) = try Config.installing(port: 41830, helperPath: path, into: first)
             XCTAssertEqual(result, .unchanged, path.debugDescription)
             XCTAssertEqual(second, first, path.debugDescription)
         }
@@ -757,7 +769,7 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
 
     func test_removing_leavesAForeignHelperNextToTheCalyxBlock() throws {
         let installed = try XCTUnwrap(text(try install(data("{\n  \"a\": 1\n}\n")).document))
-        let withForeignHelper = installed.replacingOccurrences(of: Self.helper, with: "/usr/local/bin/my-headers.sh")
+        let withForeignHelper = installed.replacingOccurrences(of: Self.helperJSONText, with: "/usr/local/bin/my-headers.sh")
         XCTAssertNotEqual(withForeignHelper, installed, "test setup: the helper must be replaced")
         let (document, result) = try Config.removing(from: data(withForeignHelper))
         XCTAssertEqual(result, .nothingToRemove)
@@ -781,5 +793,65 @@ final class ClaudeUsageTelemetryConfigTests: XCTestCase {
 
     func test_removing_throwsTypeConflict_forANonObjectEnv() {
         assertTypeConflictOnEnv { _ = try Config.removing(from: self.data("{\"env\": 3}")) }
+    }
+
+    // MARK: - G5: legacy `cat` helper is replaced
+
+    private func legacyInstalled(port: Int = 41830) -> Data {
+        let members = calyxMembers.map {
+            $0.0 == Config.endpointKey ? ($0.0, "http://127.0.0.1:\(port)/usage/v1/metrics") : $0
+        }
+        return envDoc(members, extraRoot: ", \"otelHeadersHelper\": \"" + Self.legacyHelper + "\"")
+    }
+
+    func test_state_isInstalled_forALegacyInstall() throws {
+        XCTAssertEqual(try Config.state(of: legacyInstalled()), .installed(port: 41830))
+    }
+
+    func test_installing_overALegacyInstall_replacesTheHelperWithTheNewForm() throws {
+        let (document, result) = try install(legacyInstalled())
+        XCTAssertEqual(result, .written)
+        XCTAssertEqual(try decodedRoot(document)["otelHeadersHelper"] as? String, Self.helper)
+        let env = try decodedEnv(document)
+        XCTAssertEqual(env.count, 9)
+        for (key, value) in Self.expectedEnv {
+            XCTAssertEqual(env[key] as? String, value, key)
+        }
+        XCTAssertFalse(try XCTUnwrap(text(document)).contains("usage-otel-headers.json"))
+        XCTAssertEqual(try Config.state(of: document), .installed(port: 41830))
+    }
+
+    func test_installing_overALegacyInstallOnAnotherPort_rewritesEndpointAndHelper() throws {
+        let (document, result) = try install(legacyInstalled(port: 5001))
+        XCTAssertEqual(result, .written)
+        XCTAssertEqual(try decodedRoot(document)["otelHeadersHelper"] as? String, Self.helper)
+        XCTAssertEqual(try decodedEnv(document)[Config.endpointKey] as? String, Self.endpoint41830)
+    }
+
+    func test_installing_overALoneLegacyHelper_replacesIt() throws {
+        let doc = data("{\"otelHeadersHelper\": \"" + Self.legacyHelper + "\"}")
+        let (document, result) = try install(doc)
+        XCTAssertEqual(result, .written)
+        XCTAssertEqual(try decodedRoot(document)["otelHeadersHelper"] as? String, Self.helper)
+    }
+
+    func test_installing_newForm_unchanged_returnsUnchanged() throws {
+        let first = try install(data(Self.plainOriginal)).document
+        let (second, result) = try install(first)
+        XCTAssertEqual(result, .unchanged)
+        XCTAssertEqual(second, first)
+    }
+
+    func test_installing_withAnotherHelperPath_rewritesTheHelper() throws {
+        let first = try install(data(Self.plainOriginal)).document
+        let (second, result) = try Config.installing(port: 41830, helperPath: "/opt/bin/calyx-usage-headers", into: first)
+        XCTAssertEqual(result, .written)
+        XCTAssertEqual(try decodedRoot(second)["otelHeadersHelper"] as? String, "\"/opt/bin/calyx-usage-headers\" 41830")
+    }
+
+    func test_removing_aLegacyInstall_removesTheBlockAndTheLegacyHelper() throws {
+        let (document, result) = try Config.removing(from: legacyInstalled())
+        XCTAssertEqual(result, .removed)
+        XCTAssertTrue(try decodedRoot(document).isEmpty, text(document) ?? "nil")
     }
 }

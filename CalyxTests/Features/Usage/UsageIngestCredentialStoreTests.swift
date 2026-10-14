@@ -3,7 +3,7 @@
 //  CalyxTests
 //
 //  `UsageIngestCredentialStore`: the usage route's dedicated token, kept
-//  in `<directory>/usage-otel-headers.json` as exactly
+//  in `<directory>/usage-otel-credential.json` as exactly
 //  `{"Authorization":"Bearer <64 lowercase hex>"}` at mode 0600. Every
 //  test works in its own temporary directory; every token is synthetic.
 //
@@ -35,7 +35,7 @@ final class UsageIngestCredentialStoreTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private var filePath: String { (dir as NSString).appendingPathComponent("usage-otel-headers.json") }
+    private var filePath: String { (dir as NSString).appendingPathComponent("usage-otel-credential.json") }
 
     private func expectedContents(_ token: String) -> Data {
         Data("{\"Authorization\":\"Bearer \(token)\"}".utf8)
@@ -83,12 +83,54 @@ final class UsageIngestCredentialStoreTests: XCTestCase {
 
     // MARK: - headersFilePath
 
-    func test_fileName_isUsageOtelHeadersJSON() {
-        XCTAssertEqual(UsageIngestCredentialStore.fileName, "usage-otel-headers.json")
+    func test_fileName_isUsageOtelCredentialJSON() {
+        XCTAssertEqual(UsageIngestCredentialStore.fileName, "usage-otel-credential.json")
+    }
+
+    func test_legacyFileName_isUsageOtelHeadersJSON() {
+        XCTAssertEqual(UsageIngestCredentialStore.legacyFileName, "usage-otel-headers.json")
+    }
+
+    // MARK: - Legacy file (G5 disposition 24)
+
+    private var legacyPath: String { (dir as NSString).appendingPathComponent("usage-otel-headers.json") }
+
+    func test_loadOrCreate_removesAPreExistingLegacyFile() throws {
+        try makeDir()
+        try expectedContents(tokenB).write(to: URL(fileURLWithPath: legacyPath))
+        let credential = try UsageIngestCredentialStore.loadOrCreate(directory: dir) { self.tokenA }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyPath))
+        XCTAssertEqual(credential.token, tokenA, "the legacy file's token is not adopted")
+        XCTAssertEqual(listing(dir), ["usage-otel-credential.json"])
+    }
+
+    func test_loadOrCreate_removesTheLegacyFile_whenTheNewFileIsAlreadyUsable() throws {
+        try writeFile(expectedContents(tokenA), mode: 0o600)
+        try expectedContents(tokenB).write(to: URL(fileURLWithPath: legacyPath))
+        let credential = try UsageIngestCredentialStore.loadOrCreate(directory: dir) { self.tokenB }
+        XCTAssertEqual(credential.token, tokenA)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacyPath))
+    }
+
+    func test_loadOrCreate_leavesALegacyNamedDirectoryInPlace() throws {
+        try FileManager.default.createDirectory(atPath: legacyPath, withIntermediateDirectories: true)
+        _ = try UsageIngestCredentialStore.loadOrCreate(directory: dir) { self.tokenA }
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: legacyPath, isDirectory: &isDir))
+        XCTAssertTrue(isDir.boolValue)
+        XCTAssertEqual(FileManager.default.contents(atPath: filePath), expectedContents(tokenA))
+    }
+
+    func test_read_readsOnlyTheNewName() throws {
+        try makeDir()
+        try expectedContents(tokenB).write(to: URL(fileURLWithPath: legacyPath))
+        XCTAssertNil(UsageIngestCredentialStore.read(directory: dir), "a legacy file alone is not read")
+        try writeFile(expectedContents(tokenA), mode: 0o600)
+        XCTAssertEqual(UsageIngestCredentialStore.read(directory: dir)?.token, tokenA)
     }
 
     func test_headersFilePath_isDirectoryPlusFileName() {
-        XCTAssertEqual(UsageIngestCredentialStore.headersFilePath(directory: "/some/dir"), "/some/dir/usage-otel-headers.json")
+        XCTAssertEqual(UsageIngestCredentialStore.headersFilePath(directory: "/some/dir"), "/some/dir/usage-otel-credential.json")
     }
 
     // MARK: - loadOrCreate: first creation
@@ -123,7 +165,7 @@ final class UsageIngestCredentialStoreTests: XCTestCase {
     func test_loadOrCreate_onEmptyDirectory_leavesNoOtherFileInDirectory() throws {
         try makeDir()
         _ = try UsageIngestCredentialStore.loadOrCreate(directory: dir) { self.tokenA }
-        XCTAssertEqual(listing(dir), ["usage-otel-headers.json"])
+        XCTAssertEqual(listing(dir), ["usage-otel-credential.json"])
     }
 
     // MARK: - loadOrCreate: existing usable file
@@ -362,7 +404,7 @@ final class UsageIngestCredentialStoreTests: XCTestCase {
     private var otherDir: String { (rootDir as NSString).appendingPathComponent("elsewhere") }
     private var targetPath: String { (otherDir as NSString).appendingPathComponent("target.json") }
 
-    /// `dir/usage-otel-headers.json` -> `rootDir/elsewhere/target.json`.
+    /// `dir/usage-otel-credential.json` -> `rootDir/elsewhere/target.json`.
     /// The link's own mode is set to 0600, so an implementation that takes
     /// the mode from the link (not the target) sees nothing to fix.
     private func makeLink(targetContents: Data?, targetMode: Int = 0o644) throws {
@@ -462,7 +504,7 @@ final class UsageIngestCredentialStoreTests: XCTestCase {
         try writeFile(junk, mode: 0o600)
         _ = try? UsageIngestCredentialStore.loadOrCreate(directory: dir) { throw MakeTokenFailure() }
         XCTAssertEqual(FileManager.default.contents(atPath: filePath), junk)
-        XCTAssertEqual(listing(dir), ["usage-otel-headers.json"])
+        XCTAssertEqual(listing(dir), ["usage-otel-credential.json"])
     }
 
     func test_loadOrCreate_malformedGeneratedToken_upperCase_throws() throws {
@@ -542,7 +584,7 @@ final class UsageIngestCredentialStoreTests: XCTestCase {
         _ = UsageIngestCredentialStore.read(directory: dir)
         XCTAssertEqual(FileManager.default.contents(atPath: filePath), junk)
         XCTAssertEqual(try mode(of: filePath), 0o644)
-        XCTAssertEqual(listing(dir), ["usage-otel-headers.json"])
+        XCTAssertEqual(listing(dir), ["usage-otel-credential.json"])
     }
 }
 

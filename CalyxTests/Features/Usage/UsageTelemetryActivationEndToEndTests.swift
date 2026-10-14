@@ -67,7 +67,9 @@ final class UsageTelemetryActivationEndToEndTests: XCTestCase {
     private var claudeDirectory: String { basePath + "/.claude" }
     private var settingsPath: String { claudeDirectory + "/settings.json" }
     private var credentialDirectory: String { basePath + "/credential" }
-    private var headersFilePath: String { credentialDirectory + "/usage-otel-headers.json" }
+    private var headersFilePath: String { credentialDirectory + "/usage-otel-credential.json" }
+    /// G5: the `bin` directory the test's effect installs `calyx-usage-headers` into.
+    private var binDirectory: String { basePath + "/bin" }
 
     /// The reconciler with the real effects over this test's root.
     private func makeActivation() throws -> UsageTelemetryActivation {
@@ -76,12 +78,16 @@ final class UsageTelemetryActivationEndToEndTests: XCTestCase {
         ledgers.append(ledger)
         let credentialDirectory = self.credentialDirectory
         let settingsPath = self.settingsPath
+        let binDirectory = self.binDirectory
         let effects = UsageTelemetryActivation.Effects(
             syncTracking: { await ledger.syncTracking() },
-            loadCredential: { create in try await holder.load(create: create, directory: credentialDirectory) },
-            install: { port, headersFilePath in
-                try ClaudeUsageTelemetryConfigManager.install(
-                    port: port, headersFilePath: headersFilePath, settingsPath: settingsPath)
+            loadCredential: { create, rotateForGeneration in
+                try await holder.load(create: create, directory: credentialDirectory, rotateForGeneration: rotateForGeneration)
+            },
+            install: { port in
+                let helperPath = try UsageHeadersHelperScript.install(toDirectory: binDirectory)
+                return try ClaudeUsageTelemetryConfigManager.install(
+                    port: port, helperPath: helperPath, settingsPath: settingsPath)
             },
             remove: { try ClaudeUsageTelemetryConfigManager.remove(settingsPath: settingsPath) })
         return UsageTelemetryActivation(inputs: try theInputs().inputs, effects: effects, onStatusChange: {})
@@ -103,10 +109,11 @@ final class UsageTelemetryActivationEndToEndTests: XCTestCase {
     }
 
     /// Runs `command` with /bin/sh and returns its standard output.
-    private func runShell(_ command: String) throws -> Data {
+    private func runShell(_ command: String, environment: [String: String]? = nil) throws -> Data {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
         process.arguments = ["-c", command]
+        if let environment { process.environment = environment }
         let output = Pipe()
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
@@ -148,12 +155,21 @@ final class UsageTelemetryActivationEndToEndTests: XCTestCase {
         XCTAssertEqual(env["MY_VAR"] as? String, "mine")
         XCTAssertEqual(root["model"] as? String, "opus")
         let helper = try XCTUnwrap(root["otelHeadersHelper"] as? String)
-        XCTAssertEqual(helper, "cat '\(headersFilePath)' 2>/dev/null || printf '{}'")
+        // G5: the quoted helper path and the port; no token in the settings file (J17).
+        XCTAssertEqual(helper, "\"\(binDirectory)/calyx-usage-headers\" 41831")
 
         // The helper prints exactly the credential file, which exists
-        // with mode 0600 and carries the token the route accepts.
+        // with mode 0600 and carries the token the route accepts, when a
+        // live endpoint file for that port sits next to it.
         let headers = try Data(contentsOf: URL(fileURLWithPath: headersFilePath))
-        XCTAssertEqual(try runShell(helper), headers)
+        try IPCWakeTestCrypto.writeEndpointFile(
+            directory: credentialDirectory, port: 41831, token: String(repeating: "0123456789abcdef", count: 4),
+            keyBytes: IPCWakeTestCrypto.randomKeyBytes())
+        let helperEnvironment = [
+            "HOME": basePath + "/emptyhome", "PATH": "/usr/bin:/bin",
+            "CALYX_ENDPOINT_FILE": credentialDirectory + "/agent-endpoint.json",
+        ]
+        XCTAssertEqual(try runShell(helper, environment: helperEnvironment), headers)
         let attributes = try FileManager.default.attributesOfItem(atPath: headersFilePath)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
         let holder = try XCTUnwrap(holderStorage)

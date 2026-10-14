@@ -440,6 +440,10 @@ final class IPCWakeHookScriptTests: XCTestCase {
         let signalledInit = try firstIndex(of: "`signalled=0`") { $0 == "signalled=0" }
         let curlPIDInit = try firstIndex(of: "`curl_pid=`") { $0 == "curl_pid=" }
         let firstTrap = try firstIndex(of: "a trap") { $0.hasPrefix("trap ") }
+        let exitTrap = try firstIndex(of: "the EXIT trap") { $0.hasPrefix("trap 'if") && $0.hasSuffix("' EXIT") }
+        let termTrap = try firstIndex(of: "the TERM trap") {
+            $0.hasPrefix("trap 'signalled") && $0.hasSuffix("' TERM HUP INT")
+        }
         let drain = try firstIndex(of: "`cat > /dev/null`") { $0 == "cat > /dev/null" }
         let uuidgen = try firstIndex(of: "the uuidgen line") { $0.contains("uuidgen") }
         let mktemp = try firstIndex(of: "the mktemp line") { $0.contains("mktemp") }
@@ -456,7 +460,16 @@ final class IPCWakeHookScriptTests: XCTestCase {
 
         for (name, index) in [("response_file=", responseFileInit), ("signalled=0", signalledInit), ("curl_pid=", curlPIDInit)] {
             XCTAssertLessThan(blockRead, index, "the blocks are read before \(name)")
-            XCTAssertLessThan(index, firstTrap, "`\(name)` is initialised before the first trap")
+        }
+        // Spec C.3 (G4) / J14: `response_file=` precedes the EXIT trap, and
+        // AgentHookLongPoll.setup (signalled=0, curl_pid=, TERM trap) follows it.
+        XCTAssertEqual(firstTrap, exitTrap, "the EXIT trap is the first trap")
+        let initOrder: [(String, Int)] = [
+            ("response_file=", responseFileInit), ("EXIT trap", exitTrap), ("signalled=0", signalledInit),
+            ("curl_pid=", curlPIDInit), ("TERM trap", termTrap),
+        ]
+        for (earlier, later) in zip(initOrder, initOrder.dropFirst()) {
+            XCTAssertEqual(earlier.1 + 1, later.1, "\(later.0) is the executable line right after \(earlier.0)")
         }
         let ordered: [(String, Int)] = [
             ("exec", exec), ("block read", blockRead), ("first trap", firstTrap), ("cat", drain),
@@ -646,7 +659,10 @@ final class IPCWakeHookScriptTests: XCTestCase {
     func test_run_endpointFileWithOnlyOneBlock_neverRunsCurl() throws {
         let key = C.randomKeyBytes()
         let blocks = C.blocksHex(keyBytes: key)
-        let base = #""port":41834,"token":"ipc-wake-hook-script-test-token""#
+        // pid/pidStart: the test host's own (C-D16), so the prologue's
+        // liveness check passes and the missing block is what stops curl.
+        let base = #""port":41834,"token":"ipc-wake-hook-script-test-token","pid":"#
+            + String(TestHostLiveness.pid) + #","pidStart":""# + TestHostLiveness.startText + "\""
         for (label, text) in [
             ("only inner", "{" + base + #","wakeProofInner":""# + blocks.inner + "\"}"),
             ("only outer", "{" + base + #","wakeProofOuter":""# + blocks.outer + "\"}"),

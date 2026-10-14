@@ -90,19 +90,25 @@ struct FakeCurlScriptFixture {
 /// distinct-enough values will do. The file is written by hand
 /// (`IPCWakeTestCrypto.writeEndpointFile`, 0600) with the two wake proof
 /// blocks of `wakeKeyBytes`, a fresh random 32-byte key unless given; pass
-/// nil for a file with port and token only.
+/// nil for a file without the blocks. `pid`/`pidStart` default to the test
+/// host's own liveness identifier (spec C-D16), so the prologue's liveness
+/// check passes; nil omits that key.
 func makeFakeCurlScriptFixture(
     rootDirectory: String = FileManager.default.temporaryDirectory
         .appendingPathComponent(UUID().uuidString).path,
     port: Int,
     token: String,
     wakeKeyBytes: Data? = IPCWakeTestCrypto.randomKeyBytes(),
+    pid: Int32? = TestHostLiveness.pid,
+    pidStart: String? = TestHostLiveness.startText,
     install: (String) throws -> String
 ) throws -> FakeCurlScriptFixture {
     let home = rootDirectory + "/home"
     let appSupportDir = home + "/Library/Application Support/Calyx"
     let fakeBinDir = rootDirectory + "/fakebin"
-    try IPCWakeTestCrypto.writeEndpointFile(directory: appSupportDir, port: port, token: token, keyBytes: wakeKeyBytes)
+    try IPCWakeTestCrypto.writeEndpointFile(
+        directory: appSupportDir, port: port, token: token, keyBytes: wakeKeyBytes, pid: pid, pidStart: pidStart
+    )
     let scriptPath = try install(appSupportDir + "/bin")
     return FakeCurlScriptFixture(
         rootDir: rootDirectory, home: home, appSupportDir: appSupportDir,
@@ -255,13 +261,15 @@ func makeFailingTool(named name: String, atDirectory dir: String, exitCode: Int3
     )
 }
 
-/// The real tools the wake hook runs, by absolute path, for
+/// The real tools the wake hook and the approval hook run, by absolute path, for
 /// `installRecordingWrappers`. `curl` is not here: the fake curl stands in
 /// for it (`makeRecordingFakeCurl`).
 let wakeHookRealTools: [String: String] = [
     "sed": "/usr/bin/sed", "grep": "/usr/bin/grep", "tr": "/usr/bin/tr",
     "uuidgen": "/usr/bin/uuidgen", "openssl": "/usr/bin/openssl", "xxd": "/usr/bin/xxd",
     "mktemp": "/usr/bin/mktemp", "cat": "/bin/cat", "rm": "/bin/rm",
+    // The approval hook's verification tail also runs head and tail.
+    "head": "/usr/bin/head", "tail": "/usr/bin/tail",
 ]
 
 /// Puts a recording wrapper for each of `names` into `dir`. Each wrapper
@@ -305,7 +313,8 @@ func makeRecordingFakeCurl(
     exitCode: Int32 = 0,
     noise: Bool = false,
     listDirectory: String? = nil,
-    listingPath: String? = nil
+    listingPath: String? = nil,
+    startedPath: String? = nil
 ) throws {
     try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     try FileManager.default.createDirectory(atPath: recordDirectory, withIntermediateDirectories: true)
@@ -316,8 +325,15 @@ func makeRecordingFakeCurl(
         listLine = "/bin/ls -A \"\(listDirectory)\" > \"\(listingPath)\"\n"
     }
     let noiseLine = noise ? "printf 'NOISE-curl\\n' >&2\n" : ""
+    // When requested, the very first action is an unconditional record, so
+    // a curl that starts at all leaves a trace even if it is killed
+    // immediately afterwards.
+    var startedLine = ""
+    if let startedPath {
+        startedLine = "printf 'started\\n' >> \"\(startedPath)\"\n"
+    }
     try writeFakeTool(named: "curl", atDirectory: dir, body: """
-    /bin/cat > /dev/null
+    \(startedLine)/bin/cat > /dev/null
     { printf 'ARGV curl'; for a in "$@"; do printf ' [%s]' "$a"; done; printf '\\n'; /usr/bin/env; printf 'END\\n'; } >> "\(recordDirectory)/curl.$$"
     \(listLine)\(noiseLine)/bin/cat "\(bodyPath)"
     exit \(exitCode)

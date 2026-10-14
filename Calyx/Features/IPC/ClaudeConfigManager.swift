@@ -17,8 +17,22 @@ struct ClaudeConfigManager: Sendable {
 
     // MARK: - Public API
 
-    static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
+    /// Writes the `calyx-ipc` and `calyx-mcp` entries.
+    ///
+    /// `headersHelperPath` non-nil (the installed `calyx-mcp-headers`):
+    /// each entry carries `"headersHelper"` and no `Authorization` header,
+    /// so the file holds no token. V3-2: Claude Code runs the helper at
+    /// connect and again after a 401/403 or `/mcp reconnect`, and treats a
+    /// `{}` answer as "no Authorization". The value is a shell command
+    /// line, `MCPHeadersHelperScript.helperCommand(path:port:)`: the quoted
+    /// path plus the port, so a session on an older port gets `{}`.
+    ///
+    /// `headersHelperPath` nil: today's baked-in `Authorization` header,
+    /// byte for byte (the fallback when the helper could not be installed).
+    static func enableIPC(port: Int, token: String, headersHelperPath: String? = nil, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
+        let authorization: [String: String] = headersHelperPath == nil ? ["Authorization": "Bearer \(token)"] : [:]
+        let helperField: [String: Any] = headersHelperPath.map { ["headersHelper": MCPHeadersHelperScript.helperCommand(path: $0, port: port)] } ?? [:]
 
         // Claude Code expands `${VAR}` header values from its own process
         // environment. Inside a persistent calyx-session pane,
@@ -37,12 +51,11 @@ struct ClaudeConfigManager: Sendable {
         let calyxEntry: [String: Any] = [
             "type": "http",
             "url": "http://127.0.0.1:\(port)/mcp",
-            "headers": [
-                "Authorization": "Bearer \(token)",
+            "headers": authorization.merging([
                 "X-Calyx-Surface-ID": "${CALYX_SURFACE_ID:-}",
                 "X-Calyx-Session-ID": "${CALYX_SESSION_ID:-}"
-            ]
-        ]
+            ]) { $1 }
+        ].merging(helperField) { $1 }
         // .sortedKeys: JSONSerialization on a Swift Dictionary otherwise
         // emits keys in an order seeded per process launch, so without it
         // this entry's own bytes would differ across launches even when
@@ -57,17 +70,16 @@ struct ClaudeConfigManager: Sendable {
         let calyxMCPEntry: [String: Any] = [
             "type": "http",
             "url": "http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)",
-            "headers": [
-                "Authorization": "Bearer \(token)",
+            "headers": authorization.merging([
                 "X-Calyx-Surface-ID": "${CALYX_SURFACE_ID:-}",
                 "X-Calyx-Session-ID": "${CALYX_SESSION_ID:-}",
                 "X-Calyx-Herdr-Pane-ID": "${HERDR_PANE_ID:-}",
                 "X-Calyx-Herdr-Socket-Path": "${HERDR_SOCKET_PATH:-}"
-            ]
-        ]
+            ]) { $1 }
+        ].merging(helperField) { $1 }
         let calyxMCPEntryData = try JSONSerialization.data(withJSONObject: calyxMCPEntry, options: [.sortedKeys])
 
-        // 0600: these entries carry the bearer token, so ~/.claude.json's
+        // 0600: these entries carry the bearer token (baked-in form), so ~/.claude.json's
         // mode is enforced rather than left as-is.
         try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
             let withIPC = try JSONConfigDocumentEditor.setValue(entryData, at: [mcpServersKey, calyxIPCKey], in: current)

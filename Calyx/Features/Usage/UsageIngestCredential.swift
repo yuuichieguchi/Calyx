@@ -1,8 +1,17 @@
 // UsageIngestCredential.swift
 // Calyx
 //
-// The usage route's own bearer token, kept in `usage-otel-headers.json`
-// so Claude Code's `otelHeadersHelper` command can print it as headers.
+// The usage route's own bearer token, kept in `usage-otel-credential.json`
+// so `calyx-usage-headers` (Claude Code's `otelHeadersHelper`) can print
+// it as headers.
+//
+// Why the file was renamed from `usage-otel-headers.json` (G5, C-D19):
+// Claude Code sessions started under an older build keep running the
+// legacy helper, a plain `cat` of `usage-otel-headers.json`, which prints
+// whatever that file holds to whatever process now serves the session's
+// port. Those sessions must never read a renewed token, so the credential
+// lives under a name only `calyx-usage-headers` knows, and `loadOrCreate`
+// removes the legacy file: legacy helpers then print `{}` (fail closed).
 
 import Foundation
 
@@ -25,11 +34,15 @@ enum UsageIngestCredentialError: Error, Sendable, Equatable {
 
 enum UsageIngestCredentialStore {
 
-    static let fileName = "usage-otel-headers.json"
+    static let fileName = "usage-otel-credential.json"
+
+    /// The name older builds used, still `cat`ed by legacy helpers of
+    /// sessions started under those builds; `loadOrCreate` removes it.
+    static let legacyFileName = "usage-otel-headers.json"
 
     private static let tokenLength = 64
 
-    /// `<directory>/usage-otel-headers.json`; the default directory is `AppSupportDirectory.path`.
+    /// `<directory>/usage-otel-credential.json`; the default directory is `AppSupportDirectory.path`.
     static func headersFilePath(directory: String = AppSupportDirectory.path) -> String {
         (directory as NSString).appendingPathComponent(fileName)
     }
@@ -64,9 +77,19 @@ enum UsageIngestCredentialStore {
     /// at again; a usable file found there wins and the made token is
     /// dropped. Otherwise `makeToken` runs only for an unusable file. A
     /// failing or malformed `makeToken` leaves `directory` as it was.
+    ///
+    /// `replaceExisting: true` renews the token: a fresh checked token is
+    /// written whatever the file holds (G5, C-D19: the usage token is
+    /// renewed with the IPC token when the previous port was lost). A
+    /// failing or malformed `makeToken` throws and leaves the file as it was.
+    ///
+    /// The legacy `usage-otel-headers.json` in `directory` is removed
+    /// first (best-effort, only when it is a regular file; errors are
+    /// ignored), so legacy `cat` helpers print `{}` from then on.
     static func loadOrCreate(
         directory: String = AppSupportDirectory.path,
-        makeToken: () throws -> String
+        makeToken: () throws -> String,
+        replaceExisting: Bool = false
     ) throws -> UsageIngestCredential {
         let fm = FileManager.default
         var preparedToken: String?
@@ -75,10 +98,11 @@ enum UsageIngestCredentialStore {
             try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
         }
 
+        removeLegacyFile(directory: directory)
         let path = headersFilePath(directory: directory)
         var resultToken: String?
         try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600, restoreModeOnNoWrite: true) { current in
-            if let current, let existing = token(inHeadersFile: current) {
+            if !replaceExisting, let current, let existing = token(inHeadersFile: current) {
                 resultToken = existing
                 return current
             }
@@ -90,6 +114,19 @@ enum UsageIngestCredentialStore {
             throw UsageIngestCredentialError.missingCredentialAfterWrite
         }
         return UsageIngestCredential(token: token, headersFilePath: path)
+    }
+
+    /// Removes `<directory>/usage-otel-headers.json` when it is a regular
+    /// file (a directory or a symbolic link is left alone). Best-effort by
+    /// design (G5 disposition 24): a failed removal must not stop the
+    /// credential from being written, so its error is ignored.
+    private static func removeLegacyFile(directory: String) {
+        let fm = FileManager.default
+        let legacyPath = (directory as NSString).appendingPathComponent(legacyFileName)
+        guard let attributes = try? fm.attributesOfItem(atPath: legacyPath),
+              attributes[.type] as? FileAttributeType == .typeRegular
+        else { return }
+        try? fm.removeItem(atPath: legacyPath)
     }
 
     /// `makeToken`'s token, or `malformedGeneratedToken` when it is not 64

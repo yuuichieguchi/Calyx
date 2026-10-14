@@ -120,7 +120,10 @@ enum IPCWakeHookScript {
     /// it and exits 0, for the reason documented on
     /// `ApprovalHookScript.scriptBody`: a foregrounded curl would
     /// outlive a killed script and keep the long-poll open. The same
-    /// `signalled` / `curl_pid` handshake is used here: the trap only
+    /// `signalled` / `curl_pid` handshake is used here, from the same
+    /// lines: `AgentHookLongPoll.setup`, `guardBeforeCurl` and
+    /// `afterCurl`, and the block read and nonce come from
+    /// `AgentHookProof`, all shared with the approval script. The trap only
     /// records `signalled=1` while `curl_pid` is empty, and the script
     /// checks `signalled` once before curl is started and again on the
     /// line right after `curl_pid=$!`. `curl_pid` is emptied again once
@@ -186,36 +189,25 @@ enum IPCWakeHookScript {
     exec 3>&2 2>/dev/null
     \(AgentHookScriptPrologue.body)
     # The key's two HMAC blocks (hex). Without both, do not even ask.
-    proof_inner=$(sed -n 's/.*"wakeProofInner"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
-    proof_outer=$(sed -n 's/.*"wakeProofOuter"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
-    if [ -z "$proof_inner" ] || [ -z "$proof_outer" ]; then
-        exit 0
-    fi
-    # Initialised before the traps are set, so that a trap firing early
-    # never reads a value inherited from the environment.
+    \(AgentHookProof.readBlocks)
+    # Emptied before the EXIT trap is set, so that it never reads a value
+    # inherited from the environment.
     response_file=
-    signalled=0
-    curl_pid=
     # Written as an `if` so the trap's own status can never replace the
     # script's exit status.
     trap 'if [ -n "$response_file" ]; then rm -f "$response_file"; fi' EXIT
-    # Kills and exits only once curl_pid is known; an earlier signal just
-    # records signalled=1 for the two checks below. The EXIT trap removes
-    # the response file.
-    trap 'signalled=1; if [ -n "$curl_pid" ]; then kill "$curl_pid" 2>/dev/null; exit 0; fi' TERM HUP INT
+    # Shared with calyx-approval-hook (AgentHookLongPoll.setup): the TERM
+    # trap kills and exits only once curl_pid is known; an earlier signal
+    # just records signalled=1 for the two checks below. The trap's exit
+    # runs the EXIT trap, which removes the response file.
+    \(AgentHookLongPoll.setup)
     # The event on stdin is not used.
     cat > /dev/null
     # A fresh nonce per poll, in the canonical uppercase form the server
     # accepts.
-    nonce=$(uuidgen) || exit 0
-    nonce=$(printf '%s' "$nonce" | tr 'abcdef' 'ABCDEF')
-    if [ -z "$nonce" ]; then
-        exit 0
-    fi
+    \(AgentHookProof.nonce)
     response_file=$(mktemp "${TMPDIR:-/tmp}/calyx-ipc-wake.XXXXXX") || exit 0
-    if [ "$signalled" = 1 ]; then
-        exit 0
-    fi
+    \(AgentHookLongPoll.guardBeforeCurl)
     curl -s -m \(IPCWakeHookTiming.curlTimeoutSeconds) \\
         --max-filesize 1024 \\
         --fail \\
@@ -225,14 +217,7 @@ enum IPCWakeHookScript {
         -H "X-Calyx-Agent-Kind: $kind" \\
         -H "\(IPCWakeResponse.nonceHeader): $nonce" \\
         "http://127.0.0.1:$port/ipc-wake" > "$response_file" &
-    curl_pid=$!
-    if [ "$signalled" = 1 ]; then
-        kill "$curl_pid" 2>/dev/null
-        exit 0
-    fi
-    wait "$curl_pid"
-    curl_exit=$?
-    curl_pid=
+    \(AgentHookLongPoll.afterCurl)
     # The body of a failed request is never read.
     if [ "$curl_exit" != 0 ]; then
         exit 0

@@ -58,14 +58,22 @@ final class UsageTelemetryActivation {
         var ipcEnabled: @MainActor () -> Bool
         var serverPort: @MainActor () -> Int?           // nil when the server is not running
         var mayTouchAgentFiles: @MainActor () -> Bool
+        /// The server start generation whose IPC token rotated, while that
+        /// start's server is running; nil otherwise. Passed to
+        /// `loadCredential` on the install path only, so the usage token is
+        /// renewed once per such start (G5, C-D19).
+        var rotationGeneration: @MainActor () -> Int?
     }
 
     struct Effects {
         /// Brings the store's durable tracking state in line with the setting (R3b).
         var syncTracking: @Sendable () async -> Void
-        /// Loads the credential (creating it when `create`) and hands it to the route. nil: there is none and none was created.
-        var loadCredential: @Sendable (_ create: Bool) async throws -> UsageIngestCredential?
-        var install: @Sendable (_ port: Int, _ headersFilePath: String) async throws -> ClaudeUsageTelemetryConfigManager.Outcome
+        /// Loads the credential (creating it when `create`, renewing it
+        /// for a non-nil `rotateForGeneration` not yet renewed for) and
+        /// hands it to the route. nil: there is none and none was created.
+        var loadCredential: @Sendable (_ create: Bool, _ rotateForGeneration: Int?) async throws -> UsageIngestCredential?
+        /// Installs the headers helper script and the telemetry block for `port`.
+        var install: @Sendable (_ port: Int) async throws -> ClaudeUsageTelemetryConfigManager.Outcome
         var remove: @Sendable () async throws -> ClaudeUsageTelemetryConfigManager.Outcome
     }
 
@@ -125,7 +133,7 @@ final class UsageTelemetryActivation {
         let effects = self.effects
         switch target {
         case .installed(let port):
-            status = await Self.install(port: port, effects: effects)
+            status = await Self.install(port: port, rotationGeneration: inputs.rotationGeneration(), effects: effects)
         case .removed:
             status = await Self.remove(effects: effects)
         case .untouched:
@@ -141,19 +149,19 @@ final class UsageTelemetryActivation {
     // usage file queue (`UsageFileWork`), never on a pool thread.
 
     @concurrent
-    private nonisolated static func install(port: Int, effects: Effects) async -> UsageTelemetryConfigStatus {
+    private nonisolated static func install(
+        port: Int, rotationGeneration: Int?, effects: Effects
+    ) async -> UsageTelemetryConfigStatus {
         await effects.syncTracking()
-        let credential: UsageIngestCredential
         do {
-            guard let loaded = try await effects.loadCredential(true) else {
+            guard try await effects.loadCredential(true, rotationGeneration) != nil else {
                 return .failed("The credential file was not created.")
             }
-            credential = loaded
         } catch {
             return .failed(readableText(of: error))
         }
         do {
-            switch try await effects.install(port, credential.headersFilePath) {
+            switch try await effects.install(port) {
             case .installed(let installedPort): return .installed(port: installedPort)
             case .blocked(let keys): return .blocked(keys: keys)
             case .claudeNotFound: return .claudeNotFound
@@ -176,7 +184,7 @@ final class UsageTelemetryActivation {
         }
         await effects.syncTracking()
         // Ignored by contract: without a credential the route answers 401.
-        _ = try? await effects.loadCredential(false)
+        _ = try? await effects.loadCredential(false, nil)
         return status
     }
 
@@ -187,7 +195,7 @@ final class UsageTelemetryActivation {
         // leaves the route without a credential until the next run, and
         // shows as `.failed` at the reconcile that runs once the server is up.
         do {
-            _ = try await effects.loadCredential(true)
+            _ = try await effects.loadCredential(true, nil)
         } catch {
             let nsError = error as NSError
             logger.error("""
@@ -218,9 +226,11 @@ final class UsageTelemetryActivation {
 
     static let shared = makeProduction()
 
-    /// Inputs: the two settings, the shared server, the launch policy.
+    /// Inputs: the two settings, the shared server (port, and the start
+    /// generation when that start rotated the IPC token), the launch policy.
     /// Effects: the shared ledger, the shared credential holder over
-    /// Application Support, R4a's manager on the default settings path
+    /// Application Support, the headers helper script in
+    /// `AgentHookScript.defaultInstallDirectory`, R4a's manager on the default settings path
     /// (which follows `CalyxPathRoot.testRoot`). The shared objects are
     /// looked up when an effect runs, never here.
     private static func makeProduction() -> UsageTelemetryActivation {
@@ -232,20 +242,65 @@ final class UsageTelemetryActivation {
                     let server = CalyxMCPServer.shared
                     return server.isRunning ? server.port : nil
                 },
-                mayTouchAgentFiles: { LaunchEnvironmentPolicy.mayPerformAgentIPCActivation() }),
+                mayTouchAgentFiles: { LaunchEnvironmentPolicy.mayPerformAgentIPCActivation() },
+                rotationGeneration: {
+                    let server = CalyxMCPServer.shared
+                    return rotationGeneration(
+                        isRunning: server.isRunning, rotated: server.lastStartRotatedToken,
+                        generation: server.startGeneration)
+                }),
             effects: Effects(
                 syncTracking: { await UsageLedger.shared.syncTracking() },
-                loadCredential: { create in
-                    try await UsageIngestCredentialHolder.shared.load(create: create, directory: AppSupportDirectory.path)
+                loadCredential: { create, rotateForGeneration in
+                    try await UsageIngestCredentialHolder.shared.load(
+                        create: create, directory: AppSupportDirectory.path, rotateForGeneration: rotateForGeneration)
                 },
-                install: { port, headersFilePath in
+                install: { port in
                     try await UsageFileWork.run {
-                        try ClaudeUsageTelemetryConfigManager.install(port: port, headersFilePath: headersFilePath)
+                        try productionInstall(port: port, binDirectory: AgentHookScript.defaultInstallDirectory)
                     }
                 },
-                remove: { try await UsageFileWork.run { try ClaudeUsageTelemetryConfigManager.remove() } }),
+                remove: {
+                    try await UsageFileWork.run {
+                        try productionRemove(binDirectory: AgentHookScript.defaultInstallDirectory)
+                    }
+                }),
             onStatusChange: {
                 NotificationCenter.default.post(name: .calyxUsageTelemetryStatusDidChange, object: nil)
             })
+    }
+
+    /// The start generation to renew the usage token for: the server's
+    /// `generation` when it is running and that start rotated the IPC
+    /// token, otherwise nil (no renewal).
+    nonisolated static func rotationGeneration(isRunning: Bool, rotated: Bool, generation: Int) -> Int? {
+        isRunning && rotated ? generation : nil
+    }
+
+    /// Production `Effects.install`: installs `calyx-usage-headers` into
+    /// `binDirectory`, then the telemetry config naming it and `port`.
+    /// When the script install throws, Calyx's telemetry block is removed
+    /// from the settings file (its outcome and errors ignored: the original
+    /// error is what the caller reports) and the original error rethrown,
+    /// so no config is left pointing at a missing or stale helper, legacy
+    /// `cat` helpers included (G5 disposition 24, 挙動 2).
+    /// `settingsPath` nil means the default settings path.
+    nonisolated static func productionInstall(port: Int, binDirectory: String, settingsPath: String? = nil) throws -> ClaudeUsageTelemetryConfigManager.Outcome {
+        let helperPath: String
+        do {
+            helperPath = try UsageHeadersHelperScript.install(toDirectory: binDirectory)
+        } catch {
+            _ = try? ClaudeUsageTelemetryConfigManager.remove(settingsPath: settingsPath)
+            throw error
+        }
+        return try ClaudeUsageTelemetryConfigManager.install(port: port, helperPath: helperPath, settingsPath: settingsPath)
+    }
+
+    /// Production `Effects.remove`: removes the telemetry config, then
+    /// the script from `binDirectory`.
+    nonisolated static func productionRemove(binDirectory: String, settingsPath: String? = nil) throws -> ClaudeUsageTelemetryConfigManager.Outcome {
+        let outcome = try ClaudeUsageTelemetryConfigManager.remove(settingsPath: settingsPath)
+        UsageHeadersHelperScript.remove(fromDirectory: binDirectory)
+        return outcome
     }
 }

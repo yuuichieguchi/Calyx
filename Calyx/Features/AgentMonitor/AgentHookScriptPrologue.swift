@@ -15,7 +15,16 @@
 //   nothing to do must never break the user's hook chain.
 // - Falling through it leaves three shell variables set: `kind` (the
 //   agent kind, `$1` defaulting to `claude-code`), and `port` and
-//   `token` (both non-empty, read from agent-endpoint.json).
+//   `token` (both non-empty, read from agent-endpoint.json), and only
+//   when the Calyx process that wrote the file is alive and is the same
+//   process (`pid`/`pidStart`). The positional parameters no longer
+//   hold the script's arguments.
+// - The text is two constants: `guards` (this file) and
+//   `AgentEndpointFile.shellResolution` (the endpoint resolution and the
+//   liveness check, spec Feature C, G1), joined by a blank line. The
+//   liveness check runs `set -- $(ps ...)`, which clobbers the
+//   positional parameters, so `kind` (from `$1`) must be -- and is --
+//   read in `guards`, before `shellResolution` runs.
 // - It runs no network call, sets no trap and creates no file, so a
 //   script is free to do its own posting, signal handling and temp
 //   files after it.
@@ -24,10 +33,10 @@ import Foundation
 
 enum AgentHookScriptPrologue {
 
-    /// The shared `/bin/sh` text, from the first guard's `if` line
-    /// through the `fi` of the port/token check, with no leading or
-    /// trailing newline. Four fail-open guards and the endpoint
-    /// resolution, in this order:
+    /// The shared `/bin/sh` text: `guards`, a blank line, then
+    /// `AgentEndpointFile.shellResolution`, with no leading or trailing
+    /// newline. Three fail-open guards plus the kind default (`guards`),
+    /// then the endpoint resolution and liveness check, in this order:
     ///
     /// 1. Both `CALYX_SURFACE_ID` and `CALYX_SESSION_ID` unset: the pane
     ///    wasn't launched by Calyx at all.
@@ -44,7 +53,13 @@ enum AgentHookScriptPrologue {
     ///    invocation (rather than baked in at install time) so a server
     ///    restart or token rotation never leaves a hook using a stale
     ///    port/token.
-    static let body: String = """
+    /// 5. The writing Calyx is not alive, or is not the same process
+    ///    (`AgentEndpointFile.shellResolution`).
+    static let body: String = guards + "\n\n" + AgentEndpointFile.shellResolution
+
+    /// Guards 1-3 and `kind="${1:-claude-code}"`. `kind` must be read
+    /// here: `shellResolution`'s `set --` clobbers `$1`.
+    static let guards: String = """
     if [ -z "$CALYX_SURFACE_ID" ] && [ -z "$CALYX_SESSION_ID" ]; then
         exit 0
     fi
@@ -72,24 +87,6 @@ enum AgentHookScriptPrologue {
     # an explicit kind and are unaffected. The user's own [compat.*]
     # settings are never touched.
     if [ "$kind" = "claude-code" ] && [ -n "$GROK_HOOK_EVENT" ]; then
-        exit 0
-    fi
-
-    # CALYX_ENDPOINT_FILE is injected by GhosttySurfaceController alongside
-    # CALYX_SURFACE_ID, scoped to wherever this Calyx process actually
-    # wrote agent-endpoint.json (a --calyx-path-root scratch directory
-    # under test, the real Application Support directory otherwise). The
-    # literal fallback covers a pane launched before that injection
-    # existed, or a shell that stripped the variable.
-    endpoint_file="${CALYX_ENDPOINT_FILE:-\(AgentEndpointFile.shellFallbackPath)}"
-    if [ ! -f "$endpoint_file" ]; then
-        exit 0
-    fi
-
-    port=$(sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
-    token=$(sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
-
-    if [ -z "$port" ] || [ -z "$token" ]; then
         exit 0
     fi
     """

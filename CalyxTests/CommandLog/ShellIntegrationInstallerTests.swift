@@ -449,7 +449,7 @@ final class ShellIntegrationInstallerTests: XCTestCase {
 
     private func writeFixtureEndpoint(port: Int, token: String) throws {
         let appSupportDir = tempDir.appendingPathComponent("Library/Application Support/Calyx")
-        try AgentEndpointFile.write(port: port, token: token, wakeProofKey: IPCWakeProofKey.random(), directory: appSupportDir.path)
+        try writeTestEndpointFile(port: port, token: token, wakeProofKey: IPCWakeProofKey.random(), directory: appSupportDir.path)
     }
 
     func test_realZshSession_singleCommand_postsMatchingStartAndEndEvents() async throws {

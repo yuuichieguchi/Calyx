@@ -52,7 +52,7 @@ final class AgentEndpointFileReadTests: XCTestCase {
     // MARK: - Success
 
     func test_read_decodesFileWrittenByWrite() throws {
-        try AgentEndpointFile.write(port: 41833, token: "read-token-xyz", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 41833, token: "read-token-xyz", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
 
         let endpoint = AgentEndpointFile.read(directory: tempDir)
 
@@ -95,5 +95,17 @@ final class AgentEndpointFileReadTests: XCTestCase {
 
         XCTAssertNil(AgentEndpointFile.read(directory: tempDir),
                      "read() must return nil when the \"token\" key is missing")
+    }
+
+    // MARK: - Liveness keys (spec Feature C, J15)
+
+    /// A file that also carries `pid`/`pidStart` decodes to the same
+    /// port and token: the liveness keys never make `read` fail.
+    func test_read_decodesPortAndToken_whenTheLivenessKeysArePresent() {
+        let json = #"{"pid":4242,"pidStart":"Tue Oct 7 01:02:03 2026","port":41830,"token":"live-token"}"#
+        FileManager.default.createFile(atPath: filePath, contents: Data(json.utf8))
+
+        XCTAssertEqual(AgentEndpointFile.read(directory: tempDir),
+                       AgentEndpointFile.Endpoint(port: 41830, token: "live-token"))
     }
 }

@@ -627,7 +627,7 @@ final class CalyxMCPServerIPCWakeTests: XCTestCase {
         XCTAssertTrue(fm.createFile(atPath: agentEndpointDir, contents: Data("not a directory".utf8)),
                       file: file, line: line)
         XCTAssertThrowsError(
-            try AgentEndpointFile.write(
+            try writeTestEndpointFile(
                 port: previousPort, token: testToken, wakeProofKey: IPCWakeProofKey.random(), directory: agentEndpointDir
             ),
             "precondition: writing the endpoint file into a regular file must fail", file: file, line: line

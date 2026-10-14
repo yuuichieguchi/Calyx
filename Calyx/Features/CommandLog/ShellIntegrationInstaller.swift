@@ -138,6 +138,16 @@ enum ShellIntegrationInstaller {
         port=$(command sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
         token=$(command sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
         [[ -n "$port" && -n "$token" ]] || return 0
+        # Liveness check (spec Feature C, G1): post only to the live Calyx
+        # that wrote the file -- `kill -0` fails for a dead or another
+        # user's pid, and the start time rules out a reused pid.
+        local pid pid_start
+        pid=$(command sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
+        pid_start=$(command sed -n 's/.*"pidStart"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
+        [[ -n "$pid" && -n "$pid_start" ]] || return 0
+        builtin kill -0 "$pid" 2>/dev/null || return 0
+        local live_start="${(j: :)${=$(TZ=UTC LC_ALL=C command ps -p "$pid" -o lstart=)}}"
+        [[ "$live_start" == "$pid_start" ]] || return 0
         command curl -s --connect-timeout 0.1 --max-time 0.3 \\
             -X POST \\
             -H "Authorization: Bearer $token" \\
@@ -255,6 +265,15 @@ enum ShellIntegrationInstaller {
         set -l port (command sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
         set -l token (command sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
         test -n "$port" -a -n "$token"; or return 0
+        # Liveness check (spec Feature C, G1): post only to the live Calyx
+        # that wrote the file -- `kill -0` fails for a dead or another
+        # user's pid, and the start time rules out a reused pid.
+        set -l pid (command sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9]*\\).*/\\1/p' "$endpoint_file")
+        set -l pid_start (command sed -n 's/.*"pidStart"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p' "$endpoint_file")
+        test -n "$pid" -a -n "$pid_start"; or return 0
+        command kill -0 $pid 2>/dev/null; or return 0
+        set -l live_start (env TZ=UTC LC_ALL=C ps -p $pid -o lstart= | string split -n ' ' | string join ' ')
+        test "$live_start" = "$pid_start"; or return 0
         set -l surface_id "$CALYX_SESSION_ID"
         test -n "$surface_id"; or set surface_id "$CALYX_SURFACE_ID"
         command curl -s --connect-timeout 0.1 --max-time 0.3 \\

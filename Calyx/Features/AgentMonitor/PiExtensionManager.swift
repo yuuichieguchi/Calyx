@@ -49,9 +49,13 @@ enum PiExtensionManager: Sendable {
     //
     // agent-endpoint.json (port and token) is cached by mtime and
     // re-parsed only when the file changes, so a Calyx restart or a token
-    // rotation is picked up without reinstalling this extension.
+    // rotation is picked up without reinstalling this extension. Before
+    // every request, liveEndpoint() checks that the Calyx process named by
+    // the file's pid/pidStart is alive; otherwise the request is treated
+    // exactly like an unreachable Calyx.
 
     import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+    import { spawnSync } from "node:child_process";
     import { readFile, stat } from "node:fs/promises";
 
     const EVENT_MAP = {
@@ -89,11 +93,16 @@ enum PiExtensionManager: Sendable {
         return endpoint;
       }
 
+      \(AgentEndpointFile.javascriptLiveEndpoint)
+
       // The tools of the MCP servers configured in Calyx, reached through
       // /calyx-mcp without a session. The herdr headers let Calyx find
       // the herdr pane; the pane headers find an ordinary one.
       async function callCalyxMCP(method, params, signal) {
         const endpoint = await loadEndpoint();
+        if (!liveEndpoint(endpoint)) {
+          throw new Error("Calyx is not running");
+        }
         const response = await fetch(`http://127.0.0.1:${endpoint.port}/calyx-mcp`, {
           method: "POST",
           headers: {
@@ -188,6 +197,9 @@ enum PiExtensionManager: Sendable {
       async function postState(hookEventName, ctx) {
         try {
           const endpoint = await loadEndpoint();
+          if (!liveEndpoint(endpoint)) {
+            return;
+          }
           await fetch(`http://127.0.0.1:${endpoint.port}/agent-event`, {
             method: "POST",
             headers: calyxHeaders(endpoint),
@@ -206,6 +218,9 @@ enum PiExtensionManager: Sendable {
 
       async function callCalyx(method, params, signal) {
         const endpoint = await loadEndpoint();
+        if (!liveEndpoint(endpoint)) {
+          throw new Error("Calyx is not running");
+        }
         const response = await fetch(`http://127.0.0.1:${endpoint.port}/mcp`, {
           method: "POST",
           headers: calyxHeaders(endpoint),
@@ -242,6 +257,9 @@ enum PiExtensionManager: Sendable {
         let answer;
         try {
           const endpoint = await loadEndpoint();
+          if (!liveEndpoint(endpoint)) {
+            throw new Error("Calyx is not running");
+          }
           const response = await fetch(`http://127.0.0.1:${endpoint.port}/approval-request`, {
             method: "POST",
             headers: calyxHeaders(endpoint),

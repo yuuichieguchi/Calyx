@@ -46,7 +46,7 @@ final class AgentEndpointFileTests: XCTestCase {
     // MARK: - Matching port+token
 
     func test_remove_deletesFile_whenPortAndTokenMatch() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
         XCTAssertTrue(FileManager.default.fileExists(atPath: filePath),
                      "Precondition: file must exist before remove")
 
@@ -59,7 +59,7 @@ final class AgentEndpointFileTests: XCTestCase {
     // MARK: - Mismatched port and/or token
 
     func test_remove_leavesFileUntouched_whenPortDiffers() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
 
         AgentEndpointFile.remove(directory: tempDir, port: 41831, token: "test-token-abc")
 
@@ -68,7 +68,7 @@ final class AgentEndpointFileTests: XCTestCase {
     }
 
     func test_remove_leavesFileUntouched_whenTokenDiffers() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
 
         AgentEndpointFile.remove(directory: tempDir, port: 41830, token: "different-token")
 
@@ -77,7 +77,7 @@ final class AgentEndpointFileTests: XCTestCase {
     }
 
     func test_remove_leavesFileUntouched_whenPortAndTokenBothDiffer() throws {
-        try AgentEndpointFile.write(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 41830, token: "test-token-abc", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
 
         AgentEndpointFile.remove(directory: tempDir, port: 9999, token: "different-token")
 
@@ -93,7 +93,7 @@ final class AgentEndpointFileTests: XCTestCase {
         // delete the file. The empty-token guard exists to override
         // that: an empty caller token must never be treated as proof
         // of ownership, even when it equals the file's own token.
-        try AgentEndpointFile.write(port: 0, token: "", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
+        try writeTestEndpointFile(port: 0, token: "", wakeProofKey: IPCWakeProofKey.random(), directory: tempDir)
 
         AgentEndpointFile.remove(directory: tempDir, port: 0, token: "")
 

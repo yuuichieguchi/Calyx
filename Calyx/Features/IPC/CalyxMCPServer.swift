@@ -33,10 +33,31 @@ final class CalyxMCPServer {
     private(set) var token: String = "" {
         didSet { sessionBearerToken.value = token }
     }
+    /// Whether the latest `start` ended with its `tokenIfPortLost`
+    /// instead of its `token` (G2, J4: the previous port was held by
+    /// another process). `start` resets it to false; `finishStart` sets
+    /// it together with `token`.
+    private(set) var lastStartRotatedToken = false
+    /// How many starts have succeeded in this process (`finishStart` adds
+    /// one each time; `stop()` never resets it). The usage credential
+    /// holder renews the usage token once per start whose IPC token
+    /// rotated, keyed by this number, so reconcile re-runs for the same
+    /// start do not renew it again (G5, C-D19).
+    private(set) var startGeneration = 0
+    /// The `token` argument of the most recent `start` call, recorded
+    /// before any bind is attempted and never reset by `stop()`.
+    /// `LiveIPCServerControl.stop()` keys its stale `agent-endpoint.json`
+    /// removal on it: after a `start` that threw before binding, `token`
+    /// still holds its previous value (it is assigned only in
+    /// `finishStart`), while the file on disk carries the token that
+    /// start attempted.
+    private(set) var lastStartAttemptedToken: String?
     /// `token`, readable off the main actor. The `/calyx-mcp` router keys
-    /// its session ids with it; `start` sets `token` before it binds the
-    /// listener, so the first request the listener accepts already sees
-    /// the token it was authenticated with.
+    /// its session ids with it. `finishStart` assigns `token` after the
+    /// bind, before it writes `agent-endpoint.json` and before it installs
+    /// the listener's `newConnectionHandler`, so the first request the
+    /// listener accepts already sees the token it was authenticated with.
+    /// A `start` that throws leaves `token` at its previous value.
     let sessionBearerToken = MCPSessionBearerToken()
     let store = IPCStore()
     private(set) var appPeerID: UUID?
@@ -102,7 +123,7 @@ final class CalyxMCPServer {
     /// both `routeCommandEvent` and `routeApprovalRequest` -- one 256 KiB
     /// ceiling for every event-ingestion route on this server, rather
     /// than two independently-maintained copies of the same literal.
-    private static let maxEventBodyBytes = 262_144
+    nonisolated static let maxEventBodyBytes = 262_144
 
     // MARK: - Init
 
@@ -576,7 +597,7 @@ final class CalyxMCPServer {
     /// 1 MiB) or never trigger (set at or above it) -- there is no useful
     /// value to pick.
     private func routeAgentEvent(request: HTTPRequest) async -> HTTPResponse {
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
@@ -702,7 +723,7 @@ final class CalyxMCPServer {
     /// live regardless; the shell-integration env injection is the only
     /// gate on whether events ever arrive here at all.
     private func routeCommandEvent(request: HTTPRequest) async -> HTTPResponse {
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
@@ -750,7 +771,22 @@ final class CalyxMCPServer {
     /// Handles `POST /approval-request`, the long-poll endpoint the
     /// `calyx-approval-hook` script blocks on from a CLI agent's
     /// PermissionRequest hook while a human decides whether to allow its
-    /// next tool call. Contract, in order: bearer auth (401) -> body
+    /// next tool call.
+    ///
+    /// Signing (J7/J8): an `X-Calyx-Approval-Nonce`
+    /// (`ApprovalHookResponse.nonceHeader`) that is not an uppercase
+    /// canonical UUID is answered 400 right after the bearer check,
+    /// before the body is read. With a valid nonce every 200 below leaves
+    /// through one exit as `text/plain; charset=utf-8`
+    /// `ApprovalHookResponse.signedBody`, a decision larger than
+    /// `ApprovalHookResponse.maxBodyBytes` becoming a signed empty body;
+    /// and when this start's key was never published
+    /// (`wakeProofKeyPublished == false`) the request is answered signed
+    /// empty right after the sole-authority check, before the setting and
+    /// the allow short-circuits, without entering the inbox. Without the
+    /// header every answer is unchanged (`application/json`).
+    ///
+    /// Contract, in order: bearer auth (401) -> nonce shape (400) -> body
     /// present (400) -> body.count <= maxEventBodyBytes, checked BEFORE
     /// decode (413, mirrors `routeCommandEvent`) -> `X-Calyx-Agent-Kind`
     /// read (no failure path, so reading it before decode does not
@@ -869,15 +905,60 @@ final class CalyxMCPServer {
     ///     process, driven entirely by whatever it read from its own
     ///     hook's stdout.
     private func routeApprovalRequest(request: HTTPRequest) async -> HTTPResponse {
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
-        guard let body = request.body else {
+        // J7: a malformed nonce is rejected before the body is looked at.
+        let nonce = header(named: ApprovalHookResponse.nonceHeader, in: request.headers)
+        if let nonce, !Self.isCanonicalNonce(nonce) {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
+
+        let outcome = await approvalOutcome(request: request, signed: nonce != nil)
+
+        // The single 200 exit (J8): with a nonce every 200 is signed.
+        let decisionBody: Data?
+        switch outcome {
+        case .status(let statusCode) where statusCode != 200:
+            return HTTPParser.response(statusCode: statusCode, body: nil)
+        case .status:
+            decisionBody = nil
+        case .decision(let body):
+            decisionBody = body
+        }
+        guard let nonce else {
+            return HTTPParser.response(statusCode: 200, body: decisionBody)
+        }
+        var body = decisionBody ?? Data()
+        if body.count > ApprovalHookResponse.maxBodyBytes {
+            NSLog("[CalyxMCPServer] approval decision body of \(body.count) bytes exceeds the signed cap; answering a signed empty body")
+            body = Data()
+        }
+        let proof = wakeProofKey.proof(over: ApprovalHookResponse.message(nonce: nonce, body: body))
+        return HTTPParser.response(
+            statusCode: 200,
+            body: ApprovalHookResponse.signedBody(proof: proof, body: body),
+            contentType: "text/plain; charset=utf-8"
+        )
+    }
+
+    /// The outcome of an `/approval-request` once bearer and nonce shape
+    /// have passed: a bodiless status, or a 200 decision body (`nil` for
+    /// no decision). `routeApprovalRequest` turns it into the response.
+    private enum ApprovalRouteOutcome {
+        case status(Int)
+        case decision(Data?)
+    }
+
+    /// Everything `routeApprovalRequest` decides after the bearer and
+    /// nonce checks. `signed` is whether the request carried a nonce.
+    private func approvalOutcome(request: HTTPRequest, signed: Bool) async -> ApprovalRouteOutcome {
+        guard let body = request.body else {
+            return .status(400)
+        }
         guard body.count <= Self.maxEventBodyBytes else {
-            return HTTPParser.response(statusCode: 413, body: nil)
+            return .status(413)
         }
 
         // Read before decode: `agentKind(from:)` has no failure path, so
@@ -885,11 +966,11 @@ final class CalyxMCPServer {
         // ordering for any existing guard below.
         let kind = agentKind(from: request.headers)
         guard let call = AgentHookToolCall.decode(from: body, kind: kind) else {
-            return HTTPParser.response(statusCode: 400, body: nil)
+            return .status(400)
         }
 
         guard let surfaceID = resolveSurfaceID(from: request.headers) else {
-            return HTTPParser.response(statusCode: 400, body: nil)
+            return .status(400)
         }
 
         guard kind == AgentEntry.claudeCodeKind || kind == AgentEntry.codexKind
@@ -897,7 +978,7 @@ final class CalyxMCPServer {
             // An agent CLI Calyx doesn't have a hook-response contract
             // for at all (see `AgentHookPermissionResponse`'s own
             // fail-safe contract) -- never submit to the inbox for one.
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
         }
 
         guard ApprovalHookEvent.isApprovalGate(call.hookEventName, kind: kind) else {
@@ -905,7 +986,7 @@ final class CalyxMCPServer {
             // see this method's own doc comment) or any other/missing
             // hook event name -- inert, same as the unrecognized-kind
             // guard above, never submitted to the inbox.
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
         }
 
         guard ApprovalHookEvent.gateIsSoleAuthority(kind: kind, permissionMode: call.permissionMode) else {
@@ -916,11 +997,17 @@ final class CalyxMCPServer {
             // with no decision at all leaves that pipeline deciding
             // exactly as it would without Calyx, rather than asking the
             // same human the same question in two places.
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
+        }
+
+        // D20 analog: this start's key never reached agent-endpoint.json,
+        // so no proof could verify; answer signed empty and queue nothing.
+        guard !signed || wakeProofKeyPublished else {
+            return .status(200)
         }
 
         guard CockpitSettings.agentHookApprovalEnabled else {
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
         }
 
         // An AskUserQuestion call must always ask a human: neither global
@@ -941,15 +1028,11 @@ final class CalyxMCPServer {
         // another.
         if !call.isQuestionTool {
             guard ApprovalPolicy.requiresApproval() else {
-                return HTTPParser.response(
-                    statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
-                )
+                return .decision(AgentHookPermissionResponse.body(kind: kind, decision: .allowed))
             }
 
             if agentHookApprovalMemory.isAutoAllowed(surfaceID: surfaceID, kind: kind, toolName: call.toolName) {
-                return HTTPParser.response(
-                    statusCode: 200, body: AgentHookPermissionResponse.body(kind: kind, decision: .allowed)
-                )
+                return .decision(AgentHookPermissionResponse.body(kind: kind, decision: .allowed))
             }
         }
 
@@ -959,7 +1042,7 @@ final class CalyxMCPServer {
         // guard above, rather than queuing a request whose banner no
         // window could ever show.
         guard approvalSurfaceExists(surfaceID) else {
-            return HTTPParser.response(statusCode: 200, body: nil)
+            return .status(200)
         }
 
         let requestID = UUID()
@@ -1007,10 +1090,7 @@ final class CalyxMCPServer {
         )
 
         let decision = await approvalInbox.awaitDecisionHonoringCancellation(id: requestID, timeoutMs: approvalRequestTimeoutMs)
-        return HTTPParser.response(
-            statusCode: 200,
-            body: AgentHookPermissionResponse.body(kind: kind, decision: decision)
-        )
+        return .decision(AgentHookPermissionResponse.body(kind: kind, decision: decision))
     }
 
     /// Handles `POST /ipc-wake`: a long-poll held open on behalf of a
@@ -1066,7 +1146,7 @@ final class CalyxMCPServer {
     /// `agent-endpoint.json`, and the nonce binds it to this poll, so it
     /// cannot be replayed as the answer to another one.
     private func routeIPCWake(request: HTTPRequest) async -> HTTPResponse {
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
@@ -1087,7 +1167,7 @@ final class CalyxMCPServer {
         }
 
         guard let nonce = header(named: IPCWakeResponse.nonceHeader, in: request.headers),
-              UUID(uuidString: nonce)?.uuidString == nonce
+              Self.isCanonicalNonce(nonce)
         else {
             return HTTPParser.response(statusCode: 400, body: nil)
         }
@@ -1167,7 +1247,7 @@ final class CalyxMCPServer {
         if let origin = header(named: "Origin", in: request.headers), !Self.isLoopbackOrigin(origin) {
             return HTTPParser.response(statusCode: 403, body: nil)
         }
-        guard let authToken = bearerToken(from: request.headers), authToken == token else {
+        guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
         return nil
@@ -1264,6 +1344,20 @@ final class CalyxMCPServer {
                 watch.cancel()
             }
         }
+    }
+
+    /// The single bearer check every token route runs (J11): the
+    /// presented `Authorization: Bearer <token>` against this start's
+    /// token, compared in constant time.
+    func isAuthorized(_ request: HTTPRequest) -> Bool {
+        guard let presented = bearerToken(from: request.headers) else { return false }
+        return HTTPParser.constantTimeEquals(presented, token)
+    }
+
+    /// Whether `value` is an uppercase canonical UUID, the only nonce
+    /// shape the wake and approval routes accept.
+    private static func isCanonicalNonce(_ value: String) -> Bool {
+        UUID(uuidString: value)?.uuidString == value
     }
 
     /// Case-insensitive `Authorization: Bearer <token>` extraction, shared
@@ -1372,7 +1466,19 @@ final class CalyxMCPServer {
 
     // MARK: - Lifecycle
 
-    func start(token: String, preferredPort: Int = IPCEndpointReuse.defaultPort) async throws {
+    /// Binds the listener and publishes `agent-endpoint.json`.
+    ///
+    /// `tokenIfPortLost` (G2, J4, C-D2): when non-nil and `preferredPort`
+    /// itself cannot be bound, the server ends up with this token instead
+    /// of `token` and sets `lastStartRotatedToken`. A process can rebind
+    /// its own just-closed port (V3-1), so a failed bind of the previous
+    /// port means another process holds it. `preferredPort == 0`
+    /// (kernel-assigned) is never treated as lost.
+    func start(
+        token: String,
+        preferredPort: Int = IPCEndpointReuse.defaultPort,
+        tokenIfPortLost: String? = nil
+    ) async throws {
         // Capture the teardown Task scheduled by the prior `stop()` so
         // the new LSP startup can wait for it before installing a fresh
         // bridge. Without this chain the new `lspStartTask` and the
@@ -1393,8 +1499,10 @@ final class CalyxMCPServer {
         // the prior teardown has finished its `shutdownAll` and
         // identity check.
         let priorTeardown: Task<Void, Never>? = isRunning ? stop() : nil
+        self.lastStartAttemptedToken = token
 
-        self.token = token
+        // `token` itself is assigned by `finishStart`, after the bind.
+        self.lastStartRotatedToken = false
         // A fresh key per start, before `finishStart` publishes its
         // blocks in `agent-endpoint.json`.
         self.wakeProofKey = IPCWakeProofKey.random()
@@ -1412,6 +1520,8 @@ final class CalyxMCPServer {
         }
 
         var lastError: Error?
+        // Whether `preferredPort` itself (portOffset 0) failed to bind.
+        var preferredPortLost = false
 
         // Phase 1: canonical linear scan over `preferredPort..<preferredPort+10`.
         // If a port in that window is free we bind it and publish the port
@@ -1443,12 +1553,18 @@ final class CalyxMCPServer {
                             "Failed to bind to 127.0.0.1:\(tryPort)",
                     ]
                 )
+                if portOffset == 0 && preferredPort != 0 {
+                    preferredPortLost = true
+                }
                 continue
             }
             if resolvedPort != tryPort {
                 NSLog("[CalyxMCPServer] canonical scan requested port \(tryPort) but the listener resolved to \(resolvedPort); recording the resolved port")
             }
-            finishStart(listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown)
+            finishStart(
+                listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown,
+                token: Self.finalToken(token, tokenIfPortLost: tokenIfPortLost, preferredPortLost: preferredPortLost)
+            )
             return
         }
 
@@ -1460,7 +1576,10 @@ final class CalyxMCPServer {
         // URL published by `ClaudeConfigManager.enableIPC`) stays
         // consistent with the bind.
         if let (nl, resolvedPort) = await bindKernelAssignedListener() {
-            finishStart(listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown)
+            finishStart(
+                listener: nl, boundPort: resolvedPort, priorTeardown: priorTeardown,
+                token: Self.finalToken(token, tokenIfPortLost: tokenIfPortLost, preferredPortLost: preferredPortLost)
+            )
             return
         }
 
@@ -1472,6 +1591,18 @@ final class CalyxMCPServer {
                     "Failed to bind to any port in range \(preferredPort)-\(preferredPort + 9) and kernel-assigned fallback also failed",
             ]
         )
+    }
+
+    /// The token a start ends with, and whether it is the rotated one:
+    /// `tokenIfPortLost` only when the previous port was lost and an
+    /// alternative was supplied, `token` otherwise.
+    private static func finalToken(
+        _ token: String, tokenIfPortLost: String?, preferredPortLost: Bool
+    ) -> (value: String, rotated: Bool) {
+        if preferredPortLost, let tokenIfPortLost {
+            return (tokenIfPortLost, true)
+        }
+        return (token, false)
     }
 
     /// Asks the kernel for a free ephemeral loopback port and binds an
@@ -1506,7 +1637,12 @@ final class CalyxMCPServer {
     /// The listener arrives here already started (on its probe queue)
     /// and in `.ready` state, so we only need to replace the
     /// `stateUpdateHandler` / `newConnectionHandler` with the
-    /// production wiring.
+    /// production wiring. The handler used to be dropped (set to nil)
+    /// here, since nothing past `.ready` was observed; it now stays
+    /// installed so a listener that fails or is cancelled after `.ready`
+    /// stops the server with `stop()`'s full teardown (spec Feature C,
+    /// J3): endpoint file removal, waiting `/ipc-wake` polls released,
+    /// pending approvals expired.
     ///
     /// Writes `agent-endpoint.json` (port/token for the calyx-agent-hook
     /// script, and `wakeProofKey`'s two blocks for calyx-ipc-wake-hook)
@@ -1518,24 +1654,52 @@ final class CalyxMCPServer {
     /// previous file may remain and still name a valid port and token
     /// but the previous key's blocks, which is why `routeIPCWake`
     /// withholds wakes until this write succeeds and sets
-    /// `wakeProofKeyPublished` (D20).
+    /// `wakeProofKeyPublished` (D20). The file also carries this
+    /// process's `EndpointLiveness`; when `EndpointLiveness.current()` is
+    /// nil the file is not written, handled exactly like a write failure.
     private func finishStart(
         listener nl: NWListener,
         boundPort: Int,
-        priorTeardown: Task<Void, Never>?
+        priorTeardown: Task<Void, Never>?,
+        token finalToken: (value: String, rotated: Bool)
     ) {
-        do {
-            try AgentEndpointFile.write(
-                port: boundPort, token: token, wakeProofKey: wakeProofKey, directory: agentEndpointDirectory
-            )
-            wakeProofKeyPublished = true
-        } catch {
-            NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: \(error)")
+        // The start's final token, assigned before the endpoint file is
+        // written and before `newConnectionHandler` is installed below.
+        self.token = finalToken.value
+        self.lastStartRotatedToken = finalToken.rotated
+        self.startGeneration += 1
+        if let liveness = EndpointLiveness.current() {
+            do {
+                try AgentEndpointFile.write(
+                    port: boundPort, token: token, wakeProofKey: wakeProofKey,
+                    liveness: liveness, directory: agentEndpointDirectory
+                )
+                wakeProofKeyPublished = true
+            } catch {
+                NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: \(error)")
+            }
+        } else {
+            NSLog("[CalyxMCPServer] failed to write agent-endpoint.json: proc_pidinfo gave no start time for this process")
         }
 
-        // Drop the probe handler — from here on we don't need to
-        // observe further state transitions.
-        nl.stateUpdateHandler = nil
+        // Replace the probe handler (which only waited for `.ready` or a
+        // bind failure) with the J3 one: a listener that fails or is
+        // cancelled after `.ready` while it is still this server's
+        // listener tears the server down exactly as `stop()` does, so
+        // agent-endpoint.json never keeps naming a port nobody serves.
+        // `stop()`'s own `listener?.cancel()` also lands here as
+        // `.cancelled`, after `stop()` has already cleared `listener`,
+        // so the identity check turns it into a no-op.
+        nl.stateUpdateHandler = { [weak self, weak nl] state in
+            switch state {
+            case .failed, .cancelled:
+                Task { @MainActor in
+                    self?.handleListenerEnded(nl)
+                }
+            default:
+                break
+            }
+        }
         nl.newConnectionHandler = { [weak self] connection in
             Task { @MainActor in
                 self?.handleConnection(connection)
@@ -1567,6 +1731,26 @@ final class CalyxMCPServer {
             await self.startLSP()
         }
     }
+
+    /// J3: `finishStart`'s listener reached `.failed` or `.cancelled`.
+    /// Stops the server only when `ended` is still the current listener
+    /// and the server is running; a superseded or already-stopped
+    /// listener changes nothing.
+    private func handleListenerEnded(_ ended: NWListener?) {
+        guard let ended, listener === ended, isRunning else { return }
+        NSLog("[CalyxMCPServer] listener ended after .ready; stopping the server")
+        stop()
+    }
+
+    #if DEBUG
+    /// Test seam: cancels the current listener, which drives its
+    /// `.cancelled` state through the production `stateUpdateHandler`
+    /// installed by `finishStart` (the J3 path). DO NOT use from
+    /// production code.
+    func _testSimulateListenerFailure() {
+        listener?.cancel()
+    }
+    #endif
 
     @discardableResult
     func stop() -> Task<Void, Never> {
@@ -2062,7 +2246,8 @@ final class CalyxMCPServer {
     }
 
     /// The body cap of the request whose header block is `headerString`:
-    /// 32 MiB for `/calyx-mcp` carrying this server's bearer token, 16 MiB
+    /// 32 MiB for `/calyx-mcp` carrying this server's bearer token
+    /// (compared in constant time, `HTTPParser.constantTimeEquals`), 16 MiB
     /// for `/usage/v1/metrics` carrying a token the usage route would
     /// accept (`UsageIngestEndpoint.accepts`, the route's own check), 1 MiB
     /// otherwise, so a larger cap is never available before
@@ -2080,7 +2265,7 @@ final class CalyxMCPServer {
             forHeaderString: headerString,
             isAuthorized: { authorization in
                 guard !token.isEmpty, let authorization, authorization.hasPrefix("Bearer ") else { return false }
-                return String(authorization.dropFirst(7)) == token
+                return HTTPParser.constantTimeEquals(String(authorization.dropFirst(7)), token)
             },
             isUsageAuthorized: { authorization in
                 guard let endpoint else { return false }
@@ -2208,7 +2393,8 @@ final class CalyxMCPServer {
     ) async -> (statusCode: Int, body: Data?) {
 
         // 1. Authentication
-        guard let authToken, authToken == token else {
+        // Same primitive as `isAuthorized`, for callers without an HTTPRequest.
+        guard let authToken, HTTPParser.constantTimeEquals(authToken, token) else {
             return unauthorizedResponse()
         }
 
