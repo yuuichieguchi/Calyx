@@ -160,12 +160,22 @@ final class ApprovalHookScriptLongPollBehaviourTests: XCTestCase {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = FileHandle.nullDevice
+        // Every wait on the child is bounded (see the fulfillment below):
+        // its exit is observed through terminationHandler and its stdout is
+        // read to EOF on a GCD queue, never by blocking a Swift concurrency
+        // thread, so a stall on the host side fails this test instead of
+        // hanging the whole run.
+        let exited = XCTestExpectation(description: "the script's process exits")
+        process.terminationHandler = { _ in exited.fulfill() }
+        let stdoutReadEnd = stdoutPipe.fileHandleForReading
+        let stdoutFDAtStart = Self.fdIdentity(stdoutReadEnd.fileDescriptor)
+        let stdoutCollector = StdoutCollector()
+        let stdoutDrained = XCTestExpectation(description: "the script's stdout reaches EOF")
         try process.run()
         let pid = process.processIdentifier
-        let outcome = Task.detached(priority: .userInitiated) { () -> (Int32, String) in
-            let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        DispatchQueue.global(qos: .userInitiated).async {
+            stdoutCollector.set(stdoutReadEnd.readDataToEndOfFile())
+            stdoutDrained.fulfill()
         }
 
         // stdin stays open: the script is past both mktemp calls once both
@@ -181,7 +191,19 @@ final class ApprovalHookScriptLongPollBehaviourTests: XCTestCase {
             kill(pid, SIGTERM)
         }
         stdinPipe.fileHandleForWriting.closeFile()
-        let (exitCode, stdout) = await outcome.value
+        let waitResult = await XCTWaiter().fulfillment(of: [exited, stdoutDrained], timeout: 10)
+        guard waitResult == .completed else {
+            let probeErrno = kill(pid, 0) == 0 ? "exists (0)" : "errno \(errno)"
+            XCTFail("the script did not finish within 10s after stdin closed (result \(waitResult.rawValue)): " +
+                    "exit observed=\(!process.isRunning), stdout EOF=\(stdoutCollector.isSet), " +
+                    "kill(pid, 0)=\(probeErrno), stdout read fd at start=\(stdoutFDAtStart), " +
+                    "now=\(Self.fdIdentity(stdoutReadEnd.fileDescriptor)), " +
+                    "TMPDIR=\(entries(prepared.scriptTmp))")
+            if process.isRunning { kill(pid, SIGKILL) }
+            return
+        }
+        let exitCode = process.terminationStatus
+        let stdout = String(data: stdoutCollector.data, encoding: .utf8) ?? ""
 
         XCTAssertTrue(bothFilesExist,
                       "precondition: both templated temp files must appear under TMPDIR before cat. Got: " +
@@ -202,4 +224,23 @@ final class ApprovalHookScriptLongPollBehaviourTests: XCTestCase {
                        "no curl invocation record after a TERM during cat")
         XCTAssertEqual(entries(prepared.scriptTmp), [String](), "the EXIT trap removes both temp files")
     }
+
+    /// `<inode>/<mode>` of `fd` for the timeout diagnostics, or the errno
+    /// when `fstat` fails: a changed value means the descriptor number was
+    /// closed and reused while the reader waited on it.
+    private static func fdIdentity(_ fd: Int32) -> String {
+        var info = stat()
+        guard fstat(fd, &info) == 0 else { return "fstat errno \(errno)" }
+        return "\(info.st_ino)/\(String(info.st_mode, radix: 8))"
+    }
+}
+
+/// The child's stdout, written once by the GCD reader and read by the
+/// test after both expectations are fulfilled.
+private final class StdoutCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Data?
+    func set(_ data: Data) { lock.withLock { stored = data } }
+    var data: Data { lock.withLock { stored ?? Data() } }
+    var isSet: Bool { lock.withLock { stored != nil } }
 }

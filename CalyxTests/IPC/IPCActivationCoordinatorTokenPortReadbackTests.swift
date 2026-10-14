@@ -43,7 +43,7 @@ private final class ReadbackFakeIPCServerControl: IPCServerControlling {
     var tokenAfterStart = "server-assigned-token"
     var portAfterStart = 41834
 
-    func start(token: String) async throws {
+    func start(token: String) async throws -> Bool {
         startCallCount += 1
         startedWithToken = token
         // The server resolves its OWN token/port during start, distinct
@@ -54,6 +54,7 @@ private final class ReadbackFakeIPCServerControl: IPCServerControlling {
         self.token = tokenAfterStart
         self.port = portAfterStart
         isRunning = true
+        return false
     }
 
     func stop() {

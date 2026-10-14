@@ -34,13 +34,12 @@ private final class FakeIPCServerControl: IPCServerControlling {
     var startError: Error?
     var portAfterStart: Int?
     /// When non-nil, start() ends with this token instead of the one it
-    /// was handed and reports a rotation (lastStartRotatedToken), as
+    /// was handed and reports a rotation (start returns true), as
     /// LiveIPCServerControl does when the server bound a port other than
     /// the previous one and switched to `tokenIfPortLost`.
     var rotatedTokenAfterStart: String?
-    var lastStartRotatedToken = false
 
-    func start(token: String) async throws {
+    func start(token: String) async throws -> Bool {
         startCallCount += 1
         startedWithToken = token
         if let startError {
@@ -57,11 +56,10 @@ private final class FakeIPCServerControl: IPCServerControlling {
         isRunning = true
         if let rotatedTokenAfterStart {
             self.token = rotatedTokenAfterStart
-            lastStartRotatedToken = true
-            return
+            return true
         }
         self.token = token
-        lastStartRotatedToken = false
+        return false
     }
 
     func stop() {

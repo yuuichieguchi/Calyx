@@ -31,18 +31,12 @@ protocol IPCServerControlling {
     var isRunning: Bool { get }
     var port: Int { get }
     var token: String { get }
-    func start(token: String) async throws
+    /// Starts the server. Returns `true` iff this start ended with a
+    /// rotated token rather than the one it decided to use (G2, J4: the
+    /// previous port was held by another process, so the server adopted
+    /// `tokenIfPortLost`).
+    func start(token: String) async throws -> Bool
     func stop()
-    /// Whether the latest `start(token:)` ended with a rotated token
-    /// rather than the one it decided to use (G2, J4: the previous port
-    /// was held by another process). The coordinator reads it right after
-    /// `start(token:)` returns.
-    var lastStartRotatedToken: Bool { get }
-}
-
-extension IPCServerControlling {
-    /// Conformers that never rotate report no rotation.
-    var lastStartRotatedToken: Bool { false }
 }
 
 /// Writes or removes the calyx-ipc entry in every supported agent CLI's
@@ -197,12 +191,13 @@ struct IPCActivationCoordinator {
             } catch {
                 return reportServerFailure(.tokenGeneration)
             }
+            let rotated: Bool
             do {
-                try await server.start(token: generatedToken)
+                rotated = try await server.start(token: generatedToken)
             } catch {
                 return reportServerFailure(.start(error))
             }
-            tokenRotated = server.lastStartRotatedToken
+            tokenRotated = rotated
             // Read BOTH back after start() returns: the server resolves
             // its own token and its actual listening port during start,
             // not before -- LiveIPCServerControl.start(token:) may pass
@@ -288,7 +283,6 @@ struct LiveIPCServerControl: IPCServerControlling {
     var isRunning: Bool { CalyxMCPServer.shared.isRunning }
     var port: Int { CalyxMCPServer.shared.port }
     var token: String { CalyxMCPServer.shared.token }
-    var lastStartRotatedToken: Bool { CalyxMCPServer.shared.lastStartRotatedToken }
 
     /// Reads the currently published endpoint (if any) and decides
     /// whether its token and port should be reused -- independently of
@@ -296,13 +290,15 @@ struct LiveIPCServerControl: IPCServerControlling {
     /// that already holds the old token/URL keeps working across a
     /// restart where possible. `decision.tokenIfPortLost` lets the server
     /// switch to the fresh token when the previous port turns out to be
-    /// held by another process (`IPCEndpointReuse.Policy.onLostPort`).
-    func start(token: String) async throws {
+    /// held by another process (`IPCEndpointReuse.Policy.onLostPort`);
+    /// the return value reports whether that happened.
+    func start(token: String) async throws -> Bool {
         let existing = AgentEndpointFile.read(directory: CalyxMCPServer.shared.agentEndpointDirectory)
         let decision = IPCEndpointReuse.decide(existing: existing, freshToken: token)
         try await CalyxMCPServer.shared.start(
             token: decision.token, preferredPort: decision.port, tokenIfPortLost: decision.tokenIfPortLost
         )
+        return CalyxMCPServer.shared.lastStartRotatedToken
     }
 
     /// The server's own stop reports completion through a handle this
