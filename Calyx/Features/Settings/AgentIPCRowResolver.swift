@@ -105,8 +105,9 @@ enum AgentIPCRowResolver {
     /// Shown when the server switched to a new token because the previous
     /// port was held by another process. README's IPC section mirrors it.
     static let tokenRenewedNotice =
-        "IPC token renewed. Claude Code, Codex and Grok ≥ 1.0.52 follow automatically; " +
-        "Hermes reconnects within seconds; restart OpenCode and older Grok sessions started before this launch."
+        "IPC token renewed because another process held the previous port. " +
+        "CLI config files no longer store the token; new agent sessions need no change. " +
+        "Sessions started before this launch keep the old port and must be restarted."
 
     private static func disabledStatusText(for report: IPCDeactivationReport) -> String {
         let axes = report.config.axes + report.hooks.axes

@@ -3,7 +3,8 @@
 //  CalyxTests
 //
 //  C-D17 / spec note 5 / V3-3: with a helper path, both Codex tables carry
-//  `http_headers_helper = "\"<path>\""` and `http_headers` keeps only
+//  `http_headers_helper = "\"<path>\" <port>"` (slice 4c: the helper
+//  prints the token only for that port) and `http_headers` keeps only
 //  `X-Calyx-Agent-Kind` (an explicit Authorization there would win over the
 //  helper); `env_http_headers` unchanged. nil keeps today's form.
 //
@@ -36,7 +37,8 @@ final class CodexConfigManagerHelperFormTests: XCTestCase {
         try CodexConfigManager.enableIPC(port: 41830, token: token ?? secret, headersHelperPath: helperPath, configPath: configPath)
     }
 
-    private var helperLine: String { #"http_headers_helper = "\""# + helperPath + #"\"""# }
+    private var helperLine: String { helperLine(port: 41830) }
+    private func helperLine(port: Int) -> String { #"http_headers_helper = "\""# + helperPath + #"\" "# + "\(port)" + #"""# }
 
     func test_helperForm_calyxIPCTable_exactLines() throws {
         try enableHelper()
@@ -93,5 +95,13 @@ final class CodexConfigManagerHelperFormTests: XCTestCase {
         try CodexConfigManager.disableIPC(configPath: configPath)
         XCTAssertFalse(CodexConfigManager.isIPCEnabled(configPath: configPath))
         XCTAssertEqual(read(configPath), seed)
+    }
+
+    // MARK: - Port argument (slice 4c)
+
+    func test_helperForm_commandCarriesTheConfiguredPort_inBothTables() throws {
+        try CodexConfigManager.enableIPC(port: 41831, token: secret, headersHelperPath: helperPath, configPath: configPath)
+        let text = read(configPath)
+        XCTAssertEqual(text.components(separatedBy: helperLine(port: 41831)).count - 1, 2)
     }
 }

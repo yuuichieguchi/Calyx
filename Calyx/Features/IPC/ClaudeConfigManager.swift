@@ -24,15 +24,15 @@ struct ClaudeConfigManager: Sendable {
     /// so the file holds no token. V3-2: Claude Code runs the helper at
     /// connect and again after a 401/403 or `/mcp reconnect`, and treats a
     /// `{}` answer as "no Authorization". The value is a shell command
-    /// line, and the path contains a space (`Application Support`), so it
-    /// is wrapped in double quotes inside the JSON string.
+    /// line, `MCPHeadersHelperScript.helperCommand(path:port:)`: the quoted
+    /// path plus the port, so a session on an older port gets `{}`.
     ///
     /// `headersHelperPath` nil: today's baked-in `Authorization` header,
     /// byte for byte (the fallback when the helper could not be installed).
     static func enableIPC(port: Int, token: String, headersHelperPath: String? = nil, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
         let authorization: [String: String] = headersHelperPath == nil ? ["Authorization": "Bearer \(token)"] : [:]
-        let helperField: [String: Any] = headersHelperPath.map { ["headersHelper": "\"" + $0 + "\""] } ?? [:]
+        let helperField: [String: Any] = headersHelperPath.map { ["headersHelper": MCPHeadersHelperScript.helperCommand(path: $0, port: port)] } ?? [:]
 
         // Claude Code expands `${VAR}` header values from its own process
         // environment. Inside a persistent calyx-session pane,

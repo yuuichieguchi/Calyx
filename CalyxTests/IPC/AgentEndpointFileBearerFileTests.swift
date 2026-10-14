@@ -2,11 +2,14 @@
 //  AgentEndpointFileBearerFileTests.swift
 //  CalyxTests
 //
-//  Feature C, C-D17 / spec note 7: `AgentEndpointFile.write` also writes
-//  `<directory>/calyx-bearer-token` (the token bytes only, no trailing
-//  newline, 0600, atomic), and `remove(directory:port:token:)` removes it
-//  exactly when it removes agent-endpoint.json. Grok >= 1.0.52 reads that
-//  file per request through `bearer_token_file`.
+//  Feature C, C-D17 / spec notes 7 and 18 (slice 4c): `AgentEndpointFile.write`
+//  also writes `<directory>/calyx-bearer-token-<port>` (the token bytes
+//  only, no trailing newline, 0600, atomic), after deleting every other
+//  `calyx-bearer-token-*` in the directory, and `remove(directory:port:token:)`
+//  removes the file for its port exactly when it removes agent-endpoint.json.
+//  Grok >= 1.0.52 reads that file per request through `bearer_token_file`;
+//  because the name carries the port, a session configured for an older
+//  port finds no file once the port moves.
 //
 //  The runtime file name is spelled as a literal here on purpose (derived
 //  from the spec, not from production), so this class compiles against
@@ -23,7 +26,8 @@ final class AgentEndpointFileBearerFileTests: XCTestCase {
     private let key = IPCWakeProofKey(bytes: Data(repeating: 0x01, count: 32))
     private let secret = String(repeating: "ab", count: 32)
 
-    private var bearerPath: String { tempDir + "/calyx-bearer-token" }
+    private var bearerPath: String { bearerPath(port: 41830) }
+    private func bearerPath(port: Int) -> String { tempDir + "/calyx-bearer-token-\(port)" }
     private var endpointPath: String { tempDir + "/agent-endpoint.json" }
 
     override func setUp() {
@@ -45,7 +49,7 @@ final class AgentEndpointFileBearerFileTests: XCTestCase {
     func test_write_createsBearerFile_withExactlyTheTokenBytes_noTrailingNewline() throws {
         try write()
         let data = try XCTUnwrap(FileManager.default.contents(atPath: bearerPath),
-                                 "write must also create calyx-bearer-token next to agent-endpoint.json")
+                                 "write must also create calyx-bearer-token-41830 next to agent-endpoint.json")
         XCTAssertEqual(data, Data(secret.utf8), "the file holds the token bytes and nothing else")
     }
 
@@ -64,7 +68,7 @@ final class AgentEndpointFileBearerFileTests: XCTestCase {
     func test_write_directoryHoldsExactlyTheEndpointAndBearerFiles() throws {
         try write()
         let names = Set(try FileManager.default.contentsOfDirectory(atPath: tempDir))
-        XCTAssertEqual(names, ["agent-endpoint.json", "calyx-bearer-token"],
+        XCTAssertEqual(names, ["agent-endpoint.json", "calyx-bearer-token-41830"],
                        "no temp file left behind by the atomic writes")
     }
 
@@ -103,7 +107,7 @@ final class AgentEndpointFileBearerFileTests: XCTestCase {
 
     func test_write_bearerPathUnwritable_throws_andPublishesNoEndpointFile() throws {
         try FileManager.default.createDirectory(
-            atPath: AgentEndpointFile.bearerFilePath(directory: tempDir), withIntermediateDirectories: false)
+            atPath: bearerPath, withIntermediateDirectories: false)
         XCTAssertThrowsError(try write(), "a bearer-file failure must throw")
         XCTAssertFalse(FileManager.default.fileExists(atPath: endpointPath),
                        "nothing is published when the bearer file cannot be written")
@@ -114,9 +118,65 @@ final class AgentEndpointFileBearerFileTests: XCTestCase {
         let before = try XCTUnwrap(FileManager.default.contents(atPath: endpointPath))
         try FileManager.default.removeItem(atPath: bearerPath)
         try FileManager.default.createDirectory(
-            atPath: AgentEndpointFile.bearerFilePath(directory: tempDir), withIntermediateDirectories: false)
+            atPath: bearerPath, withIntermediateDirectories: false)
         XCTAssertThrowsError(try write(), "a bearer-file failure must throw")
         XCTAssertEqual(FileManager.default.contents(atPath: endpointPath), before,
                        "the old endpoint file (old token) is left untouched")
+    }
+
+    // MARK: - Port-named file (slice 4c)
+
+    func test_write_forAnotherPort_removesThePreviousPortsFile_andCreatesItsOwn() throws {
+        try write(port: 41830)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bearerPath(port: 41830)), "precondition")
+        try write(port: 41831)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bearerPath(port: 41830)),
+                       "the old port's file must disappear so sessions bound to it read nothing")
+        XCTAssertEqual(FileManager.default.contents(atPath: bearerPath(port: 41831)), Data(secret.utf8))
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: tempDir)),
+                       ["agent-endpoint.json", "calyx-bearer-token-41831"])
+    }
+
+    func test_write_removesStrayBearerFilesOfOtherPorts() throws {
+        try Data("old".utf8).write(to: URL(fileURLWithPath: bearerPath(port: 99999)))
+        try Data("old".utf8).write(to: URL(fileURLWithPath: tempDir + "/calyx-bearer-token-"))
+        try write(port: 41830)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bearerPath(port: 99999)))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempDir + "/calyx-bearer-token-"),
+                       "every name with the prefix goes")
+        XCTAssertEqual(FileManager.default.contents(atPath: bearerPath), Data(secret.utf8))
+    }
+
+    func test_write_removesThePortlessLegacyName() throws {
+        try Data("legacy".utf8).write(to: URL(fileURLWithPath: tempDir + "/calyx-bearer-token"))
+        try write(port: 41830)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempDir + "/calyx-bearer-token"),
+                       "write must delete the port-less legacy calyx-bearer-token")
+    }
+
+    func test_write_leavesFilesWithOtherNamesUntouched() throws {
+        let others = ["calyx-bearer-tokens", "xcalyx-bearer-token-1", "notes.txt"]
+        for name in others {
+            try Data(name.utf8).write(to: URL(fileURLWithPath: tempDir + "/" + name))
+        }
+        try write(port: 41830)
+        for name in others {
+            XCTAssertEqual(FileManager.default.contents(atPath: tempDir + "/" + name), Data(name.utf8), name)
+        }
+    }
+
+    func test_write_doesNotCreateThePortlessName() throws {
+        try write()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempDir + "/calyx-bearer-token"))
+    }
+
+    func test_remove_deletesOnlyItsOwnPortsFile() throws {
+        try write(port: 41830)
+        try Data("other".utf8).write(to: URL(fileURLWithPath: bearerPath(port: 41999)))
+        AgentEndpointFile.remove(directory: tempDir, port: 41830, token: secret)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: endpointPath))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: bearerPath(port: 41830)))
+        XCTAssertEqual(FileManager.default.contents(atPath: bearerPath(port: 41999)), Data("other".utf8),
+                       "remove touches only the file for its own port")
     }
 }

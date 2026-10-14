@@ -149,8 +149,13 @@ final class AgentIPCRowResolverTests: XCTestCase {
     // MARK: - Idle status: token rotated (J5, c4-spec-notes item 9)
 
     private let tokenRenewedLine =
-        "IPC token renewed. Claude Code, Codex and Grok ≥ 1.0.52 follow automatically; " +
-        "Hermes reconnects within seconds; restart OpenCode and older Grok sessions started before this launch."
+        "IPC token renewed because another process held the previous port. " +
+        "CLI config files no longer store the token; new agent sessions need no change. " +
+        "Sessions started before this launch keep the old port and must be restarted."
+
+    func test_tokenRenewedNotice_isTheSlice4cWording() {
+        XCTAssertEqual(AgentIPCRowResolver.tokenRenewedNotice, tokenRenewedLine)
+    }
 
     func test_idle_enabled_tokenRotated_allAxesSucceed_appendsRenewedLineAfterSummary() {
         let outcome = IPCActivationOutcome.enabled(

@@ -5,8 +5,10 @@
 //  Feature C, J6 / C-D3 / C-D17 / spec note 4: `calyx-mcp-headers`, the
 //  headers helper Claude Code (`headersHelper`) and Codex
 //  (`http_headers_helper`) run to obtain the bearer header. Contract:
-//  stdout is exactly `{"Authorization":"Bearer <token>"}` when
-//  agent-endpoint.json passes J2 (readable, port/token/pid/pidStart, pid
+//  stdout is exactly `{"Authorization":"Bearer <token>"}` when the first
+//  argument equals the endpoint file's port (slice 4c, spec notes 17-18:
+//  a session configured for an older port must not hand the renewed token
+//  to whatever now holds that port) and agent-endpoint.json passes J2 (readable, port/token/pid/pidStart, pid
 //  alive, pidStart matches), otherwise exactly `{}`; always exit 0, empty
 //  stderr, no trailing newline. No surface guard: Claude Code outside
 //  Calyx uses calyx-ipc too. V3-2: Claude Code treats `{}` as "no
@@ -67,6 +69,40 @@ final class MCPHeadersHelperScriptTests: XCTestCase {
         let trapRange = try XCTUnwrap(body.range(of: trap))
         let resolutionRange = try XCTUnwrap(body.range(of: AgentEndpointFile.shellResolution))
         XCTAssertLessThan(trapRange.lowerBound, resolutionRange.lowerBound)
+    }
+
+    /// Slice 4c: `$1` is captured right after the trap and BEFORE
+    /// shellResolution, whose `set --` clobbers the positional parameters;
+    /// an empty/missing argument ends at once (the trap prints `{}`).
+    func test_expectedPortCapture_followsTrap_andPrecedesResolution() throws {
+        let trap = #"trap 'if [ "$emitted" != 1 ]; then printf "{}"; fi' EXIT"#
+        XCTAssertEqual(Array(executableLines.prefix(7)), [
+            "exec 2>/dev/null", "emitted=0", trap,
+            #"expected_port="$1""#,
+            #"if [ -z "$expected_port" ]; then"#, "exit 0", "fi",
+        ])
+        let captureRange = try XCTUnwrap(body.range(of: #"expected_port="$1""#))
+        let resolutionRange = try XCTUnwrap(body.range(of: AgentEndpointFile.shellResolution))
+        XCTAssertLessThan(captureRange.lowerBound, resolutionRange.lowerBound)
+    }
+
+    func test_positionalParameter_readOnlyOnce() {
+        let executable = executableLines.joined(separator: "\n")
+        XCTAssertEqual(executable.components(separatedBy: "$1").count - 1, 1, "only the expected_port capture reads $1")
+    }
+
+    /// Slice 4c: after shellResolution, the port comparison, then the
+    /// printf / flag / exit, and nothing else.
+    func test_afterResolution_portComparison_thenPrintfFlagExit() throws {
+        let resolutionRange = try XCTUnwrap(body.range(of: AgentEndpointFile.shellResolution))
+        let tail = String(body[resolutionRange.upperBound...])
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+        XCTAssertEqual(tail, [
+            #"if [ "$port" != "$expected_port" ]; then"#, "exit 0", "fi",
+            #"printf '{"Authorization":"Bearer %s"}' "$token""#, "emitted=1", "exit 0",
+        ])
     }
 
     func test_shellResolution_interpolatedExactlyOnce() {
@@ -135,12 +171,12 @@ final class MCPHeadersHelperScriptTests: XCTestCase {
     private struct Run { let exitCode: Int32; let stdout: String; let stderr: String }
 
     private func runHelper(
-        endpointFile: String?, home: String? = nil, pathPrefix: String? = nil
+        endpointFile: String?, arguments: [String] = ["41830"], home: String? = nil, pathPrefix: String? = nil
     ) throws -> Run {
         let scriptPath = try MCPHeadersHelperScript.install(toDirectory: tempDir + "/bin")
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = [scriptPath]
+        process.arguments = [scriptPath] + arguments
         var env = ["HOME": home ?? (tempDir + "/emptyhome"), "PATH": (pathPrefix.map { $0 + ":" } ?? "") + "/usr/bin:/bin"]
         if let endpointFile { env["CALYX_ENDPOINT_FILE"] = endpointFile }
         process.environment = env
@@ -190,6 +226,40 @@ final class MCPHeadersHelperScriptTests: XCTestCase {
         XCTAssertEqual(run.stdout, expectedHeader)
         XCTAssertEqual(run.exitCode, 0)
         XCTAssertEqual(run.stderr, "")
+    }
+
+    // MARK: - Expected-port binding (slice 4c)
+
+    func test_differentPortArgument_printsEmptyObject() throws {
+        let run = try runHelper(endpointFile: try writeEndpoint(directory: tempDir + "/ep"), arguments: ["41831"])
+        assertEmptyObject(run, "endpoint port 41830, helper configured for 41831")
+    }
+
+    func test_differentPortArgument_viaHomeFallback_printsEmptyObject() throws {
+        let home = tempDir + "/home"
+        _ = try writeEndpoint(directory: home + "/Library/Application Support/Calyx")
+        assertEmptyObject(try runHelper(endpointFile: nil, arguments: ["41829"], home: home), "fallback, other port")
+    }
+
+    func test_portPrefixArgument_printsEmptyObject() throws {
+        let run = try runHelper(endpointFile: try writeEndpoint(directory: tempDir + "/ep"), arguments: ["4183"])
+        assertEmptyObject(run, "a prefix of the port is not the port")
+    }
+
+    func test_noArgument_printsEmptyObject() throws {
+        let run = try runHelper(endpointFile: try writeEndpoint(directory: tempDir + "/ep"), arguments: [])
+        assertEmptyObject(run, "no expected port")
+    }
+
+    func test_noArgument_viaHomeFallback_printsEmptyObject() throws {
+        let home = tempDir + "/home"
+        _ = try writeEndpoint(directory: home + "/Library/Application Support/Calyx")
+        assertEmptyObject(try runHelper(endpointFile: nil, arguments: [], home: home), "fallback, no expected port")
+    }
+
+    func test_emptyArgument_printsEmptyObject() throws {
+        let run = try runHelper(endpointFile: try writeEndpoint(directory: tempDir + "/ep"), arguments: [""])
+        assertEmptyObject(run, "empty expected port")
     }
 
     func test_deadPid_printsEmptyObject() throws {

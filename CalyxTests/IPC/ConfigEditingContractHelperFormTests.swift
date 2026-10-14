@@ -6,6 +6,8 @@
 //  Calyx's owned region survive enable -> disable; no extra file left;
 //  detection agrees with disable) applied to the slice-4b forms: Claude
 //  `headersHelper`, Codex `http_headers_helper`, Grok `bearer_token_file`.
+//  Slice 4c: the helper value carries the port (`"\"<path>\" <port>"`) and
+//  the Grok bearer file is `calyx-bearer-token-<port>`.
 //  A separate class because the original's driver is private to its file
 //  and these calls need the new parameters.
 //
@@ -17,7 +19,7 @@ final class ConfigEditingContractHelperFormTests: XCTestCase {
 
     private var tempDir: String!
     private let helperPath = "/opt/calyx dir/bin/calyx-mcp-headers"
-    private let bearerPath = "/opt/calyx dir/calyx-bearer-token"
+    private let bearerPath = "/opt/calyx dir/calyx-bearer-token-41830"
 
     override func setUp() {
         super.setUp()
@@ -112,5 +114,20 @@ final class ConfigEditingContractHelperFormTests: XCTestCase {
                       },
                       disable: { try GrokConfigManager.disableIPC(configPath: $0) },
                       detect: { GrokConfigManager.isIPCEnabled(configPath: $0) })
+    }
+
+    func test_helperForms_carryThePortArgument() throws {
+        let claude = tempDir + "/claude.json"
+        try ClaudeConfigManager.enableIPC(port: 41830, token: "contract-x", headersHelperPath: helperPath, configPath: claude)
+        let json = try XCTUnwrap(try JSONSerialization.jsonObject(
+            with: FileManager.default.contents(atPath: claude) ?? Data()) as? [String: Any])
+        let servers = try XCTUnwrap(json["mcpServers"] as? [String: [String: Any]])
+        for name in ["calyx-ipc", "calyx-mcp"] {
+            XCTAssertEqual(servers[name]?["headersHelper"] as? String, "\"" + helperPath + "\" 41830", name)
+        }
+        let codex = tempDir + "/config.toml"
+        try CodexConfigManager.enableIPC(port: 41830, token: "contract-x", headersHelperPath: helperPath, configPath: codex)
+        let codexText = (try? String(contentsOfFile: codex, encoding: .utf8)) ?? ""
+        XCTAssertEqual(codexText.components(separatedBy: #"http_headers_helper = "\""# + helperPath + #"\" 41830""#).count - 1, 2)
     }
 }

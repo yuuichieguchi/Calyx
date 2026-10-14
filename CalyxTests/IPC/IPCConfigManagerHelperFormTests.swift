@@ -6,8 +6,9 @@
 //  - enableIPC installs `calyx-mcp-headers` (0755) into
 //    `AgentHookScript.defaultInstallDirectory` and hands its path to
 //    Claude Code and Codex; disableIPC removes it.
-//  - Grok gets `bearer_token_file = <AgentEndpointFile.bearerFilePath(
-//    directory: defaultDirectory)>` only when the given version supports
+//  - Slice 4c: Claude/Codex get the helper COMMAND `"<path>" <port>`, and
+//    Grok's bearer file is `<defaultDirectory>/calyx-bearer-token-<port>`.
+//  - Grok gets `bearer_token_file = <that path>` only when the given version supports
 //    it (>= 1.0.52); older or unknown keeps the baked-in Authorization.
 //  - A helper install failure falls back to the baked-in form for Claude
 //    and Codex without adding a result axis or failing one.
@@ -108,7 +109,13 @@ final class IPCConfigManagerHelperFormTests: XCTestCase {
     }
 
     private var expectedBearerPath: String {
-        AgentEndpointFile.bearerFilePath(directory: AgentEndpointFile.defaultDirectory)
+        expectedBearerPath(port: 41830)
+    }
+
+    /// Slice 4c: spelled from the spec (`calyx-bearer-token-<port>` beside
+    /// agent-endpoint.json), not from production.
+    private func expectedBearerPath(port: Int) -> String {
+        AgentEndpointFile.defaultDirectory + "/calyx-bearer-token-\(port)"
     }
 
     // MARK: - Grok version gate
@@ -150,14 +157,14 @@ final class IPCConfigManagerHelperFormTests: XCTestCase {
         let attrs = try FileManager.default.attributesOfItem(atPath: helperPath)
         XCTAssertEqual((attrs[.posixPermissions] as? NSNumber)?.intValue, 0o755)
 
-        let quoted = "\"" + helperPath + "\""
+        let quoted = "\"" + helperPath + "\" 41830"
         let entries = try claudeEntries()
         XCTAssertEqual(entries.ipc["headersHelper"] as? String, quoted)
         XCTAssertEqual(entries.mcp["headersHelper"] as? String, quoted)
         XCTAssertNil((entries.ipc["headers"] as? [String: String])?["Authorization"])
         XCTAssertNil((entries.mcp["headers"] as? [String: String])?["Authorization"])
 
-        let codexLine = #"http_headers_helper = "\""# + helperPath + #"\"""#
+        let codexLine = #"http_headers_helper = "\""# + helperPath + #"\" 41830""#
         XCTAssertEqual(codexConfig.components(separatedBy: codexLine).count - 1, 2)
         XCTAssertFalse(codexConfig.contains("Authorization"))
     }
@@ -192,5 +199,28 @@ final class IPCConfigManagerHelperFormTests: XCTestCase {
         XCTAssertEqual((entries.mcp["headers"] as? [String: String])?["Authorization"], "Bearer " + secret)
         XCTAssertFalse(codexConfig.contains("http_headers_helper"))
         XCTAssertEqual(codexConfig.components(separatedBy: #""Authorization" = "Bearer "# + secret + #"""#).count - 1, 2)
+    }
+
+    // MARK: - Port binding (slice 4c)
+
+    func test_enable_onAnotherPort_bindsEveryHelperFormToThatPort() throws {
+        let result = IPCConfigManager.enableIPC(port: 41837, token: secret,
+                                                grokVersion: GrokCLIVersion(major: 1, minor: 0, patch: 52))
+        XCTAssertTrue(isSuccess(result.claudeCode))
+        XCTAssertTrue(isSuccess(result.codex))
+        XCTAssertTrue(isSuccess(result.grok))
+
+        let command = "\"" + helperPath + "\" 41837"
+        let entries = try claudeEntries()
+        XCTAssertEqual(entries.ipc["headersHelper"] as? String, command)
+        XCTAssertEqual(entries.mcp["headersHelper"] as? String, command)
+
+        XCTAssertEqual(codexConfig.components(
+            separatedBy: #"http_headers_helper = "\""# + helperPath + #"\" 41837""#).count - 1, 2)
+
+        let grokLine = #"bearer_token_file = ""# + expectedBearerPath(port: 41837) + #"""#
+        XCTAssertEqual(grokConfig.components(separatedBy: grokLine).count - 1, 2,
+                       "Grok's bearer file is named for the port: \(grokConfig)")
+        XCTAssertTrue(expectedBearerPath(port: 41837).hasSuffix("/calyx-bearer-token-41837"))
     }
 }

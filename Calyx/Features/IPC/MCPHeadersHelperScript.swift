@@ -42,15 +42,38 @@ enum MCPHeadersHelperScript {
     # `{"Authorization":...}{}` is invalid JSON, so (V3-2) Claude Code
     # sends no Authorization and the server answers 401: the window fails
     # closed.
+    #
+    # Port binding (spec note 17): the config passes the port it was
+    # written for as the first argument. A session started before a token
+    # rotation keeps the old URL; without this check the helper would hand
+    # the new token to whatever process now holds the old port. The
+    # argument is captured before shellResolution, whose `set --` replaces
+    # the positional parameters. A missing or empty argument fails closed.
     exec 2>/dev/null
     emitted=0
     trap 'if [ "$emitted" != 1 ]; then printf "{}"; fi' EXIT
+    expected_port="$1"
+    if [ -z "$expected_port" ]; then
+        exit 0
+    fi
     \(AgentEndpointFile.shellResolution)
+    if [ "$port" != "$expected_port" ]; then
+        exit 0
+    fi
     printf '{"Authorization":"Bearer %s"}' "$token"
     emitted=1
     exit 0
 
     """
+
+    /// The command line Claude Code (`headersHelper`) and Codex
+    /// (`http_headers_helper`) run, used verbatim by both: the path in
+    /// double quotes (it contains a space, `Application Support`), one
+    /// space, then the port the config points at, which the script
+    /// compares with agent-endpoint.json's port before printing the token.
+    static func helperCommand(path: String, port: Int) -> String {
+        "\"\(path)\" \(port)"
+    }
 
     /// Installs the script (0755) into `directory`, returning its path.
     static func install(toDirectory directory: String) throws -> String {

@@ -3,8 +3,9 @@
 //  CalyxTests
 //
 //  J6 / C-D3: with a headers-helper path, both `~/.claude.json` entries
-//  carry `"headersHelper": "\"<path>\""` (shell-quoted, the path has a
-//  space) and no `Authorization` header; the other headers are unchanged.
+//  carry `"headersHelper": "\"<path>\" <port>"` (shell-quoted path, a
+//  space, the configured port: slice 4c binds the fetched token to that
+//  port) and no `Authorization` header; the other headers are unchanged.
 //  `headersHelperPath: nil` must produce today's baked-in bytes exactly.
 //  Kept apart from `ClaudeConfigManagerTests` so that class still compiles
 //  before the new parameter exists.
@@ -45,7 +46,7 @@ final class ClaudeConfigManagerHelperFormTests: XCTestCase {
         let expected: NSDictionary = [
             "type": "http",
             "url": "http://127.0.0.1:41830/mcp",
-            "headersHelper": "\"" + helperPath + "\"",
+            "headersHelper": "\"" + helperPath + "\" 41830",
             "headers": [
                 "X-Calyx-Surface-ID": "${CALYX_SURFACE_ID:-}",
                 "X-Calyx-Session-ID": "${CALYX_SESSION_ID:-}",
@@ -59,7 +60,7 @@ final class ClaudeConfigManagerHelperFormTests: XCTestCase {
         let expected: NSDictionary = [
             "type": "http",
             "url": "http://127.0.0.1:41830/calyx-mcp",
-            "headersHelper": "\"" + helperPath + "\"",
+            "headersHelper": "\"" + helperPath + "\" 41830",
             "headers": [
                 "X-Calyx-Surface-ID": "${CALYX_SURFACE_ID:-}",
                 "X-Calyx-Session-ID": "${CALYX_SESSION_ID:-}",
@@ -136,5 +137,20 @@ final class ClaudeConfigManagerHelperFormTests: XCTestCase {
         let text = String(decoding: bytes(configPath), as: UTF8.self)
         XCTAssertFalse(text.contains("calyx-ipc"))
         XCTAssertFalse(text.contains("calyx-mcp"))
+    }
+
+    // MARK: - Port argument (slice 4c)
+
+    func test_helperForm_commandCarriesTheConfiguredPort() throws {
+        try ClaudeConfigManager.enableIPC(port: 41831, token: secret, headersHelperPath: helperPath, configPath: configPath)
+        let e = try entries(configPath)
+        XCTAssertEqual(e.ipc["headersHelper"] as? String, "\"" + helperPath + "\" 41831")
+        XCTAssertEqual(e.mcp["headersHelper"] as? String, "\"" + helperPath + "\" 41831")
+    }
+
+    func test_helperForm_portChange_rewritesTheCommand() throws {
+        try ClaudeConfigManager.enableIPC(port: 41830, token: secret, headersHelperPath: helperPath, configPath: configPath)
+        try ClaudeConfigManager.enableIPC(port: 41832, token: secret, headersHelperPath: helperPath, configPath: configPath)
+        XCTAssertEqual(try entries(configPath).ipc["headersHelper"] as? String, "\"" + helperPath + "\" 41832")
     }
 }

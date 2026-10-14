@@ -31,8 +31,9 @@ struct CodexConfigManager: Sendable {
     // MARK: - Public API
 
     /// `headersHelperPath` non-nil (the installed `calyx-mcp-headers`):
-    /// both tables carry `http_headers_helper` (the path wrapped in double
-    /// quotes, as it is a command line and contains a space) and
+    /// both tables carry `http_headers_helper`
+    /// (`MCPHeadersHelperScript.helperCommand(path:port:)`: quoted path
+    /// plus port, so a session on an older port gets `{}`) and
     /// `http_headers` keeps only `X-Calyx-Agent-Kind`. V3-3: Codex reruns
     /// the helper once on a 401, and an explicit `Authorization` in
     /// `http_headers` would win over the helper, so it is left out.
@@ -64,8 +65,10 @@ struct CodexConfigManager: Sendable {
         // before.
         let headerLines: String
         if let headersHelperPath {
+            let command = MCPHeadersHelperScript.helperCommand(path: headersHelperPath, port: port)
+                .replacingOccurrences(of: "\"", with: "\\\"")
             headerLines = """
-            http_headers_helper = "\\"\(headersHelperPath)\\""
+            http_headers_helper = "\(command)"
             http_headers = { "X-Calyx-Agent-Kind" = "\(AgentEntry.codexKind)" }
             """
         } else {

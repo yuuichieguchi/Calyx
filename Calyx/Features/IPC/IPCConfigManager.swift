@@ -86,7 +86,7 @@ struct IPCConfigManager: Sendable {
             helperPath = nil
         }
         let bearerFilePath: String? = grokVersion?.supportsBearerTokenFile == true
-            ? AgentEndpointFile.bearerFilePath(directory: AgentEndpointFile.defaultDirectory)
+            ? AgentEndpointFile.bearerFilePath(directory: AgentEndpointFile.defaultDirectory, port: port)
             : nil
 
         let claudeCode = enableClaudeCode(port: port, token: token, headersHelperPath: helperPath)

@@ -14,19 +14,31 @@ enum AgentEndpointFile {
 
     private static let fileName = "agent-endpoint.json"
 
-    /// `calyx-bearer-token`: the bare token, written beside
+    /// `calyx-bearer-token-<port>`: the bare token, written beside
     /// agent-endpoint.json by `write` and removed with it by `remove`.
     /// Grok >= 1.0.52 reads it on every request through
     /// `bearer_token_file` (C-D17), so a renewed token reaches Grok
-    /// without a config rewrite. Like the endpoint file it persists across
-    /// Cmd-Q (C-D13 residual): nothing removes it at quit. `calyx-mcp-headers`
-    /// does NOT read it; it reads the endpoint file so the liveness check
-    /// in `shellResolution` applies before the token is sent.
-    static let bearerFileName = "calyx-bearer-token"
+    /// without a config rewrite. The port is in the name (spec note 18):
+    /// a Grok session started before a rotation keeps the old URL and the
+    /// old file name; `write` deletes every other `calyx-bearer-token-*`,
+    /// so that session finds no file and sends no token to whatever now
+    /// holds the old port. The port-less legacy name `calyx-bearer-token`
+    /// (written by an intermediate build) is removed too. Like the endpoint file it persists across
+    /// Cmd-Q (C-D13 residual, unchanged): nothing removes it at quit.
+    /// `calyx-mcp-headers` does NOT read it; it reads the endpoint file so
+    /// the liveness check in `shellResolution` applies before the token is sent.
+    static let bearerFileNamePrefix = "calyx-bearer-token-"
+    /// Port-less name an intermediate build wrote; `write` removes it.
+    private static let legacyBearerFileName = "calyx-bearer-token"
 
-    /// `<directory>/calyx-bearer-token`.
-    static func bearerFilePath(directory: String) -> String {
-        (directory as NSString).appendingPathComponent(bearerFileName)
+    /// `calyx-bearer-token-<port>`.
+    static func bearerFileName(port: Int) -> String {
+        bearerFileNamePrefix + String(port)
+    }
+
+    /// `<directory>/calyx-bearer-token-<port>`.
+    static func bearerFilePath(directory: String, port: Int) -> String {
+        (directory as NSString).appendingPathComponent(bearerFileName(port: port))
     }
 
     /// Default directory: `~/Library/Application Support/Calyx`.
@@ -226,7 +238,10 @@ enum AgentEndpointFile {
     /// token (spec Feature C, J1/J2; see `shellResolution` and
     /// `EndpointLiveness`). `read` ignores them.
     ///
-    /// Writes `bearerFilePath(directory:)` FIRST: the token bytes only (no
+    /// First deletes, best-effort, every regular file in `directory` whose
+    /// name starts with `bearerFileNamePrefix` other than this port's
+    /// (spec note 18: sessions bound to an older port must find nothing).
+    /// Then writes `bearerFilePath(directory:port:)`: the token bytes only (no
     /// trailing newline), atomically, 0600 (`atomicWrite`'s fixed mode).
     /// Only then is agent-endpoint.json written. A bearer-file failure
     /// therefore throws before anything is published, leaving any existing
@@ -251,7 +266,8 @@ enum AgentEndpointFile {
         ]
         let data = try JSONSerialization.data(withJSONObject: dict)
         let filePath = (directory as NSString).appendingPathComponent(fileName)
-        try ConfigFileUtils.atomicWrite(data: Data(token.utf8), to: bearerFilePath(directory: directory))
+        removeOtherBearerFiles(directory: directory, keeping: bearerFileName(port: port))
+        try ConfigFileUtils.atomicWrite(data: Data(token.utf8), to: bearerFilePath(directory: directory, port: port))
         try ConfigFileUtils.atomicWrite(data: data, to: filePath)
     }
 
@@ -278,8 +294,8 @@ enum AgentEndpointFile {
     /// self-healing only this file would imply a multi-instance story
     /// that does not exist.
     ///
-    /// `calyx-bearer-token` is removed exactly when agent-endpoint.json
-    /// is, and left alone otherwise.
+    /// `calyx-bearer-token-<port>` (this `port` only) is removed exactly
+    /// when agent-endpoint.json is, and left alone otherwise.
     static func remove(directory: String, port: Int, token: String) {
         guard !token.isEmpty else { return }
         let filePath = (directory as NSString).appendingPathComponent(fileName)
@@ -294,6 +310,22 @@ enum AgentEndpointFile {
             return nil
         }
         guard removedEndpointFile else { return }
-        try? FileManager.default.removeItem(atPath: bearerFilePath(directory: directory))
+        try? FileManager.default.removeItem(atPath: bearerFilePath(directory: directory, port: port))
+    }
+
+    /// Best-effort cleanup for `write`: errors are ignored because a stale
+    /// file left behind only names a port no current config points at
+    /// after the endpoint moves, and failing the write would leave Calyx
+    /// without a published endpoint.
+    private static func removeOtherBearerFiles(directory: String, keeping keptName: String) {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: directory) else { return }
+        for name in names where (name.hasPrefix(bearerFileNamePrefix) || name == legacyBearerFileName)
+            && name != keptName {
+            let path = (directory as NSString).appendingPathComponent(name)
+            guard let type = try? fm.attributesOfItem(atPath: path)[.type] as? FileAttributeType,
+                  type == .typeRegular else { continue }
+            try? fm.removeItem(atPath: path)
+        }
     }
 }
