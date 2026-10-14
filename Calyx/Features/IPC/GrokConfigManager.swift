@@ -51,7 +51,17 @@ struct GrokConfigManager: Sendable {
     /// Throws `.directoryNotFound` when `configPath`'s parent directory
     /// does not exist: Grok not being installed must never make Calyx
     /// create `~/.grok` on the user's behalf.
-    static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
+    ///
+    /// `bearerTokenFilePath` non-nil (`AgentEndpointFile.bearerFilePath`):
+    /// each `[mcp_servers.<name>]` table carries `bearer_token_file` and
+    /// the headers sub-tables have no `Authorization` line. Grok reads
+    /// that file on every request, so a renewed token takes effect
+    /// without a restart. The key exists from Grok 1.0.52 (absent in
+    /// 1.0.34, V3-3); how an older Grok treats an unknown key is not
+    /// established, which is why the caller passes a path only for a
+    /// detected version >= 1.0.52 (`GrokCLIVersion`). nil: today's
+    /// baked-in `Authorization` header, byte for byte.
+    static func enableIPC(port: Int, token: String, bearerTokenFilePath: String? = nil, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
         let resolvedPath = try ConfigFileUtils.resolveConfigPath(path)
         let parentDir = (resolvedPath as NSString).deletingLastPathComponent
@@ -60,12 +70,17 @@ struct GrokConfigManager: Sendable {
             throw GrokConfigError.directoryNotFound
         }
 
+        // The `bearer_token_file` line ending each server table, or the
+        // `Authorization` line opening each headers sub-table: exactly one
+        // of the two is non-empty.
+        let fileLine = bearerTokenFilePath.map { "\nbearer_token_file = \"\($0)\"" } ?? ""
+        let authorizationLine = bearerTokenFilePath == nil ? "Authorization = \"Bearer \(token)\"\n" : ""
+
         let body = """
-        url = "http://127.0.0.1:\(port)/mcp"
+        url = "http://127.0.0.1:\(port)/mcp"\(fileLine)
 
         [mcp_servers.calyx-ipc.headers]
-        Authorization = "Bearer \(token)"
-        X-Calyx-Agent-Kind = "\(AgentEntry.grokKind)"
+        \(authorizationLine)X-Calyx-Agent-Kind = "\(AgentEntry.grokKind)"
         X-Calyx-Session-ID = "${CALYX_SESSION_ID:-}"
         X-Calyx-Surface-ID = "${CALYX_SURFACE_ID:-}"
         """
@@ -73,18 +88,18 @@ struct GrokConfigManager: Sendable {
         // Same host, port and headers as calyx-ipc, plus the herdr pane and
         // socket headers `/calyx-mcp` resolves a herdr pane by.
         let calyxMCPBody = """
-        url = "http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)"
+        url = "http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)"\(fileLine)
 
         [mcp_servers.calyx-mcp.headers]
-        Authorization = "Bearer \(token)"
-        X-Calyx-Agent-Kind = "\(AgentEntry.grokKind)"
+        \(authorizationLine)X-Calyx-Agent-Kind = "\(AgentEntry.grokKind)"
         X-Calyx-Session-ID = "${CALYX_SESSION_ID:-}"
         X-Calyx-Surface-ID = "${CALYX_SURFACE_ID:-}"
         X-Calyx-Herdr-Pane-ID = "${HERDR_PANE_ID:-}"
         X-Calyx-Herdr-Socket-Path = "${HERDR_SOCKET_PATH:-}"
         """
 
-        // 0600: both tables' headers sub-tables carry the bearer token.
+        // 0600: in the baked-in form both headers sub-tables carry the
+        // bearer token; kept for the bearer-file form too.
         try ConfigFileUtils.withExclusiveConfig(path: path, mode: 0o600) { current in
             let withIPC = try tableEditor.setTable(body: body, in: current)
             return try calyxMCPTableEditor.setTable(body: calyxMCPBody, in: withIPC)

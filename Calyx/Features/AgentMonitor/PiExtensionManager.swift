@@ -93,44 +93,7 @@ enum PiExtensionManager: Sendable {
         return endpoint;
       }
 
-      // Liveness check (spec Feature C, G1): the token goes only to the
-      // Calyx process that wrote agent-endpoint.json. process.kill(pid, 0)
-      // throws ESRCH for a dead pid and EPERM for another user's; the start
-      // time from `ps -o lstart=` (UTC, C locale, whitespace collapsed, the
-      // same normalisation Calyx wrote pidStart with) rules out a reused pid.
-      // A verified (pid, pidStart) pair is cached for this process's lifetime
-      // and afterwards only process.kill(pid, 0) is re-checked: the residual
-      // is the pid being reused by another process with the same pidStart
-      // text, which needs the pid counter to wrap around within it.
-      let verifiedPid = null;
-      let verifiedPidStart = null;
-
-      function liveEndpoint(endpoint) {
-        const pid = endpoint["pid"];
-        const pidStart = endpoint["pidStart"];
-        if (typeof pid !== "number" || typeof pidStart !== "string" || !pidStart) {
-          return false;
-        }
-        try {
-          process.kill(pid, 0);
-        } catch {
-          return false;
-        }
-        if (pid === verifiedPid && pidStart === verifiedPidStart) {
-          return true;
-        }
-        const ps = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
-          env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
-          encoding: "utf8",
-        });
-        const liveStart = String(ps.stdout ?? "").split(/\\s+/).filter(Boolean).join(" ");
-        if (liveStart !== pidStart) {
-          return false;
-        }
-        verifiedPid = pid;
-        verifiedPidStart = pidStart;
-        return true;
-      }
+      \(AgentEndpointFile.javascriptLiveEndpoint)
 
       // The tools of the MCP servers configured in Calyx, reached through
       // /calyx-mcp without a session. The herdr headers let Calyx find

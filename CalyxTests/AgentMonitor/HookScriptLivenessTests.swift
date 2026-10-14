@@ -336,4 +336,17 @@ final class HookScriptLivenessTests: XCTestCase {
     func test_piExtension_checksLivenessBeforeEveryFetch() {
         assertJSLiveness(PiExtensionManager.scriptBody, label: "pi", expectedFetches: 4)
     }
+
+    /// Both JS bodies take the liveness guard from the one shared constant,
+    /// so the OpenCode plugin and the pi extension cannot drift.
+    func test_jsBodies_embedSharedLiveEndpointExactlyOnce() {
+        let shared = AgentEndpointFile.javascriptLiveEndpoint
+        XCTAssertTrue(shared.contains("function liveEndpoint"))
+        for (label, body) in [
+            ("OpenCode", OpenCodePluginManager.scriptBody),
+            ("pi", PiExtensionManager.scriptBody),
+        ] {
+            XCTAssertEqual(body.components(separatedBy: shared).count - 1, 1, label)
+        }
+    }
 }

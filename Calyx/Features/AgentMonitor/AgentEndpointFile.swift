@@ -14,6 +14,21 @@ enum AgentEndpointFile {
 
     private static let fileName = "agent-endpoint.json"
 
+    /// `calyx-bearer-token`: the bare token, written beside
+    /// agent-endpoint.json by `write` and removed with it by `remove`.
+    /// Grok >= 1.0.52 reads it on every request through
+    /// `bearer_token_file` (C-D17), so a renewed token reaches Grok
+    /// without a config rewrite. Like the endpoint file it persists across
+    /// Cmd-Q (C-D13 residual): nothing removes it at quit. `calyx-mcp-headers`
+    /// does NOT read it; it reads the endpoint file so the liveness check
+    /// in `shellResolution` applies before the token is sent.
+    static let bearerFileName = "calyx-bearer-token"
+
+    /// `<directory>/calyx-bearer-token`.
+    static func bearerFilePath(directory: String) -> String {
+        (directory as NSString).appendingPathComponent(bearerFileName)
+    }
+
     /// Default directory: `~/Library/Application Support/Calyx`.
     static var defaultDirectory: String {
         AppSupportDirectory.path
@@ -53,6 +68,66 @@ enum AgentEndpointFile {
     /// embedding in a Node/Bun generated script body's fallback
     /// expression.
     static let javascriptFallbackPathExpression = "`${process.env.HOME}/" + homeRelativePath + "`"
+
+    /// The JavaScript `liveEndpoint(endpoint)` guard shared by the OpenCode
+    /// plugin (`OpenCodePluginManager.scriptBody`, Bun) and the pi extension
+    /// (`PiExtensionManager.scriptBody`, TypeScript), so the two cannot
+    /// drift (spec Feature C, G1; C-D7). Plain JavaScript, valid in both.
+    ///
+    /// Threat model: the bearer goes only to the Calyx process that wrote
+    /// agent-endpoint.json. `process.kill(pid, 0)` rejects a dead pid
+    /// (ESRCH) and another user's (EPERM); `ps -o lstart=` under
+    /// `TZ=UTC LC_ALL=C`, whitespace collapsed, must equal `pidStart`,
+    /// which rules out a reused pid. C-D7: a verified (pid, pidStart) pair
+    /// is cached in `verifiedPid`/`verifiedPidStart` for the host
+    /// process's lifetime, after which only `process.kill(pid, 0)` is
+    /// re-checked. Residual: another process reusing the pid with the same
+    /// `pidStart` text, which needs the pid counter to wrap within it.
+    ///
+    /// The caller must import `spawnSync` from `node:child_process` and
+    /// interpolate this at a six-space indentation inside its literal:
+    /// the first line carries no indentation of its own and every later
+    /// line carries two spaces, matching the enclosing function body.
+    static let javascriptLiveEndpoint: String = """
+    // Liveness check (spec Feature C, G1): the token goes only to the
+      // Calyx process that wrote agent-endpoint.json. process.kill(pid, 0)
+      // throws ESRCH for a dead pid and EPERM for another user's; the start
+      // time from `ps -o lstart=` (UTC, C locale, whitespace collapsed, the
+      // same normalisation Calyx wrote pidStart with) rules out a reused pid.
+      // A verified (pid, pidStart) pair is cached for this process's lifetime
+      // and afterwards only process.kill(pid, 0) is re-checked: the residual
+      // is the pid being reused by another process with the same pidStart
+      // text, which needs the pid counter to wrap around within it.
+      let verifiedPid = null;
+      let verifiedPidStart = null;
+
+      function liveEndpoint(endpoint) {
+        const pid = endpoint["pid"];
+        const pidStart = endpoint["pidStart"];
+        if (typeof pid !== "number" || typeof pidStart !== "string" || !pidStart) {
+          return false;
+        }
+        try {
+          process.kill(pid, 0);
+        } catch {
+          return false;
+        }
+        if (pid === verifiedPid && pidStart === verifiedPidStart) {
+          return true;
+        }
+        const ps = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+          env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+          encoding: "utf8",
+        });
+        const liveStart = String(ps.stdout ?? "").split(/\\s+/).filter(Boolean).join(" ");
+        if (liveStart !== pidStart) {
+          return false;
+        }
+        verifiedPid = pid;
+        verifiedPidStart = pidStart;
+        return true;
+      }
+    """
 
     struct Endpoint: Sendable, Equatable {
         let port: Int
@@ -150,6 +225,15 @@ enum AgentEndpointFile {
     /// six keys in all: every sender checks them before sending the
     /// token (spec Feature C, J1/J2; see `shellResolution` and
     /// `EndpointLiveness`). `read` ignores them.
+    ///
+    /// Writes `bearerFilePath(directory:)` FIRST: the token bytes only (no
+    /// trailing newline), atomically, 0600 (`atomicWrite`'s fixed mode).
+    /// Only then is agent-endpoint.json written. A bearer-file failure
+    /// therefore throws before anything is published, leaving any existing
+    /// agent-endpoint.json untouched, so `finishStart`'s catch/log
+    /// describes the on-disk state accurately. The only remaining window
+    /// is "bearer new, endpoint old": Grok then sends the new token to the
+    /// new server, which is correct.
     static func write(
         port: Int, token: String, wakeProofKey: IPCWakeProofKey, liveness: EndpointLiveness, directory: String
     ) throws {
@@ -167,6 +251,7 @@ enum AgentEndpointFile {
         ]
         let data = try JSONSerialization.data(withJSONObject: dict)
         let filePath = (directory as NSString).appendingPathComponent(fileName)
+        try ConfigFileUtils.atomicWrite(data: Data(token.utf8), to: bearerFilePath(directory: directory))
         try ConfigFileUtils.atomicWrite(data: data, to: filePath)
     }
 
@@ -192,16 +277,23 @@ enum AgentEndpointFile {
     /// single shared resource across all running instances, so
     /// self-healing only this file would imply a multi-instance story
     /// that does not exist.
+    ///
+    /// `calyx-bearer-token` is removed exactly when agent-endpoint.json
+    /// is, and left alone otherwise.
     static func remove(directory: String, port: Int, token: String) {
         guard !token.isEmpty else { return }
         let filePath = (directory as NSString).appendingPathComponent(fileName)
+        var removedEndpointFile = false
         // 0600: Calyx owns this file outright and it carries the bearer
         // token (see `write(port:token:wakeProofKey:liveness:directory:)` above).
         try? ConfigFileUtils.withExclusiveConfig(path: filePath, mode: 0o600, restoreModeOnNoWrite: true) { current in
             guard let current else { return current }
             guard let onDisk = decode(current), onDisk.port == port, onDisk.token == token
             else { return current }
+            removedEndpointFile = true
             return nil
         }
+        guard removedEndpointFile else { return }
+        try? FileManager.default.removeItem(atPath: bearerFilePath(directory: directory))
     }
 }

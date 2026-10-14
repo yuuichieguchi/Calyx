@@ -30,7 +30,14 @@ struct CodexConfigManager: Sendable {
 
     // MARK: - Public API
 
-    static func enableIPC(port: Int, token: String, configPath: String? = nil) throws {
+    /// `headersHelperPath` non-nil (the installed `calyx-mcp-headers`):
+    /// both tables carry `http_headers_helper` (the path wrapped in double
+    /// quotes, as it is a command line and contains a space) and
+    /// `http_headers` keeps only `X-Calyx-Agent-Kind`. V3-3: Codex reruns
+    /// the helper once on a 401, and an explicit `Authorization` in
+    /// `http_headers` would win over the helper, so it is left out.
+    /// nil: today's baked-in `Authorization`, byte for byte.
+    static func enableIPC(port: Int, token: String, headersHelperPath: String? = nil, configPath: String? = nil) throws {
         let path = configPath ?? defaultConfigPath
         let resolvedPath = try ConfigFileUtils.resolveConfigPath(path)
         let parentDir = (resolvedPath as NSString).deletingLastPathComponent
@@ -55,9 +62,21 @@ struct CodexConfigManager: Sendable {
         // Codex omits that header entirely rather than sending an empty
         // value, so the surface header alone still resolves exactly as
         // before.
+        let headerLines: String
+        if let headersHelperPath {
+            headerLines = """
+            http_headers_helper = "\\"\(headersHelperPath)\\""
+            http_headers = { "X-Calyx-Agent-Kind" = "\(AgentEntry.codexKind)" }
+            """
+        } else {
+            headerLines = """
+            http_headers = { "Authorization" = "Bearer \(token)", "X-Calyx-Agent-Kind" = "\(AgentEntry.codexKind)" }
+            """
+        }
+
         let body = """
         url = "http://127.0.0.1:\(port)/mcp"
-        http_headers = { "Authorization" = "Bearer \(token)", "X-Calyx-Agent-Kind" = "\(AgentEntry.codexKind)" }
+        \(headerLines)
         env_http_headers = { "X-Calyx-Surface-ID" = "CALYX_SURFACE_ID", "X-Calyx-Session-ID" = "CALYX_SESSION_ID" }
         """
 
@@ -66,11 +85,12 @@ struct CodexConfigManager: Sendable {
         // an env header whose variable is unset.
         let calyxMCPBody = """
         url = "http://127.0.0.1:\(port)\(HTTPParser.calyxMCPPath)"
-        http_headers = { "Authorization" = "Bearer \(token)", "X-Calyx-Agent-Kind" = "\(AgentEntry.codexKind)" }
+        \(headerLines)
         env_http_headers = { "X-Calyx-Surface-ID" = "CALYX_SURFACE_ID", "X-Calyx-Session-ID" = "CALYX_SESSION_ID", "X-Calyx-Herdr-Pane-ID" = "HERDR_PANE_ID", "X-Calyx-Herdr-Socket-Path" = "HERDR_SOCKET_PATH" }
         """
 
-        // 0600: this table carries the bearer token. ~/.codex/config.toml
+        // 0600: this table carries the bearer token (baked-in form; kept
+        // for the helper form too). ~/.codex/config.toml
         // is shared with CodexHooksConfigManager's hooks block, which
         // carries no token and therefore leaves the file's mode alone
         // (mode: nil) -- one file, two policies, deliberately: whichever

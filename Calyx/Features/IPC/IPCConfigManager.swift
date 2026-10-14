@@ -64,12 +64,36 @@ struct IPCConfigManager: Sendable {
 
     /// Enables IPC MCP server config in Claude Code, Codex, OpenCode, Hermes, and Grok config files.
     /// Each tool is handled independently — one failing does not prevent the others.
-    static func enableIPC(port: Int, token: String) -> IPCConfigResult {
-        let claudeCode = enableClaudeCode(port: port, token: token)
-        let codex = enableCodex(port: port, token: token)
+    ///
+    /// First installs `calyx-mcp-headers` into
+    /// `AgentHookScript.defaultInstallDirectory` and points Claude Code and
+    /// Codex at it, so a renewed token reaches them without a rewrite. If
+    /// the install fails, that is logged and both get the baked-in
+    /// `Authorization` form instead; no axis reports it, since IPC still
+    /// works. Grok gets `bearer_token_file` only when `grokVersion`
+    /// supports it (>= 1.0.52); an unknown or older version keeps the
+    /// baked-in form. The default argument runs `grok --version` once per
+    /// call.
+    static func enableIPC(
+        port: Int, token: String, grokVersion: GrokCLIVersion? = GrokCLIVersion.detect()
+    ) -> IPCConfigResult {
+        let helperPath: String?
+        do {
+            helperPath = try MCPHeadersHelperScript.install(toDirectory: AgentHookScript.defaultInstallDirectory)
+        } catch {
+            NSLog("Calyx: installing %@ failed, using the baked-in Authorization header: %@",
+                  MCPHeadersHelperScript.fileName, error.localizedDescription)
+            helperPath = nil
+        }
+        let bearerFilePath: String? = grokVersion?.supportsBearerTokenFile == true
+            ? AgentEndpointFile.bearerFilePath(directory: AgentEndpointFile.defaultDirectory)
+            : nil
+
+        let claudeCode = enableClaudeCode(port: port, token: token, headersHelperPath: helperPath)
+        let codex = enableCodex(port: port, token: token, headersHelperPath: helperPath)
         let openCode = enableOpenCode(port: port, token: token)
         let hermes = enableHermes(port: port, token: token)
-        let grok = enableGrok(port: port, token: token)
+        let grok = enableGrok(port: port, token: token, bearerTokenFilePath: bearerFilePath)
         return IPCConfigResult(
             claudeCode: claudeCode,
             codex: codex,
@@ -87,6 +111,8 @@ struct IPCConfigManager: Sendable {
         let openCode = disableOpenCode()
         let hermes = disableHermes()
         let grok = disableGrok()
+        // Last: the configs that referenced the helper are gone by now.
+        MCPHeadersHelperScript.remove(fromDirectory: AgentHookScript.defaultInstallDirectory)
         return IPCConfigResult(
             claudeCode: claudeCode,
             codex: codex,
@@ -109,12 +135,12 @@ struct IPCConfigManager: Sendable {
 
     // MARK: - Private: Claude Code
 
-    private static func enableClaudeCode(port: Int, token: String) -> ConfigStatus {
+    private static func enableClaudeCode(port: Int, token: String, headersHelperPath: String?) -> ConfigStatus {
         guard ConfigFileUtils.directoryExists(at: AgentToolPaths.claudeConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         do {
-            try ClaudeConfigManager.enableIPC(port: port, token: token)
+            try ClaudeConfigManager.enableIPC(port: port, token: token, headersHelperPath: headersHelperPath)
             return .success
         } catch {
             return .failed(error)
@@ -132,12 +158,12 @@ struct IPCConfigManager: Sendable {
 
     // MARK: - Private: Codex
 
-    private static func enableCodex(port: Int, token: String) -> ConfigStatus {
+    private static func enableCodex(port: Int, token: String, headersHelperPath: String?) -> ConfigStatus {
         guard ConfigFileUtils.directoryExists(at: AgentToolPaths.codexConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         do {
-            try CodexConfigManager.enableIPC(port: port, token: token)
+            try CodexConfigManager.enableIPC(port: port, token: token, headersHelperPath: headersHelperPath)
             return .success
         } catch {
             return .failed(error)
@@ -201,12 +227,12 @@ struct IPCConfigManager: Sendable {
 
     // MARK: - Private: Grok
 
-    private static func enableGrok(port: Int, token: String) -> ConfigStatus {
+    private static func enableGrok(port: Int, token: String, bearerTokenFilePath: String?) -> ConfigStatus {
         guard ConfigFileUtils.directoryExists(at: AgentToolPaths.grokConfigDirectory) else {
             return .skipped(reason: "not installed")
         }
         do {
-            try GrokConfigManager.enableIPC(port: port, token: token)
+            try GrokConfigManager.enableIPC(port: port, token: token, bearerTokenFilePath: bearerTokenFilePath)
             return .success
         } catch {
             return .failed(error)
