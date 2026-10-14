@@ -7,3 +7,10 @@ useDefault = true
 description = "Placeholder hex token used as a test fixture"
 regexTarget = "secret"
 regexes = ['''^(?:0123456789abcdef){4}$''']
+
+# Synthetic UUID-shaped test token in CalyxTests/IPC/AgentEndpointFileWakeProofTests.swift.
+# Matches the captured secret only, so real keys in the same file are still flagged.
+[[allowlists]]
+description = "Placeholder UUID token used as a test fixture"
+regexTarget = "secret"
+regexes = ['''^7B0D1F5C-2E44-4C0A-9D1B-6A5E3C2F1A00$''']
