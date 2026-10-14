@@ -18,7 +18,7 @@
 //  Config File + help footer edits ghostty's config file, and the help
 //  popover it opens (GhosttyConfigManager.managedKeys) lists exactly
 //  background-opacity, background-blur, background-opacity-cells,
-//  font-codepoint-map, and foreground -- all glass/theme-color keys,
+//  and foreground -- all glass/theme-color keys,
 //  none LSP- or session-related. The footer's content is entirely about
 //  what the Appearance pane manages, so that is its natural home.
 //
