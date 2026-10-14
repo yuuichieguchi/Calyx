@@ -64,6 +64,8 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 - **Git Source Control** -- working changes, staging state, commit graph, branch visualization, and inline diffs in the sidebar, as one collapsible section per repository the window can reach, including linked worktrees and checked-out submodules
 - **Commit Log Ref Picker** -- the commit graph uses an Auto scope modelled on VSCode's (the checked-out branch, its upstream, and the remote's default branch), with a per-repository picker for all references or any set of branches, remotes, and tags, and branch and tag badges on commit rows
 - **Diff Review Comments** -- comment on individual lines and submit a complete review directly to an agent pane ([demo video](https://www.youtube.com/watch?v=_O2Lr4oFf4c))
+- **Diff Preview Tab** -- a single click on a file in the Changes sidebar opens its diff in the group's one reusable preview tab (italic title, VS Code style); double-click the file or the tab, add a review comment, or choose **Keep Open** (also **Keep Tab Open** in the command palette) to keep it; Settings -> Appearance -> **Open diffs in a preview tab** turns the behavior off
+- **Worktree Tasks** -- **File -> New Worktree Task…** (`Cmd+Shift+N`, also in the command palette and the **+** button of the Changes sidebar) creates a branch and a linked worktree under `~/.calyx/worktrees/`, launches Claude Code, Codex, OpenCode, Hermes, Grok, or pi there as the pane's own process with optional CLI arguments and an initial prompt, and offers **Merge into \<base>** and **Discard** from the Changes section header and the Mission Map card; when the agent exits, the pane continues as a shell in the worktree
 - **AI Agent IPC** -- built-in MCP messaging lets agents discover and communicate with peers across tabs and panes ([demo video](https://www.youtube.com/watch?v=Xty0ad9gGcM))
 - **LSP Proxy MCP** -- hover, definition, references, rename, diagnostics, and other language-server features for agents; missing servers can be installed from Settings
 - **MCP Apps** -- add MCP servers (stdio or HTTP, with OAuth sign-in) in Settings -> **MCP Apps** and Calyx republishes their tools to every agent CLI as `calyx-mcp`; a tool that declares an MCP Apps view renders it docked to the right of the calling pane, with Open Link and Send Message consent routed through the approval panel
@@ -80,7 +82,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 
 - **libghostty Engine** -- Metal GPU-accelerated rendering powered by Ghostty v1.3.1
 - **Tab Groups and Split Panes** -- color-coded collapsible groups, tab renaming and reordering, group reordering and moving tabs between groups by dragging in the sidebar, horizontal and vertical splits, directional focus, and split zoom
-- **Tab Context Menu** -- right-click or Ctrl+click a tab in the tab bar or sidebar to close it, close the other tabs or the tabs to its right in its group, rename it, or open Mission Map with **Show All Tabs**, without switching to it
+- **Tab Context Menu** -- right-click or Ctrl+click a tab in the tab bar or sidebar to close it, close the other tabs or the tabs to its right in its group, rename it, keep a diff preview tab with **Keep Open**, or open Mission Map with **Show All Tabs**, without switching to it
 - **Group Context Menu** -- right-click or Ctrl+click a group header in the sidebar to close it, close the other groups or the groups below it, rename it, or pick its color, without switching to it
 - **Command Palette** -- search and run operations with `Cmd+Shift+P`
 - **Ghostty Compatibility** -- read `~/.config/ghostty/config`, hot-reload most settings, and bind Calyx operations through Ghostty keybind actions
@@ -151,6 +153,7 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 | `Cmd+Shift+E` | Toggle compose overlay |
 | `Cmd+Shift+B` | Session Browser |
 | `Cmd+Shift+M` | Toggle Mission Map |
+| `Cmd+Shift+N` | New Worktree Task |
 | `Cmd+Option+U` | Usage window |
 | `Cmd+?` | Calyx Help (opens the help center) |
 | `Cmd+Enter` / `Ctrl+Cmd+F` | Toggle full screen |
