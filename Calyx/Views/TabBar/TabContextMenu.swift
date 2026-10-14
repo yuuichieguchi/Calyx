@@ -12,6 +12,10 @@ enum TabContextMenu {
         var closeToTheRight: () -> Void
         var showAllTabs: () -> Void
         var rename: () -> Void
+        /// Promotes a preview diff tab to a permanent one (issue #51).
+        /// Non-nil only when the tab `isPreview`; the "Keep Open" item is
+        /// shown only then, so permanent tabs get the menu unchanged.
+        var keepOpen: (() -> Void)? = nil
     }
 
     @MainActor
@@ -37,6 +41,10 @@ enum TabContextMenu {
         menu.addItem(.separator())
 
         menu.addItem(ClosureMenuItem(title: "Rename Tab...", symbolName: "pencil.line", handler: actions.rename))
+
+        if let keepOpen = actions.keepOpen {
+            menu.addItem(ClosureMenuItem(title: "Keep Open", symbolName: "pin", handler: keepOpen))
+        }
 
         return menu
     }

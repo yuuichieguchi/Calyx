@@ -122,6 +122,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// `SurfaceRegistry._testInsert`'s naming/gating convention. DO NOT
     /// use from production code.
     var _closingTabIDsForTesting: Set<UUID> { closingTabIDs }
+    /// Test seam: read-only view of `diffStates`. DO NOT use from production code.
+    var _diffStatesForTesting: [UUID: DiffLoadState] { diffStates }
+    /// Test seam: read-only view of `reviewStores`. DO NOT use from production code.
+    var _reviewStoresForTesting: [UUID: DiffReviewStore] { reviewStores }
     /// Test seam: number of `activateCurrentTab()` runs since this
     /// controller was created. DO NOT use from production code.
     var _activateCurrentTabCountForTesting = 0
@@ -817,6 +821,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             guard case .browser = self?.activeTab?.content else { return }
             self?.activeBrowserController?.reload()
         })
+        commandRegistry.register(PaletteCommand(id: "tab.keepOpen", title: "Keep Tab Open", category: "Tab") { [weak self] in
+            guard let self, let tab = self.activeTab else { return }
+            self.keepTabOpen(id: tab.id)
+        })
         commandRegistry.register(PaletteCommand(id: "git.showChanges", title: "Show Git Changes", category: "Git") { [weak self] in
             self?.windowSession.showSidebar = true
             self?.setSidebarMode(.changes)
@@ -1461,6 +1469,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             onNewTab: { [weak self] in self?.createNewTab() },
             onNewGroup: { [weak self] in self?.createNewGroup() },
             onCloseTab: { [weak self] tabID in self?.closeTab(id: tabID) },
+            onKeepTabOpen: { [weak self] tabID in self?.keepTabOpen(id: tabID) },
             onCloseOtherTabs: { [weak self] tabID in
                 self?.closeTabs(relativeTo: tabID, mode: GHOSTTY_ACTION_CLOSE_TAB_MODE_OTHER)
             },
@@ -1477,6 +1486,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             },
             onCommitFileSelected: { [weak self] repoID, entry in
                 self?.handleCommitFileSelected(repoID: repoID, entry: entry)
+            },
+            onWorkingFileOpenPinned: { [weak self] repoID, entry in
+                self?.handleWorkingFileSelected(repoID: repoID, entry: entry, pinned: true)
+            },
+            onCommitFileOpenPinned: { [weak self] repoID, entry in
+                self?.handleCommitFileSelected(repoID: repoID, entry: entry, pinned: true)
             },
             onRefreshGitStatus: { [weak self] in self?.refreshGitSidebar(trigger: .manualRefresh) },
             onLoadMoreCommits: { [weak self] repoID in self?.loadMoreCommits(repoID: repoID) },
@@ -6183,7 +6198,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    private func handleWorkingFileSelected(repoID: String, entry: GitFileEntry) {
+    /// - Parameter pinned: `true` for a double-click in the Changes
+    ///   sidebar, which opens (or promotes) a permanent tab instead of the
+    ///   reusable preview tab — see `openDiffTab(source:pinned:)`.
+    private func handleWorkingFileSelected(repoID: String, entry: GitFileEntry, pinned: Bool = false) {
         guard let descriptor = gitRepoSection(id: repoID) else { return }
         let repoRoot = descriptor.rootPath
 
@@ -6196,24 +6214,52 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             source = .unstaged(path: entry.path, workDir: repoRoot)
         }
 
-        openDiffTab(source: source)
+        openDiffTab(source: source, pinned: pinned)
     }
 
-    private func handleCommitFileSelected(repoID: String, entry: CommitFileEntry) {
+    /// - Parameter pinned: See `handleWorkingFileSelected(repoID:entry:pinned:)`.
+    private func handleCommitFileSelected(repoID: String, entry: CommitFileEntry, pinned: Bool = false) {
         guard let descriptor = gitRepoSection(id: repoID) else { return }
 
         let source: DiffSource = .commit(
             hash: entry.commitHash, path: entry.path, workDir: descriptor.rootPath
         )
-        openDiffTab(source: source)
+        openDiffTab(source: source, pinned: pinned)
     }
 
-    private func openDiffTab(source: DiffSource) {
+    /// UserDefaults key for the "Changes" preview-tab setting (issue #51,
+    /// VS Code's `workbench.editor.enablePreview`, scoped to diff tabs
+    /// only). Absent means ON, so the key is read with `object(forKey:)`
+    /// rather than `bool(forKey:)` (which would turn absence into `false`).
+    static let gitDiffPreviewTabEnabledKey = "gitDiffPreviewTabEnabled"
+
+    private var isDiffPreviewTabEnabled: Bool {
+        UserDefaults.standard.object(forKey: Self.gitDiffPreviewTabEnabledKey) as? Bool ?? true
+    }
+
+    /// Opens `source` in a diff tab of the active group.
+    ///
+    /// An already-open tab for the same source is just activated. Otherwise,
+    /// with the preview setting ON, the group's single preview tab (if any)
+    /// is reused in place so that browsing the Changes sidebar does not pile
+    /// up tabs; `pinned` (double-click) additionally promotes it to a
+    /// permanent tab. With no preview tab, a new tab is created — a preview
+    /// one unless `pinned`. With the setting OFF every new source gets its
+    /// own permanent tab, as before. This keeps at most one preview tab per
+    /// group, because the only paths that set `isPreview = true` either
+    /// reuse the existing preview tab or run when none exists.
+    func openDiffTab(source: DiffSource, pinned: Bool = false) {
         // Dedup: check if same source already open
         if let group = windowSession.activeGroup {
             for tab in group.tabs {
                 if case .diff(let existingSource) = tab.content, existingSource == source {
                     switchToTab(id: tab.id)
+                    // A pinned open of an already-open preview (the second
+                    // click of a Changes-sidebar double-click lands here)
+                    // must still promote it to a permanent tab.
+                    if pinned {
+                        keepTabOpen(id: tab.id)
+                    }
                     return
                 }
             }
@@ -6227,28 +6273,62 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             fileName = (path as NSString).lastPathComponent
         }
 
+        let previewEnabled = isDiffPreviewTabEnabled
+        if previewEnabled, let previewTab = group.tabs.first(where: { $0.isPreview }) {
+            previewTab.content = .diff(source: source)
+            previewTab.title = fileName
+            previewTab.isPreview = !pinned
+            if group.activeTabID != previewTab.id {
+                deactivateCurrentTab()
+                group.activeTabID = previewTab.id
+            }
+            startDiffTabSession(tabID: previewTab.id, source: source)
+            return
+        }
+
         let tab = Tab(title: fileName, content: .diff(source: source))
+        tab.isPreview = previewEnabled && !pinned
         deactivateCurrentTab()
         group.addTab(tab)
         group.activeTabID = tab.id
+        startDiffTabSession(tabID: tab.id, source: source)
+    }
 
-        diffStates[tab.id] = .loading
+    /// Promotes the preview tab `id` (in any group) to a permanent tab, so
+    /// the next single-click in the Changes sidebar no longer replaces it.
+    /// No-op for an unknown id or an already-permanent tab.
+    func keepTabOpen(id: UUID) {
+        guard let tab = windowSession.groups.tabAndGroup(tabID: id)?.tab, tab.isPreview else { return }
+        tab.isPreview = false
+        refreshHostingView()
+    }
+
+    /// (Re)initialises the per-tab diff state for `tabID` showing `source`:
+    /// load state, a fresh review store and the diff-load Task. Shared by
+    /// the new-tab and preview-reuse paths of `openDiffTab(source:pinned:)`
+    /// so a reused tab never keeps the previous file's state or comments.
+    private func startDiffTabSession(tabID: UUID, source: DiffSource) {
+        diffStates[tabID] = .loading
         let reviewStore = DiffReviewStore()
-        reviewStore.onCommentsChanged = { [weak self] in self?.refreshHostingView() }
-        reviewStores[tab.id] = reviewStore
+        reviewStore.onCommentsChanged = { [weak self, weak reviewStore] in
+            guard let self else { return }
+            // Commenting on a preview diff means the user wants to keep
+            // it: promote so the next single-click doesn't discard it.
+            if let reviewStore, !reviewStore.comments.isEmpty,
+               let tab = self.windowSession.groups.tabAndGroup(tabID: tabID)?.tab {
+                tab.isPreview = false
+            }
+            self.refreshHostingView()
+        }
+        reviewStores[tabID] = reviewStore
         refreshHostingView()
 
-        let tabID = tab.id
-        // Plain subscript store, not `insert(_:task:)`: tabID is the id
-        // of the `Tab()` just created above, so this key was never
-        // registered before -- `insert`'s cancel-before-replace would
-        // never actually match anything here, mirroring
-        // `reconnectEstablishGraceTasks`' own "fresh key" reasoning at
-        // its `insert` call site above. This Task also never self-
-        // removes its own entry once done (unlike `expandTasks`'/
-        // `childExitedTasks`' Tasks) -- a pre-existing divergence kept
-        // as-is here, not something this refactor changes.
-        diffTasks[tabID] = Task { [weak self] in
+        // `insert(_:task:)` cancels any previous load for this key: on the
+        // preview-reuse path the tab id is already registered with the
+        // previous file's load, which must not land after this one. For a
+        // fresh tab id it is equivalent to a plain store. The Task never
+        // self-removes its entry once done (pre-existing behaviour).
+        diffTasks.insert(tabID, task: Task { [weak self] in
             guard let self else { return }
             do {
                 let rawDiff = try await GitService.fileDiff(source: source)
@@ -6272,7 +6352,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 self.diffStates[tabID] = .error(error.localizedDescription)
                 self.refreshHostingView()
             }
-        }
+        })
     }
 
     /// `findSeedWorkDirs()` for the Changes sidebar, with the standardizer

@@ -11,6 +11,9 @@ struct TabBarContentView: View {
     var onTabSelected: ((UUID) -> Void)?
     var onNewTab: (() -> Void)?
     var onCloseTab: ((UUID) -> Void)?
+    /// Promotes a preview diff tab to permanent (issue #51); reached by
+    /// double-clicking a preview tab or its "Keep Open" menu item.
+    var onKeepTabOpen: ((UUID) -> Void)?
     var onCloseOtherTabs: ((UUID) -> Void)?
     var onCloseTabsToTheRight: ((UUID) -> Void)?
     var onShowAllTabs: (() -> Void)?
@@ -34,6 +37,7 @@ struct TabBarContentView: View {
                                 tabCount: tabs.count,
                                 onSelected: { onTabSelected?(tab.id) },
                                 onClose: { onCloseTab?(tab.id) },
+                                onKeepOpen: { onKeepTabOpen?(tab.id) },
                                 onCloseOtherTabs: { onCloseOtherTabs?(tab.id) },
                                 onCloseTabsToTheRight: { onCloseTabsToTheRight?(tab.id) },
                                 onShowAllTabs: onShowAllTabs,
@@ -399,6 +403,7 @@ private struct TabItemButton: View {
     let tabCount: Int
     var onSelected: (() -> Void)?
     var onClose: (() -> Void)?
+    var onKeepOpen: (() -> Void)?
     var onCloseOtherTabs: (() -> Void)?
     var onCloseTabsToTheRight: (() -> Void)?
     var onShowAllTabs: (() -> Void)?
@@ -436,7 +441,13 @@ private struct TabItemButton: View {
                 onSelected?()
             },
             onDoubleClick: {
-                isEditing = true
+                // A preview diff tab's double-click means "keep it", as
+                // in VS Code; every other tab keeps inline rename.
+                if tab.isPreview {
+                    onKeepOpen?()
+                } else {
+                    isEditing = true
+                }
             },
             onClose: {
                 onClose?()
@@ -461,7 +472,8 @@ private struct TabItemButton: View {
                         showAllTabs: { onShowAllTabs?() },
                         rename: {
                             isEditing = true
-                        }
+                        },
+                        keepOpen: tab.isPreview ? { onKeepOpen?() } : nil
                     )
                 )
             }
@@ -490,6 +502,8 @@ private struct TabItemButton: View {
                     Text(visibleTitle.isEmpty ? fallbackTitle : visibleTitle)
                         .lineLimit(1)
                         .font(.system(size: 12.5, weight: isActive ? .semibold : .medium, design: .rounded))
+                        // Italic marks the reusable preview diff tab.
+                        .italic(tab.isPreview)
                         .tracking(0.18)
                         .foregroundStyle(isActive ? .primary : .secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)

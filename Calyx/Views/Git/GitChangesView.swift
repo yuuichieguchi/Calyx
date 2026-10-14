@@ -10,6 +10,11 @@ struct GitChangesView: View {
 
     var onWorkingFileSelected: ((String, GitFileEntry) -> Void)?
     var onCommitFileSelected: ((String, CommitFileEntry) -> Void)?
+    /// Double-click on a file row: open its diff as a permanent tab
+    /// (issue #51). Fires alongside, not instead of, the single-click
+    /// handler, so single-click is never delayed.
+    var onWorkingFileOpenPinned: ((String, GitFileEntry) -> Void)?
+    var onCommitFileOpenPinned: ((String, CommitFileEntry) -> Void)?
     var onRefresh: (() -> Void)?
     var onLoadMore: ((String) -> Void)?
     var onExpandCommit: ((String, String) -> Void)?
@@ -131,6 +136,8 @@ struct GitChangesView: View {
                         onDiscardTask: { onDiscardWorktreeTask?(section.id) },
                         onWorkingFileSelected: { entry in onWorkingFileSelected?(section.id, entry) },
                         onCommitFileSelected: { file in onCommitFileSelected?(section.id, file) },
+                        onWorkingFileOpenPinned: { entry in onWorkingFileOpenPinned?(section.id, entry) },
+                        onCommitFileOpenPinned: { file in onCommitFileOpenPinned?(section.id, file) },
                         onLoadMore: { onLoadMore?(section.id) },
                         onExpandCommit: { hash in onExpandCommit?(section.id, hash) },
                         onSelectRefFilter: { selection in onSelectRefFilter?(section.id, selection) }
@@ -158,6 +165,11 @@ private struct GitRepoSectionView: View {
     var onDiscardTask: (() -> Void)?
     var onWorkingFileSelected: ((GitFileEntry) -> Void)?
     var onCommitFileSelected: ((CommitFileEntry) -> Void)?
+    /// Double-click on a file row: open its diff as a permanent tab
+    /// (issue #51). Fires alongside, not instead of, the single-click
+    /// handler, so single-click is never delayed.
+    var onWorkingFileOpenPinned: ((GitFileEntry) -> Void)?
+    var onCommitFileOpenPinned: ((CommitFileEntry) -> Void)?
     var onLoadMore: (() -> Void)?
     var onExpandCommit: ((String) -> Void)?
     var onSelectRefFilter: ((GitRefSelection) -> Void)?
@@ -386,6 +398,8 @@ private struct GitRepoSectionView: View {
                 commitFiles: commitFiles,
                 onWorkingFileSelected: onWorkingFileSelected,
                 onCommitFileSelected: onCommitFileSelected,
+                onWorkingFileOpenPinned: onWorkingFileOpenPinned,
+                onCommitFileOpenPinned: onCommitFileOpenPinned,
                 onLoadMore: onLoadMore,
                 onExpandCommit: onExpandCommit
             )
@@ -429,6 +443,11 @@ private struct GitRepoChangesBody: View {
     let commitFiles: [String: [CommitFileEntry]]
     var onWorkingFileSelected: ((GitFileEntry) -> Void)?
     var onCommitFileSelected: ((CommitFileEntry) -> Void)?
+    /// Double-click on a file row: open its diff as a permanent tab
+    /// (issue #51). Fires alongside, not instead of, the single-click
+    /// handler, so single-click is never delayed.
+    var onWorkingFileOpenPinned: ((GitFileEntry) -> Void)?
+    var onCommitFileOpenPinned: ((CommitFileEntry) -> Void)?
     var onLoadMore: (() -> Void)?
     var onExpandCommit: ((String) -> Void)?
 
@@ -458,6 +477,7 @@ private struct GitRepoChangesBody: View {
                         ForEach(staged) { entry in
                             GitFileRow(entry: entry)
                                 .onTapGesture { onWorkingFileSelected?(entry) }
+                                .simultaneousGesture(TapGesture(count: 2).onEnded { onWorkingFileOpenPinned?(entry) })
                         }
                     } label: {
                         HStack {
@@ -479,6 +499,7 @@ private struct GitRepoChangesBody: View {
                         ForEach(unstaged) { entry in
                             GitFileRow(entry: entry)
                                 .onTapGesture { onWorkingFileSelected?(entry) }
+                                .simultaneousGesture(TapGesture(count: 2).onEnded { onWorkingFileOpenPinned?(entry) })
                         }
                     } label: {
                         HStack {
@@ -500,6 +521,7 @@ private struct GitRepoChangesBody: View {
                         ForEach(untracked) { entry in
                             GitFileRow(entry: entry)
                                 .onTapGesture { onWorkingFileSelected?(entry) }
+                                .simultaneousGesture(TapGesture(count: 2).onEnded { onWorkingFileOpenPinned?(entry) })
                         }
                     } label: {
                         HStack {
@@ -557,7 +579,8 @@ private struct GitRepoChangesBody: View {
                             isExpanded: expandedCommitIDs.contains(commit.id),
                             files: commitFiles[commit.id] ?? [],
                             onTap: { onExpandCommit?(commit.id) },
-                            onFileSelected: { file in onCommitFileSelected?(file) }
+                            onFileSelected: { file in onCommitFileSelected?(file) },
+                            onFileOpenPinned: { file in onCommitFileOpenPinned?(file) }
                         )
                         .accessibilityIdentifier(AccessibilityID.Git.commitRow(commit.shortHash))
                         .onAppear {
@@ -641,6 +664,8 @@ private struct CommitRowView: View {
     let files: [CommitFileEntry]
     var onTap: (() -> Void)?
     var onFileSelected: ((CommitFileEntry) -> Void)?
+    /// Double-click on a commit file row: open as a permanent tab.
+    var onFileOpenPinned: ((CommitFileEntry) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -728,6 +753,7 @@ private struct CommitRowView: View {
                 ForEach(files) { file in
                     CommitFileRow(file: file)
                         .onTapGesture { onFileSelected?(file) }
+                        .simultaneousGesture(TapGesture(count: 2).onEnded { onFileOpenPinned?(file) })
                 }
             }
         }

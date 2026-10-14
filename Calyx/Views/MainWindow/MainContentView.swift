@@ -31,6 +31,9 @@ struct MainContentView: View {
     var onNewTab: (() -> Void)?
     var onNewGroup: (() -> Void)?
     var onCloseTab: ((UUID) -> Void)?
+    /// Promotes a preview diff tab to permanent (issue #51): tab-bar /
+    /// sidebar double-click on a preview tab, or its "Keep Open" item.
+    var onKeepTabOpen: ((UUID) -> Void)?
     var onCloseOtherTabs: ((UUID) -> Void)?
     var onCloseTabsToTheRight: ((UUID) -> Void)?
     var onShowAllTabs: (() -> Void)?
@@ -40,6 +43,9 @@ struct MainContentView: View {
     var onDismissCommandPalette: (() -> Void)?
     var onWorkingFileSelected: ((String, GitFileEntry) -> Void)?
     var onCommitFileSelected: ((String, CommitFileEntry) -> Void)?
+    /// Double-click in the Changes list: open the diff as a permanent tab.
+    var onWorkingFileOpenPinned: ((String, GitFileEntry) -> Void)?
+    var onCommitFileOpenPinned: ((String, CommitFileEntry) -> Void)?
     var onRefreshGitStatus: (() -> Void)?
     var onLoadMoreCommits: ((String) -> Void)?
     var onExpandCommit: ((String, String) -> Void)?
@@ -173,6 +179,7 @@ struct MainContentView: View {
                             onTabSelected: onTabSelected,
                             onNewGroup: onNewGroup,
                             onCloseTab: onCloseTab,
+                            onKeepTabOpen: onKeepTabOpen,
                             onCloseOtherTabs: onCloseOtherTabs,
                             onCloseTabsToTheRight: onCloseTabsToTheRight,
                             onShowAllTabs: onShowAllTabs,
@@ -185,6 +192,8 @@ struct MainContentView: View {
                             onGroupColorChanged: onGroupColorChanged,
                             onWorkingFileSelected: onWorkingFileSelected,
                             onCommitFileSelected: onCommitFileSelected,
+                            onWorkingFileOpenPinned: onWorkingFileOpenPinned,
+                            onCommitFileOpenPinned: onCommitFileOpenPinned,
                             onRefreshGitStatus: onRefreshGitStatus,
                             onLoadMoreCommits: onLoadMoreCommits,
                             onExpandCommit: onExpandCommit,
@@ -221,6 +230,7 @@ struct MainContentView: View {
                                     onTabSelected: onTabSelected,
                                     onNewTab: onNewTab,
                                     onCloseTab: onCloseTab,
+                            onKeepTabOpen: onKeepTabOpen,
                                     onCloseOtherTabs: onCloseOtherTabs,
                                     onCloseTabsToTheRight: onCloseTabsToTheRight,
                                     onShowAllTabs: onShowAllTabs,
