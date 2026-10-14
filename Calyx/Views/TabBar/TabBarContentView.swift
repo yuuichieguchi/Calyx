@@ -501,7 +501,8 @@ private struct TabItemButton: View {
                 } else {
                     Text(visibleTitle.isEmpty ? fallbackTitle : visibleTitle)
                         .lineLimit(1)
-                        .font(.system(size: 12.5, weight: isActive ? .semibold : .medium, design: .rounded))
+                        // SF Rounded has no italic face, so a preview tab uses SF Pro (.default) for the italic to render.
+                        .font(.system(size: 12.5, weight: isActive ? .semibold : .medium, design: tab.isPreview ? .default : .rounded))
                         // Italic marks the reusable preview diff tab.
                         .italic(tab.isPreview)
                         .tracking(0.18)
