@@ -178,6 +178,11 @@ class SettingsWindowController: NSWindowController {
             return SectionHeading(title: "Glass", subtitle: "Controls the transparency of the glass effect.")
         case .smoothScrolling:
             return SectionHeading(title: "Scrolling", subtitle: nil)
+        case .gitDiffPreviewTab:
+            return SectionHeading(
+                title: "Changes",
+                subtitle: "Open diffs from the Changes sidebar in a single reusable preview tab. Double-click, comment, or Keep Open to keep a diff tab."
+            )
         case .lspAutoInstall:
             return SectionHeading(
                 title: "Auto-Install",
@@ -269,6 +274,8 @@ class SettingsWindowController: NSWindowController {
             return glassOpacityCellsRow()
         case .smoothScrolling:
             return smoothScrollingRow()
+        case .gitDiffPreviewTab:
+            return gitDiffPreviewTabRow()
         case .lspAutoInstall:
             return lspAutoInstallRow()
         case .lspRequireConfirmation:
@@ -361,6 +368,17 @@ class SettingsWindowController: NSWindowController {
         smoothScrollSwitch.target = self
         smoothScrollSwitch.action = #selector(smoothScrollDidChange(_:))
         return controlRow(label: "Smooth Scrolling", control: smoothScrollSwitch)
+    }
+
+    /// Toggle for `CalyxWindowController.gitDiffPreviewTabEnabledKey`;
+    /// absent key reads as ON, matching `openDiffTab(source:pinned:)`.
+    private func gitDiffPreviewTabRow() -> NSView {
+        let previewSwitch = NSSwitch()
+        previewSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.gitDiffPreviewTabSwitch)
+        previewSwitch.state = (UserDefaults.standard.object(forKey: CalyxWindowController.gitDiffPreviewTabEnabledKey) as? Bool ?? true) ? .on : .off
+        previewSwitch.target = self
+        previewSwitch.action = #selector(gitDiffPreviewTabDidChange(_:))
+        return controlRow(label: "Open diffs in a preview tab", control: previewSwitch)
     }
 
     private func lspAutoInstallRow() -> NSView {
@@ -684,6 +702,11 @@ class SettingsWindowController: NSWindowController {
         if !enabled {
             NotificationCenter.default.post(name: .smoothScrollSettingChanged, object: nil)
         }
+    }
+
+    /// Read on each `openDiffTab` call, so no notification is needed.
+    @objc private func gitDiffPreviewTabDidChange(_ sender: NSSwitch) {
+        UserDefaults.standard.set(sender.state == .on, forKey: CalyxWindowController.gitDiffPreviewTabEnabledKey)
     }
 
     @objc private func lspAutoInstallDidChange(_ sender: NSSwitch) {

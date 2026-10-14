@@ -16,6 +16,8 @@ struct SidebarContentView: View {
     var onTabSelected: ((UUID) -> Void)?
     var onNewGroup: (() -> Void)?
     var onCloseTab: ((UUID) -> Void)?
+    /// Promotes a preview diff tab to permanent (issue #51).
+    var onKeepTabOpen: ((UUID) -> Void)?
     var onCloseOtherTabs: ((UUID) -> Void)?
     var onCloseTabsToTheRight: ((UUID) -> Void)?
     var onShowAllTabs: (() -> Void)?
@@ -28,6 +30,9 @@ struct SidebarContentView: View {
     var onGroupColorChanged: (() -> Void)?
     var onWorkingFileSelected: ((String, GitFileEntry) -> Void)?
     var onCommitFileSelected: ((String, CommitFileEntry) -> Void)?
+    /// Double-click in the Changes list: open the diff as a permanent tab.
+    var onWorkingFileOpenPinned: ((String, GitFileEntry) -> Void)?
+    var onCommitFileOpenPinned: ((String, CommitFileEntry) -> Void)?
     var onRefreshGitStatus: (() -> Void)?
     var onLoadMoreCommits: ((String) -> Void)?
     var onExpandCommit: ((String, String) -> Void)?
@@ -194,6 +199,7 @@ struct SidebarContentView: View {
                                 onGroupSelected: onGroupSelected,
                                 onTabSelected: onTabSelected,
                                 onCloseTab: onCloseTab,
+                                onKeepTabOpen: onKeepTabOpen,
                                 onCloseOtherTabs: onCloseOtherTabs,
                                 onCloseTabsToTheRight: onCloseTabsToTheRight,
                                 onShowAllTabs: onShowAllTabs,
@@ -269,6 +275,8 @@ struct SidebarContentView: View {
                     state: gitSidebarState,
                     onWorkingFileSelected: onWorkingFileSelected,
                     onCommitFileSelected: onCommitFileSelected,
+                    onWorkingFileOpenPinned: onWorkingFileOpenPinned,
+                    onCommitFileOpenPinned: onCommitFileOpenPinned,
                     onRefresh: onRefreshGitStatus,
                     onLoadMore: onLoadMoreCommits,
                     onExpandCommit: onExpandCommit,
@@ -350,6 +358,8 @@ private struct GroupSectionView: View {
     var onGroupSelected: ((UUID) -> Void)?
     var onTabSelected: ((UUID) -> Void)?
     var onCloseTab: ((UUID) -> Void)?
+    /// Promotes a preview diff tab to permanent (issue #51).
+    var onKeepTabOpen: ((UUID) -> Void)?
     var onCloseOtherTabs: ((UUID) -> Void)?
     var onCloseTabsToTheRight: ((UUID) -> Void)?
     var onShowAllTabs: (() -> Void)?
@@ -605,6 +615,7 @@ private struct GroupSectionView: View {
                             tabCount: group.tabs.count,
                             onSelected: { onTabSelected?(tab.id) },
                             onClose: { onCloseTab?(tab.id) },
+                            onKeepOpen: { onKeepTabOpen?(tab.id) },
                             onCloseOtherTabs: { onCloseOtherTabs?(tab.id) },
                             onCloseTabsToTheRight: { onCloseTabsToTheRight?(tab.id) },
                             onShowAllTabs: onShowAllTabs,
@@ -751,6 +762,7 @@ private struct TabRowItemView: View {
     let tabCount: Int
     var onSelected: (() -> Void)?
     var onClose: (() -> Void)?
+    var onKeepOpen: (() -> Void)?
     var onCloseOtherTabs: (() -> Void)?
     var onCloseTabsToTheRight: (() -> Void)?
     var onShowAllTabs: (() -> Void)?
@@ -793,7 +805,13 @@ private struct TabRowItemView: View {
                 onSelected?()
             },
             onDoubleClick: {
-                isEditing = true
+                // A preview diff tab's double-click means "keep it" (see
+                // `TabItemButton`); every other tab keeps inline rename.
+                if tab.isPreview {
+                    onKeepOpen?()
+                } else {
+                    isEditing = true
+                }
             },
             onClose: {
                 onClose?()
@@ -819,7 +837,8 @@ private struct TabRowItemView: View {
                         closeOthers: { onCloseOtherTabs?() },
                         closeToTheRight: { onCloseTabsToTheRight?() },
                         showAllTabs: { onShowAllTabs?() },
-                        rename: { isEditing = true }
+                        rename: { isEditing = true },
+                        keepOpen: tab.isPreview ? { onKeepOpen?() } : nil
                     )
                 )
             }
@@ -849,7 +868,10 @@ private struct TabRowItemView: View {
                 } else {
                     Text(displayText)
                         .lineLimit(1)
-                        .font(.system(size: 12.5, weight: isActive ? .semibold : .medium, design: .rounded))
+                        // SF Rounded has no italic face, so a preview tab uses SF Pro (.default) for the italic to render.
+                        .font(.system(size: 12.5, weight: isActive ? .semibold : .medium, design: tab.isPreview ? .default : .rounded))
+                        // Italic marks the reusable preview diff tab.
+                        .italic(tab.isPreview)
                 }
                 Spacer()
                 MCPAppActivityDot(tabID: tab.id)

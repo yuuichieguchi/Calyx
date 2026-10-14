@@ -95,6 +95,7 @@ final class SettingsPaneTests: XCTestCase {
         ("glassOpacity", .appearance),
         ("glassOpacityCells", .appearance),
         ("smoothScrolling", .appearance),
+        ("gitDiffPreviewTab", .appearance),
         ("lspAutoInstall", .lsp),
         ("lspRequireConfirmation", .lsp),
         ("persistentSessions", .sessions),

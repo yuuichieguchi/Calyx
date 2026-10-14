@@ -143,6 +143,7 @@ enum AccessibilityID {
         static let agentResumeAutoExecuteSwitch = "calyx.settings.sessions.agentResumeAutoExecuteSwitch"
         static let commandTrackingSwitch = "calyx.settings.sessions.commandTrackingSwitch"
         static let smoothScrollingSwitch = "calyx.settings.appearance.smoothScrollingSwitch"
+        static let gitDiffPreviewTabSwitch = "calyx.settings.appearance.gitDiffPreviewTabSwitch"
         static let glassOpacityCellsSwitch = "calyx.settings.appearance.glassOpacityCellsSwitch"
         static let lspAutoInstallSwitch = "calyx.settings.lsp.lspAutoInstallSwitch"
         static let lspRequireConfirmationSwitch = "calyx.settings.lsp.lspRequireConfirmationSwitch"

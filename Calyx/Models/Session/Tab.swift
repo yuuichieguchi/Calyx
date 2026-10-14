@@ -55,6 +55,15 @@ class Tab: Identifiable {
     var splitTree: SplitTree
     var content: TabContent
     var unreadNotifications: Int = 0
+    /// `true` while this is the reusable "preview" diff tab opened by a
+    /// single click in the Changes sidebar (issue #51, VS Code's
+    /// `workbench.editor.enablePreview`): the next single-click replaces
+    /// its content instead of opening another tab. Only ever set by
+    /// `CalyxWindowController.openDiffTab(source:pinned:)`, and cleared by
+    /// `keepTabOpen(id:)` or by adding a review comment. Not persisted
+    /// (diff tabs are never snapshotted) and not an init parameter (mirrors
+    /// `unreadNotifications`), so every other tab is permanent.
+    var isPreview: Bool = false
     var lastNotificationTime: Date?
     let registry: SurfaceRegistry
     /// calyx-session references for this tab's persistent-session
