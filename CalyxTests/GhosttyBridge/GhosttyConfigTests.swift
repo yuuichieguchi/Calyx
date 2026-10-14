@@ -179,13 +179,13 @@ struct GhosttyConfigTests {
             "background-opacity",
             "background-blur",
             "background-opacity-cells",
-            "font-codepoint-map",
             "foreground",
         ]
         let managed = GhosttyConfigManager.managedKeys
         for key in expectedKeys {
             #expect(managed.contains(key), "managedKeys should contain '\(key)'")
         }
+        #expect(!managed.contains("font-codepoint-map"), "font-codepoint-map must not be a Calyx-managed key (#50)")
     }
 
     @Test("managedKeys has no duplicates")
@@ -227,7 +227,6 @@ struct GhosttyConfigTests {
             "background-opacity",
             "background-blur",
             "background-opacity-cells",
-            "font-codepoint-map",
         ]
 
         let managed = Set(GhosttyConfigManager.managedKeys)
@@ -335,14 +334,6 @@ struct GhosttyConfigRuntimeOverrideTextTests {
         background-opacity = 0.700
         background-blur = macos-glass-regular
         background-opacity-cells = false
-        font-codepoint-map = U+2600-U+27BF=Apple Color Emoji
-        font-codepoint-map = U+1F300-U+1F5FF=Apple Color Emoji
-        font-codepoint-map = U+1F600-U+1F64F=Apple Color Emoji
-        font-codepoint-map = U+1F680-U+1F6FF=Apple Color Emoji
-        font-codepoint-map = U+1F7E0-U+1F7FF=Apple Color Emoji
-        font-codepoint-map = U+1F900-U+1F9FF=Apple Color Emoji
-        font-codepoint-map = U+1FA70-U+1FAFF=Apple Color Emoji
-        font-codepoint-map = U+FE00-U+FE0F=Apple Color Emoji
         # --- End Calyx Runtime Override ---
         """
         #expect(result == expected,
@@ -428,8 +419,8 @@ struct GhosttyConfigRuntimeOverrideTextTests {
         #expect(result.contains("# --- End Calyx Runtime Override ---"))
     }
 
-    @Test("All 8 font-codepoint-map lines are present, none dropped")
-    func fontCodepointMapLinesAllPresent() {
+    @Test("No font-codepoint-map lines are emitted (#50)")
+    func noFontCodepointMapLines() {
         let result = GhosttyConfigManager.runtimeOverrideText(
             glassOpacity: 0.7,
             opacityCells: false,
@@ -439,8 +430,8 @@ struct GhosttyConfigRuntimeOverrideTextTests {
         let mapLineCount = result.split(separator: "\n")
             .filter { $0.trimmingCharacters(in: .whitespaces).hasPrefix("font-codepoint-map = ") }
             .count
-        #expect(mapLineCount == 8,
-                "Exactly 8 font-codepoint-map lines must be present, found \(mapLineCount)")
+        #expect(mapLineCount == 0,
+                "No font-codepoint-map lines may be emitted (#50), found \(mapLineCount)")
     }
 
     // "original" at glassOpacity 0.7 is pinned by darkPresetReturnsWhiteForeground

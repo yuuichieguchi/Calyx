@@ -27,7 +27,6 @@ final class GhosttyConfigManager {
         "background-opacity",
         "background-blur",
         "background-opacity-cells",
-        "font-codepoint-map",
         "foreground",
     ]
 
@@ -187,14 +186,6 @@ final class GhosttyConfigManager {
         background-opacity = \(String(format: "%.3f", clampedOpacity))
         background-blur = macos-glass-regular
         background-opacity-cells = \(opacityCells ? "true" : "false")
-        font-codepoint-map = U+2600-U+27BF=Apple Color Emoji
-        font-codepoint-map = U+1F300-U+1F5FF=Apple Color Emoji
-        font-codepoint-map = U+1F600-U+1F64F=Apple Color Emoji
-        font-codepoint-map = U+1F680-U+1F6FF=Apple Color Emoji
-        font-codepoint-map = U+1F7E0-U+1F7FF=Apple Color Emoji
-        font-codepoint-map = U+1F900-U+1F9FF=Apple Color Emoji
-        font-codepoint-map = U+1FA70-U+1FAFF=Apple Color Emoji
-        font-codepoint-map = U+FE00-U+FE0F=Apple Color Emoji
         # --- End Calyx Runtime Override ---
         """
 
