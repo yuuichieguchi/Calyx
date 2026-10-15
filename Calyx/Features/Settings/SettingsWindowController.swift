@@ -14,6 +14,11 @@ class SettingsWindowController: NSWindowController {
     private let opacityLabel = NSTextField(labelWithString: "")
     private let opacitySlider = NSSlider(value: 0.7, minValue: 0.0, maxValue: 1.0, target: nil, action: nil)
     private let presetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    /// Diff layout controls, held so `diffLayoutSettingDidChange` can
+    /// re-sync them when the settings change elsewhere (palette, toolbar).
+    private let diffLayoutPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let diffHideUnchangedRegionsSwitch = NSSwitch()
+    private let diffIgnoreTrimWhitespaceSwitch = NSSwitch()
     private let colorWell = NSColorWell()
     private let hexField = NSTextField()
     /// The AI Agent IPC row's three controls -- stored so
@@ -119,6 +124,10 @@ class SettingsWindowController: NSWindowController {
         NotificationCenter.default.addObserver(
             self, selector: #selector(agentIPCStateDidChange),
             name: .calyxIPCStateDidChange, object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(diffLayoutSettingDidChange(_:)),
+            name: .diffLayoutSettingChanged, object: nil
         )
         // Arms the feed's observers (status, IPC state, monitor values).
         _ = usageTelemetryStatusFeed
@@ -231,7 +240,8 @@ class SettingsWindowController: NSWindowController {
             )
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
-        case .glassOpacityCells, .themeColorWell, .themeColorHex, .lspRequireConfirmation,
+        case .glassOpacityCells, .gitDiffLayout, .gitDiffHideUnchangedRegions, .gitDiffIgnoreTrimWhitespace,
+             .themeColorWell, .themeColorHex, .lspRequireConfirmation,
              .historyPersistence, .ipcWake, .agentResumeAutoExecute,
              .openSessionBrowserButton:
             return nil
@@ -276,6 +286,12 @@ class SettingsWindowController: NSWindowController {
             return smoothScrollingRow()
         case .gitDiffPreviewTab:
             return gitDiffPreviewTabRow()
+        case .gitDiffLayout:
+            return gitDiffLayoutRow()
+        case .gitDiffHideUnchangedRegions:
+            return gitDiffHideUnchangedRegionsRow()
+        case .gitDiffIgnoreTrimWhitespace:
+            return gitDiffIgnoreTrimWhitespaceRow()
         case .lspAutoInstall:
             return lspAutoInstallRow()
         case .lspRequireConfirmation:
@@ -381,6 +397,40 @@ class SettingsWindowController: NSWindowController {
         return controlRow(label: "Open diffs in a preview tab", control: previewSwitch)
     }
 
+    private func gitDiffLayoutRow() -> NSView {
+        for pref in DiffLayoutPreference.allCases {
+            diffLayoutPopup.addItem(withTitle: pref.displayName)
+        }
+        diffLayoutPopup.setAccessibilityIdentifier(AccessibilityID.Settings.gitDiffLayoutPopup)
+        diffLayoutPopup.selectItem(at: Self.diffLayoutInitialSelectionIndex())
+        diffLayoutPopup.target = self
+        diffLayoutPopup.action = #selector(gitDiffLayoutDidChange(_:))
+        return controlRow(label: "Diff layout", control: diffLayoutPopup)
+    }
+
+    private func gitDiffHideUnchangedRegionsRow() -> NSView {
+        diffHideUnchangedRegionsSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.gitDiffHideUnchangedRegionsSwitch)
+        diffHideUnchangedRegionsSwitch.state = Self.sessionToggleInitialState(for: .gitDiffHideUnchangedRegions) ? .on : .off
+        diffHideUnchangedRegionsSwitch.target = self
+        diffHideUnchangedRegionsSwitch.action = #selector(gitDiffHideUnchangedRegionsDidChange(_:))
+        return controlRow(label: "Collapse unchanged regions", control: diffHideUnchangedRegionsSwitch)
+    }
+
+    private func gitDiffIgnoreTrimWhitespaceRow() -> NSView {
+        diffIgnoreTrimWhitespaceSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.gitDiffIgnoreTrimWhitespaceSwitch)
+        diffIgnoreTrimWhitespaceSwitch.state = Self.sessionToggleInitialState(for: .gitDiffIgnoreTrimWhitespace) ? .on : .off
+        diffIgnoreTrimWhitespaceSwitch.target = self
+        diffIgnoreTrimWhitespaceSwitch.action = #selector(gitDiffIgnoreTrimWhitespaceDidChange(_:))
+        return controlRow(label: "Ignore trim whitespace", control: diffIgnoreTrimWhitespaceSwitch)
+    }
+
+    /// Index into `DiffLayoutPreference.allCases` of the persisted
+    /// preference; the popup's items are built in that order.
+    static func diffLayoutInitialSelectionIndex() -> Int {
+        // allCases contains every case, so firstIndex always succeeds.
+        DiffLayoutPreference.allCases.firstIndex(of: DiffLayoutSettings.preference)!
+    }
+
     private func lspAutoInstallRow() -> NSView {
         let autoInstallSwitch = NSSwitch()
         autoInstallSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.lspAutoInstallSwitch)
@@ -428,6 +478,8 @@ class SettingsWindowController: NSWindowController {
         case .usageTracking: return UsageTrackingSettings.enabled
         case .ipcWake: return IPCWakeSettings.enabled
         case .glassOpacityCells: return UserDefaults.standard.bool(forKey: "terminalGlassOpacityCells")
+        case .gitDiffHideUnchangedRegions: return DiffLayoutSettings.hideUnchangedRegionsEnabled
+        case .gitDiffIgnoreTrimWhitespace: return DiffLayoutSettings.ignoreTrimWhitespace
         default: return false
         }
     }
@@ -707,6 +759,28 @@ class SettingsWindowController: NSWindowController {
     /// Read on each `openDiffTab` call, so no notification is needed.
     @objc private func gitDiffPreviewTabDidChange(_ sender: NSSwitch) {
         UserDefaults.standard.set(sender.state == .on, forKey: CalyxWindowController.gitDiffPreviewTabEnabledKey)
+    }
+
+    @objc private func gitDiffLayoutDidChange(_ sender: NSPopUpButton) {
+        // The popup's items are DiffLayoutPreference.allCases in order and a
+        // user selection always leaves one item selected.
+        DiffLayoutSettings.preference = DiffLayoutPreference.allCases[sender.indexOfSelectedItem]
+    }
+
+    @objc private func gitDiffHideUnchangedRegionsDidChange(_ sender: NSSwitch) {
+        DiffLayoutSettings.hideUnchangedRegionsEnabled = sender.state == .on
+    }
+
+    @objc private func gitDiffIgnoreTrimWhitespaceDidChange(_ sender: NSSwitch) {
+        DiffLayoutSettings.ignoreTrimWhitespace = sender.state == .on
+    }
+
+    /// Re-syncs the diff controls when a setting changes elsewhere while
+    /// this window exists.
+    @objc private func diffLayoutSettingDidChange(_ notification: Notification) {
+        diffLayoutPopup.selectItem(at: Self.diffLayoutInitialSelectionIndex())
+        diffHideUnchangedRegionsSwitch.state = DiffLayoutSettings.hideUnchangedRegionsEnabled ? .on : .off
+        diffIgnoreTrimWhitespaceSwitch.state = DiffLayoutSettings.ignoreTrimWhitespace ? .on : .off
     }
 
     @objc private func lspAutoInstallDidChange(_ sender: NSSwitch) {

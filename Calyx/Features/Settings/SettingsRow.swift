@@ -20,6 +20,10 @@ enum SettingsRow: String, CaseIterable {
     case smoothScrolling
     /// Changes-sidebar diffs open in a reusable preview tab (issue #51).
     case gitDiffPreviewTab
+    /// Diff layout preference: Automatic / Inline / Side by Side.
+    case gitDiffLayout
+    case gitDiffHideUnchangedRegions
+    case gitDiffIgnoreTrimWhitespace
     case lspAutoInstall
     case lspRequireConfirmation
     case persistentSessions
@@ -39,7 +43,8 @@ enum SettingsRow: String, CaseIterable {
     var pane: SettingsPane {
         switch self {
         case .themeColorPreset, .themeColorWell, .themeColorHex,
-             .glassOpacity, .glassOpacityCells, .smoothScrolling, .gitDiffPreviewTab, .openConfigFileFooter:
+             .glassOpacity, .glassOpacityCells, .smoothScrolling, .gitDiffPreviewTab,
+             .gitDiffLayout, .gitDiffHideUnchangedRegions, .gitDiffIgnoreTrimWhitespace, .openConfigFileFooter:
             return .appearance
         case .lspAutoInstall, .lspRequireConfirmation:
             return .lsp

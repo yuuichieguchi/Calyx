@@ -260,6 +260,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     /// dictionary discipline.
     private var reconnectEstablishGraceTasks = KeyedTaskRegistry<UUID>()
     private var reviewStores: [UUID: DiffReviewStore] = [:]
+    /// Per-diff-tab unchanged-region reveal state; same lifetime as `reviewStores`.
+    private var diffRevealStates: [UUID: DiffRevealState] = [:]
+    /// The `ignoreTrimWhitespace` value the current (or in-flight) diff of
+    /// each diff tab was computed with; a settings change recomputes the
+    /// tabs whose value differs.
+    private var diffComputedIgnoreTrimWhitespace: [UUID: Bool] = [:]
     private var clipboardConfirmationController: ClipboardConfirmationController?
     /// The New Worktree Task sheet while it is presented. Internal, not
     /// `private`, for the `WorktreeTaskHost` extension in
@@ -622,6 +628,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         return reviewStores[tab.id]
     }
 
+    /// The active tab's reveal state; nil unless the active tab is a diff.
+    var activeDiffRevealState: DiffRevealState? {
+        guard let tab = activeTab, case .diff = tab.content else { return nil }
+        return diffRevealStates[tab.id]
+    }
+
+    var isDiffTabActive: Bool {
+        guard let tab = activeTab, case .diff = tab.content else { return false }
+        return true
+    }
+
     private var totalReviewCommentCount: Int {
         reviewStores.values.filter { $0.hasUnsubmittedComments }.reduce(0) { $0 + $1.comments.count }
     }
@@ -741,6 +758,47 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: - Setup
 
+    /// Diff view palette commands (VS Code diff editor parity); available
+    /// only while a diff tab is active.
+    private func registerDiffLayoutCommands() {
+        let isAvailable: @MainActor @Sendable () -> Bool = { [weak self] in self?.isDiffTabActive ?? false }
+        for pref in DiffLayoutPreference.allCases {
+            commandRegistry.register(PaletteCommand(
+                id: "diff.layout.\(pref.rawValue)",
+                title: "Diff View: \(pref.displayName)",
+                category: "View",
+                isAvailable: isAvailable
+            ) {
+                DiffLayoutSettings.preference = pref
+            })
+        }
+        commandRegistry.register(PaletteCommand(
+            id: "diff.layout.toggleInline", title: "Toggle Inline View", category: "View", isAvailable: isAvailable
+        ) {
+            DiffLayoutSettings.preference = DiffLayoutSettings.preference.toggledInline
+        })
+        commandRegistry.register(PaletteCommand(
+            id: "diff.unchangedRegions.toggle", title: "Toggle Collapse Unchanged Regions", category: "View", isAvailable: isAvailable
+        ) {
+            DiffLayoutSettings.hideUnchangedRegionsEnabled.toggle()
+        })
+        commandRegistry.register(PaletteCommand(
+            id: "diff.unchangedRegions.collapseAll", title: "Collapse All Unchanged Regions", category: "View", isAvailable: isAvailable
+        ) { [weak self] in
+            self?.activeDiffRevealState?.collapseAll()
+        })
+        commandRegistry.register(PaletteCommand(
+            id: "diff.unchangedRegions.showAll", title: "Show All Unchanged Regions", category: "View", isAvailable: isAvailable
+        ) { [weak self] in
+            self?.activeDiffRevealState?.revealAllRegions()
+        })
+        commandRegistry.register(PaletteCommand(
+            id: "diff.ignoreTrimWhitespace.toggle", title: "Toggle Ignore Trim Whitespace", category: "View", isAvailable: isAvailable
+        ) {
+            DiffLayoutSettings.ignoreTrimWhitespace.toggle()
+        })
+    }
+
     private func setupCommandRegistry() {
         commandRegistry.register(PaletteCommand(id: "tab.new", title: "New Tab", shortcut: "Cmd+T", category: "Tabs") { [weak self] in
             self?.createNewTab()
@@ -806,6 +864,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ) {
             UsageWindowController.shared.showUsage()
         })
+        registerDiffLayoutCommands()
         commandRegistry.register(PaletteCommand(id: "browser.open", title: "Open Browser Tab", category: "Browser") { [weak self] in
             self?.promptAndOpenBrowserTab()
         })
@@ -1458,6 +1517,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             activeDiffState: activeDiffState,
             activeDiffSource: activeDiffSource,
             activeDiffReviewStore: activeDiffReviewStore,
+            activeDiffRevealState: activeDiffRevealState,
             recoveryBarModel: recoveryBarModel,
             sidebarMode: Binding(
                 get: { [weak self] in self?.windowSession.sidebarMode ?? .tabs },
@@ -2142,6 +2202,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         diffTasks.removeValue(forKey: tab.id)
         diffStates.removeValue(forKey: tab.id)
         reviewStores.removeValue(forKey: tab.id)
+        diffRevealStates.removeValue(forKey: tab.id)
+        diffComputedIgnoreTrimWhitespace.removeValue(forKey: tab.id)
         tearDownSurfaces(in: tab, isTerminating: false)
     }
 
@@ -2855,6 +2917,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                            name: .ghosttyToggleMaximize, object: nil)
         center.addObserver(self, selector: #selector(handleResetWindowSizeNotification(_:)),
                            name: .ghosttyResetWindowSize, object: nil)
+        center.addObserver(self, selector: #selector(handleDiffLayoutSettingChanged(_:)),
+                           name: .diffLayoutSettingChanged, object: nil)
         // GHOSTTY_ACTION_PROMPT_TITLE (GitHub issue #42): needs the same
         // explicit observer as the two batches above -- see "MARK: -
         // Prompt Title" below.
@@ -5487,6 +5551,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         diffTasks.cancelAll()
         diffStates.removeAll()
         reviewStores.removeAll()
+        diffRevealStates.removeAll()
+        diffComputedIgnoreTrimWhitespace.removeAll()
         expandTasks.cancelAll()
         childExitedTasks.cancelAll()
         reconnectEstablishGraceTasks.cancelAll()
@@ -6321,15 +6387,24 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             self.refreshHostingView()
         }
         reviewStores[tabID] = reviewStore
+        diffRevealStates[tabID] = DiffRevealState()
         refreshHostingView()
+        loadDiff(tabID: tabID, source: source)
+    }
+
+    /// Fetches and computes the diff for `tabID` off the main actor and
+    /// publishes it into `diffStates`. Records the `ignoreTrimWhitespace`
+    /// value used so `handleDiffLayoutSettingChanged` can recompute.
+    private func loadDiff(tabID: UUID, source: DiffSource) {
+        let options = LinesDiffOptions(ignoreTrimWhitespace: DiffLayoutSettings.ignoreTrimWhitespace)
+        diffComputedIgnoreTrimWhitespace[tabID] = options.ignoreTrimWhitespace
 
         // `insert(_:task:)` cancels any previous load for this key: on the
-        // preview-reuse path the tab id is already registered with the
-        // previous file's load, which must not land after this one. For a
-        // fresh tab id it is equivalent to a plain store. The Task never
-        // self-removes its entry once done (pre-existing behaviour).
+        // preview-reuse path (and on a settings recompute) the tab id is
+        // already registered with the previous load, which must not land
+        // after this one. The Task never self-removes its entry once done
+        // (pre-existing behaviour).
         diffTasks.insert(tabID, task: Task { [weak self] in
-            guard let self else { return }
             do {
                 let rawDiff = try await GitService.fileDiff(source: source)
                 guard !Task.isCancelled else { return }
@@ -6339,8 +6414,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 case .unstaged(let p, _), .staged(let p, _), .commit(_, let p, _), .untracked(let p, _):
                     path = p
                 }
-                let parsed = DiffParser.parse(rawDiff, path: path)
-                guard !Task.isCancelled else { return }
+                let parsed = await Self.computeFileDiff(rawDiff, path: path, options: options)
+                guard !Task.isCancelled, let self else { return }
 
                 // Verify tab still exists
                 guard self.windowSession.groups.tabAndGroup(tabID: tabID) != nil else { return }
@@ -6348,11 +6423,53 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 self.diffStates[tabID] = .success(parsed)
                 self.refreshHostingView()
             } catch {
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled, let self else { return }
                 self.diffStates[tabID] = .error(error.localizedDescription)
                 self.refreshHostingView()
             }
         })
+    }
+
+    /// Runs the diff computation on the cooperative pool, not the main
+    /// actor. Above `DiffComputationLimits.maxFileSizeBytes` no diff is
+    /// computed (VS Code `maxFileSize`): both sides are shown uncompared.
+    @concurrent
+    nonisolated private static func computeFileDiff(_ raw: String, path: String, options: LinesDiffOptions) async -> FileDiff {
+        guard DiffContent.exceedsMaxFileSize(byteCount: raw.utf8.count) else {
+            // A superseded load cancels this task: stop computing too.
+            return DiffParser.parse(raw, path: path, options: options,
+                                    wrapTimeout: { CancellationAwareTimeout(base: $0) })
+        }
+        let content = DiffContent.extract(from: raw)
+        if content.isBinary {
+            return FileDiff(path: path, lines: [], isBinary: true, isTruncated: false, isTooLarge: true)
+        }
+        return FileDiff(
+            path: path,
+            lines: DiffLineGenerator.uncomparedLines(content: content),
+            isBinary: false,
+            isTruncated: false,
+            oldLineCount: content.oldLines.count,
+            newLineCount: content.newLines.count,
+            isTooLarge: true
+        )
+    }
+
+    /// Recomputes every open diff tab whose diff was computed with a
+    /// different `ignoreTrimWhitespace` than the current setting. The
+    /// review store, reveal state and current diff stay in place until
+    /// the new result lands.
+    @objc private func handleDiffLayoutSettingChanged(_ notification: Notification) {
+        let current = DiffLayoutSettings.ignoreTrimWhitespace
+        for group in windowSession.groups {
+            for tab in group.tabs {
+                guard case .diff(let source) = tab.content,
+                      let computed = diffComputedIgnoreTrimWhitespace[tab.id],
+                      computed != current
+                else { continue }
+                loadDiff(tabID: tab.id, source: source)
+            }
+        }
     }
 
     /// `findSeedWorkDirs()` for the Changes sidebar, with the standardizer

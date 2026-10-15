@@ -144,6 +144,9 @@ enum AccessibilityID {
         static let commandTrackingSwitch = "calyx.settings.sessions.commandTrackingSwitch"
         static let smoothScrollingSwitch = "calyx.settings.appearance.smoothScrollingSwitch"
         static let gitDiffPreviewTabSwitch = "calyx.settings.appearance.gitDiffPreviewTabSwitch"
+        static let gitDiffLayoutPopup = "calyx.settings.appearance.gitDiffLayoutPopup"
+        static let gitDiffHideUnchangedRegionsSwitch = "calyx.settings.appearance.gitDiffHideUnchangedRegionsSwitch"
+        static let gitDiffIgnoreTrimWhitespaceSwitch = "calyx.settings.appearance.gitDiffIgnoreTrimWhitespaceSwitch"
         static let glassOpacityCellsSwitch = "calyx.settings.appearance.glassOpacityCellsSwitch"
         static let lspAutoInstallSwitch = "calyx.settings.lsp.lspAutoInstallSwitch"
         static let lspRequireConfirmationSwitch = "calyx.settings.lsp.lspRequireConfirmationSwitch"
@@ -294,6 +297,12 @@ enum AccessibilityID {
         static let toolbar = "calyx.diff.toolbar"
         static let content = "calyx.diff.content"
         static let lineNumberGutter = "calyx.diff.lineNumbers"
+        static let moreActionsButton = "calyx.diff.moreActions"
+        static let collapseUnchangedItem = "calyx.diff.collapseUnchangedItem"
+        static let ignoreTrimWhitespaceItem = "calyx.diff.ignoreTrimWhitespaceItem"
+        static func layoutMenuItem(_ pref: DiffLayoutPreference) -> String {
+            "calyx.diff.layoutMenuItem.\(pref.rawValue)"
+        }
     }
     enum DiffReview {
         static let submitButton = "calyx.diff.review.submitButton"

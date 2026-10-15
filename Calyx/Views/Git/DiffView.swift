@@ -1,19 +1,43 @@
 // DiffView.swift
 // Calyx
 //
-// AppKit-based diff viewer with line number gutter and syntax coloring.
+// Container of the diff panes: one inline `DiffPaneView`, or an
+// `NSSplitView` with the original (left) and modified (right) panes.
+// Rows come from `DiffRowBuilder` (+ `UnchangedRegions` when collapsing
+// is enabled); the effective layout follows `DiffLayoutSettings`.
 
 import AppKit
 
 @MainActor
 final class DiffView: NSView {
-    private let scrollView = NSScrollView()
-    private let textView = DiffTextView()
-    private let lineNumberView = DiffLineNumberView()
+    static let splitViewDefaultRatio: CGFloat = 0.5
+    static let splitViewMinPaneWidth: CGFloat = 200
+
+    private let inlinePane = DiffPaneView(side: .left, gutterColumns: .dual, accessibilitySuffix: ".inline")
+    private let leftPane = DiffPaneView(side: .left, gutterColumns: .single, accessibilitySuffix: ".old")
+    private let rightPane = DiffPaneView(side: .right, gutterColumns: .single, accessibilitySuffix: ".new")
+    private let splitView = NSSplitView()
+
     private(set) var currentDiff: FileDiff?
     var reviewStore: DiffReviewStore?
+    var revealState: DiffRevealState? {
+        didSet {
+            guard oldValue !== revealState else { return }
+            oldValue?.onChanged = nil
+            revealState?.onChanged = { [weak self] in
+                self?.rebuild(preserveScroll: true)
+            }
+        }
+    }
+    /// A width-driven layout switch detected in `layout()` is applied on
+    /// the next main-queue turn, outside the layout pass.
+    private var isLayoutSwitchPending = false
     private(set) var displayLines: [DisplayLine] = []
+    private(set) var rows: [DiffLayoutRow] = []
+    private(set) var currentLayout: DiffLayout?
     private var activePopover: NSPopover?
+    private var isSyncingScroll = false
+    private var needsInitialDividerPosition = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -25,268 +49,522 @@ final class DiffView: NSView {
         fatalError("init(coder:) is not supported")
     }
 
+    private var activePanes: [DiffPaneView] {
+        switch currentLayout {
+        case .sideBySide: return [leftPane, rightPane]
+        case .inline, .none: return [inlinePane]
+        }
+    }
+
     private func setupViews() {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
 
-        // Scroll view
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-        addSubview(scrollView)
+        splitView.isVertical = true
+        splitView.dividerStyle = .thin
+        splitView.delegate = self
+        splitView.translatesAutoresizingMaskIntoConstraints = false
+        splitView.addSubview(leftPane)
+        splitView.addSubview(rightPane)
 
-        // Text view
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.isRichText = true
-        textView.usesFindBar = true
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = true
-        textView.textContainerInset = NSSize(width: 4, height: 4)
-        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.textContainer?.widthTracksTextView = false
-        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.drawsBackground = false
-        textView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        scrollView.documentView = textView
+        inlinePane.translatesAutoresizingMaskIntoConstraints = false
 
-        // Line number ruler
-        scrollView.rulersVisible = true
-        scrollView.hasVerticalRuler = true
-        scrollView.verticalRulerView = lineNumberView
-        lineNumberView.clientView = textView
-
-        NSLayoutConstraint.activate([
-            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-
-        // Observe text changes for ruler updates
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(textDidChange(_:)),
-            name: NSView.frameDidChangeNotification, object: textView
-        )
-
-        // Wire up line click callback (gutter)
-        lineNumberView.onLineClicked = { [weak self] displayLineIndex, displayLine in
-            self?.handleLineClicked(displayLineIndex: displayLineIndex, displayLine: displayLine)
-        }
-
-        // Wire up range selection callback (gutter drag)
-        lineNumberView.onRangeSelected = { [weak self] startIdx, endIdx in
-            self?.handleRangeSelected(startDisplayIdx: startIdx, endDisplayIdx: endIdx)
-        }
-
-        // Wire up comment text click (💬 lines in text view)
-        textView.onCommentLineClicked = { [weak self] textLineIndex in
-            guard let self, textLineIndex < self.displayLines.count else { return }
-            let displayLine = self.displayLines[textLineIndex]
-            if case .commentBlock = displayLine {
-                self.handleLineClicked(displayLineIndex: textLineIndex, displayLine: displayLine)
+        for pane in [inlinePane, leftPane, rightPane] {
+            pane.onRowClicked = { [weak self, weak pane] row in
+                guard let self, let pane else { return }
+                self.handleRowClicked(pane: pane, row: row)
+            }
+            pane.onRangeSelected = { [weak self, weak pane] lo, hi in
+                guard let self, let pane else { return }
+                self.handleRangeSelected(pane: pane, startRow: lo, endRow: hi)
+            }
+            pane.onCollapsedRowAction = { [weak self, weak pane] row, action in
+                guard let self, let pane else { return }
+                self.handleCollapsedRowAction(pane: pane, row: row, action: action)
             }
         }
+        leftPane.onBecameFirstResponder = { [weak self] in self?.rightPane.clearSelection() }
+        rightPane.onBecameFirstResponder = { [weak self] in self?.leftPane.clearSelection() }
+
+        for pane in [leftPane, rightPane] {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(clipViewBoundsDidChange(_:)),
+                name: NSView.boundsDidChangeNotification, object: pane.scrollView.contentView
+            )
+        }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(layoutSettingDidChange(_:)),
+            name: .diffLayoutSettingChanged, object: nil
+        )
+
+        install(resolvedLayout())
     }
 
-    @objc private func textDidChange(_ notification: Notification) {
-        lineNumberView.needsDisplay = true
+    // MARK: Layout
+
+    private func resolvedLayout() -> DiffLayout {
+        if currentDiff?.isBinary == true { return .inline }
+        return DiffLayoutSettings.effectiveLayout(preference: DiffLayoutSettings.preference, width: bounds.width)
     }
+
+    private func install(_ layout: DiffLayout) {
+        guard layout != currentLayout else { return }
+        activePopover?.close()
+        let view: NSView
+        switch layout {
+        case .inline:
+            splitView.removeFromSuperview()
+            view = inlinePane
+        case .sideBySide:
+            inlinePane.removeFromSuperview()
+            view = splitView
+            needsInitialDividerPosition = true
+        }
+        addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: trailingAnchor),
+            view.topAnchor.constraint(equalTo: topAnchor),
+            view.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        currentLayout = layout
+    }
+
+    override func layout() {
+        super.layout()
+        // Swapping subviews, constraints and text storage must not happen
+        // during the layout pass: schedule the switch once.
+        if resolvedLayout() != currentLayout, !isLayoutSwitchPending {
+            isLayoutSwitchPending = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isLayoutSwitchPending = false
+                self.applyEffectiveLayout(preserveScroll: true, forceRebuild: false)
+            }
+        }
+        if needsInitialDividerPosition, currentLayout == .sideBySide, splitView.bounds.width > 0 {
+            needsInitialDividerPosition = false
+            splitView.layoutSubtreeIfNeeded()
+            splitView.setPosition(
+                (splitView.bounds.width - splitView.dividerThickness) * Self.splitViewDefaultRatio,
+                ofDividerAt: 0
+            )
+        }
+    }
+
+    @objc private func layoutSettingDidChange(_ notification: Notification) {
+        applyEffectiveLayout(preserveScroll: true, forceRebuild: true)
+    }
+
+    /// Installs the effective layout and rebuilds. The scroll anchor is read
+    /// from the pane active before the switch, so it survives the switch.
+    private func applyEffectiveLayout(preserveScroll: Bool, forceRebuild: Bool) {
+        let effective = resolvedLayout()
+        let changed = effective != currentLayout
+        guard changed || forceRebuild else { return }
+        let anchor = preserveScroll ? firstVisibleDisplayIndex() : nil
+        install(effective)
+        rebuild(anchor: anchor)
+    }
+
+    // MARK: Scroll sync (side-by-side)
+
+    /// Both axes follow the other pane, as VS Code's diff editor syncs
+    /// scrollTop and scrollLeft between its two editors.
+    @objc private func clipViewBoundsDidChange(_ notification: Notification) {
+        guard !isSyncingScroll, currentLayout == .sideBySide,
+              let source = notification.object as? NSClipView else { return }
+        let target = source === leftPane.scrollView.contentView ? rightPane : leftPane
+        let targetClip = target.scrollView.contentView
+        // Each pane clamps to its own content (the panes' widths differ), as
+        // each VS Code editor clamps scrollLeft to its own scrollWidth.
+        let origin = targetClip.constrainBoundsRect(
+            NSRect(origin: source.bounds.origin, size: targetClip.bounds.size)).origin
+        guard targetClip.bounds.origin != origin else { return }
+        isSyncingScroll = true
+        targetClip.scroll(to: origin)
+        target.scrollView.reflectScrolledClipView(targetClip)
+        isSyncingScroll = false
+    }
+
+    // MARK: Display
 
     func display(diff: FileDiff) {
+        let isNewFile = currentDiff?.path != diff.path
+        // Anchor from the pane shown before `diff` may change the layout.
+        let anchor = isNewFile ? nil : firstVisibleDisplayIndex()
         currentDiff = diff
+        install(resolvedLayout())
+        rebuild(anchor: anchor)
+    }
+
+    func redisplayWithComments() {
+        guard currentDiff != nil else { return }
+        rebuild(preserveScroll: true)
+    }
+
+    private func rebuild(preserveScroll: Bool) {
+        rebuild(anchor: preserveScroll ? firstVisibleDisplayIndex() : nil)
+    }
+
+    private func rebuild(anchor: Int?) {
+        guard let diff = currentDiff else { return }
 
         if diff.isBinary {
+            displayLines = []
+            rows = []
+            inlinePane.setCommentedLineIndices([])
             displayBinaryMessage()
             return
         }
 
-        rebuildDisplayLines()
-        let attributed = buildAttributedString(from: displayLines)
-        textView.textStorage?.setAttributedString(attributed)
+        let layout = currentLayout ?? resolvedLayout()
+        displayLines = reviewStore?.buildDisplayLines(from: diff.lines) ?? diff.lines.map { .diff($0) }
 
-        if diff.isTruncated {
-            appendTruncationBanner()
+        var commentedLineIndices = Set<Int>()
+        for comment in reviewStore?.comments ?? [] {
+            let end = comment.endLineIndex ?? comment.lineIndex
+            guard comment.lineIndex <= end else { continue }
+            commentedLineIndices.formUnion(comment.lineIndex...end)
         }
 
-        lineNumberView.needsDisplay = true
-    }
+        var built = DiffRowBuilder.build(displayLines: displayLines, changes: diff.changes, layout: layout)
 
-    func redisplayWithComments() {
-        guard let diff = currentDiff, !diff.isBinary else { return }
-        rebuildDisplayLines()
-        let attributed = buildAttributedString(from: displayLines)
-        textView.textStorage?.setAttributedString(attributed)
-        if diff.isTruncated {
-            appendTruncationBanner()
+        // A too-large file was not compared: no line is known to be unchanged.
+        if DiffLayoutSettings.hideUnchangedRegionsEnabled && !diff.isTooLarge {
+            let regions = UnchangedRegions.fromDiffs(
+                changes: diff.changes,
+                originalLineCount: diff.oldLineCount,
+                modifiedLineCount: diff.newLineCount
+            )
+            revealState?.updateRegions(regions)
+            let snapshot = revealState?.snapshot ?? DiffRevealSnapshot(counts: [:], isAllRevealed: false)
+            built = UnchangedRegions.apply(
+                rows: built,
+                regions: regions,
+                reveal: snapshot,
+                forcedVisibleDisplayIndices: forcedVisibleDisplayIndices(commentedLineIndices: commentedLineIndices)
+            )
         }
-        lineNumberView.needsDisplay = true
-    }
 
-    private func rebuildDisplayLines() {
-        guard let diff = currentDiff else {
-            displayLines = []
-            lineNumberView.displayLines = []
-            lineNumberView.commentedLineIndices = []
-            return
-        }
-        if let store = reviewStore {
-            displayLines = store.buildDisplayLines(from: diff.lines)
-            var indices = Set<Int>()
-            for comment in store.comments {
-                let start = comment.lineIndex
-                let end = comment.endLineIndex ?? comment.lineIndex
-                for i in start...end {
-                    indices.insert(i)
-                }
-            }
-            lineNumberView.commentedLineIndices = indices
+        let bannerMessage: String?
+        if diff.isTooLarge {
+            bannerMessage = "File too large to compare (> 50 MB)"
+        } else if diff.hitTimeout {
+            bannerMessage = "Diff computation stopped early (5000 ms)"
         } else {
-            displayLines = diff.lines.map { .diff($0) }
-            lineNumberView.commentedLineIndices = []
+            bannerMessage = nil
         }
-        lineNumberView.displayLines = displayLines
+        if bannerMessage != nil {
+            let banner = DiffCell(displayIndex: nil, lineIndex: nil, kind: .banner,
+                                  innerRanges: [], isWholeLineChange: false)
+            built.append(DiffLayoutRow(left: banner, right: layout == .sideBySide ? banner : nil))
+        }
+        rows = built
+
+        // An uncompared file's inline view is the modified file alone.
+        let showsOldNumbers = !(diff.isTooLarge && layout == .inline)
+        for pane in activePanes {
+            let cells = rows.map { row -> DiffCell? in
+                let cell = pane.side == .left ? row.left : row.right
+                return cell.map { Self.clampedToDisplayedText($0, displayLines: displayLines) }
+            }
+            let attributed = Self.attributedString(cells: cells, displayLines: displayLines, bannerMessage: bannerMessage)
+            let gutterRows = cells.map { gutterRow(for: $0, lines: diff.lines, showsOldNumbers: showsOldNumbers) }
+            pane.setCommentedLineIndices(commentedLineIndices)
+            pane.setRows(cells: cells, attributed: attributed, gutterRows: gutterRows)
+        }
+
+        if let anchor {
+            restoreScroll(toDisplayIndex: anchor)
+        } else {
+            for pane in activePanes { pane.scrollToRow(0) }
+        }
     }
+
+    /// Display indices of commented lines and of comment rows: the
+    /// unchanged regions containing them stay expanded.
+    private func forcedVisibleDisplayIndices(commentedLineIndices: Set<Int>) -> Set<Int> {
+        var result = Set<Int>()
+        var lineIndex = 0
+        for (displayIndex, displayLine) in displayLines.enumerated() {
+            switch displayLine {
+            case .diff:
+                if commentedLineIndices.contains(lineIndex) { result.insert(displayIndex) }
+                lineIndex += 1
+            case .commentBlock:
+                result.insert(displayIndex)
+            }
+        }
+        return result
+    }
+
+    private func gutterRow(for cell: DiffCell?, lines: [DiffLine], showsOldNumbers: Bool) -> GutterRow {
+        guard let cell else {
+            return GutterRow(oldNumber: nil, newNumber: nil, kind: nil, displayIndex: nil, lineIndex: nil, indicator: nil)
+        }
+        var oldNumber: Int?
+        var newNumber: Int?
+        var indicator: String?
+        if let lineIndex = cell.lineIndex, lineIndex < lines.count {
+            let line = lines[lineIndex]
+            oldNumber = showsOldNumbers ? line.oldLineNumber : nil
+            newNumber = line.newLineNumber
+            switch line.type {
+            case .addition: indicator = "+"
+            case .deletion: indicator = "-"
+            case .context, .hunkHeader, .meta: indicator = nil
+            }
+        }
+        return GutterRow(oldNumber: oldNumber, newNumber: newNumber, kind: cell.kind,
+                         displayIndex: cell.displayIndex, lineIndex: cell.lineIndex, indicator: indicator)
+    }
+
+    // MARK: Scroll preservation
+
+    private func firstVisibleDisplayIndex() -> Int? {
+        guard let pane = activePanes.first, let first = pane.firstVisibleRow else { return nil }
+        let paneCells = pane.cells
+        for row in first..<paneCells.count {
+            if let d = rowDisplayIndex(row, cells: paneCells) { return d }
+        }
+        return nil
+    }
+
+    /// Display index of the row from either side (rows of the pane's
+    /// `cells` correspond to `rows`).
+    private func rowDisplayIndex(_ row: Int, cells: [DiffCell?]) -> Int? {
+        if row < rows.count {
+            return rows[row].left?.displayIndex ?? rows[row].right?.displayIndex
+        }
+        return row < cells.count ? cells[row]?.displayIndex : nil
+    }
+
+    private func restoreScroll(toDisplayIndex anchor: Int) {
+        var target: Int?
+        for (index, row) in rows.enumerated() {
+            let indices = [row.left?.displayIndex, row.right?.displayIndex].compactMap { $0 }
+            if indices.contains(where: { $0 >= anchor }) {
+                target = index
+                break
+            }
+        }
+        let row = target ?? max(rows.count - 1, 0)
+        for pane in activePanes { pane.scrollToRow(row) }
+    }
+
+    // MARK: Attributed string
 
     private func displayBinaryMessage() {
-        lineNumberView.displayLines = []
-        lineNumberView.commentedLineIndices = []
-        displayLines = []
         let message = "Binary file — cannot display diff"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .medium),
             .foregroundColor: NSColor.secondaryLabelColor,
         ]
-        textView.textStorage?.setAttributedString(NSAttributedString(string: "\n\n\t\(message)", attributes: attrs))
+        inlinePane.showMessage(NSAttributedString(string: "\n\n\t\(message)", attributes: attrs))
     }
 
-    private func appendTruncationBanner() {
-        let banner = "\n\n--- Diff truncated (file too large) ---\n"
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .bold),
-            .foregroundColor: NSColor.systemOrange,
-            .backgroundColor: NSColor.systemOrange.withAlphaComponent(0.1),
-        ]
-        textView.textStorage?.append(NSAttributedString(string: banner, attributes: attrs))
-    }
-
-    private func buildAttributedString(from displayLines: [DisplayLine]) -> NSAttributedString {
+    /// One paragraph per cell, joined by "\n" (the panes' row arithmetic
+    /// depends on it: no other paragraph separator may appear).
+    static func attributedString(cells: [DiffCell?], displayLines: [DisplayLine],
+                                 bannerMessage: String?) -> NSAttributedString {
         let result = NSMutableAttributedString()
-        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let boldFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
+        let paragraph = DiffMetrics.rowParagraphStyle
+        let newline = NSAttributedString(string: "\n", attributes: [.font: DiffMetrics.font, .paragraphStyle: paragraph])
 
-        for (index, displayLine) in displayLines.enumerated() {
-            if index > 0 {
-                result.append(NSAttributedString(string: "\n"))
+        for (index, cell) in cells.enumerated() {
+            if index > 0 { result.append(newline) }
+            guard let cell else {
+                result.append(NSAttributedString(string: "", attributes: [.paragraphStyle: paragraph]))
+                continue
             }
-
-            switch displayLine {
-            case .diff(let line):
-                // Truncate very long lines (minified files)
-                var text = line.text
-                if text.count > 10_000 {
-                    text = String(text.prefix(10_000)) + " [truncated]"
+            switch cell.kind {
+            case .line(let type):
+                guard let d = cell.displayIndex, d < displayLines.count, case .diff(let line) = displayLines[d] else {
+                    continue
                 }
-
-                let attrs: [NSAttributedString.Key: Any]
-                switch line.type {
-                case .addition:
-                    attrs = [
-                        .font: font,
-                        .foregroundColor: NSColor(named: "diffAdditionText") ?? NSColor.systemGreen,
-                        .backgroundColor: NSColor.systemGreen.withAlphaComponent(0.08),
-                    ]
-                case .deletion:
-                    attrs = [
-                        .font: font,
-                        .foregroundColor: NSColor(named: "diffDeletionText") ?? NSColor.systemRed,
-                        .backgroundColor: NSColor.systemRed.withAlphaComponent(0.08),
-                    ]
-                case .hunkHeader:
-                    attrs = [
-                        .font: boldFont,
-                        .foregroundColor: NSColor.systemCyan,
-                        .backgroundColor: NSColor.systemCyan.withAlphaComponent(0.06),
-                    ]
-                case .meta:
-                    attrs = [
-                        .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                        .foregroundColor: NSColor.secondaryLabelColor,
-                        .obliqueness: 0.1 as NSNumber,
-                    ]
-                case .context:
-                    attrs = [
-                        .font: font,
-                        .foregroundColor: NSColor.labelColor,
-                    ]
-                }
-                result.append(NSAttributedString(string: text, attributes: attrs))
-
-            case .commentBlock(let comment):
-                let prefix: String
-                if comment.endLineIndex != nil {
-                    prefix = "[\(comment.displayLineNumber)] "
-                } else {
-                    prefix = ""
-                }
-                let commentText = "\u{1F4AC} \(prefix)\(comment.text)"
+                result.append(lineString(line, type: type, cell: cell, paragraph: paragraph))
+            case .comment:
+                guard let d = cell.displayIndex, d < displayLines.count,
+                      case .commentBlock(let comment) = displayLines[d] else { continue }
+                result.append(commentString(comment, paragraph: paragraph))
+            case .banner:
                 let attrs: [NSAttributedString.Key: Any] = [
-                    .font: font,
-                    .foregroundColor: NSColor.systemBlue,
-                    .backgroundColor: NSColor.systemBlue.withAlphaComponent(0.08),
+                    .font: DiffMetrics.boldFont,
+                    .foregroundColor: NSColor.systemOrange,
+                    .paragraphStyle: paragraph,
                 ]
-                result.append(NSAttributedString(string: commentText, attributes: attrs))
+                result.append(NSAttributedString(string: bannerMessage ?? "", attributes: attrs))
+            case .filler, .collapsedRegion:
+                // Drawn by DiffTextView (hatch / band + centred label).
+                break
             }
         }
+        return result
+    }
 
+    static let maxDisplayedLineLength = 10_000
+    static let truncationSuffix = " [truncated]"
+
+    /// A line cell's text as displayed: the cell's side of the line,
+    /// truncated to `maxDisplayedLineLength` UTF-16 units (very long lines,
+    /// e.g. minified files), with the characters NSTextView treats as
+    /// line/paragraph breaks replaced one UTF-16 unit for one by visible
+    /// symbols, so UTF-16 inner-range offsets stay valid. `contentLength`
+    /// excludes the truncation suffix.
+    static func displayedText(_ line: DiffLine, side: DiffSide) -> (text: String, contentLength: Int) {
+        var units = Array((side == .left ? line.text : line.modifiedText).utf16)
+        let isTruncated = units.count > maxDisplayedLineLength
+        if isTruncated {
+            var end = maxDisplayedLineLength
+            // Do not split a surrogate pair.
+            if UTF16.isTrailSurrogate(units[end]) { end -= 1 }
+            units.removeSubrange(end...)
+        }
+        for i in units.indices {
+            switch units[i] {
+            case 0x000D: units[i] = 0x240D // CR -> SYMBOL FOR CARRIAGE RETURN
+            case 0x2028: units[i] = 0x21B5 // LINE SEPARATOR -> DOWNWARDS ARROW WITH CORNER LEFTWARDS
+            case 0x2029: units[i] = 0x00B6 // PARAGRAPH SEPARATOR -> PILCROW SIGN
+            case 0x0085: units[i] = 0x2424 // NEXT LINE -> SYMBOL FOR NEWLINE
+            default: break
+            }
+        }
+        let content = String(decoding: units, as: UTF16.self)
+        return (isTruncated ? content + truncationSuffix : content, units.count)
+    }
+
+    /// `cell` with inner ranges (and empty markers) clamped to the displayed
+    /// content of its line, truncation suffix excluded.
+    static func clampedToDisplayedText(_ cell: DiffCell, displayLines: [DisplayLine]) -> DiffCell {
+        guard case .line = cell.kind, !cell.innerRanges.isEmpty,
+              let d = cell.displayIndex, d < displayLines.count, case .diff(let line) = displayLines[d] else {
+            return cell
+        }
+        let length = displayedText(line, side: cell.textSide).contentLength
+        var clamped = cell
+        clamped.innerRanges = cell.innerRanges.compactMap { range in
+            guard range.location <= length else { return nil }
+            return NSRange(location: range.location, length: min(range.length, length - range.location))
+        }
+        return clamped
+    }
+
+    private static func lineString(_ line: DiffLine, type: DiffLineType, cell: DiffCell,
+                                   paragraph: NSParagraphStyle) -> NSAttributedString {
+        let (text, contentLength) = displayedText(line, side: cell.textSide)
+        var attrs: [NSAttributedString.Key: Any] = [.font: DiffMetrics.font, .paragraphStyle: paragraph]
+        let innerColor: NSColor?
+        switch type {
+        case .addition:
+            attrs[.foregroundColor] = NSColor(named: "diffAdditionText") ?? NSColor.systemGreen
+            innerColor = DiffMetrics.additionInnerBackground
+        case .deletion:
+            attrs[.foregroundColor] = NSColor(named: "diffDeletionText") ?? NSColor.systemRed
+            innerColor = DiffMetrics.deletionInnerBackground
+        case .hunkHeader:
+            attrs[.font] = DiffMetrics.boldFont
+            attrs[.foregroundColor] = NSColor.systemCyan
+            attrs[.backgroundColor] = NSColor.systemCyan.withAlphaComponent(0.06)
+            innerColor = nil
+        case .meta:
+            attrs[.foregroundColor] = NSColor.secondaryLabelColor
+            attrs[.obliqueness] = 0.1 as NSNumber
+            innerColor = nil
+        case .context:
+            attrs[.foregroundColor] = NSColor.labelColor
+            innerColor = nil
+        }
+        let string = NSMutableAttributedString(string: text, attributes: attrs)
+        if let innerColor, !cell.isWholeLineChange {
+            for range in cell.innerRanges where range.length > 0 && range.location < contentLength {
+                let clamped = NSRange(location: range.location, length: min(range.length, contentLength - range.location))
+                string.addAttribute(.backgroundColor, value: innerColor, range: clamped)
+            }
+        }
+        return string
+    }
+
+    private static func commentString(_ comment: ReviewComment, paragraph: NSParagraphStyle) -> NSAttributedString {
+        let font = DiffMetrics.font
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.systemBlue,
+            .paragraphStyle: paragraph,
+        ]
+        let result = NSMutableAttributedString()
+        let config = NSImage.SymbolConfiguration(pointSize: font.pointSize, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(hierarchicalColor: .systemBlue))
+        if let image = NSImage(systemSymbolName: "text.bubble", accessibilityDescription: "Comment")?
+            .withSymbolConfiguration(config) {
+            let attachment = NSTextAttachment()
+            attachment.image = image
+            let side = min(font.ascender - font.descender, DiffMetrics.rowHeight)
+            let width = image.size.height > 0 ? side * image.size.width / image.size.height : side
+            attachment.bounds = NSRect(x: 0, y: font.descender, width: width, height: side)
+            let attachmentString = NSMutableAttributedString(attachment: attachment)
+            attachmentString.addAttributes(attrs, range: NSRange(location: 0, length: attachmentString.length))
+            result.append(attachmentString)
+            result.append(NSAttributedString(string: " ", attributes: attrs))
+        }
+        let prefix = comment.endLineIndex != nil ? "[\(comment.displayLineNumber)] " : ""
+        result.append(NSAttributedString(string: "\(prefix)\(comment.text)", attributes: attrs))
         return result
     }
 
     // MARK: - Comment Interaction
 
-    private func handleLineClicked(displayLineIndex: Int, displayLine: DisplayLine) {
-        guard let store = reviewStore else { return }
+    private func cell(pane: DiffPaneView, row: Int) -> DiffCell? {
+        guard row >= 0, row < pane.cells.count else { return nil }
+        return pane.cells[row]
+    }
 
-        switch displayLine {
-        case .diff(let line):
-            // Only commentable types
-            guard line.type == .addition || line.type == .deletion || line.type == .context else { return }
-
-            // Find the original lineIndex in diff.lines by counting .diff entries
-            var diffCount = 0
-            for i in 0..<displayLineIndex {
-                if case .diff = displayLines[i] {
-                    diffCount += 1
-                }
-            }
-            let originalIndex = diffCount
-
-            showAddPopover(
-                atDisplayLineIndex: displayLineIndex,
-                originalDiffLineIndex: originalIndex,
-                line: line,
-                store: store
-            )
-
-        case .commentBlock(let comment):
-            showEditPopover(
-                atDisplayLineIndex: displayLineIndex,
-                comment: comment,
-                store: store
-            )
+    private func handleRowClicked(pane: DiffPaneView, row: Int) {
+        guard let cell = cell(pane: pane, row: row) else { return }
+        switch cell.kind {
+        case .collapsedRegion(let regionID, _):
+            revealState?.showAll(regionID: regionID)
+        case .comment:
+            guard let store = reviewStore, let d = cell.displayIndex, d < displayLines.count,
+                  case .commentBlock(let comment) = displayLines[d] else { return }
+            showEditPopover(pane: pane, row: row, comment: comment, store: store)
+        case .line(.addition), .line(.deletion), .line(.context):
+            guard let store = reviewStore, let diff = currentDiff,
+                  let lineIndex = cell.lineIndex, lineIndex < diff.lines.count else { return }
+            showAddPopover(pane: pane, row: row, lineIndex: lineIndex, line: diff.lines[lineIndex], store: store)
+        case .line, .filler, .banner:
+            return
         }
     }
 
-    private func showAddPopover(atDisplayLineIndex: Int, originalDiffLineIndex: Int, line: DiffLine, store: DiffReviewStore) {
-        activePopover?.close()
+    private func handleCollapsedRowAction(pane: DiffPaneView, row: Int, action: CollapsedAction) {
+        guard let cell = cell(pane: pane, row: row),
+              case .collapsedRegion(let regionID, _) = cell.kind else { return }
+        // revealState.onChanged triggers the rebuild.
+        switch action {
+        case .expandTop: revealState?.showMoreAbove(regionID: regionID, count: 20)
+        case .expandBottom: revealState?.showMoreBelow(regionID: regionID, count: 20)
+        case .expandAll: revealState?.showAll(regionID: regionID)
+        }
+    }
 
+    private func presentPopover(_ controller: DiffCommentPopoverController, height: CGFloat,
+                                pane: DiffPaneView, row: Int) {
+        let popover = NSPopover()
+        popover.contentViewController = controller
+        controller.enclosingPopover = popover
+        popover.contentSize = NSSize(width: 320, height: height)
+        popover.behavior = .transient
+        activePopover = popover
+        popover.show(relativeTo: pane.rowRect(row), of: pane.lineNumberView, preferredEdge: .maxX)
+    }
+
+    private func showAddPopover(pane: DiffPaneView, row: Int, lineIndex: Int, line: DiffLine, store: DiffReviewStore) {
+        activePopover?.close()
         let controller = DiffCommentPopoverController(mode: .add)
         controller.onAdd = { [weak self] text in
             store.addComment(
-                lineIndex: originalDiffLineIndex,
+                lineIndex: lineIndex,
                 lineNumber: line.newLineNumber,
                 oldLineNumber: line.oldLineNumber,
                 lineType: line.type,
@@ -294,28 +572,12 @@ final class DiffView: NSView {
             )
             self?.redisplayWithComments()
         }
-
-        let popover = NSPopover()
-        popover.contentViewController = controller
-        controller.enclosingPopover = popover
-        popover.contentSize = NSSize(width: 320, height: 80)
-        popover.behavior = .transient
-        activePopover = popover
-
-        let rect = rectForLine(at: atDisplayLineIndex)
-        popover.show(relativeTo: rect, of: lineNumberView, preferredEdge: .maxX)
+        presentPopover(controller, height: 80, pane: pane, row: row)
     }
 
-    private func showEditPopover(atDisplayLineIndex: Int, comment: ReviewComment, store: DiffReviewStore) {
+    private func showEditPopover(pane: DiffPaneView, row: Int, comment: ReviewComment, store: DiffReviewStore) {
         activePopover?.close()
-
-        let rangeHeader: String?
-        if comment.endLineIndex != nil {
-            rangeHeader = comment.displayLineNumber
-        } else {
-            rangeHeader = nil
-        }
-
+        let rangeHeader = comment.endLineIndex != nil ? comment.displayLineNumber : nil
         let controller = DiffCommentPopoverController(mode: .edit(existingText: comment.text), rangeHeader: rangeHeader)
         controller.onUpdate = { [weak self] text in
             store.updateComment(id: comment.id, text: text)
@@ -325,35 +587,27 @@ final class DiffView: NSView {
             store.removeComment(id: comment.id)
             self?.redisplayWithComments()
         }
-
-        let popover = NSPopover()
-        popover.contentViewController = controller
-        controller.enclosingPopover = popover
-        popover.contentSize = NSSize(width: 320, height: comment.endLineIndex != nil ? 100 : 80)
-        popover.behavior = .transient
-        activePopover = popover
-
-        let rect = rectForLine(at: atDisplayLineIndex)
-        popover.show(relativeTo: rect, of: lineNumberView, preferredEdge: .maxX)
+        presentPopover(controller, height: comment.endLineIndex != nil ? 100 : 80, pane: pane, row: row)
     }
 
-    private func handleRangeSelected(startDisplayIdx: Int, endDisplayIdx: Int) {
+    private func handleRangeSelected(pane: DiffPaneView, startRow: Int, endRow: Int) {
         guard let store = reviewStore, let diff = currentDiff else { return }
-
+        guard let display = DiffSideRangeResolver.displayRange(
+            rows: rows, side: pane.side, startRow: startRow, endRow: endRow
+        ) else { return }
         guard let range = DiffReviewStore.resolveDisplayRange(
-            startDisplayIdx: startDisplayIdx,
-            endDisplayIdx: endDisplayIdx,
+            startDisplayIdx: display.start,
+            endDisplayIdx: display.end,
             displayLines: displayLines
         ) else { return }
 
         guard range.startOriginal >= 0, range.endOriginal < diff.lines.count else { return }
-        let startLine = diff.lines[range.startOriginal]
-        let endLine = diff.lines[range.endOriginal]
-        let startNum = DiffReviewStore.displayNumber(for: startLine)
-        let endNum = DiffReviewStore.displayNumber(for: endLine)
+        let startNum = DiffReviewStore.displayNumber(for: diff.lines[range.startOriginal])
+        let endNum = DiffReviewStore.displayNumber(for: diff.lines[range.endOriginal])
 
         showAddPopoverForRange(
-            atDisplayLineIndex: endDisplayIdx,
+            pane: pane,
+            row: max(startRow, endRow),
             startOriginal: range.startOriginal,
             endOriginal: range.endOriginal,
             rangeHeader: "Lines \(startNum) – \(endNum)",
@@ -362,7 +616,8 @@ final class DiffView: NSView {
     }
 
     private func showAddPopoverForRange(
-        atDisplayLineIndex: Int,
+        pane: DiffPaneView,
+        row: Int,
         startOriginal: Int,
         endOriginal: Int,
         rangeHeader: String,
@@ -370,7 +625,6 @@ final class DiffView: NSView {
     ) {
         guard let diff = currentDiff else { return }
         activePopover?.close()
-
         let controller = DiffCommentPopoverController(mode: .add, rangeHeader: rangeHeader)
         controller.onAdd = { [weak self] text in
             store.addRangeComment(
@@ -381,352 +635,20 @@ final class DiffView: NSView {
             )
             self?.redisplayWithComments()
         }
-
-        let popover = NSPopover()
-        popover.contentViewController = controller
-        controller.enclosingPopover = popover
-        popover.contentSize = NSSize(width: 320, height: 100)
-        popover.behavior = .transient
-        activePopover = popover
-
-        let rect = rectForLine(at: atDisplayLineIndex)
-        popover.show(relativeTo: rect, of: lineNumberView, preferredEdge: .maxX)
-    }
-
-    private func rectForLine(at displayLineIndex: Int) -> NSRect {
-        guard let layoutManager = textView.layoutManager,
-              let textContainer = textView.textContainer else {
-            return .zero
-        }
-
-        let content = textView.string
-        let lines = content.components(separatedBy: "\n")
-        guard displayLineIndex < lines.count else { return .zero }
-
-        var charOffset = 0
-        for i in 0..<displayLineIndex {
-            charOffset += lines[i].utf16.count + 1 // +1 for \n
-        }
-
-        let lineLength = max(1, lines[displayLineIndex].utf16.count)
-        let glyphRange = layoutManager.glyphRange(
-            forCharacterRange: NSRange(location: charOffset, length: lineLength),
-            actualCharacterRange: nil
-        )
-        var lineRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
-        lineRect.origin.y += textView.textContainerInset.height
-
-        // Convert from textView coordinates to lineNumberView coordinates
-        let visibleRect = scrollView.documentVisibleRect
-        lineRect.origin.y -= visibleRect.minY
-        lineRect.origin.y += lineNumberView.convert(NSPoint.zero, from: textView).y
-
-        return NSRect(x: 0, y: lineRect.minY, width: lineNumberView.bounds.width, height: lineRect.height)
+        presentPopover(controller, height: 100, pane: pane, row: row)
     }
 }
 
-// MARK: - DiffTextView (click-on-comment support)
+// MARK: - NSSplitViewDelegate
 
-@MainActor
-final class DiffTextView: NSTextView {
-    /// Called when a comment line (💬) is clicked. Parameter is the text line index.
-    var onCommentLineClicked: ((Int) -> Void)?
-
-    override func mouseDown(with event: NSEvent) {
-        // Check if click is on a comment line before passing to super
-        if let lineIndex = textLineIndex(at: event) {
-            onCommentLineClicked?(lineIndex)
-            return
-        }
-        super.mouseDown(with: event)
+extension DiffView: NSSplitViewDelegate {
+    func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat,
+                   ofSubviewAt dividerIndex: Int) -> CGFloat {
+        max(proposedMinimumPosition, Self.splitViewMinPaneWidth)
     }
 
-    private func textLineIndex(at event: NSEvent) -> Int? {
-        guard let layoutManager, let textContainer else { return nil }
-        let point = convert(event.locationInWindow, from: nil)
-        let adjustedPoint = NSPoint(x: point.x - textContainerInset.width,
-                                    y: point.y - textContainerInset.height)
-        let glyphIndex = layoutManager.glyphIndex(for: adjustedPoint, in: textContainer)
-        let charIndex = layoutManager.characterIndexForGlyph(at: glyphIndex)
-
-        let lines = string.components(separatedBy: "\n")
-        var offset = 0
-        for (idx, line) in lines.enumerated() {
-            let lineEnd = offset + line.utf16.count
-            if charIndex >= offset && charIndex <= lineEnd {
-                return idx
-            }
-            offset = lineEnd + 1 // +1 for \n
-        }
-        return nil
-    }
-}
-
-// MARK: - Line Number Ruler
-
-@MainActor
-final class DiffLineNumberView: NSRulerView {
-    var displayLines: [DisplayLine] = []
-    var commentedLineIndices: Set<Int> = []
-    var onLineClicked: ((Int, DisplayLine) -> Void)?
-    var onRangeSelected: ((Int, Int) -> Void)?
-    private var dragStartIndex: Int?
-    private var dragCurrentIndex: Int?
-    private var lineRectCache: [(y: CGFloat, height: CGFloat)] = []
-    private var hoveredDisplayLineIndex: Int? {
-        didSet {
-            if oldValue != hoveredDisplayLineIndex { needsDisplay = true }
-        }
-    }
-    private var trackingArea: NSTrackingArea?
-
-    override var requiredThickness: CGFloat { 80 }
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        if let existing = trackingArea { removeTrackingArea(existing) }
-        let area = NSTrackingArea(
-            rect: bounds,
-            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow],
-            owner: self,
-            userInfo: nil
-        )
-        addTrackingArea(area)
-        trackingArea = area
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        hoveredDisplayLineIndex = nil
-    }
-
-    override func mouseMoved(with event: NSEvent) {
-        hoveredDisplayLineIndex = displayLineIndex(at: event)
-    }
-
-    override func draw(_ dirtyRect: NSRect) {
-        // Override default NSRulerView drawing entirely (no background, no border)
-        drawHashMarksAndLabels(in: dirtyRect)
-    }
-
-    override func drawHashMarksAndLabels(in rect: NSRect) {
-        guard let textView = clientView as? NSTextView,
-              let layoutManager = textView.layoutManager,
-              let textContainer = textView.textContainer else { return }
-
-        let visibleRect = scrollView?.documentVisibleRect ?? bounds
-        let font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
-        let lineNumberColor = NSColor.secondaryLabelColor
-
-        let content = textView.string as NSString
-        guard content.length > 0 else { return }
-
-        let glyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
-        let charRange = layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
-
-        // Track the current diff line index (for commentedLineIndices lookup)
-        var currentDiffLineIndex = 0
-
-        lineRectCache.removeAll()
-
-        let lines = textView.string.components(separatedBy: "\n")
-        var charOffset = 0
-
-        for (idx, line) in lines.enumerated() {
-            let lineLength = line.utf16.count + (idx < lines.count - 1 ? 1 : 0)
-            let lineStart = charOffset
-            charOffset += lineLength
-
-            guard lineStart < charRange.upperBound else { break }
-            guard charOffset > charRange.location else {
-                // Track diff line index even for offscreen lines
-                if idx < displayLines.count, case .diff = displayLines[idx] {
-                    currentDiffLineIndex += 1
-                }
-                lineRectCache.append((y: 0, height: 0))
-                continue
-            }
-
-            guard idx < displayLines.count else { break }
-            let displayLine = displayLines[idx]
-
-            let lineGlyphRange = layoutManager.glyphRange(forCharacterRange: NSRange(location: lineStart, length: max(1, lineLength - 1)), actualCharacterRange: nil)
-            var lineRect = layoutManager.boundingRect(forGlyphRange: lineGlyphRange, in: textContainer)
-            lineRect.origin.y += textView.textContainerInset.height
-
-            let y = lineRect.minY - visibleRect.minY + convert(NSPoint.zero, from: textView).y
-
-            lineRectCache.append((y: y, height: lineRect.height))
-
-            // Draw drag selection highlight
-            if let start = dragStartIndex, let current = dragCurrentIndex {
-                let lo = min(start, current)
-                let hi = max(start, current)
-                if idx >= lo && idx <= hi {
-                    NSColor.systemBlue.withAlphaComponent(0.15).setFill()
-                    NSRect(x: 0, y: y, width: bounds.width, height: lineRect.height).fill()
-                }
-            }
-
-            switch displayLine {
-            case .diff(let diffLine):
-                let isCommentable = diffLine.type == .addition || diffLine.type == .deletion || diffLine.type == .context
-
-                // Draw blue dot for commented lines
-                if commentedLineIndices.contains(currentDiffLineIndex) {
-                    NSColor.systemBlue.setFill()
-                    let dotRect = NSRect(x: 4, y: y + (lineRect.height - 6) / 2, width: 6, height: 6)
-                    NSBezierPath(ovalIn: dotRect).fill()
-                } else if isCommentable && hoveredDisplayLineIndex == idx {
-                    // GitHub-style hover "+" button
-                    let btnSize: CGFloat = 16
-                    let btnRect = NSRect(x: 2, y: y + (lineRect.height - btnSize) / 2, width: btnSize, height: btnSize)
-                    NSColor.systemBlue.setFill()
-                    NSBezierPath(roundedRect: btnRect, xRadius: 3, yRadius: 3).fill()
-                    let plusStr = "+" as NSString
-                    let plusAttrs: [NSAttributedString.Key: Any] = [
-                        .font: NSFont.systemFont(ofSize: 12, weight: .bold),
-                        .foregroundColor: NSColor.white,
-                    ]
-                    let plusSize = plusStr.size(withAttributes: plusAttrs)
-                    plusStr.draw(at: NSPoint(
-                        x: btnRect.midX - plusSize.width / 2,
-                        y: btnRect.midY - plusSize.height / 2
-                    ), withAttributes: plusAttrs)
-                }
-
-                // Draw old line number (left column)
-                if let oldNum = diffLine.oldLineNumber {
-                    let str = "\(oldNum)" as NSString
-                    let attrs: [NSAttributedString.Key: Any] = [
-                        .font: font,
-                        .foregroundColor: lineNumberColor,
-                    ]
-                    let size = str.size(withAttributes: attrs)
-                    let x = 34 - size.width
-                    str.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
-                }
-
-                // Draw new line number (right column)
-                if let newNum = diffLine.newLineNumber {
-                    let str = "\(newNum)" as NSString
-                    let attrs: [NSAttributedString.Key: Any] = [
-                        .font: font,
-                        .foregroundColor: lineNumberColor,
-                    ]
-                    let size = str.size(withAttributes: attrs)
-                    let x = 72 - size.width
-                    str.draw(at: NSPoint(x: x, y: y), withAttributes: attrs)
-                }
-
-                currentDiffLineIndex += 1
-
-            case .commentBlock:
-                // Draw blue background band for comment lines (no icon — click 💬 in text to edit)
-                let bandRect = NSRect(x: 0, y: y, width: bounds.width - 1, height: lineRect.height)
-                NSColor.systemBlue.withAlphaComponent(0.15).setFill()
-                bandRect.fill()
-            }
-        }
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let idx = cachedDisplayLineIndex(at: event) ?? displayLineIndex(at: event)
-        if let idx, idx < displayLines.count {
-            // Check if the line is commentable
-            if case .diff(let line) = displayLines[idx] {
-                if line.type == .addition || line.type == .deletion || line.type == .context {
-                    dragStartIndex = idx
-                    dragCurrentIndex = idx
-                    needsDisplay = true
-                    return
-                }
-            }
-            // For comment blocks, handle immediately
-            if case .commentBlock = displayLines[idx] {
-                onLineClicked?(idx, displayLines[idx])
-                return
-            }
-        }
-        super.mouseDown(with: event)
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        guard dragStartIndex != nil else { return }
-        if let idx = cachedDisplayLineIndex(at: event) {
-            dragCurrentIndex = idx
-            needsDisplay = true
-        }
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        guard let start = dragStartIndex else {
-            super.mouseUp(with: event)
-            return
-        }
-        let current = dragCurrentIndex ?? start
-
-        let lo = min(start, current)
-        let hi = max(start, current)
-
-        // Reset drag state
-        dragStartIndex = nil
-        dragCurrentIndex = nil
-        needsDisplay = true
-
-        if lo == hi {
-            // Single line click — use existing callback
-            if lo < displayLines.count {
-                onLineClicked?(lo, displayLines[lo])
-            }
-        } else {
-            // Range selection
-            onRangeSelected?(lo, hi)
-        }
-    }
-
-    private func cachedDisplayLineIndex(at event: NSEvent) -> Int? {
-        let locationInRuler = convert(event.locationInWindow, from: nil)
-        for (idx, entry) in lineRectCache.enumerated() {
-            if entry.height > 0 && locationInRuler.y >= entry.y && locationInRuler.y < entry.y + entry.height {
-                return idx
-            }
-        }
-        return nil
-    }
-
-    /// Hit-test: returns the displayLines index for the line under the mouse event.
-    private func displayLineIndex(at event: NSEvent) -> Int? {
-        guard let textView = clientView as? NSTextView,
-              let layoutManager = textView.layoutManager,
-              let textContainer = textView.textContainer else { return nil }
-
-        let locationInRuler = convert(event.locationInWindow, from: nil)
-        let visibleRect = scrollView?.documentVisibleRect ?? bounds
-
-        let lines = textView.string.components(separatedBy: "\n")
-        var charOffset = 0
-
-        for (idx, line) in lines.enumerated() {
-            let lineLength = line.utf16.count + (idx < lines.count - 1 ? 1 : 0)
-            let lineStart = charOffset
-            charOffset += lineLength
-
-            guard idx < displayLines.count else { continue }
-
-            let lineGlyphRange = layoutManager.glyphRange(
-                forCharacterRange: NSRange(location: lineStart, length: max(1, lineLength - 1)),
-                actualCharacterRange: nil
-            )
-            var lineRect = layoutManager.boundingRect(forGlyphRange: lineGlyphRange, in: textContainer)
-            lineRect.origin.y += textView.textContainerInset.height
-
-            let y = lineRect.minY - visibleRect.minY + convert(NSPoint.zero, from: textView).y
-            let hitRect = NSRect(x: 0, y: y, width: bounds.width, height: lineRect.height)
-
-            if hitRect.contains(locationInRuler) {
-                return idx
-            }
-        }
-        return nil
+    func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+                   ofSubviewAt dividerIndex: Int) -> CGFloat {
+        min(proposedMaximumPosition, splitView.bounds.width - splitView.dividerThickness - Self.splitViewMinPaneWidth)
     }
 }

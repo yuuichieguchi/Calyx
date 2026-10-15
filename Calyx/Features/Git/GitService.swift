@@ -87,7 +87,6 @@ enum GitService {
     }
 
     private static let gitPath = "/usr/bin/git"
-    private static let maxDiffSize = 1_000_000
 
     // MARK: - Public API
 
@@ -505,35 +504,42 @@ enum GitService {
         return parseCommitFiles(output, commitHash: hash)
     }
 
-    static func fileDiff(source: DiffSource) async throws -> String {
-        let args: [String]
-        let workDir: String
-
+    /// git arguments for a full-context diff of one file (the whole file is a
+    /// single hunk, so both sides can be reconstructed). nil for untracked
+    /// files, whose diff is synthesized from the file content.
+    static func fileDiffArguments(for source: DiffSource) -> [String]? {
+        let fullContext = "-U2147483647"
         switch source {
-        case .unstaged(let path, let wd):
-            args = ["diff", "--", path]
-            workDir = wd
-        case .staged(let path, let wd):
-            args = ["diff", "--cached", "--", path]
-            workDir = wd
-        case .commit(let hash, let path, let wd):
+        case .unstaged(let path, _):
+            return ["diff", fullContext, "--", path]
+        case .staged(let path, _):
+            return ["diff", "--cached", fullContext, "--", path]
+        case .commit(let hash, let path, _):
+            return ["show", "--format=", "--patch", fullContext, hash, "--", path]
+        case .untracked:
+            return nil
+        }
+    }
+
+    static func fileDiff(source: DiffSource) async throws -> String {
+        switch source {
+        case .untracked(let path, let workDir):
+            return try await untrackedFileDiff(path: path, workDir: workDir)
+        case .commit(let hash, _, let workDir):
             guard isValidRef(hash) else {
                 throw GitError.commandFailed(exitCode: -1, stderr: "Invalid commit hash", command: "show")
             }
-            args = ["show", "--format=", "--patch", hash, "--", path]
-            workDir = wd
-        case .untracked(let path, let wd):
-            return try await untrackedFileDiff(path: path, workDir: wd)
+            return try await runFileDiff(source: source, workDir: workDir)
+        case .unstaged(_, let workDir), .staged(_, let workDir):
+            return try await runFileDiff(source: source, workDir: workDir)
         }
+    }
 
-        let output = try await run(args: args, workDir: workDir)
-
-        if output.utf8.count > maxDiffSize {
-            let index = output.utf8.index(output.utf8.startIndex, offsetBy: maxDiffSize)
-            return String(output[..<index])
+    private static func runFileDiff(source: DiffSource, workDir: String) async throws -> String {
+        guard let args = fileDiffArguments(for: source) else {
+            preconditionFailure("fileDiffArguments returns arguments for every tracked source")
         }
-
-        return output
+        return try await run(args: args, workDir: workDir)
     }
 
     /// Synthesize a unified diff for an untracked file by reading its content.
@@ -554,13 +560,8 @@ enum GitService {
             return "Binary files /dev/null and b/\(path) differ\n"
         }
 
-        guard var content = String(data: data, encoding: .utf8) else {
+        guard let content = String(data: data, encoding: .utf8) else {
             return "Binary files /dev/null and b/\(path) differ\n"
-        }
-
-        if content.utf8.count > maxDiffSize {
-            let idx = content.utf8.index(content.utf8.startIndex, offsetBy: maxDiffSize)
-            content = String(content[..<idx])
         }
 
         let lines = content.components(separatedBy: "\n")

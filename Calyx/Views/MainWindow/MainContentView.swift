@@ -16,6 +16,7 @@ struct MainContentView: View {
     var activeDiffState: DiffLoadState?
     var activeDiffSource: DiffSource?
     var activeDiffReviewStore: DiffReviewStore?
+    var activeDiffRevealState: DiffRevealState?
     /// Chrome-style in-app recovery bar (RecoveryBarModel.swift), shown
     /// above the tab bar/pane content as the first child of `body`'s own
     /// top-level `VStack`. `nil` (no existing caller besides
@@ -266,7 +267,8 @@ struct MainContentView: View {
                                             diff: diff,
                                             reduceTransparency: reduceTransparency,
                                             glassOpacity: glassOpacity,
-                                            reviewStore: activeDiffReviewStore
+                                            reviewStore: activeDiffReviewStore,
+                                            revealState: activeDiffRevealState
                                         )
                                             .accessibilityIdentifier(AccessibilityID.Diff.content)
                                     case .error(let message):
@@ -281,6 +283,7 @@ struct MainContentView: View {
                                         }
                                     }
                                 }
+                                .accessibilityElement(children: .contain)
                                 .accessibilityIdentifier(AccessibilityID.Diff.container)
                             } else if let browserController = activeBrowserController {
                                 BrowserContainerView(controller: browserController)
@@ -413,6 +416,7 @@ struct DiffGlassContentView: NSViewRepresentable {
     let reduceTransparency: Bool
     let glassOpacity: Double
     var reviewStore: DiffReviewStore?
+    var revealState: DiffRevealState?
 
     func makeNSView(context: Context) -> DiffGlassHostView {
         let host = DiffGlassHostView(
@@ -420,6 +424,7 @@ struct DiffGlassContentView: NSViewRepresentable {
             glassOpacity: glassOpacity
         )
         host.diffView.reviewStore = reviewStore
+        host.diffView.revealState = revealState
         host.diffView.display(diff: diff)
         return host
     }
@@ -430,6 +435,7 @@ struct DiffGlassContentView: NSViewRepresentable {
             glassOpacity: glassOpacity
         )
         nsView.diffView.reviewStore = reviewStore
+        nsView.diffView.revealState = revealState
         if nsView.diffView.currentDiff != diff {
             nsView.diffView.display(diff: diff)
         } else {
