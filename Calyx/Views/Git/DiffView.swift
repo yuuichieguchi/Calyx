@@ -58,6 +58,22 @@ final class DiffView: NSView {
     /// next main-queue turn (coalesced; deferred during live resize).
     private var isRealignPending = false
     private var isRealignScheduled = false
+    /// Viewport anchor read before the first re-wrap of a width change;
+    /// held across re-wraps (live-resize ticks, both panes) until the
+    /// realign that follows them restores it after the pads.
+    private var widthChangeAnchor: DiffScrollAnchor?
+    /// The width-change anchor is being applied: the scrolls it causes do
+    /// not discard it.
+    private var isRestoringAnchor = false
+    /// A pane announced a re-wrap (`onViewportWidthWillChange`) and has not
+    /// yet reported it done (`onViewportWidthChanged`): clip-view changes
+    /// in between come from the re-wrap, not from a scroll.
+    private var isWidthChangeInProgress = false
+    /// Last observed clip-view y per pane: a bounds notification that
+    /// leaves y unchanged (a size change) is not a scroll.
+    private var lastClipOriginY: [ObjectIdentifier: CGFloat] = [:]
+    /// Width of the last layout pass (0 before the first sized one).
+    private var lastLayoutWidth: CGFloat = 0
     /// Row heights of the active pane after the last alignment pass.
     private var lastAlignedHeights: [CGFloat] = []
 
@@ -109,7 +125,15 @@ final class DiffView: NSView {
                 guard let self, let pane else { return }
                 self.handleCollapsedRowAction(pane: pane, row: row, action: action)
             }
-            pane.onViewportWidthChanged = { [weak self] in self?.scheduleRealign() }
+            pane.onViewportWidthWillChange = { [weak self] in
+                self?.isWidthChangeInProgress = true
+                self?.captureWidthChangeAnchor()
+            }
+            pane.onViewportWidthChanged = { [weak self] in
+                self?.restoreWidthChangeAnchor()
+                self?.isWidthChangeInProgress = false
+                self?.scheduleRealign()
+            }
         }
         leftPane.onBecameFirstResponder = { [weak self] in
             self?.rightPane.clearSelection()
@@ -197,6 +221,16 @@ final class DiffView: NSView {
     }
 
     override func layout() {
+        // A width change resizes the panes in this pass (scroll view tile,
+        // clip and document frames) before they re-wrap: read the viewport
+        // anchor from the old geometry now; the realign restores it.
+        if bounds.width != lastLayoutWidth {
+            if lastLayoutWidth > 0 {
+                captureWidthChangeAnchor()
+                scheduleRealign()
+            }
+            lastLayoutWidth = bounds.width
+        }
         super.layout()
         // Swapping subviews, constraints and text storage must not happen
         // during the layout pass: schedule the switch once.
@@ -278,6 +312,47 @@ final class DiffView: NSView {
 
     // MARK: Realign (word wrap)
 
+    /// The pane whose geometry anchors the viewport across a re-wrap: the
+    /// modified side (VS Code's modified editor drives the viewport).
+    private var anchorPane: DiffPaneView? { activePanes.last }
+
+    /// Reads the anchor from the anchor pane's geometry before any pane
+    /// re-wraps; later re-wraps of the same width change keep it.
+    private func captureWidthChangeAnchor() {
+        guard widthChangeAnchor == nil else { return }
+        widthChangeAnchor = anchorPane?.captureScrollAnchor()
+    }
+
+    /// Re-applies the width-change anchor after a re-wrap (every
+    /// live-resize tick included; the pad realign may still be pending).
+    private func restoreWidthChangeAnchor() {
+        guard let anchor = widthChangeAnchor else { return }
+        restoreScroll(to: anchor)
+    }
+
+    /// Scrolls every active pane to the anchor pane's y for `anchor` (the
+    /// side-by-side panes share one vertical position).
+    private func restoreScroll(to anchor: DiffScrollAnchor) {
+        guard let y = anchorPane?.scrollY(for: anchor) else { return }
+        isRestoringAnchor = true
+        defer { isRestoringAnchor = false }
+        for pane in activePanes { pane.scroll(toY: y) }
+    }
+
+    /// A scroll the anchor restore did not cause (user or programmatic)
+    /// supersedes a pending width-change anchor. Origin changes made by a
+    /// re-wrap or by the pane's layout pass are geometry, not scrolls.
+    private func discardWidthChangeAnchorIfScrolled(_ clip: NSClipView) {
+        let key = ObjectIdentifier(clip)
+        let y = clip.bounds.origin.y
+        let previous = lastClipOriginY.updateValue(y, forKey: key)
+        let isPaneLayout = activePanes.contains { $0.scrollView.contentView === clip && $0.isLayingOut }
+        // A sync scroll mirrors the source pane, whose own notification decided.
+        guard !isRestoringAnchor, !isWidthChangeInProgress, !isSyncingScroll, !isPaneLayout,
+              previous != y else { return }
+        widthChangeAnchor = nil
+    }
+
     private func scheduleRealign() {
         isRealignPending = true
         guard !isRealignScheduled else { return }
@@ -302,9 +377,10 @@ final class DiffView: NSView {
     private func realignIfNeeded() {
         guard isRealignPending else { return }
         isRealignPending = false
-        let anchor = firstVisibleDisplayIndex()
+        let anchor = widthChangeAnchor ?? anchorPane?.captureScrollAnchor()
+        widthChangeAnchor = nil
         if alignPanes(), let anchor {
-            restoreScroll(toDisplayIndex: anchor)
+            restoreScroll(to: anchor)
         }
         updateRulerViewport()
     }
@@ -363,6 +439,9 @@ final class DiffView: NSView {
     /// scrollTop and scrollLeft between its two editors. A wrapping source
     /// pane has no horizontal scroll: only y follows.
     @objc private func clipViewBoundsDidChange(_ notification: Notification) {
+        if let clip = notification.object as? NSClipView {
+            discardWidthChangeAnchorIfScrolled(clip)
+        }
         if let source = notification.object as? NSClipView,
            source === activePanes.first?.scrollView.contentView {
             updateRulerViewport()
@@ -425,6 +504,8 @@ final class DiffView: NSView {
     private func rebuild(anchor: Int?, caretDisplayIndex: Int?) {
         guard let diff = currentDiff else { return }
         hasCaret = false
+        // Row indices change: a pending width-change anchor no longer applies.
+        widthChangeAnchor = nil
 
         if diff.isBinary {
             displayLines = []
@@ -521,6 +602,21 @@ final class DiffView: NSView {
         guard let pane = activePanes.first else { return }
         rulerView.viewportRect = pane.scrollView.documentVisibleRect
             .offsetBy(dx: 0, dy: -DiffMetrics.textInset.height)
+        let description = visibleLinesDescription
+        if rulerView.accessibilityValue() as? String != description {
+            rulerView.setAccessibilityValue(description)
+            NSAccessibility.post(element: rulerView, notification: .valueChanged)
+        }
+    }
+
+    /// Modified lines shown in the active pane's viewport, e.g.
+    /// "lines 2690–2712 of 3000"; nil when no visible row maps to a line.
+    var visibleLinesDescription: String? {
+        let range = visibleRowRange
+        guard let diff = currentDiff, !range.isEmpty, range.upperBound <= rows.count,
+              let first = modifiedLineForCursor(atRow: range.lowerBound),
+              let last = modifiedLineForCursor(atRow: range.upperBound - 1) else { return nil }
+        return "lines \(first)\u{2013}\(last) of \(diff.newLineCount)"
     }
 
     // MARK: Change navigation (VS Code DiffEditorWidget goToDiff / _goTo)
@@ -659,6 +755,8 @@ final class DiffView: NSView {
     /// Centres `range` vertically in every active pane; a range taller than
     /// the viewport starts at the top (VS Code revealRangeInCenter).
     private func revealRowsInCenter(_ range: Range<Int>) {
+        // An explicit reveal supersedes a pending width-change anchor.
+        widthChangeAnchor = nil
         guard let pane = activePanes.first else { return }
         let frames = pane.textView.ensureRowFrames()
         let lo = min(max(range.lowerBound, 0), frames.count)
@@ -740,6 +838,8 @@ final class DiffView: NSView {
             }
         }
         let row = target ?? max(rows.count - 1, 0)
+        // An explicit scroll supersedes a pending width-change anchor.
+        widthChangeAnchor = nil
         for pane in activePanes { pane.scrollToRow(row) }
     }
 

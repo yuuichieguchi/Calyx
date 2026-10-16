@@ -134,10 +134,12 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         let more = element("calyx.diff.moreActions")
         XCTAssertTrue(waitFor(more, timeout: 10), "diff toolbar must have the More Actions (…) button")
         more.click()
-        let submenu = app.menuItems["Diff View"]
+        // Scoped to the open More Actions menu so a "Diff View" item elsewhere
+        // (e.g. the app's View menu) cannot make the lookup ambiguous.
+        let submenu = more.menuItems["Diff View"]
         XCTAssertTrue(waitFor(submenu, timeout: 5), "More Actions must contain a Diff View submenu")
         submenu.hover()
-        let item = app.menuItems[title]
+        let item = submenu.menuItems[title]
         XCTAssertTrue(waitFor(item, timeout: 5), "Diff View submenu must contain \(title)")
         item.click()
     }
@@ -150,14 +152,14 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         pane.click()
 
         let setup = shell(
-            "mkdir -p '\(repoDir)' && cd '\(repoDir)' && git init -q -b main && " +
+            "rm -rf '\(repoDir)' && mkdir -p '\(repoDir)' && cd '\(repoDir)' && git init -q -b main && " +
             "git config user.name t && git config user.email t@e && " +
             "printf 'a\\nb\\nc\\nd\\ne\\n' > \(fileName) && git add \(fileName) && git commit -q -m init && " +
             "printf 'a\\nb\\nX\\nd\\ne\\n' > \(fileName) && echo ready"
         )
         XCTAssertEqual(setup, "ready", "fixture repo setup failed: \(setup)")
         typeIntoPane("cd \(repoDir)\n")
-        Thread.sleep(forTimeInterval: 2)
+        // shell() waits for its own completion marker, so this runs after the cd.
         XCTAssertEqual(shell("pwd"), repoDir, "pane cwd must be the fixture repo")
 
         openCommandPaletteViaMenu()
@@ -242,5 +244,168 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
 
         toggleWordWrapFromMoreActions()
         assertWordWrapSwitch(1, "a second toggle must turn word wrap back on")
+    }
+
+    // MARK: - (d) Long diff, inline: screenshots for visual inspection
+
+    private func shot(_ name: String) {
+        let a = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
+        a.name = name
+        a.lifetime = .deleteOnSuccess
+        add(a)
+    }
+
+    /// After each step: the diff content and the expected gutter(s) exist and the app is alive.
+    private func assertDiffHealthy(sideBySide: Bool, _ step: String,
+                                   file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(waitFor(element("calyx.diff.content"), timeout: 5),
+                      "[\(step)] calyx.diff.content must exist", file: file, line: line)
+        let gutters = sideBySide
+            ? ["calyx.diff.lineNumbers.old", "calyx.diff.lineNumbers.new"]
+            : ["calyx.diff.lineNumbers.inline"]
+        for id in gutters {
+            XCTAssertTrue(waitFor(element(id), timeout: 5),
+                          "[\(step)] \(id) must exist", file: file, line: line)
+        }
+        XCTAssertTrue(app.state == .runningForeground || app.state == .runningBackground,
+                      "[\(step)] app must still be running (state: \(app.state.rawValue))",
+                      file: file, line: line)
+    }
+
+    /// Polls `condition` until it holds or `timeout` elapses.
+    private func waitUntil(timeout: TimeInterval = 10, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            if Date() >= deadline { return false }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        return true
+    }
+
+    /// The diff host of the long.txt diff (AX label "Diff of …long.txt").
+    private func longDiffContent() -> XCUIElement {
+        app.descendants(matching: .any)
+            .matching(NSPredicate(format: "identifier == %@ AND label ENDSWITH %@", "calyx.diff.content", "long.txt"))
+            .firstMatch
+    }
+
+    private func overviewRuler() -> XCUIElement {
+        longDiffContent().descendants(matching: .any)["calyx.diff.overviewRuler"]
+    }
+
+    /// Visible modified lines from the ruler's AX value "lines A–B of N".
+    private func visibleLines() -> (first: Int, last: Int, total: Int)? {
+        guard let value = overviewRuler().value as? String else { return nil }
+        let numbers = value.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+        guard value.hasPrefix("lines "), numbers.count == 3 else { return nil }
+        return (numbers[0], numbers[1], numbers[2])
+    }
+
+    /// Waits for the More Actions menu item just chosen to disappear (menu closed).
+    private func waitForMenuClosed(item title: String, _ step: String,
+                                   file: StaticString = #filePath, line: UInt = #line) {
+        let item = element("calyx.diff.moreActions").menuItems[title]
+        XCTAssertTrue(waitUntil(timeout: 5) { !item.exists },
+                      "[\(step)] More Actions menu must close", file: file, line: line)
+    }
+
+    func test_longDiff_inline_scrollLayoutAndWrapSmoke() {
+        waitForMainWindow()
+        let pane = terminalPane()
+        XCTAssertTrue(waitFor(pane, timeout: 10), "terminal pane not found")
+        pane.click()
+
+        let setup = shell(
+            "rm -rf '\(repoDir)' && mkdir -p '\(repoDir)' && cd '\(repoDir)' && git init -q -b main && " +
+            "git config user.name t && git config user.email t@e && " +
+            "printf 'a\\nb\\nc\\n' > \(fileName) && " +
+            "awk 'BEGIN{for(i=1;i<=3000;i++){s=\"line \" i \" - some text to make the line reasonably long so it wraps when narrow\"; if(i%10==0){while(length(s)<200)s=s\" pad\"}; print s}}' > long.txt && " +
+            "git add . && git commit -q -m init && " +
+            "printf 'a\\nX\\nc\\n' > \(fileName) && sed -i '' '2700s/$/ MODIFIED LINE/' long.txt && echo ready"
+        )
+        XCTAssertEqual(setup, "ready", "fixture repo setup failed: \(setup)")
+        typeIntoPane("cd \(repoDir)\n")
+        // shell() waits for its own completion marker, so this runs after the cd.
+        XCTAssertEqual(shell("pwd"), repoDir, "pane cwd must be the fixture repo")
+
+        openCommandPaletteViaMenu()
+        let searchField = element("calyx.commandPalette.searchField")
+        XCTAssertTrue(waitFor(searchField), "Command palette should appear")
+        searchField.typeText("Show Git Changes")
+        searchField.typeKey(.enter, modifierFlags: [])
+
+        let notesRow = element("calyx.git.file.\(fileName)")
+        XCTAssertTrue(waitFor(notesRow, timeout: 20), "notes.txt row must appear")
+        let longRow = element("calyx.git.file.long.txt")
+        XCTAssertTrue(waitFor(longRow, timeout: 20), "long.txt row must appear")
+        shot("00-before-open")
+
+        // Set inline on a small diff first so the long diff opens inline.
+        notesRow.click()
+        XCTAssertTrue(waitFor(element("calyx.diff.toolbar"), timeout: 10), "a diff tab must open")
+        chooseDiffView("Inline")
+        XCTAssertTrue(waitFor(element("calyx.diff.lineNumbers.inline"), timeout: 5),
+                      "notes.txt must switch to the inline gutter")
+
+        longRow.click()
+        let content = longDiffContent()
+        XCTAssertTrue(waitFor(content, timeout: 10),
+                      "[open] the diff tab must show long.txt (AX label \"Diff of …long.txt\")")
+        // Reveal-first-change scrolls the 3000-line file to the edit on line 2700.
+        XCTAssertTrue(waitUntil { visibleLines().map { $0.total == 3000 && ($0.first...$0.last).contains(2700) } ?? false },
+                      "[open] the viewport must show line 2700 (ruler: \(String(describing: overviewRuler().value)))")
+        assertDiffHealthy(sideBySide: false, "open")
+        shot("01-open-inline")
+        guard let opened = visibleLines() else {
+            XCTFail("[open] overview ruler must report the visible lines")
+            return
+        }
+
+        // Scroll the pane's scroll view: wheel events synthesized on the host
+        // group did not move the viewport. Keep this to 2 up + 2 down.
+        let paneScroll = content.scrollViews.firstMatch
+        for _ in 0..<2 { paneScroll.scroll(byDeltaX: 0, deltaY: 400) }
+        XCTAssertTrue(waitUntil { (visibleLines()?.first ?? .max) < opened.first },
+                      "[scroll up] first visible line must decrease from \(opened.first) (ruler: \(String(describing: overviewRuler().value)))")
+        assertDiffHealthy(sideBySide: false, "scroll up")
+        shot("02-scrolled-up")
+        guard let scrolledUp = visibleLines() else {
+            XCTFail("[scroll up] overview ruler must report the visible lines")
+            return
+        }
+
+        for _ in 0..<2 { paneScroll.scroll(byDeltaX: 0, deltaY: -400) }
+        XCTAssertTrue(waitUntil { (visibleLines()?.first ?? .min) > scrolledUp.first },
+                      "[scroll down] first visible line must increase from \(scrolledUp.first) (ruler: \(String(describing: overviewRuler().value)))")
+        assertDiffHealthy(sideBySide: false, "scroll down")
+        shot("03-scrolled-down")
+
+        chooseDiffView("Side by Side")
+        waitForNonExistence(element("calyx.diff.lineNumbers.inline"), timeout: 5)
+        assertDiffHealthy(sideBySide: true, "side by side")
+        shot("04-side-by-side")
+
+        toggleWordWrapFromMoreActions()
+        waitForMenuClosed(item: "Word Wrap", "wrap off")
+        assertDiffHealthy(sideBySide: true, "wrap off")
+        shot("05-wrap-off")
+        toggleWordWrapFromMoreActions()
+        waitForMenuClosed(item: "Word Wrap", "wrap on")
+        assertDiffHealthy(sideBySide: true, "wrap on")
+        shot("06-wrap-on")
+
+        chooseDiffView("Automatic")
+        waitForMenuClosed(item: "Diff View", "automatic")
+        // Automatic resolves by window width, so accept either gutter configuration.
+        XCTAssertTrue(waitFor(element("calyx.diff.content"), timeout: 5),
+                      "[automatic] calyx.diff.content must exist")
+        let inlineGutter = element("calyx.diff.lineNumbers.inline")
+        let oldGutter = element("calyx.diff.lineNumbers.old")
+        let newGutter = element("calyx.diff.lineNumbers.new")
+        XCTAssertTrue(waitUntil(timeout: 5) { inlineGutter.exists || (oldGutter.exists && newGutter.exists) },
+                      "[automatic] inline gutter or both side-by-side gutters must exist")
+        XCTAssertTrue(app.state == .runningForeground || app.state == .runningBackground,
+                      "[automatic] app must still be running (state: \(app.state.rawValue))")
+        shot("07-automatic")
     }
 }

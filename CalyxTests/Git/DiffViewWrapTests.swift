@@ -71,6 +71,8 @@ private func makeF3() -> FileDiff {
     return DiffParser.parse(out, path: "w.txt")
 }
 
+extension DiffViewWindowedSuites {
+
 @MainActor
 @Suite(.serialized)
 struct DiffViewWrapTests {
@@ -425,7 +427,10 @@ struct DiffViewWrapTests {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
                                   styleMask: [.titled], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
-            defer { window.close() }
+            defer {
+                window.orderOut(nil)
+                window.close()
+            }
             window.contentView = view
             try await settle(view)
             let textView = view.rightPaneForTesting.textView
@@ -467,7 +472,12 @@ struct DiffViewWrapTests {
             }
             let diff = DiffParser.parse(raw, path: "w.txt")
             var windows: [NSWindow] = []
-            defer { windows.forEach { $0.close() } }
+            defer {
+                for window in windows {
+                    window.orderOut(nil)
+                    window.close()
+                }
+            }
             for legacy in [false, true] {
                 let view = DiffView(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
                 let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
@@ -501,4 +511,147 @@ struct DiffViewWrapTests {
             }
         }
     }
+
+    // MARK: Width change keeps the viewport (VS Code viewport-start line + delta)
+
+    /// 400 lines with long (wrapping) lines every 10 lines; line 200
+    /// replaced by a long line.
+    private func makeAnchorDiff() -> FileDiff {
+        var raw = header(old: 400, new: 400)
+        for n in 1...400 {
+            if n == 200 {
+                raw += "-line 200\n+200 \(longText)\n"
+            } else if n % 10 == 0 {
+                raw += " \(n) \(longText)\n"
+            } else {
+                raw += " line \(n)\n"
+            }
+        }
+        return DiffParser.parse(raw, path: "w.txt")
+    }
+
+    private func viewportTop(_ pane: DiffPaneView) -> CGFloat {
+        pane.scrollView.documentVisibleRect.minY
+    }
+
+    @Test(arguments: [(DiffLayoutPreference.sideBySide, true), (.sideBySide, false), (.inline, true), (.inline, false)])
+    func widthChange_keepsFirstVisibleLineAndOffset(layout: DiffLayoutPreference, wrap: Bool) async throws {
+        try await withIsolatedSettings {
+            DiffLayoutSettings.preference = layout
+            DiffLayoutSettings.wordWrap = wrap
+            let view = DiffView(frame: NSRect(x: 0, y: 0, width: 900, height: 400))
+            let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .resizable],
+                                  backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            defer {
+                window.orderOut(nil)
+                window.close()
+            }
+            window.contentView = view
+            view.display(diff: makeAnchorDiff())
+            window.layoutIfNeeded()
+            try await settle(view)
+
+            let panes = layout == .inline
+                ? [view.inlinePaneForTesting] : [view.leftPaneForTesting, view.rightPaneForTesting]
+            // The modified line 200 (its addition row; in side-by-side the
+            // row shared by the deletion and the addition).
+            let addCells = view.rightPaneForTesting.cells
+            let row = try #require((layout == .inline ? panes[0].cells : addCells).firstIndex {
+                if case .line(.addition)? = $0?.kind { return true }
+                return false
+            })
+            // The modified side anchors the viewport; panes share one y.
+            let reference = panes[panes.count - 1]
+            let natural0 = reference.textView.naturalHeights()[row]
+            if wrap { #expect(natural0 > DiffMetrics.rowHeight * 1.5, "line 200 wraps at 900 pt") }
+            // Viewport top inside line 200: half way down when wrapped, 7 pt otherwise.
+            let fraction: CGFloat = wrap ? 0.5 : 7 / natural0
+            for pane in panes {
+                pane.scroll(toY: pane.textView.ensureRowFrames()[row].minY + fraction * natural0)
+            }
+            try await settle(view)
+            #expect(reference.firstVisibleRow == row)
+
+            for width in [600.0, 1200.0, 900.0] {
+                window.setContentSize(NSSize(width: width, height: 400))
+                window.layoutIfNeeded()
+                try await settle(view)
+                for pane in panes {
+                    #expect(pane.firstVisibleRow == row, "width \(width): first visible row")
+                    #expect(abs(viewportTop(pane) - viewportTop(reference)) <= 0.5, "width \(width): panes share y")
+                }
+                let frame = reference.textView.ensureRowFrames()[row]
+                let natural = reference.textView.naturalHeights()[row]
+                let offset = viewportTop(reference) - frame.minY
+                #expect(abs(offset - fraction * natural) <= 1,
+                        "width \(width): offset \(offset) vs \(fraction * natural) (natural \(natural))")
+            }
+        }
+    }
+
+    // MARK: A scroll during a pending width change supersedes the anchor
+
+    /// Window-hosted side-by-side wrapped view of `makeAnchorDiff()` at
+    /// 900 pt, its viewport top at the modified line 50.
+    private func makeAnchoredWindow() async throws -> (NSWindow, DiffView) {
+        let view = DiffView(frame: NSRect(x: 0, y: 0, width: 900, height: 400))
+        let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .resizable],
+                              backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.contentView = view
+        view.display(diff: makeAnchorDiff())
+        window.layoutIfNeeded()
+        try await settle(view)
+        let row50 = try #require(view.row(forModifiedLine: 50))
+        for pane in [view.leftPaneForTesting, view.rightPaneForTesting] { pane.scrollToRow(row50) }
+        try await settle(view)
+        #expect(view.rightPaneForTesting.firstVisibleRow == row50)
+        return (window, view)
+    }
+
+    /// Starts a width change: the panes re-wrap (anchor captured and
+    /// restored) and the realign stays queued on the main queue.
+    private func startWidthChange(_ window: NSWindow) {
+        window.setContentSize(NSSize(width: 600, height: 400))
+        window.layoutIfNeeded()
+    }
+
+    @Test func widthChange_userScrollBeforeRealign_winsOverAnchor() async throws {
+        try await withIsolatedSettings {
+            let (window, view) = try await makeAnchoredWindow()
+            defer {
+                window.orderOut(nil)
+                window.close()
+            }
+            startWidthChange(window)
+            let row300 = try #require(view.row(forModifiedLine: 300))
+            for pane in [view.leftPaneForTesting, view.rightPaneForTesting] { pane.scrollToRow(row300) }
+            try await settle(view)
+            #expect(view.rightPaneForTesting.firstVisibleRow == row300, "the user scroll stays")
+            #expect(view.leftPaneForTesting.firstVisibleRow == row300)
+        }
+    }
+
+    @Test func widthChange_goToDiffBeforeRealign_winsOverAnchor() async throws {
+        try await withIsolatedSettings {
+            let (window, view) = try await makeAnchoredWindow()
+            defer {
+                window.orderOut(nil)
+                window.close()
+            }
+            startWidthChange(window)
+            view.goToDiff(.next)
+            try await settle(view)
+            #expect(view.currentChangeIndex == 0)
+            let row200 = try #require(view.row(forModifiedLine: 200))
+            let pane = view.rightPaneForTesting
+            let visible = pane.scrollView.documentVisibleRect
+            let frame = pane.textView.ensureRowFrames()[row200]
+            #expect(frame.minY >= visible.minY && frame.minY < visible.maxY,
+                    "the revealed change stays visible: \(frame) in \(visible)")
+        }
+    }
 }
+
+} // extension DiffViewWindowedSuites

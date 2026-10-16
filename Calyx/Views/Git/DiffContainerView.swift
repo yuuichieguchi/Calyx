@@ -1,44 +1,9 @@
 // DiffContainerView.swift
 // Calyx
 //
-// SwiftUI wrapper for the diff viewer with toolbar.
+// Toolbar shown above the diff viewer.
 
 import SwiftUI
-
-struct DiffContainerView: View {
-    let source: DiffSource
-    let loadState: DiffLoadState
-
-    var body: some View {
-        VStack(spacing: 0) {
-            DiffToolbarView(source: source)
-
-            switch loadState {
-            case .loading:
-                VStack {
-                    Spacer()
-                    ProgressView("Loading diff...")
-                    Spacer()
-                }
-            case .success(let diff):
-                DiffViewRepresentable(diff: diff)
-                    .accessibilityIdentifier(AccessibilityID.Diff.content)
-            case .error(let message):
-                VStack(spacing: 12) {
-                    Spacer()
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text(message)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier(AccessibilityID.Diff.container)
-    }
-}
 
 struct DiffToolbarView: View {
     let source: DiffSource
@@ -241,25 +206,6 @@ struct DiffToolbarView: View {
     }
 }
 
-struct DiffViewRepresentable: NSViewRepresentable {
-    let diff: FileDiff
-    var reviewStore: DiffReviewStore?
-
-    func makeNSView(context: Context) -> DiffView {
-        let view = DiffView(frame: .zero)
-        view.reviewStore = reviewStore
-        view.display(diff: diff)
-        return view
-    }
-
-    func updateNSView(_ nsView: DiffView, context: Context) {
-        nsView.reviewStore = reviewStore
-        // Only re-render if diff changed
-        if nsView.currentDiff != diff {
-            nsView.display(diff: diff)
-        }
-    }
-}
 extension DiffLoadState {
     /// Number of changes of a loaded diff; 0 while loading or on error.
     var changeCount: Int {

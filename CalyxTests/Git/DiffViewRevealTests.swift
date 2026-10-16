@@ -34,6 +34,8 @@ private func makeRaw() -> String {
     return out
 }
 
+extension DiffViewWindowedSuites {
+
 @MainActor
 @Suite(.serialized)
 struct DiffViewRevealTests {
@@ -294,7 +296,10 @@ struct DiffViewRevealTests {
 
             let view = try await makeView(diff)
             let window = makeWindow(holding: view)
-            defer { window.close() }
+            defer {
+                window.orderOut(nil)
+                window.close()
+            }
             let textView = try #require(descendants(of: view, DiffTextView.self).first)
             #expect(window.makeFirstResponder(textView))
             let deletedRow = 10 // inline rows: lines 1-10, then deleted 11, 12
@@ -310,7 +315,10 @@ struct DiffViewRevealTests {
         try await withIsolatedSettings {
             let view = try await makeView(DiffParser.parse(makeRaw(), path: "big.txt"))
             let window = makeWindow(holding: view)
-            defer { window.close() }
+            defer {
+                window.orderOut(nil)
+                window.close()
+            }
             try await settle(view)
             let textViews = descendants(of: view, DiffTextView.self)
             #expect(textViews.count == 2)
@@ -326,3 +334,5 @@ struct DiffViewRevealTests {
         }
     }
 }
+
+} // extension DiffViewWindowedSuites

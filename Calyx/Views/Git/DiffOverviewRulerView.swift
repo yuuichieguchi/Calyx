@@ -65,9 +65,8 @@ final class DiffOverviewRulerView: NSView {
         func fill(_ ranges: [Range<Int>], x: CGFloat, color: NSColor) {
             color.setFill()
             for range in ranges {
-                let minY = top(range.lowerBound)
-                let height = max((top(range.upperBound) - minY) * scale, DiffOverviewRuler.minimumMarkHeight)
-                NSRect(x: x, y: minY * scale, width: column, height: height).fill()
+                DiffOverviewRuler.zoneRect(top: top(range.lowerBound), bottom: top(range.upperBound), scale: scale,
+                                           x: x, height: bounds.height).fill()
             }
         }
         fill(zones.original, x: 0, color: Self.removedColor)
@@ -75,6 +74,7 @@ final class DiffOverviewRulerView: NSView {
 
         let slider = DiffOverviewRuler.viewport(visibleRect: viewportRect, documentHeight: documentHeight,
                                                 height: bounds.height)
+        guard slider.height > 0 else { return }
         let rect = NSRect(x: 0, y: slider.minY, width: bounds.width, height: slider.height)
         Self.sliderFill.setFill()
         rect.fill()

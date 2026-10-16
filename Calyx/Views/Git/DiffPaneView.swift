@@ -124,6 +124,26 @@ enum DiffGutterGeometry {
     static func markerRect(rowFrame: CGRect, rowHeight: CGFloat, x: CGFloat, size: CGFloat) -> CGRect {
         CGRect(x: x, y: rowFrame.minY + (rowHeight - size) / 2, width: size, height: size)
     }
+
+    /// Rows to draw for a dirty `rect`: those intersecting `rect ∩ bounds`.
+    /// With `clipsToBounds == false` (macOS 14+) AppKit may pass a dirty
+    /// rect reaching past the view's bounds (up to whatever ancestor
+    /// clips); rows there are outside the gutter and must not be drawn.
+    static func rowsToDraw(rowFrames: [CGRect], in rect: CGRect, bounds: CGRect) -> Range<Int> {
+        let area = rect.intersection(bounds)
+        guard !area.isNull, !area.isEmpty else { return 0..<0 }
+        return DiffRowFrameSearch.rows(intersecting: area.minY, area.maxY, in: rowFrames)
+    }
+}
+
+/// Viewport top relative to the rows (see `DiffPaneView.captureScrollAnchor`).
+enum DiffScrollAnchor: Equatable {
+    /// Above the first row (in the top inset), at document `y`.
+    case aboveRows(y: CGFloat)
+    /// Inside `row`'s content, `fraction` of its natural (unpadded) height down.
+    case row(Int, fraction: CGFloat)
+    /// Inside `row`'s alignment pad, `offset` pt below its content.
+    case pad(Int, offset: CGFloat)
 }
 
 /// One gutter row; parallel to the pane's cells.
@@ -174,6 +194,9 @@ final class DiffPaneView: NSView {
     var onSelectionChanged: (() -> Void)?
     /// The viewport width changed in `layout()` (rows may have re-wrapped).
     var onViewportWidthChanged: (() -> Void)?
+    /// The rows are about to re-wrap at a new viewport width (the old row
+    /// geometry is still in place: the scroll anchor is read from it).
+    var onViewportWidthWillChange: (() -> Void)?
 
     /// Wrap lines at the viewport width (VS Code `wordWrap: on`). Applied
     /// synchronously from the current viewport width.
@@ -296,13 +319,15 @@ final class DiffPaneView: NSView {
         if !wordWrap {
             textView.minSize = NSSize(width: scrollView.contentSize.width, height: textView.minSize.height)
         }
-        _ = updateContainerWidth()
+        _ = updateContainerWidth(announcing: false)
     }
 
     /// Sets the container width for the current mode and viewport; returns
     /// whether it changed. Wrapping at a zero-width viewport is deferred
-    /// (infinite width) until the pane has a size.
-    private func updateContainerWidth() -> Bool {
+    /// (infinite width) until the pane has a size. `announcing` calls
+    /// `onViewportWidthWillChange` before the rows re-wrap (viewport width
+    /// changes; a wrap toggle rebuilds with its own anchor instead).
+    private func updateContainerWidth(announcing: Bool) -> Bool {
         let container = textView.container
         let target: CGFloat
         let viewport = wrapViewportWidth
@@ -313,11 +338,15 @@ final class DiffPaneView: NSView {
         } else {
             target = .greatestFiniteMagnitude
         }
+        let rewraps = container.containerSize.width != target
+        // Before the text view's frame changes too: the clip view may
+        // re-constrain its origin on a document frame change.
+        if rewraps, announcing { onViewportWidthWillChange?() }
         if wordWrap, viewport > 0, textView.minSize.width != viewport || textView.frame.width != viewport {
             textView.minSize = NSSize(width: viewport, height: textView.minSize.height)
             textView.setFrameSize(NSSize(width: viewport, height: textView.frame.height))
         }
-        guard container.containerSize.width != target else { return false }
+        guard rewraps else { return false }
         container.containerSize = NSSize(width: target, height: CGFloat.greatestFiniteMagnitude)
         textView.invalidateRowFrames()
         textView.sizeToFit()
@@ -333,10 +362,17 @@ final class DiffPaneView: NSView {
         return max(Int(usable / DiffMetrics.columnWidth), 0)
     }
 
+    /// `layout()` is running: clip-view origin changes in it come from
+    /// geometry (frame changes, AppKit's origin constraining and
+    /// alignment), not from a scroll.
+    private(set) var isLayingOut = false
+
     override func layout() {
+        isLayingOut = true
+        defer { isLayingOut = false }
         super.layout()
         if wordWrap {
-            if updateContainerWidth() { onViewportWidthChanged?() }
+            if updateContainerWidth(announcing: true) { onViewportWidthChanged?() }
         } else {
             // Keep the document at least as wide as the viewport so full-row
             // backgrounds and filler hatching span the visible width.
@@ -365,7 +401,7 @@ final class DiffPaneView: NSView {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.isClipWidthUpdatePending = false
-            guard self.wordWrap, self.updateContainerWidth() else { return }
+            guard self.wordWrap, self.updateContainerWidth(announcing: true) else { return }
             self.onViewportWidthChanged?()
         }
     }
@@ -431,6 +467,40 @@ final class DiffPaneView: NSView {
     func scrollToRow(_ row: Int) {
         let frames = textView.ensureRowFrames()
         scroll(toY: frames.indices.contains(row) ? frames[row].minY : 0)
+    }
+
+    /// The viewport top as a row-relative position (VS Code keeps the
+    /// viewport's start line and its offset across a re-wrap). Rows keep
+    /// their indices across re-wraps and pads; only their geometry changes.
+    func captureScrollAnchor() -> DiffScrollAnchor? {
+        let frames = textView.ensureRowFrames()
+        guard let first = frames.first else { return nil }
+        let top = scrollView.documentVisibleRect.minY
+        guard top >= first.minY else { return .aboveRows(y: top) }
+        let row = DiffRowFrameSearch.lastRow(startingAtOrBefore: top, in: frames)
+        let content = textView.naturalHeights()[row]
+        let delta = top - frames[row].minY
+        if delta < content {
+            return .row(row, fraction: content > 0 ? delta / content : 0)
+        }
+        return .pad(row, offset: delta - content)
+    }
+
+    /// Viewport-top y for `anchor` in the current geometry.
+    func scrollY(for anchor: DiffScrollAnchor) -> CGFloat? {
+        let frames = textView.ensureRowFrames()
+        switch anchor {
+        case .aboveRows(let y):
+            return y
+        case .row(let row, let fraction):
+            guard frames.indices.contains(row) else { return nil }
+            return frames[row].minY + fraction * textView.naturalHeights()[row]
+        case .pad(let row, let offset):
+            guard frames.indices.contains(row) else { return nil }
+            let content = textView.naturalHeights()[row]
+            let pad = frames[row].height - content
+            return frames[row].minY + content + min(offset, max(pad, 0))
+        }
     }
 
     /// Rows intersecting the visible rect (partially visible rows included).
@@ -915,6 +985,12 @@ final class DiffLineNumberView: NSRulerView {
         self.columns = columns
         self.textView = textView
         super.init(scrollView: nil, orientation: .verticalRuler)
+        // The gutter is a viewport onto document rows, like the clip view
+        // beside it: a row straddling the top or bottom edge is partially
+        // visible and its label must be cut at the edge. Unclipped
+        // (macOS 14+ default), that part is painted over whatever lies
+        // outside the scroll view (tab bar, toolbar) and stays there.
+        clipsToBounds = true
     }
 
     @available(*, unavailable)
@@ -932,6 +1008,12 @@ final class DiffLineNumberView: NSRulerView {
         return textView.ensureRowFrames().map {
             CGRect(x: 0, y: $0.minY + offset, width: width, height: $0.height)
         }
+    }
+
+    /// Rows `drawHashMarksAndLabels(in:)` draws for `rect` (within bounds).
+    func rowsToDraw(in rect: CGRect) -> Range<Int> {
+        let range = DiffGutterGeometry.rowsToDraw(rowFrames: rowFrames(), in: rect, bounds: bounds)
+        return range.clamped(to: 0..<rows.count)
     }
 
     private func row(at point: NSPoint) -> Int? {
@@ -981,7 +1063,7 @@ final class DiffLineNumberView: NSRulerView {
     override func drawHashMarksAndLabels(in rect: NSRect) {
         guard !rows.isEmpty else { return }
         let frames = rowFrames()
-        let visible = DiffRowFrameSearch.rows(intersecting: rect.minY, rect.maxY, in: frames)
+        let visible = rowsToDraw(in: rect)
         let numberAttrs: [NSAttributedString.Key: Any] = [
             .font: DiffMetrics.gutterFont,
             .foregroundColor: NSColor.secondaryLabelColor,
@@ -991,7 +1073,7 @@ final class DiffLineNumberView: NSRulerView {
             return min(s, c)...max(s, c)
         }()
 
-        for index in visible where index < rows.count {
+        for index in visible {
             let gutterRow = rows[index]
             let rowRect = frames[index]
 

@@ -45,11 +45,26 @@ enum DiffOverviewRuler {
     /// Pixel variant for variable row heights (word wrap): slider rect in
     /// top-left-origin ruler coordinates, document y 0 at y = 0 and
     /// `documentHeight` at y = `height`.
+    /// The visible rect includes the text insets (it starts at -inset at
+    /// the top and ends past `documentHeight` at the end): the slider is
+    /// limited to the ruler, `0...height`.
     static func viewport(visibleRect: CGRect, documentHeight: CGFloat, height: CGFloat) -> CGRect {
         guard documentHeight > 0 else { return .zero }
         let scale = height / documentHeight
-        return CGRect(x: 0, y: visibleRect.minY * scale,
-                      width: width, height: visibleRect.height * scale)
+        let minY = min(max(visibleRect.minY * scale, 0), height)
+        let maxY = min(max(visibleRect.maxY * scale, minY), height)
+        return CGRect(x: 0, y: minY, width: width, height: maxY - minY)
+    }
+
+    /// Zone mark for document rows spanning `top..<bottom` in a ruler column
+    /// at `x`; `scale` maps document y to ruler y, the ruler is `height` tall.
+    /// A zone shorter than `minimumMarkHeight` grows to it; one that would
+    /// then reach past the bottom edge moves up (VS Code
+    /// overviewZoneManager keeps zones inside the ruler the same way).
+    static func zoneRect(top: CGFloat, bottom: CGFloat, scale: CGFloat, x: CGFloat, height: CGFloat) -> CGRect {
+        let markHeight = min(max((bottom - top) * scale, minimumMarkHeight), max(height, 0))
+        let y = max(min(top * scale, height - markHeight), 0)
+        return CGRect(x: x, y: y, width: columnWidth, height: markHeight)
     }
 
     /// Index of the row containing document y: the last row whose top
