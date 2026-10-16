@@ -35,6 +35,7 @@ struct DiffContainerView: View {
                 }
             }
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.Diff.container)
     }
 }
@@ -48,6 +49,13 @@ struct DiffToolbarView: View {
     var reviewFileCount: Int = 0
     var onSubmitAllReviews: (() -> Void)?
     var onDiscardAllReviews: (() -> Void)?
+    /// Number of changes of the loaded diff (0 while loading / on error).
+    var changeCount: Int = 0
+    var onGoToChange: ((DiffChangeNavigator.Direction) -> Void)?
+
+    @State private var layoutPreference = DiffLayoutSettings.preference
+    @State private var hideUnchangedRegions = DiffLayoutSettings.hideUnchangedRegionsEnabled
+    @State private var ignoreTrimWhitespace = DiffLayoutSettings.ignoreTrimWhitespace
 
     var body: some View {
         HStack(spacing: 8) {
@@ -131,10 +139,87 @@ struct DiffToolbarView: View {
                     .accessibilityIdentifier(AccessibilityID.DiffReview.discardAllButton)
                 }
             }
+
+            changeNavigationButtons
+
+            moreActionsMenu
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.Diff.toolbar)
+    }
+
+    /// VS Code's diff editor title Previous / Next Change actions.
+    private var changeNavigationButtons: some View {
+        HStack(spacing: 4) {
+            Button {
+                onGoToChange?(.previous)
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .help("Go to Previous Change")
+            .accessibilityLabel("Go to Previous Change")
+            .accessibilityIdentifier(AccessibilityID.Diff.previousChangeButton)
+            Button {
+                onGoToChange?(.next)
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .help("Go to Next Change")
+            .accessibilityLabel("Go to Next Change")
+            .accessibilityIdentifier(AccessibilityID.Diff.nextChangeButton)
+        }
+        .buttonStyle(.borderless)
+        .disabled(changeCount == 0)
+    }
+
+    /// "…" menu: diff layout, collapse unchanged regions, ignore trim
+    /// whitespace. Writes go to `DiffLayoutSettings`; the notification
+    /// re-reads them so the checkmarks follow the palette / Settings.
+    private var moreActionsMenu: some View {
+        Menu {
+            Menu("Diff View") {
+                Picker("Diff View", selection: $layoutPreference) {
+                    ForEach(DiffLayoutPreference.allCases, id: \.self) { pref in
+                        Text(pref.displayName)
+                            .tag(pref)
+                            .accessibilityIdentifier(AccessibilityID.Diff.layoutMenuItem(pref))
+                    }
+                }
+                .pickerStyle(.inline)
+                .labelsHidden()
+            }
+            Toggle("Collapse Unchanged Regions", isOn: $hideUnchangedRegions)
+                .accessibilityIdentifier(AccessibilityID.Diff.collapseUnchangedItem)
+            Toggle("Ignore Trim Whitespace", isOn: $ignoreTrimWhitespace)
+                .accessibilityIdentifier(AccessibilityID.Diff.ignoreTrimWhitespaceItem)
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .accessibilityIdentifier(AccessibilityID.Diff.moreActionsButton)
+        .onChange(of: layoutPreference) { _, newValue in
+            if DiffLayoutSettings.preference != newValue {
+                DiffLayoutSettings.preference = newValue
+            }
+        }
+        .onChange(of: hideUnchangedRegions) { _, newValue in
+            if DiffLayoutSettings.hideUnchangedRegionsEnabled != newValue {
+                DiffLayoutSettings.hideUnchangedRegionsEnabled = newValue
+            }
+        }
+        .onChange(of: ignoreTrimWhitespace) { _, newValue in
+            if DiffLayoutSettings.ignoreTrimWhitespace != newValue {
+                DiffLayoutSettings.ignoreTrimWhitespace = newValue
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .diffLayoutSettingChanged)) { _ in
+            layoutPreference = DiffLayoutSettings.preference
+            hideUnchangedRegions = DiffLayoutSettings.hideUnchangedRegionsEnabled
+            ignoreTrimWhitespace = DiffLayoutSettings.ignoreTrimWhitespace
+        }
     }
 
     private var filePath: String {
@@ -164,5 +249,12 @@ struct DiffViewRepresentable: NSViewRepresentable {
         if nsView.currentDiff != diff {
             nsView.display(diff: diff)
         }
+    }
+}
+extension DiffLoadState {
+    /// Number of changes of a loaded diff; 0 while loading or on error.
+    var changeCount: Int {
+        if case .success(let diff) = self { return diff.changes.count }
+        return 0
     }
 }

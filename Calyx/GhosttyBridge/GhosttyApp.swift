@@ -570,6 +570,8 @@ extension Notification.Name {
     /// ghostty reported no exit code).
     static let ghosttyCommandFinished = Notification.Name("com.calyx.ghostty.commandFinished")
     static let smoothScrollSettingChanged = Notification.Name("com.calyx.smoothScrollSettingChanged")
+    /// Posted by every `DiffLayoutSettings` setter.
+    static let diffLayoutSettingChanged = Notification.Name("com.calyx.diffLayoutSettingChanged")
 
     // MARK: - Second Missing-Observer Investigation
     //

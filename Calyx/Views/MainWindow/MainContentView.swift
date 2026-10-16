@@ -16,6 +16,7 @@ struct MainContentView: View {
     var activeDiffState: DiffLoadState?
     var activeDiffSource: DiffSource?
     var activeDiffReviewStore: DiffReviewStore?
+    var activeDiffRevealState: DiffRevealState?
     /// Chrome-style in-app recovery bar (RecoveryBarModel.swift), shown
     /// above the tab bar/pane content as the first child of `body`'s own
     /// top-level `VStack`. `nil` (no existing caller besides
@@ -72,6 +73,8 @@ struct MainContentView: View {
     var onDiscardReview: (() -> Void)?
     var onSubmitAllReviews: (() -> Void)?
     var onDiscardAllReviews: (() -> Void)?
+    /// Toolbar Previous / Next Change buttons.
+    var onGoToChange: ((DiffChangeNavigator.Direction) -> Void)?
     var onComposeOverlaySend: ((String) -> Bool)?
     var onDismissComposeOverlay: (() -> Void)?
     var onComposeOverlayEscapePressed: (() -> Void)?
@@ -252,7 +255,9 @@ struct MainContentView: View {
                                         totalReviewCommentCount: totalReviewCommentCount,
                                         reviewFileCount: reviewFileCount,
                                         onSubmitAllReviews: onSubmitAllReviews,
-                                        onDiscardAllReviews: onDiscardAllReviews
+                                        onDiscardAllReviews: onDiscardAllReviews,
+                                        changeCount: diffState.changeCount,
+                                        onGoToChange: onGoToChange
                                     )
                                     switch diffState {
                                     case .loading:
@@ -266,7 +271,8 @@ struct MainContentView: View {
                                             diff: diff,
                                             reduceTransparency: reduceTransparency,
                                             glassOpacity: glassOpacity,
-                                            reviewStore: activeDiffReviewStore
+                                            reviewStore: activeDiffReviewStore,
+                                            revealState: activeDiffRevealState
                                         )
                                             .accessibilityIdentifier(AccessibilityID.Diff.content)
                                     case .error(let message):
@@ -281,6 +287,7 @@ struct MainContentView: View {
                                         }
                                     }
                                 }
+                                .accessibilityElement(children: .contain)
                                 .accessibilityIdentifier(AccessibilityID.Diff.container)
                             } else if let browserController = activeBrowserController {
                                 BrowserContainerView(controller: browserController)
@@ -413,6 +420,7 @@ struct DiffGlassContentView: NSViewRepresentable {
     let reduceTransparency: Bool
     let glassOpacity: Double
     var reviewStore: DiffReviewStore?
+    var revealState: DiffRevealState?
 
     func makeNSView(context: Context) -> DiffGlassHostView {
         let host = DiffGlassHostView(
@@ -420,6 +428,7 @@ struct DiffGlassContentView: NSViewRepresentable {
             glassOpacity: glassOpacity
         )
         host.diffView.reviewStore = reviewStore
+        host.diffView.revealState = revealState
         host.diffView.display(diff: diff)
         return host
     }
@@ -430,6 +439,7 @@ struct DiffGlassContentView: NSViewRepresentable {
             glassOpacity: glassOpacity
         )
         nsView.diffView.reviewStore = reviewStore
+        nsView.diffView.revealState = revealState
         if nsView.diffView.currentDiff != diff {
             nsView.diffView.display(diff: diff)
         } else {
@@ -466,6 +476,25 @@ final class DiffGlassHostView: NSView {
             diffView.topAnchor.constraint(equalTo: topAnchor),
             diffView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+    }
+
+    /// Leaving a window: its controller must not keep routing change
+    /// navigation to this (now detached) diff view.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow !== window, let controller = window?.windowController as? CalyxWindowController,
+           controller.activeDiffView === diffView {
+            controller.activeDiffView = nil
+        }
+    }
+
+    /// Registers the diff view with the window's controller, which routes
+    /// the change navigation commands and toolbar buttons to it.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let controller = window?.windowController as? CalyxWindowController {
+            controller.activeDiffView = diffView
+        }
     }
 
     func configureAppearance(reduceTransparency: Bool, glassOpacity: Double) {

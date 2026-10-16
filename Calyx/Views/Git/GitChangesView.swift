@@ -491,6 +491,7 @@ private struct GitRepoChangesBody: View {
                         .contentShape(Rectangle())
                         .onTapGesture { isStagedExpanded.toggle() }
                     }
+                    .accessibilityElement(children: .contain)
                     .accessibilityIdentifier(AccessibilityID.Git.stagedSection)
                 }
 
@@ -513,6 +514,7 @@ private struct GitRepoChangesBody: View {
                         .contentShape(Rectangle())
                         .onTapGesture { isUnstagedExpanded.toggle() }
                     }
+                    .accessibilityElement(children: .contain)
                     .accessibilityIdentifier(AccessibilityID.Git.unstagedSection)
                 }
 
@@ -535,6 +537,7 @@ private struct GitRepoChangesBody: View {
                         .contentShape(Rectangle())
                         .onTapGesture { isUntrackedExpanded.toggle() }
                     }
+                    .accessibilityElement(children: .contain)
                     .accessibilityIdentifier(AccessibilityID.Git.untrackedSection)
                 }
             }
@@ -582,6 +585,7 @@ private struct GitRepoChangesBody: View {
                             onFileSelected: { file in onCommitFileSelected?(file) },
                             onFileOpenPinned: { file in onCommitFileOpenPinned?(file) }
                         )
+                        .accessibilityElement(children: .contain)
                         .accessibilityIdentifier(AccessibilityID.Git.commitRow(commit.shortHash))
                         .onAppear {
                             if commit.id == prefetchTriggerCommitID {
@@ -630,6 +634,7 @@ private struct GitFileRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 3)
         .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
         .accessibilityIdentifier(AccessibilityID.Git.fileEntry(entry.path))
     }
 
@@ -792,6 +797,7 @@ private struct CommitFileRow: View {
         .padding(.trailing, 8)
         .padding(.vertical, 2)
         .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
         .accessibilityIdentifier(AccessibilityID.Git.fileEntry(file.path))
     }
 

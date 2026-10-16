@@ -1,7 +1,9 @@
 // DiffParserTests.swift
 // CalyxTests
 //
-// Tests for DiffParser: unified diff parsing, line numbering, binary detection, truncation.
+// Tests for DiffParser: full-context unified diff -> FileDiff via DiffContent,
+// DefaultLinesDiffComputer and DiffLineGenerator (line numbering, binary
+// detection; hunk headers / meta rows are no longer emitted).
 
 import Testing
 @testable import Calyx
@@ -39,7 +41,10 @@ struct DiffParserTests {
         #expect(additions.count == 2)
         #expect(deletions.count == 1)
         #expect(contexts.count == 2)
-        #expect(hunks.count == 1)
+        #expect(hunks.isEmpty)
+        #expect(result.changes.count == 1)
+        #expect(result.oldLineCount == 3)
+        #expect(result.newLineCount == 4)
     }
 
     @Test func lineNumbersIncrement() {
@@ -53,37 +58,39 @@ struct DiffParserTests {
         """
         let result = DiffParser.parse(diff, path: "test")
 
-        // Find lines in hunk
-        let hunkLines = result.lines.filter { $0.type != .hunkHeader && $0.type != .meta }
+        // The hunk is the whole file (full-context diff), so numbering starts at 1;
+        // the hunk header's start offsets are not used.
+        let hunkLines = result.lines
+        #expect(hunkLines.count == 5)
 
-        // context: old=10, new=20
+        // context: old=1, new=1
         let ctx1 = hunkLines[0]
         #expect(ctx1.type == .context)
-        #expect(ctx1.oldLineNumber == 10)
-        #expect(ctx1.newLineNumber == 20)
+        #expect(ctx1.oldLineNumber == 1)
+        #expect(ctx1.newLineNumber == 1)
 
-        // deletion: old=11
+        // deletion: old=2
         let del = hunkLines[1]
         #expect(del.type == .deletion)
-        #expect(del.oldLineNumber == 11)
+        #expect(del.oldLineNumber == 2)
         #expect(del.newLineNumber == nil)
 
-        // addition: new=21
+        // addition: new=2
         let add1 = hunkLines[2]
         #expect(add1.type == .addition)
         #expect(add1.oldLineNumber == nil)
-        #expect(add1.newLineNumber == 21)
+        #expect(add1.newLineNumber == 2)
 
-        // addition: new=22
+        // addition: new=3
         let add2 = hunkLines[3]
         #expect(add2.type == .addition)
-        #expect(add2.newLineNumber == 22)
+        #expect(add2.newLineNumber == 3)
 
-        // context: old=12, new=23
+        // context: old=3, new=4
         let ctx2 = hunkLines[4]
         #expect(ctx2.type == .context)
-        #expect(ctx2.oldLineNumber == 12)
-        #expect(ctx2.newLineNumber == 23)
+        #expect(ctx2.oldLineNumber == 3)
+        #expect(ctx2.newLineNumber == 4)
     }
 
     @Test func multipleHunks() {
@@ -97,9 +104,12 @@ struct DiffParserTests {
         -y
         +z
         """
+        // Full-context diffs have a single hunk; extra hunks are concatenated.
         let result = DiffParser.parse(diff, path: "test")
         let hunks = result.lines.filter { $0.type == .hunkHeader }
-        #expect(hunks.count == 2)
+        #expect(hunks.isEmpty)
+        #expect(result.oldLineCount == 4)
+        #expect(result.newLineCount == 4)
     }
 
     @Test func headerLines() {
@@ -113,8 +123,11 @@ struct DiffParserTests {
         +hello
         """
         let result = DiffParser.parse(diff, path: "new.swift")
-        let metas = result.lines.filter { $0.type == .meta }
-        #expect(metas.count >= 4) // diff --git, new file mode, index, ---, +++
+        // Header lines are skipped; only the file content becomes rows.
+        #expect(!result.lines.contains { $0.type == .meta || $0.type == .hunkHeader })
+        #expect(result.lines == [DiffLine(type: .addition, text: "+hello", oldLineNumber: nil, newLineNumber: 1)])
+        #expect(result.oldLineCount == 0)
+        #expect(result.newLineCount == 1)
     }
 
     @Test func binaryFilesDiffer() {
@@ -137,30 +150,39 @@ struct DiffParserTests {
         \\ No newline at end of file
         """
         let result = DiffParser.parse(diff, path: "test")
-        let metas = result.lines.filter { $0.type == .meta }
-        #expect(metas.contains { $0.text.hasPrefix("\\") })
+        // The marker is not file content and produces no row.
+        #expect(!result.lines.contains { $0.type == .meta })
+        #expect(!result.lines.contains { $0.text.hasPrefix("\\") })
+        #expect(result.lines.map(\.text) == ["-old", "+new"])
     }
 
-    @Test func truncatesLargeInput() {
-        // Create a string larger than 1MB
-        let line = String(repeating: "x", count: 1000) + "\n"
-        let bigInput = String(repeating: line, count: 1100)
+    @Test func largeInputIsNotTruncated() {
+        // The 1 MB / 50,000-line truncation is gone; size limits live in the loader.
+        let line = String(repeating: "x", count: 1000)
+        var lines: [String] = ["@@ -0,0 +1,1100 @@"]
+        lines.append(contentsOf: Array(repeating: "+" + line, count: 1100))
+        let bigInput = lines.joined(separator: "\n")
         #expect(bigInput.utf8.count > 1_000_000)
 
         let result = DiffParser.parse(bigInput, path: "big.txt")
-        #expect(result.isTruncated)
+        #expect(!result.isTruncated)
+        #expect(result.lines.count == 1100)
     }
 
-    @Test func truncatesManyLines() {
-        // 50,001 lines
-        var lines: [String] = ["@@ -1,50001 +1,50001 @@"]
-        for i in 1...50001 {
-            lines.append("+line \(i)")
-        }
-        let input = lines.joined(separator: "\n")
-        let result = DiffParser.parse(input, path: "many.txt")
-        #expect(result.isTruncated)
-        #expect(result.lines.count <= 50001)
+    @Test func trailingNewlineOfGitOutput_isNotALine() {
+        let result = DiffParser.parse("@@ -1,1 +1,1 @@\n-old\n+new\n", path: "test")
+        #expect(result.lines.map(\.text) == ["-old", "+new"])
+        #expect(result.oldLineCount == 1)
+        #expect(result.newLineCount == 1)
+    }
+
+    @Test func newFileWithSingleBlankLine_isOneAddition() {
+        // The diff computer treats [] like [""]; DiffParser restores the change.
+        let result = DiffParser.parse("@@ -0,0 +1 @@\n+\n", path: "f")
+        #expect(result.lines == [DiffLine(type: .addition, text: "+", oldLineNumber: nil, newLineNumber: 1)])
+        #expect(result.changes.count == 1)
+        #expect(result.oldLineCount == 0)
+        #expect(result.newLineCount == 1)
     }
 
     @Test func renameDiff() {
@@ -177,8 +199,8 @@ struct DiffParserTests {
         +new content
         """
         let result = DiffParser.parse(diff, path: "new.swift")
-        let metas = result.lines.filter { $0.type == .meta }
-        #expect(metas.contains { $0.text.hasPrefix("rename from") })
-        #expect(metas.contains { $0.text.hasPrefix("rename to") })
+        // Rename headers are skipped; the content change is diffed.
+        #expect(!result.lines.contains { $0.type == .meta })
+        #expect(result.lines.map(\.text) == ["-old content", "+new content"])
     }
 }
