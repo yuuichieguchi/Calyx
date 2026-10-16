@@ -88,6 +88,8 @@ final class DiffPaneView: NSView {
     var onCollapsedRowAction: ((Int, CollapsedAction) -> Void)?
     /// The text view became first responder (used to clear the other pane's selection).
     var onBecameFirstResponder: (() -> Void)?
+    /// The text view's selection changed (user or programmatic).
+    var onSelectionChanged: (() -> Void)?
 
     private(set) var cells: [DiffCell?] = []
 
@@ -166,6 +168,14 @@ final class DiffPaneView: NSView {
         }
         textView.onRowClicked = { [weak self] row in self?.onRowClicked?(row) }
         textView.onBecameFirstResponder = { [weak self] in self?.onBecameFirstResponder?() }
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(textViewSelectionDidChange(_:)),
+            name: NSTextView.didChangeSelectionNotification, object: textView
+        )
+    }
+
+    @objc private func textViewSelectionDidChange(_ notification: Notification) {
+        onSelectionChanged?()
     }
 
     override func layout() {
@@ -232,6 +242,33 @@ final class DiffPaneView: NSView {
         scrollView.reflectScrolledClipView(clip)
     }
 
+    /// Rows intersecting the visible rect (partially visible rows included).
+    var visibleRowRange: Range<Int> {
+        let rect = scrollView.documentVisibleRect
+        guard !cells.isEmpty, rect.height > 0 else { return 0..<0 }
+        let first = Int(floor((rect.minY - DiffMetrics.textInset.height) / DiffMetrics.rowHeight))
+        let last = Int(ceil((rect.maxY - DiffMetrics.textInset.height) / DiffMetrics.rowHeight))
+        let lo = min(max(first, 0), cells.count)
+        let hi = min(max(last, lo), cells.count)
+        return lo..<hi
+    }
+
+    /// Whole rows that fit in the viewport.
+    var viewportRowCapacity: Int {
+        Int(floor(scrollView.contentView.bounds.height / DiffMetrics.rowHeight))
+    }
+
+    /// Row containing the start of the text selection.
+    var selectionStartRow: Int? {
+        textView.row(containingCharacterAt: textView.selectedRange().location)
+    }
+
+    /// Moves the insertion point to the start of `row`'s text without scrolling.
+    func placeInsertionPoint(atRow row: Int) {
+        guard let location = textView.textStart(ofRow: row) else { return }
+        textView.setSelectedRange(NSRange(location: location, length: 0))
+    }
+
     func clearSelection() {
         let location = textView.selectedRange().location
         textView.setSelectedRange(NSRange(location: min(location, textView.string.utf16.count), length: 0))
@@ -275,6 +312,24 @@ final class DiffTextView: NSTextView {
         rowRanges = ranges
         textStorage?.setAttributedString(attributed)
         needsDisplay = true
+    }
+
+    /// UTF-16 location of the start of `row`'s text.
+    func textStart(ofRow row: Int) -> Int? {
+        guard row >= 0, row < rowRanges.count else { return nil }
+        return rowRanges[row].location
+    }
+
+    /// Row whose text (or trailing newline) holds the UTF-16 `location`.
+    func row(containingCharacterAt location: Int) -> Int? {
+        guard !rowRanges.isEmpty else { return nil }
+        var lo = 0
+        var hi = rowRanges.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if rowRanges[mid].location <= location { lo = mid } else { hi = mid - 1 }
+        }
+        return lo
     }
 
     func rowIndex(atY y: CGFloat) -> Int? {

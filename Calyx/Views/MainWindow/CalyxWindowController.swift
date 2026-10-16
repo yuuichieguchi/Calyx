@@ -634,6 +634,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         return diffRevealStates[tab.id]
     }
 
+    /// The `DiffView` of the shown diff tab, registered by its
+    /// `DiffGlassHostView` when it enters this window.
+    weak var activeDiffView: DiffView?
+
     var isDiffTabActive: Bool {
         guard let tab = activeTab, case .diff = tab.content else { return false }
         return true
@@ -797,7 +801,28 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         ) {
             DiffLayoutSettings.ignoreTrimWhitespace.toggle()
         })
+        commandRegistry.register(PaletteCommand(
+            id: "diff.nextChange", title: "Go to Next Change", shortcut: "Opt+F5", category: "View",
+            isAvailable: isAvailable
+        ) { [weak self] in
+            self?.goToChange(.next)
+        })
+        commandRegistry.register(PaletteCommand(
+            id: "diff.previousChange", title: "Go to Previous Change", shortcut: "Opt+Shift+F5", category: "View",
+            isAvailable: isAvailable
+        ) { [weak self] in
+            self?.goToChange(.previous)
+        })
     }
+
+    /// VS Code `workbench.action.compareEditor.nextChange` / `previousChange`.
+    func goToChange(_ direction: DiffChangeNavigator.Direction) {
+        guard isDiffTabActive else { return }
+        activeDiffView?.goToDiff(direction)
+    }
+
+    @objc func goToNextChange(_ sender: Any?) { goToChange(.next) }
+    @objc func goToPreviousChange(_ sender: Any?) { goToChange(.previous) }
 
     private func setupCommandRegistry() {
         commandRegistry.register(PaletteCommand(id: "tab.new", title: "New Tab", shortcut: "Cmd+T", category: "Tabs") { [weak self] in
@@ -1605,6 +1630,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             },
             onDiscardAllReviews: { [weak self] in
                 self?.discardAllDiffReviews()
+            },
+            onGoToChange: { [weak self] direction in
+                self?.goToChange(direction)
             },
             onComposeOverlaySend: { [weak self] text in self?.sendComposeText(text) ?? false },
             onDismissComposeOverlay: { [weak self] in self?.dismissComposeOverlay() },
@@ -5088,6 +5116,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
            Self.keyWindowGatedActions.contains(action),
            !isKeyWindowForMenuValidation {
             return false
+        }
+        if menuItem.action == #selector(goToNextChange(_:)) || menuItem.action == #selector(goToPreviousChange(_:)) {
+            return isDiffTabActive
         }
         if menuItem.action == #selector(jumpToMostRecentUnreadTab) {
             return windowSession.groups.flatMap(\.tabs).contains { $0.unreadNotifications > 0 }

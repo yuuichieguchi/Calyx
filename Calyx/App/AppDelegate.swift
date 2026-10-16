@@ -2678,6 +2678,26 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
 
         viewMenu.addItem(.separator())
 
+        // VS Code compareEditor.nextChange / previousChange (Alt+F5 / Shift+Alt+F5).
+        // NSF5FunctionKey (0xF708) is a valid BMP scalar, so the init never fails.
+        let f5 = String(Character(UnicodeScalar(NSF5FunctionKey)!))
+        let nextChangeItem = NSMenuItem(
+            title: "Go to Next Change",
+            action: #selector(CalyxWindowController.goToNextChange(_:)),
+            keyEquivalent: f5
+        )
+        nextChangeItem.keyEquivalentModifierMask = [.option]
+        viewMenu.addItem(nextChangeItem)
+        let previousChangeItem = NSMenuItem(
+            title: "Go to Previous Change",
+            action: #selector(CalyxWindowController.goToPreviousChange(_:)),
+            keyEquivalent: f5
+        )
+        previousChangeItem.keyEquivalentModifierMask = [.option, .shift]
+        viewMenu.addItem(previousChangeItem)
+
+        viewMenu.addItem(.separator())
+
         let paletteItem = NSMenuItem(
             title: "Command Palette",
             action: #selector(CalyxWindowController.toggleCommandPalette),

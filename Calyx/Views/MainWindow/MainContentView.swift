@@ -73,6 +73,8 @@ struct MainContentView: View {
     var onDiscardReview: (() -> Void)?
     var onSubmitAllReviews: (() -> Void)?
     var onDiscardAllReviews: (() -> Void)?
+    /// Toolbar Previous / Next Change buttons.
+    var onGoToChange: ((DiffChangeNavigator.Direction) -> Void)?
     var onComposeOverlaySend: ((String) -> Bool)?
     var onDismissComposeOverlay: (() -> Void)?
     var onComposeOverlayEscapePressed: (() -> Void)?
@@ -253,7 +255,9 @@ struct MainContentView: View {
                                         totalReviewCommentCount: totalReviewCommentCount,
                                         reviewFileCount: reviewFileCount,
                                         onSubmitAllReviews: onSubmitAllReviews,
-                                        onDiscardAllReviews: onDiscardAllReviews
+                                        onDiscardAllReviews: onDiscardAllReviews,
+                                        changeCount: diffState.changeCount,
+                                        onGoToChange: onGoToChange
                                     )
                                     switch diffState {
                                     case .loading:
@@ -472,6 +476,25 @@ final class DiffGlassHostView: NSView {
             diffView.topAnchor.constraint(equalTo: topAnchor),
             diffView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+    }
+
+    /// Leaving a window: its controller must not keep routing change
+    /// navigation to this (now detached) diff view.
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        if newWindow !== window, let controller = window?.windowController as? CalyxWindowController,
+           controller.activeDiffView === diffView {
+            controller.activeDiffView = nil
+        }
+    }
+
+    /// Registers the diff view with the window's controller, which routes
+    /// the change navigation commands and toolbar buttons to it.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let controller = window?.windowController as? CalyxWindowController {
+            controller.activeDiffView = diffView
+        }
     }
 
     func configureAppearance(reduceTransparency: Bool, glassOpacity: Double) {

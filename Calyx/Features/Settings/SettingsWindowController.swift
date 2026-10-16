@@ -19,6 +19,7 @@ class SettingsWindowController: NSWindowController {
     private let diffLayoutPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let diffHideUnchangedRegionsSwitch = NSSwitch()
     private let diffIgnoreTrimWhitespaceSwitch = NSSwitch()
+    private let diffOverviewRulerSwitch = NSSwitch()
     private let colorWell = NSColorWell()
     private let hexField = NSTextField()
     /// The AI Agent IPC row's three controls -- stored so
@@ -241,6 +242,7 @@ class SettingsWindowController: NSWindowController {
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .glassOpacityCells, .gitDiffLayout, .gitDiffHideUnchangedRegions, .gitDiffIgnoreTrimWhitespace,
+             .gitDiffOverviewRuler,
              .themeColorWell, .themeColorHex, .lspRequireConfirmation,
              .historyPersistence, .ipcWake, .agentResumeAutoExecute,
              .openSessionBrowserButton:
@@ -292,6 +294,8 @@ class SettingsWindowController: NSWindowController {
             return gitDiffHideUnchangedRegionsRow()
         case .gitDiffIgnoreTrimWhitespace:
             return gitDiffIgnoreTrimWhitespaceRow()
+        case .gitDiffOverviewRuler:
+            return gitDiffOverviewRulerRow()
         case .lspAutoInstall:
             return lspAutoInstallRow()
         case .lspRequireConfirmation:
@@ -424,6 +428,14 @@ class SettingsWindowController: NSWindowController {
         return controlRow(label: "Ignore trim whitespace", control: diffIgnoreTrimWhitespaceSwitch)
     }
 
+    private func gitDiffOverviewRulerRow() -> NSView {
+        diffOverviewRulerSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.gitDiffOverviewRulerSwitch)
+        diffOverviewRulerSwitch.state = Self.sessionToggleInitialState(for: .gitDiffOverviewRuler) ? .on : .off
+        diffOverviewRulerSwitch.target = self
+        diffOverviewRulerSwitch.action = #selector(gitDiffOverviewRulerDidChange(_:))
+        return controlRow(label: "Show overview ruler", control: diffOverviewRulerSwitch)
+    }
+
     /// Index into `DiffLayoutPreference.allCases` of the persisted
     /// preference; the popup's items are built in that order.
     static func diffLayoutInitialSelectionIndex() -> Int {
@@ -480,6 +492,7 @@ class SettingsWindowController: NSWindowController {
         case .glassOpacityCells: return UserDefaults.standard.bool(forKey: "terminalGlassOpacityCells")
         case .gitDiffHideUnchangedRegions: return DiffLayoutSettings.hideUnchangedRegionsEnabled
         case .gitDiffIgnoreTrimWhitespace: return DiffLayoutSettings.ignoreTrimWhitespace
+        case .gitDiffOverviewRuler: return DiffLayoutSettings.renderOverviewRuler
         default: return false
         }
     }
@@ -775,12 +788,17 @@ class SettingsWindowController: NSWindowController {
         DiffLayoutSettings.ignoreTrimWhitespace = sender.state == .on
     }
 
+    @objc private func gitDiffOverviewRulerDidChange(_ sender: NSSwitch) {
+        DiffLayoutSettings.renderOverviewRuler = sender.state == .on
+    }
+
     /// Re-syncs the diff controls when a setting changes elsewhere while
     /// this window exists.
     @objc private func diffLayoutSettingDidChange(_ notification: Notification) {
         diffLayoutPopup.selectItem(at: Self.diffLayoutInitialSelectionIndex())
         diffHideUnchangedRegionsSwitch.state = DiffLayoutSettings.hideUnchangedRegionsEnabled ? .on : .off
         diffIgnoreTrimWhitespaceSwitch.state = DiffLayoutSettings.ignoreTrimWhitespace ? .on : .off
+        diffOverviewRulerSwitch.state = DiffLayoutSettings.renderOverviewRuler ? .on : .off
     }
 
     @objc private func lspAutoInstallDidChange(_ sender: NSSwitch) {

@@ -141,4 +141,36 @@ final class DiffLayoutSettingsRowWiringTests: XCTestCase {
         XCTAssertNil(SettingsWindowController.sectionHeading(for: .gitDiffHideUnchangedRegions))
         XCTAssertNil(SettingsWindowController.sectionHeading(for: .gitDiffIgnoreTrimWhitespace))
     }
+
+    // MARK: - Overview ruler row
+
+    func test_overviewRulerSwitch_accessibilityIdentifier() {
+        XCTAssertEqual(AccessibilityID.Settings.gitDiffOverviewRulerSwitch,
+                       "calyx.settings.appearance.gitDiffOverviewRulerSwitch")
+    }
+
+    func test_overviewRulerSwitch_existsWithTargetAndAction() throws {
+        let toggle = try XCTUnwrap(
+            find(NSSwitch.self, identifier: AccessibilityID.Settings.gitDiffOverviewRulerSwitch, in: try appearancePaneView())
+        )
+        XCTAssertTrue(toggle.target === SettingsWindowController.shared)
+        XCTAssertNotNil(toggle.action)
+    }
+
+    func test_sessionToggleInitialState_overviewRuler_readsSetting() {
+        XCTAssertTrue(SettingsWindowController.sessionToggleInitialState(for: .gitDiffOverviewRuler),
+                      "default is true")
+        DiffLayoutSettings.renderOverviewRuler = false
+        XCTAssertFalse(SettingsWindowController.sessionToggleInitialState(for: .gitDiffOverviewRuler))
+        DiffLayoutSettings.renderOverviewRuler = true
+        XCTAssertTrue(SettingsWindowController.sessionToggleInitialState(for: .gitDiffOverviewRuler))
+    }
+
+    func test_overviewRulerRow_appearancePane_afterIgnoreTrimWhitespace_noHeading() throws {
+        XCTAssertEqual(SettingsRow.gitDiffOverviewRuler.pane, .appearance)
+        let all = SettingsRow.allCases
+        let trim = try XCTUnwrap(all.firstIndex(of: .gitDiffIgnoreTrimWhitespace))
+        XCTAssertEqual(all.firstIndex(of: .gitDiffOverviewRuler), trim + 1)
+        XCTAssertNil(SettingsWindowController.sectionHeading(for: .gitDiffOverviewRuler))
+    }
 }

@@ -17,6 +17,10 @@ final class DiffView: NSView {
     private let leftPane = DiffPaneView(side: .left, gutterColumns: .single, accessibilitySuffix: ".old")
     private let rightPane = DiffPaneView(side: .right, gutterColumns: .single, accessibilitySuffix: ".new")
     private let splitView = NSSplitView()
+    private let rulerView = DiffOverviewRulerView(frame: .zero)
+    /// Trailing constraint of the installed content (inline pane or split
+    /// view): inset by the ruler's width while the ruler is shown.
+    private var contentTrailingConstraint: NSLayoutConstraint?
 
     private(set) var currentDiff: FileDiff?
     var reviewStore: DiffReviewStore?
@@ -38,6 +42,15 @@ final class DiffView: NSView {
     private var activePopover: NSPopover?
     private var isSyncingScroll = false
     private var needsInitialDividerPosition = false
+    /// Index into `currentDiff.changes` of the change last navigated to.
+    private(set) var currentChangeIndex: Int?
+    /// The panes' selection was placed by navigation or by the user since
+    /// the last rebuild (a rebuild replaces the text and its selection).
+    private var hasCaret = false
+    /// Change to reveal once the view has a size and its final layout
+    /// (a new diff is displayed before SwiftUI sizes the view).
+    private var pendingRevealChangeIndex: Int?
+    private var isRevealScheduled = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -83,10 +96,36 @@ final class DiffView: NSView {
                 self.handleCollapsedRowAction(pane: pane, row: row, action: action)
             }
         }
-        leftPane.onBecameFirstResponder = { [weak self] in self?.rightPane.clearSelection() }
-        rightPane.onBecameFirstResponder = { [weak self] in self?.leftPane.clearSelection() }
+        leftPane.onBecameFirstResponder = { [weak self] in
+            self?.rightPane.clearSelection()
+            self?.hasCaret = true
+        }
+        // VS Code's goToDiff reads only the modified editor's cursor: a
+        // selection the user makes in the original pane moves the modified
+        // pane's caret to the same row.
+        leftPane.onSelectionChanged = { [weak self] in self?.mirrorLeftSelectionToCaretPane() }
+        rightPane.onBecameFirstResponder = { [weak self] in
+            self?.leftPane.clearSelection()
+            self?.hasCaret = true
+        }
+        inlinePane.onBecameFirstResponder = { [weak self] in self?.hasCaret = true }
 
-        for pane in [leftPane, rightPane] {
+        rulerView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(rulerView)
+        NSLayoutConstraint.activate([
+            rulerView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            rulerView.topAnchor.constraint(equalTo: topAnchor),
+            rulerView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            rulerView.widthAnchor.constraint(equalToConstant: DiffOverviewRuler.width),
+        ])
+        rulerView.onRevealRow = { [weak self] row in
+            guard let self else { return }
+            self.cancelPendingReveal()
+            self.revealRowsInCenter(row..<(row + 1))
+        }
+        rulerView.isHidden = !DiffLayoutSettings.renderOverviewRuler
+
+        for pane in [inlinePane, leftPane, rightPane] {
             NotificationCenter.default.addObserver(
                 self, selector: #selector(clipViewBoundsDidChange(_:)),
                 name: NSView.boundsDidChangeNotification, object: pane.scrollView.contentView
@@ -120,14 +159,26 @@ final class DiffView: NSView {
             view = splitView
             needsInitialDividerPosition = true
         }
-        addSubview(view)
+        addSubview(view, positioned: .below, relativeTo: rulerView)
+        let trailing = view.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -rulerInset)
         NSLayoutConstraint.activate([
             view.leadingAnchor.constraint(equalTo: leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: trailingAnchor),
+            trailing,
             view.topAnchor.constraint(equalTo: topAnchor),
             view.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+        contentTrailingConstraint = trailing
         currentLayout = layout
+    }
+
+    private var rulerInset: CGFloat {
+        rulerView.isHidden ? 0 : DiffOverviewRuler.width
+    }
+
+    /// Shows or hides the ruler per `DiffLayoutSettings.renderOverviewRuler`.
+    private func applyRulerVisibility() {
+        rulerView.isHidden = !DiffLayoutSettings.renderOverviewRuler
+        contentTrailingConstraint?.constant = -rulerInset
     }
 
     override func layout() {
@@ -140,6 +191,8 @@ final class DiffView: NSView {
                 guard let self else { return }
                 self.isLayoutSwitchPending = false
                 self.applyEffectiveLayout(preserveScroll: true, forceRebuild: false)
+                // The next layout pass runs a reveal deferred until the layout settled.
+                if self.pendingRevealChangeIndex != nil { self.needsLayout = true }
             }
         }
         if needsInitialDividerPosition, currentLayout == .sideBySide, splitView.bounds.width > 0 {
@@ -150,10 +203,38 @@ final class DiffView: NSView {
                 ofDividerAt: 0
             )
         }
+        updateRulerViewport()
+        // Reveal outside the layout pass, once the layout is final.
+        if pendingRevealChangeIndex != nil, !isRevealScheduled, canRevealNow {
+            isRevealScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isRevealScheduled = false
+                self.performPendingReveal()
+            }
+        }
+    }
+
+    private var canRevealNow: Bool {
+        bounds.height > 0 && !isLayoutSwitchPending && resolvedLayout() == currentLayout
+    }
+
+    private func performPendingReveal() {
+        guard let index = pendingRevealChangeIndex, canRevealNow else { return }
+        pendingRevealChangeIndex = nil
+        goTo(changeIndex: index)
     }
 
     @objc private func layoutSettingDidChange(_ notification: Notification) {
-        applyEffectiveLayout(preserveScroll: true, forceRebuild: true)
+        let key = notification.userInfo?[DiffLayoutSettings.changedKeyUserInfoKey] as? String
+        if key == DiffLayoutSettings.renderOverviewRulerKey {
+            // The ruler only changes the content inset: no rebuild, so the
+            // caret and scroll position stay.
+            applyRulerVisibility()
+            needsLayout = true
+        } else {
+            applyEffectiveLayout(preserveScroll: true, forceRebuild: true)
+        }
     }
 
     /// Installs the effective layout and rebuilds. The scroll anchor is read
@@ -163,8 +244,9 @@ final class DiffView: NSView {
         let changed = effective != currentLayout
         guard changed || forceRebuild else { return }
         let anchor = preserveScroll ? firstVisibleDisplayIndex() : nil
+        let caret = caretDisplayIndex()
         install(effective)
-        rebuild(anchor: anchor)
+        rebuild(anchor: anchor, caretDisplayIndex: caret)
     }
 
     // MARK: Scroll sync (side-by-side)
@@ -172,6 +254,10 @@ final class DiffView: NSView {
     /// Both axes follow the other pane, as VS Code's diff editor syncs
     /// scrollTop and scrollLeft between its two editors.
     @objc private func clipViewBoundsDidChange(_ notification: Notification) {
+        if let source = notification.object as? NSClipView,
+           source === activePanes.first?.scrollView.contentView {
+            updateRulerViewport()
+        }
         guard !isSyncingScroll, currentLayout == .sideBySide,
               let source = notification.object as? NSClipView else { return }
         let target = source === leftPane.scrollView.contentView ? rightPane : leftPane
@@ -193,9 +279,18 @@ final class DiffView: NSView {
         let isNewFile = currentDiff?.path != diff.path
         // Anchor from the pane shown before `diff` may change the layout.
         let anchor = isNewFile ? nil : firstVisibleDisplayIndex()
+        let caret = isNewFile ? nil : caretDisplayIndex()
         currentDiff = diff
         install(resolvedLayout())
-        rebuild(anchor: anchor)
+        rebuild(anchor: anchor, caretDisplayIndex: caret)
+        if isNewFile {
+            // VS Code revealFirstDiff: a newly opened diff starts at its first change.
+            currentChangeIndex = nil
+            // Always deferred to layout() -> main queue: display(diff:) runs
+            // inside SwiftUI's updateNSView, where no layout may be forced.
+            pendingRevealChangeIndex = diff.changes.isEmpty ? nil : 0
+            needsLayout = true
+        }
     }
 
     func redisplayWithComments() {
@@ -204,15 +299,25 @@ final class DiffView: NSView {
     }
 
     private func rebuild(preserveScroll: Bool) {
-        rebuild(anchor: preserveScroll ? firstVisibleDisplayIndex() : nil)
+        rebuild(anchor: preserveScroll ? firstVisibleDisplayIndex() : nil, caretDisplayIndex: caretDisplayIndex())
     }
 
-    private func rebuild(anchor: Int?) {
+    /// Display index of the cursor's row, read before a rebuild replaces
+    /// the text (and its selection) so the caret stays on its line.
+    private func caretDisplayIndex() -> Int? {
+        guard hasCaret else { return nil }
+        return caretPane.selectionStartRow.flatMap { rowDisplayIndex($0, cells: caretPane.cells) }
+    }
+
+    private func rebuild(anchor: Int?, caretDisplayIndex: Int?) {
         guard let diff = currentDiff else { return }
+        hasCaret = false
 
         if diff.isBinary {
             displayLines = []
             rows = []
+            rulerView.zones = DiffOverviewRuler.zones(rows: [])
+            rulerView.rowCount = 0
             inlinePane.setCommentedLineIndices([])
             displayBinaryMessage()
             return
@@ -261,6 +366,8 @@ final class DiffView: NSView {
             built.append(DiffLayoutRow(left: banner, right: layout == .sideBySide ? banner : nil))
         }
         rows = built
+        rulerView.zones = DiffOverviewRuler.zones(rows: rows)
+        rulerView.rowCount = rows.count
 
         // An uncompared file's inline view is the modified file alone.
         let showsOldNumbers = !(diff.isTooLarge && layout == .inline)
@@ -274,12 +381,171 @@ final class DiffView: NSView {
             pane.setCommentedLineIndices(commentedLineIndices)
             pane.setRows(cells: cells, attributed: attributed, gutterRows: gutterRows)
         }
+        if let caretDisplayIndex, let caretRow = rows.firstIndex(where: {
+            $0.left?.displayIndex == caretDisplayIndex || $0.right?.displayIndex == caretDisplayIndex
+        }) {
+            caretPane.placeInsertionPoint(atRow: caretRow)
+            hasCaret = true
+        }
 
         if let anchor {
             restoreScroll(toDisplayIndex: anchor)
         } else {
             for pane in activePanes { pane.scrollToRow(0) }
         }
+        updateRulerViewport()
+    }
+
+    // MARK: Overview ruler
+
+    private func updateRulerViewport() {
+        guard let pane = activePanes.first else { return }
+        let range = pane.visibleRowRange
+        rulerView.visibleRows = (range.lowerBound, range.count)
+    }
+
+    // MARK: Change navigation (VS Code DiffEditorWidget goToDiff / _goTo)
+
+    /// Rows of the active pane intersecting its viewport.
+    var visibleRowRange: Range<Int> {
+        activePanes.first?.visibleRowRange ?? 0..<0
+    }
+
+    /// The pane holding the modified editor's cursor.
+    private var caretPane: DiffPaneView {
+        currentLayout == .sideBySide ? rightPane : inlinePane
+    }
+
+    /// Places the modified pane's caret on the row of the user's selection
+    /// in the original pane (side-by-side rows are aligned).
+    private func mirrorLeftSelectionToCaretPane() {
+        guard currentLayout == .sideBySide, window?.firstResponder === leftPane.textView,
+              let row = leftPane.selectionStartRow else { return }
+        rightPane.placeInsertionPoint(atRow: row)
+        hasCaret = true
+    }
+
+    /// Row showing modified line `line` (right cell side-by-side, the
+    /// single cell inline).
+    func row(forModifiedLine line: Int) -> Int? {
+        rows.indices.first { modifiedLine(ofRow: $0) == line }
+    }
+
+    private func lineNumbers(of cell: DiffCell?) -> DiffLine? {
+        guard let cell, case .line = cell.kind, let lineIndex = cell.lineIndex,
+              let lines = currentDiff?.lines, lineIndex < lines.count else { return nil }
+        return lines[lineIndex]
+    }
+
+    private func originalLine(ofRow row: Int) -> Int? {
+        lineNumbers(of: rows[row].left)?.oldLineNumber
+    }
+
+    private func modifiedLine(ofRow row: Int) -> Int? {
+        lineNumbers(of: rows[row].right ?? rows[row].left)?.newLineNumber
+    }
+
+    /// Rows showing the mapping's original or modified lines.
+    private func rowRange(for mapping: DetailedLineRangeMapping) -> Range<Int>? {
+        let original = mapping.original.startLineNumber..<mapping.original.endLineNumberExclusive
+        let modified = mapping.modified.startLineNumber..<mapping.modified.endLineNumberExclusive
+        var lo: Int?
+        var hi: Int?
+        for index in rows.indices {
+            let inOriginal = originalLine(ofRow: index).map(original.contains) ?? false
+            let inModified = modifiedLine(ofRow: index).map(modified.contains) ?? false
+            guard inOriginal || inModified else { continue }
+            if lo == nil { lo = index }
+            hi = index
+        }
+        guard let lo, let hi else { return nil }
+        return lo..<(hi + 1)
+    }
+
+    /// Modified line of `row`: its modified cell's line, else the modified
+    /// start of the mapping holding its original line, else the nearest
+    /// row above (then below) that has one (filler, comment, collapsed rows).
+    /// Clamped to the last line, as Monaco clamps cursor positions (a pure
+    /// deletion at the end of the file starts at `newLineCount + 1`).
+    private func modifiedLineForCursor(atRow row: Int) -> Int? {
+        guard let diff = currentDiff, let line = unclampedModifiedLineForCursor(atRow: row) else { return nil }
+        return min(line, max(diff.newLineCount, 1))
+    }
+
+    private func unclampedModifiedLineForCursor(atRow row: Int) -> Int? {
+        func resolve(_ index: Int) -> Int? {
+            if let line = modifiedLine(ofRow: index) { return line }
+            guard let old = originalLine(ofRow: index) else { return nil }
+            return currentDiff?.changes.first {
+                ($0.original.startLineNumber..<$0.original.endLineNumberExclusive).contains(old)
+            }?.modified.startLineNumber
+        }
+        guard rows.indices.contains(row) else { return nil }
+        for index in stride(from: row, through: 0, by: -1) {
+            if let line = resolve(index) { return line }
+        }
+        for index in (row + 1)..<rows.count {
+            if let line = resolve(index) { return line }
+        }
+        return nil
+    }
+
+    /// The modified editor's cursor line: from the modified (right / inline)
+    /// pane's caret, or the row at the vertical centre of the viewport
+    /// without one.
+    func currentModifiedLine() -> Int? {
+        let row: Int?
+        if hasCaret {
+            row = caretPane.selectionStartRow
+        } else {
+            let visible = visibleRowRange
+            row = visible.isEmpty ? nil : (visible.lowerBound + visible.upperBound - 1) / 2
+        }
+        return row.flatMap(modifiedLineForCursor(atRow:))
+    }
+
+    func goToDiff(_ direction: DiffChangeNavigator.Direction) {
+        // User navigation wins over a reveal still waiting for layout.
+        cancelPendingReveal()
+        guard let diff = currentDiff, let line = currentModifiedLine(),
+              let target = DiffChangeNavigator.target(changes: diff.changes, currentModifiedLine: line,
+                                                      modifiedLineCount: diff.newLineCount, direction: direction)
+        else { return }
+        goTo(changeIndex: target)
+    }
+
+    private func cancelPendingReveal() {
+        pendingRevealChangeIndex = nil
+    }
+
+    /// Port of `_goTo`: the modified cursor moves to the mapping's modified
+    /// start (clamped to the last line, as Monaco clamps positions), then
+    /// the mapping's rows are revealed in the centre.
+    private func goTo(changeIndex index: Int) {
+        guard let diff = currentDiff, diff.changes.indices.contains(index) else { return }
+        let mapping = diff.changes[index]
+        currentChangeIndex = index
+        // The viewport capacity and row geometry must be current.
+        layoutSubtreeIfNeeded()
+        let caretLine = min(mapping.modified.startLineNumber, max(diff.newLineCount, 1))
+        if let caretRow = row(forModifiedLine: caretLine) {
+            caretPane.placeInsertionPoint(atRow: caretRow)
+            hasCaret = true
+        }
+        if let range = rowRange(for: mapping) {
+            revealRowsInCenter(range)
+        }
+    }
+
+    /// Centres `range` vertically in every active pane; a range taller than
+    /// the viewport starts at the top (VS Code revealRangeInCenter).
+    private func revealRowsInCenter(_ range: Range<Int>) {
+        guard let capacity = activePanes.first?.viewportRowCapacity else { return }
+        let top = range.count >= capacity
+            ? range.lowerBound
+            : range.lowerBound - (capacity - range.count) / 2
+        for pane in activePanes { pane.scrollToRow(max(top, 0)) }
+        updateRulerViewport()
     }
 
     /// Display indices of commented lines and of comment rows: the

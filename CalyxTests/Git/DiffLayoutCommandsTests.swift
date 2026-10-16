@@ -109,6 +109,35 @@ struct DiffLayoutCommandsTests {
         #expect(controller.activeDiffRevealState != nil)
     }
 
+    // MARK: - Change navigation commands
+
+    private static let navigation: [(id: String, title: String, shortcut: String)] = [
+        ("diff.nextChange", "Go to Next Change", "Opt+F5"),
+        ("diff.previousChange", "Go to Previous Change", "Opt+Shift+F5"),
+    ]
+
+    @Test func changeNavigation_registeredWithTitleShortcutAndViewCategory() {
+        let (controller, _) = makeController()
+        for (id, title, shortcut) in Self.navigation {
+            let cmd = command(id, in: controller)
+            #expect(cmd != nil, "missing \(id)")
+            #expect(cmd?.title == title)
+            #expect(cmd?.shortcut == shortcut)
+            #expect(cmd?.category == "View")
+        }
+    }
+
+    @Test func changeNavigation_unavailableOnTerminal_availableOnDiff() {
+        let (controller, _) = makeController()
+        for (id, _, _) in Self.navigation {
+            #expect(command(id, in: controller)?.isAvailable() == false, "\(id) must be unavailable on a terminal tab")
+        }
+        controller.openDiffTab(source: source, pinned: true)
+        for (id, _, _) in Self.navigation {
+            #expect(command(id, in: controller)?.isAvailable() == true, "\(id) must be available on a diff tab")
+        }
+    }
+
     // MARK: - Layout handlers
 
     @Test func layoutInline_setsInline() throws {

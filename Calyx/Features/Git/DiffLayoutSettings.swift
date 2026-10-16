@@ -6,7 +6,8 @@
 // read/write through a private SettingsStore" shape as
 // GitRefFilterSettings; see Calyx/Helpers/SettingsStore.swift for the
 // test/production resolution rationale. Every setter posts
-// `.diffLayoutSettingChanged`.
+// `.diffLayoutSettingChanged` with the changed key under
+// `changedKeyUserInfoKey`, so observers react only to the setting they own.
 
 import CoreGraphics
 import Foundation
@@ -46,6 +47,7 @@ struct DiffLayoutSettings: Sendable {
     static let layoutPreferenceKey = "calyx.diff.layoutPreference"
     static let hideUnchangedRegionsKey = "calyx.diff.hideUnchangedRegions"
     static let ignoreTrimWhitespaceKey = "calyx.diff.ignoreTrimWhitespace"
+    static let renderOverviewRulerKey = "calyx.diff.renderOverviewRuler"
 
     /// VS Code `renderSideBySideInlineBreakpoint`.
     static let sideBySideInlineBreakpoint: CGFloat = 900
@@ -76,7 +78,7 @@ struct DiffLayoutSettings: Sendable {
         }
         set {
             store.set(newValue.rawValue, forKey: layoutPreferenceKey)
-            postChanged()
+            postChanged(key: layoutPreferenceKey)
         }
     }
 
@@ -85,7 +87,7 @@ struct DiffLayoutSettings: Sendable {
         get { store.object(forKey: hideUnchangedRegionsKey) as? Bool ?? false }
         set {
             store.set(newValue, forKey: hideUnchangedRegionsKey)
-            postChanged()
+            postChanged(key: hideUnchangedRegionsKey)
         }
     }
 
@@ -94,7 +96,16 @@ struct DiffLayoutSettings: Sendable {
         get { store.object(forKey: ignoreTrimWhitespaceKey) as? Bool ?? true }
         set {
             store.set(newValue, forKey: ignoreTrimWhitespaceKey)
-            postChanged()
+            postChanged(key: ignoreTrimWhitespaceKey)
+        }
+    }
+
+    /// Default true (VS Code `renderOverviewRuler`).
+    static var renderOverviewRuler: Bool {
+        get { store.object(forKey: renderOverviewRulerKey) as? Bool ?? true }
+        set {
+            store.set(newValue, forKey: renderOverviewRulerKey)
+            postChanged(key: renderOverviewRulerKey)
         }
     }
 
@@ -108,7 +119,11 @@ struct DiffLayoutSettings: Sendable {
         }
     }
 
-    private static func postChanged() {
-        NotificationCenter.default.post(name: .diffLayoutSettingChanged, object: nil)
+    /// `userInfo` key of `.diffLayoutSettingChanged`: the defaults key that changed.
+    static let changedKeyUserInfoKey = "key"
+
+    private static func postChanged(key: String) {
+        NotificationCenter.default.post(name: .diffLayoutSettingChanged, object: nil,
+                                        userInfo: [changedKeyUserInfoKey: key])
     }
 }

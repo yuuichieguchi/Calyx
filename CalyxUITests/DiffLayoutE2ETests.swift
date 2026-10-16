@@ -183,6 +183,13 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         }
         XCTAssertTrue(toolbarAppeared, "a diff tab must open")
 
+        XCTAssertTrue(waitFor(app.descendants(matching: .any)["calyx.diff.nextChange"], timeout: 5),
+                      "diff toolbar must have the Next Change button")
+        XCTAssertTrue(waitFor(app.descendants(matching: .any)["calyx.diff.previousChange"], timeout: 5),
+                      "diff toolbar must have the Previous Change button")
+        XCTAssertTrue(waitFor(app.descendants(matching: .any)["calyx.diff.overviewRuler"], timeout: 5),
+                      "the diff view must show the overview ruler")
+
         chooseDiffView("Inline")
         XCTAssertTrue(waitFor(element("calyx.diff.lineNumbers.inline"), timeout: 5),
                       "Inline layout must show the single dual-column gutter")

@@ -111,4 +111,30 @@ final class DiffLayoutSettingsTests: XCTestCase {
         DiffLayoutSettings.ignoreTrimWhitespace = false
         wait(for: [exp], timeout: 1)
     }
+
+    // MARK: - renderOverviewRuler
+
+    func test_renderOverviewRuler_defaultsToTrue() {
+        XCTAssertTrue(DiffLayoutSettings.renderOverviewRuler)
+    }
+
+    func test_renderOverviewRuler_roundTrips() {
+        DiffLayoutSettings.renderOverviewRuler = false
+        XCTAssertFalse(DiffLayoutSettings.renderOverviewRuler)
+        XCTAssertEqual(suite.object(forKey: "calyx.diff.renderOverviewRuler") as? Bool, false)
+        DiffLayoutSettings.renderOverviewRuler = true
+        XCTAssertTrue(DiffLayoutSettings.renderOverviewRuler)
+        XCTAssertEqual(suite.object(forKey: "calyx.diff.renderOverviewRuler") as? Bool, true)
+    }
+
+    func test_renderOverviewRuler_readsFromSuiteKey() {
+        suite.set(false, forKey: "calyx.diff.renderOverviewRuler")
+        XCTAssertFalse(DiffLayoutSettings.renderOverviewRuler)
+    }
+
+    func test_renderOverviewRulerSetter_postsNotification() {
+        let exp = XCTNSNotificationExpectation(name: .diffLayoutSettingChanged)
+        DiffLayoutSettings.renderOverviewRuler = false
+        wait(for: [exp], timeout: 1)
+    }
 }

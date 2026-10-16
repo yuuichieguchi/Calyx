@@ -49,6 +49,9 @@ struct DiffToolbarView: View {
     var reviewFileCount: Int = 0
     var onSubmitAllReviews: (() -> Void)?
     var onDiscardAllReviews: (() -> Void)?
+    /// Number of changes of the loaded diff (0 while loading / on error).
+    var changeCount: Int = 0
+    var onGoToChange: ((DiffChangeNavigator.Direction) -> Void)?
 
     @State private var layoutPreference = DiffLayoutSettings.preference
     @State private var hideUnchangedRegions = DiffLayoutSettings.hideUnchangedRegionsEnabled
@@ -137,12 +140,38 @@ struct DiffToolbarView: View {
                 }
             }
 
+            changeNavigationButtons
+
             moreActionsMenu
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(AccessibilityID.Diff.toolbar)
+    }
+
+    /// VS Code's diff editor title Previous / Next Change actions.
+    private var changeNavigationButtons: some View {
+        HStack(spacing: 4) {
+            Button {
+                onGoToChange?(.previous)
+            } label: {
+                Image(systemName: "chevron.up")
+            }
+            .help("Go to Previous Change")
+            .accessibilityLabel("Go to Previous Change")
+            .accessibilityIdentifier(AccessibilityID.Diff.previousChangeButton)
+            Button {
+                onGoToChange?(.next)
+            } label: {
+                Image(systemName: "chevron.down")
+            }
+            .help("Go to Next Change")
+            .accessibilityLabel("Go to Next Change")
+            .accessibilityIdentifier(AccessibilityID.Diff.nextChangeButton)
+        }
+        .buttonStyle(.borderless)
+        .disabled(changeCount == 0)
     }
 
     /// "…" menu: diff layout, collapse unchanged regions, ignore trim
@@ -220,5 +249,12 @@ struct DiffViewRepresentable: NSViewRepresentable {
         if nsView.currentDiff != diff {
             nsView.display(diff: diff)
         }
+    }
+}
+extension DiffLoadState {
+    /// Number of changes of a loaded diff; 0 while loading or on error.
+    var changeCount: Int {
+        if case .success(let diff) = self { return diff.changes.count }
+        return 0
     }
 }

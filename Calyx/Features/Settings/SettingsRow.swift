@@ -24,6 +24,8 @@ enum SettingsRow: String, CaseIterable {
     case gitDiffLayout
     case gitDiffHideUnchangedRegions
     case gitDiffIgnoreTrimWhitespace
+    /// Overview ruler at the diff view's trailing edge (VS Code `renderOverviewRuler`).
+    case gitDiffOverviewRuler
     case lspAutoInstall
     case lspRequireConfirmation
     case persistentSessions
@@ -44,7 +46,8 @@ enum SettingsRow: String, CaseIterable {
         switch self {
         case .themeColorPreset, .themeColorWell, .themeColorHex,
              .glassOpacity, .glassOpacityCells, .smoothScrolling, .gitDiffPreviewTab,
-             .gitDiffLayout, .gitDiffHideUnchangedRegions, .gitDiffIgnoreTrimWhitespace, .openConfigFileFooter:
+             .gitDiffLayout, .gitDiffHideUnchangedRegions, .gitDiffIgnoreTrimWhitespace, .gitDiffOverviewRuler,
+             .openConfigFileFooter:
             return .appearance
         case .lspAutoInstall, .lspRequireConfirmation:
             return .lsp
