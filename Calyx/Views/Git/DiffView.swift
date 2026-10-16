@@ -38,6 +38,9 @@ final class DiffView: NSView {
     private var isLayoutSwitchPending = false
     private(set) var displayLines: [DisplayLine] = []
     private(set) var rows: [DiffLayoutRow] = []
+    /// Alignment blocks partitioning `rows` (side by side: each block's
+    /// height is equalised across the panes).
+    private(set) var blocks: [Range<Int>] = []
     private(set) var currentLayout: DiffLayout?
     private var activePopover: NSPopover?
     private var isSyncingScroll = false
@@ -51,6 +54,12 @@ final class DiffView: NSView {
     /// (a new diff is displayed before SwiftUI sizes the view).
     private var pendingRevealChangeIndex: Int?
     private var isRevealScheduled = false
+    /// A viewport width change may have re-wrapped rows: realign on the
+    /// next main-queue turn (coalesced; deferred during live resize).
+    private var isRealignPending = false
+    private var isRealignScheduled = false
+    /// Row heights of the active pane after the last alignment pass.
+    private var lastAlignedHeights: [CGFloat] = []
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -61,6 +70,11 @@ final class DiffView: NSView {
     required init?(coder: NSCoder) {
         fatalError("init(coder:) is not supported")
     }
+
+    var leftPaneForTesting: DiffPaneView { leftPane }
+    var rightPaneForTesting: DiffPaneView { rightPane }
+    var inlinePaneForTesting: DiffPaneView { inlinePane }
+    var blocksForTesting: [Range<Int>] { blocks }
 
     private var activePanes: [DiffPaneView] {
         switch currentLayout {
@@ -95,6 +109,7 @@ final class DiffView: NSView {
                 guard let self, let pane else { return }
                 self.handleCollapsedRowAction(pane: pane, row: row, action: action)
             }
+            pane.onViewportWidthChanged = { [weak self] in self?.scheduleRealign() }
         }
         leftPane.onBecameFirstResponder = { [weak self] in
             self?.rightPane.clearSelection()
@@ -232,6 +247,8 @@ final class DiffView: NSView {
             // caret and scroll position stay.
             applyRulerVisibility()
             needsLayout = true
+        } else if key == DiffLayoutSettings.wordWrapKey {
+            applyWordWrap()
         } else {
             applyEffectiveLayout(preserveScroll: true, forceRebuild: true)
         }
@@ -249,10 +266,102 @@ final class DiffView: NSView {
         rebuild(anchor: anchor, caretDisplayIndex: caret)
     }
 
+    /// Applies `DiffLayoutSettings.wordWrap` to every pane and rebuilds;
+    /// the scroll anchor and the caret survive.
+    private func applyWordWrap() {
+        let anchor = firstVisibleDisplayIndex()
+        let caret = caretDisplayIndex()
+        let wrap = DiffLayoutSettings.wordWrap
+        for pane in [inlinePane, leftPane, rightPane] { pane.wordWrap = wrap }
+        rebuild(anchor: anchor, caretDisplayIndex: caret)
+    }
+
+    // MARK: Realign (word wrap)
+
+    private func scheduleRealign() {
+        isRealignPending = true
+        guard !isRealignScheduled else { return }
+        isRealignScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isRealignScheduled = false
+            // Re-wrapping per live-resize tick is too costly: realign once at the end.
+            guard self.window?.inLiveResize != true else { return }
+            self.realignIfNeeded()
+        }
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        realignIfNeeded()
+    }
+
+    /// Runs a pending realign now; the scroll anchor is restored only when
+    /// the row geometry changed. Never touches the text content, so the
+    /// caret survives.
+    private func realignIfNeeded() {
+        guard isRealignPending else { return }
+        isRealignPending = false
+        let anchor = firstVisibleDisplayIndex()
+        if alignPanes(), let anchor {
+            restoreScroll(toDisplayIndex: anchor)
+        }
+        updateRulerViewport()
+    }
+
+    /// Two-pass alignment: measure both panes' natural row heights, pad the
+    /// shorter side of each block (one edit batch per pane, none when
+    /// nothing changes), and zero wrap indents that leave no room. Feeds
+    /// the ruler geometry. Returns whether the active pane's row geometry
+    /// changed since the last pass.
+    @discardableResult
+    private func alignPanes() -> Bool {
+        switch currentLayout {
+        case .sideBySide:
+            let needsPass = !rows.isEmpty && [leftPane, rightPane].contains { pane in
+                pane.wrappingColumns != .max || pane.textView.hasLayoutAdjustments
+            }
+            if needsPass {
+                // Indent zeroing changes wrap counts, so it runs before the
+                // heights the pads are computed from are measured.
+                leftPane.textView.applyIndentZeroing(wrappingColumns: leftPane.wrappingColumns)
+                rightPane.textView.applyIndentZeroing(wrappingColumns: rightPane.wrappingColumns)
+                let leftHeights = leftPane.textView.naturalHeights()
+                let rightHeights = rightPane.textView.naturalHeights()
+                var leftPads: [Int: CGFloat] = [:]
+                var rightPads: [Int: CGFloat] = [:]
+                for pad in DiffBlockAlignment.padding(blocks: blocks, leftHeights: leftHeights,
+                                                      rightHeights: rightHeights) {
+                    switch pad.side {
+                    case .left: leftPads[pad.row] = pad.pad
+                    case .right: rightPads[pad.row] = pad.pad
+                    }
+                }
+                leftPane.textView.applyPadding(leftPads)
+                rightPane.textView.applyPadding(rightPads)
+            }
+        case .inline, .none:
+            if inlinePane.wrappingColumns != .max || inlinePane.textView.hasLayoutAdjustments {
+                inlinePane.textView.applyIndentZeroing(wrappingColumns: inlinePane.wrappingColumns)
+                inlinePane.textView.applyPadding([:])
+            }
+        }
+        guard let pane = activePanes.first else { return false }
+        let frames = pane.textView.ensureRowFrames()
+        let inset = DiffMetrics.textInset.height
+        rulerView.rowOffsets = frames.map { $0.minY - inset }
+        rulerView.documentHeight = max((frames.last?.maxY ?? inset) - inset, 0)
+        let heights = frames.map(\.height)
+        let changed = heights != lastAlignedHeights
+        lastAlignedHeights = heights
+        return changed
+    }
+
     // MARK: Scroll sync (side-by-side)
 
     /// Both axes follow the other pane, as VS Code's diff editor syncs
-    /// scrollTop and scrollLeft between its two editors.
+    /// scrollTop and scrollLeft between its two editors. A wrapping source
+    /// pane has no horizontal scroll: only y follows.
     @objc private func clipViewBoundsDidChange(_ notification: Notification) {
         if let source = notification.object as? NSClipView,
            source === activePanes.first?.scrollView.contentView {
@@ -260,12 +369,16 @@ final class DiffView: NSView {
         }
         guard !isSyncingScroll, currentLayout == .sideBySide,
               let source = notification.object as? NSClipView else { return }
-        let target = source === leftPane.scrollView.contentView ? rightPane : leftPane
+        let sourcePane = source === leftPane.scrollView.contentView ? leftPane : rightPane
+        let target = sourcePane === leftPane ? rightPane : leftPane
         let targetClip = target.scrollView.contentView
+        let proposed = sourcePane.wordWrap
+            ? NSPoint(x: targetClip.bounds.origin.x, y: source.bounds.origin.y)
+            : source.bounds.origin
         // Each pane clamps to its own content (the panes' widths differ), as
         // each VS Code editor clamps scrollLeft to its own scrollWidth.
         let origin = targetClip.constrainBoundsRect(
-            NSRect(origin: source.bounds.origin, size: targetClip.bounds.size)).origin
+            NSRect(origin: proposed, size: targetClip.bounds.size)).origin
         guard targetClip.bounds.origin != origin else { return }
         isSyncingScroll = true
         targetClip.scroll(to: origin)
@@ -316,8 +429,11 @@ final class DiffView: NSView {
         if diff.isBinary {
             displayLines = []
             rows = []
+            blocks = []
+            lastAlignedHeights = []
             rulerView.zones = DiffOverviewRuler.zones(rows: [])
-            rulerView.rowCount = 0
+            rulerView.rowOffsets = []
+            rulerView.documentHeight = 0
             inlinePane.setCommentedLineIndices([])
             displayBinaryMessage()
             return
@@ -333,7 +449,7 @@ final class DiffView: NSView {
             commentedLineIndices.formUnion(comment.lineIndex...end)
         }
 
-        var built = DiffRowBuilder.build(displayLines: displayLines, changes: diff.changes, layout: layout)
+        var built = DiffRowBuilder.buildLayout(displayLines: displayLines, changes: diff.changes, layout: layout)
 
         // A too-large file was not compared: no line is known to be unchanged.
         if DiffLayoutSettings.hideUnchangedRegionsEnabled && !diff.isTooLarge {
@@ -345,7 +461,7 @@ final class DiffView: NSView {
             revealState?.updateRegions(regions)
             let snapshot = revealState?.snapshot ?? DiffRevealSnapshot(counts: [:], isAllRevealed: false)
             built = UnchangedRegions.apply(
-                rows: built,
+                layout: built,
                 regions: regions,
                 reveal: snapshot,
                 forcedVisibleDisplayIndices: forcedVisibleDisplayIndices(commentedLineIndices: commentedLineIndices)
@@ -363,11 +479,12 @@ final class DiffView: NSView {
         if bannerMessage != nil {
             let banner = DiffCell(displayIndex: nil, lineIndex: nil, kind: .banner,
                                   innerRanges: [], isWholeLineChange: false)
-            built.append(DiffLayoutRow(left: banner, right: layout == .sideBySide ? banner : nil))
+            built.rows.append(DiffLayoutRow(left: banner, right: layout == .sideBySide ? banner : nil))
+            built.blocks.append((built.rows.count - 1)..<built.rows.count)
         }
-        rows = built
+        rows = built.rows
+        blocks = built.blocks
         rulerView.zones = DiffOverviewRuler.zones(rows: rows)
-        rulerView.rowCount = rows.count
 
         // An uncompared file's inline view is the modified file alone.
         let showsOldNumbers = !(diff.isTooLarge && layout == .inline)
@@ -387,6 +504,8 @@ final class DiffView: NSView {
             caretPane.placeInsertionPoint(atRow: caretRow)
             hasCaret = true
         }
+        // Scroll targets need the final (aligned) row frames.
+        alignPanes()
 
         if let anchor {
             restoreScroll(toDisplayIndex: anchor)
@@ -400,8 +519,8 @@ final class DiffView: NSView {
 
     private func updateRulerViewport() {
         guard let pane = activePanes.first else { return }
-        let range = pane.visibleRowRange
-        rulerView.visibleRows = (range.lowerBound, range.count)
+        rulerView.viewportRect = pane.scrollView.documentVisibleRect
+            .offsetBy(dx: 0, dy: -DiffMetrics.textInset.height)
     }
 
     // MARK: Change navigation (VS Code DiffEditorWidget goToDiff / _goTo)
@@ -498,8 +617,7 @@ final class DiffView: NSView {
         if hasCaret {
             row = caretPane.selectionStartRow
         } else {
-            let visible = visibleRowRange
-            row = visible.isEmpty ? nil : (visible.lowerBound + visible.upperBound - 1) / 2
+            row = activePanes.first?.rowIndexAtViewportCentre
         }
         return row.flatMap(modifiedLineForCursor(atRow:))
     }
@@ -525,8 +643,9 @@ final class DiffView: NSView {
         guard let diff = currentDiff, diff.changes.indices.contains(index) else { return }
         let mapping = diff.changes[index]
         currentChangeIndex = index
-        // The viewport capacity and row geometry must be current.
+        // The viewport and row geometry must be current.
         layoutSubtreeIfNeeded()
+        realignIfNeeded()
         let caretLine = min(mapping.modified.startLineNumber, max(diff.newLineCount, 1))
         if let caretRow = row(forModifiedLine: caretLine) {
             caretPane.placeInsertionPoint(atRow: caretRow)
@@ -540,11 +659,16 @@ final class DiffView: NSView {
     /// Centres `range` vertically in every active pane; a range taller than
     /// the viewport starts at the top (VS Code revealRangeInCenter).
     private func revealRowsInCenter(_ range: Range<Int>) {
-        guard let capacity = activePanes.first?.viewportRowCapacity else { return }
-        let top = range.count >= capacity
-            ? range.lowerBound
-            : range.lowerBound - (capacity - range.count) / 2
-        for pane in activePanes { pane.scrollToRow(max(top, 0)) }
+        guard let pane = activePanes.first else { return }
+        let frames = pane.textView.ensureRowFrames()
+        let lo = min(max(range.lowerBound, 0), frames.count)
+        let hi = min(max(range.upperBound, lo), frames.count)
+        guard lo < hi else { return }
+        let top = frames[lo].minY
+        let height = frames[hi - 1].maxY - top
+        let clipHeight = pane.scrollView.contentView.bounds.height
+        let y = height >= clipHeight ? top : top - (clipHeight - height) / 2
+        for pane in activePanes { pane.scroll(toY: y) }
         updateRulerViewport()
     }
 
@@ -631,39 +755,46 @@ final class DiffView: NSView {
     }
 
     /// One paragraph per cell, joined by "\n" (the panes' row arithmetic
-    /// depends on it: no other paragraph separator may appear).
+    /// depends on it: no other paragraph separator may appear). Each
+    /// paragraph, its terminating "\n" included, carries one row paragraph
+    /// style; line paragraphs carry their wrap indent (VS Code
+    /// `wrappingIndent: same`), the others none.
     static func attributedString(cells: [DiffCell?], displayLines: [DisplayLine],
                                  bannerMessage: String?) -> NSAttributedString {
         let result = NSMutableAttributedString()
-        let paragraph = DiffMetrics.rowParagraphStyle
-        let newline = NSAttributedString(string: "\n", attributes: [.font: DiffMetrics.font, .paragraphStyle: paragraph])
+        let plain = DiffMetrics.rowParagraphStyle
 
         for (index, cell) in cells.enumerated() {
-            if index > 0 { result.append(newline) }
-            guard let cell else {
-                result.append(NSAttributedString(string: "", attributes: [.paragraphStyle: paragraph]))
-                continue
-            }
-            switch cell.kind {
-            case .line(let type):
-                guard let d = cell.displayIndex, d < displayLines.count, case .diff(let line) = displayLines[d] else {
-                    continue
+            var paragraph = plain
+            if let cell {
+                switch cell.kind {
+                case .line(let type):
+                    if let d = cell.displayIndex, d < displayLines.count, case .diff(let line) = displayLines[d] {
+                        let text = displayedText(line, side: cell.textSide).text
+                        let indent = DiffWrapIndent.columns(lineText: text, wrappingColumns: .max)
+                        paragraph = DiffMetrics.paragraphStyle(indentColumns: indent, paragraphSpacing: 0)
+                        result.append(lineString(line, type: type, cell: cell, paragraph: paragraph))
+                    }
+                case .comment:
+                    if let d = cell.displayIndex, d < displayLines.count,
+                       case .commentBlock(let comment) = displayLines[d] {
+                        result.append(commentString(comment, paragraph: paragraph))
+                    }
+                case .banner:
+                    let attrs: [NSAttributedString.Key: Any] = [
+                        .font: DiffMetrics.boldFont,
+                        .foregroundColor: NSColor.systemOrange,
+                        .paragraphStyle: paragraph,
+                    ]
+                    result.append(NSAttributedString(string: bannerMessage ?? "", attributes: attrs))
+                case .filler, .collapsedRegion:
+                    // Drawn by DiffTextView (hatch / band + centred label).
+                    break
                 }
-                result.append(lineString(line, type: type, cell: cell, paragraph: paragraph))
-            case .comment:
-                guard let d = cell.displayIndex, d < displayLines.count,
-                      case .commentBlock(let comment) = displayLines[d] else { continue }
-                result.append(commentString(comment, paragraph: paragraph))
-            case .banner:
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: DiffMetrics.boldFont,
-                    .foregroundColor: NSColor.systemOrange,
-                    .paragraphStyle: paragraph,
-                ]
-                result.append(NSAttributedString(string: bannerMessage ?? "", attributes: attrs))
-            case .filler, .collapsedRegion:
-                // Drawn by DiffTextView (hatch / band + centred label).
-                break
+            }
+            if index < cells.count - 1 {
+                result.append(NSAttributedString(string: "\n",
+                                                 attributes: [.font: DiffMetrics.font, .paragraphStyle: paragraph]))
             }
         }
         return result

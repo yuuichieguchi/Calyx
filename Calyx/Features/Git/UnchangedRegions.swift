@@ -52,6 +52,75 @@ enum UnchangedRegions {
     static func apply(rows: [DiffLayoutRow], regions: [UnchangedRegion], reveal: DiffRevealSnapshot,
                       forcedVisibleDisplayIndices: Set<Int>) -> [DiffLayoutRow] {
         guard !regions.isEmpty else { return rows }
+        let replacements = replacements(rows: rows, regions: regions, reveal: reveal,
+                                        forcedVisibleDisplayIndices: forcedVisibleDisplayIndices)
+        return splice(rows: rows, replacements: replacements)
+    }
+
+    /// Same rows as `apply(rows:...)`, with the alignment blocks remapped:
+    /// blocks before a collapsed range shift by the cumulative shrink, and
+    /// the rows of a collapsed range become one singleton block.
+    static func apply(layout: DiffRowLayout, regions: [UnchangedRegion], reveal: DiffRevealSnapshot,
+                      forcedVisibleDisplayIndices: Set<Int>) -> DiffRowLayout {
+        guard !regions.isEmpty else { return layout }
+        let replacements = replacements(rows: layout.rows, regions: regions, reveal: reveal,
+                                        forcedVisibleDisplayIndices: forcedVisibleDisplayIndices)
+        let rows = splice(rows: layout.rows, replacements: replacements)
+
+        // Old row index -> new row index, and whether the old row was replaced.
+        var newIndex = [Int](repeating: 0, count: layout.rows.count)
+        var replaced = [Bool](repeating: false, count: layout.rows.count)
+        var shrink = 0
+        var next = 0
+        for replacement in replacements {
+            for old in next..<replacement.range.lowerBound { newIndex[old] = old - shrink }
+            let collapsed = replacement.range.lowerBound - shrink
+            for old in replacement.range {
+                newIndex[old] = collapsed
+                replaced[old] = true
+            }
+            shrink += replacement.range.count - 1
+            next = replacement.range.upperBound + 1
+        }
+        for old in next..<layout.rows.count { newIndex[old] = old - shrink }
+
+        var blocks: [Range<Int>] = []
+        var covered = 0
+        for block in layout.blocks {
+            let kept = block.filter { !replaced[$0] }
+            if kept.isEmpty {
+                // Fully inside a collapsed range: one block for the collapsed row.
+                guard let first = block.first else { continue }
+                let collapsed = newIndex[first]
+                if collapsed >= covered {
+                    blocks.append(collapsed..<(collapsed + 1))
+                    covered = collapsed + 1
+                }
+                continue
+            }
+            assert(kept.count == block.count, "alignment block \(block) straddles a collapsed region")
+            // Release builds clip a straddling block to its kept rows; any
+            // collapsed row skipped by the clip becomes its own block.
+            let lo = newIndex[kept[0]]
+            let hi = newIndex[kept[kept.count - 1]] + 1
+            while covered < lo {
+                blocks.append(covered..<(covered + 1))
+                covered += 1
+            }
+            blocks.append(max(lo, covered)..<hi)
+            covered = hi
+        }
+        while covered < rows.count {
+            blocks.append(covered..<(covered + 1))
+            covered += 1
+        }
+        return DiffRowLayout(rows: rows, blocks: blocks)
+    }
+
+    private static func replacements(
+        rows: [DiffLayoutRow], regions: [UnchangedRegion], reveal: DiffRevealSnapshot,
+        forcedVisibleDisplayIndices: Set<Int>
+    ) -> [(range: ClosedRange<Int>, row: DiffLayoutRow)] {
 
         // Original line number -> row index of its left context cell.
         var contextRowByOriginalLine: [Int: Int] = [:]
@@ -96,6 +165,11 @@ enum UnchangedRegions {
         }
 
         replacements.sort { $0.range.lowerBound < $1.range.lowerBound }
+        return replacements
+    }
+
+    private static func splice(rows: [DiffLayoutRow],
+                               replacements: [(range: ClosedRange<Int>, row: DiffLayoutRow)]) -> [DiffLayoutRow] {
         var out: [DiffLayoutRow] = []
         out.reserveCapacity(rows.count)
         var next = 0

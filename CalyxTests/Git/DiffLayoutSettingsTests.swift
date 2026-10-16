@@ -137,4 +137,37 @@ final class DiffLayoutSettingsTests: XCTestCase {
         DiffLayoutSettings.renderOverviewRuler = false
         wait(for: [exp], timeout: 1)
     }
+
+    // MARK: - wordWrap (addendum 2)
+
+    func test_wordWrapKey_hasDocumentedValue() {
+        XCTAssertEqual(DiffLayoutSettings.wordWrapKey, "calyx.diff.wordWrap")
+    }
+
+    func test_wordWrap_defaultsToTrue() {
+        XCTAssertTrue(DiffLayoutSettings.wordWrap)
+    }
+
+    func test_wordWrap_roundTrips() {
+        DiffLayoutSettings.wordWrap = false
+        XCTAssertFalse(DiffLayoutSettings.wordWrap)
+        XCTAssertEqual(suite.object(forKey: "calyx.diff.wordWrap") as? Bool, false)
+        DiffLayoutSettings.wordWrap = true
+        XCTAssertTrue(DiffLayoutSettings.wordWrap)
+        XCTAssertEqual(suite.object(forKey: "calyx.diff.wordWrap") as? Bool, true)
+    }
+
+    func test_wordWrap_readsFromSuiteKey() {
+        suite.set(false, forKey: "calyx.diff.wordWrap")
+        XCTAssertFalse(DiffLayoutSettings.wordWrap)
+    }
+
+    func test_wordWrapSetter_postsNotificationWithItsKey() {
+        let exp = XCTNSNotificationExpectation(name: .diffLayoutSettingChanged)
+        exp.handler = { note in
+            (note.userInfo?[DiffLayoutSettings.changedKeyUserInfoKey] as? String) == "calyx.diff.wordWrap"
+        }
+        DiffLayoutSettings.wordWrap = false
+        wait(for: [exp], timeout: 1)
+    }
 }

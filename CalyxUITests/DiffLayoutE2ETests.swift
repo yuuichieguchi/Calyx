@@ -142,7 +142,8 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         item.click()
     }
 
-    func test_diffToolbarMoreActions_switchesBetweenInlineAndSideBySide() {
+    /// Creates the fixture repo, opens the Changes sidebar and the diff tab.
+    private func openDiffTab() {
         waitForMainWindow()
         let pane = terminalPane()
         XCTAssertTrue(waitFor(pane, timeout: 10), "terminal pane not found")
@@ -190,6 +191,11 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         XCTAssertTrue(waitFor(app.descendants(matching: .any)["calyx.diff.overviewRuler"], timeout: 5),
                       "the diff view must show the overview ruler")
 
+    }
+
+    func test_diffToolbarMoreActions_switchesBetweenInlineAndSideBySide() {
+        openDiffTab()
+
         chooseDiffView("Inline")
         XCTAssertTrue(waitFor(element("calyx.diff.lineNumbers.inline"), timeout: 5),
                       "Inline layout must show the single dual-column gutter")
@@ -201,5 +207,40 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
                       "Side by Side must show the modified-side gutter")
         XCTAssertFalse(element("calyx.diff.lineNumbers.inline").exists,
                        "the inline gutter must be removed in Side by Side")
+    }
+
+    // MARK: - (c) Toolbar "..." -> Word Wrap toggles the Settings switch
+
+    private func wordWrapSwitch() -> XCUIElement {
+        element("calyx.settings.appearance.gitDiffWordWrapSwitch")
+    }
+
+    private func toggleWordWrapFromMoreActions() {
+        let more = element("calyx.diff.moreActions")
+        XCTAssertTrue(waitFor(more, timeout: 10), "diff toolbar must have the More Actions (…) button")
+        more.click()
+        let item = more.menuItems["Word Wrap"]
+        XCTAssertTrue(waitFor(item, timeout: 5), "More Actions must contain a Word Wrap item")
+        item.click()
+    }
+
+    private func assertWordWrapSwitch(_ expected: Int, _ message: String) {
+        openAppearancePane()
+        let toggle = wordWrapSwitch()
+        XCTAssertTrue(waitFor(toggle, timeout: 5), "gitDiffWordWrapSwitch not found on the Appearance pane")
+        revealInScrollView(toggle)
+        XCTAssertEqual(toggle.value as? Int, expected, message) // NSSwitch exposes an NSNumber, not a String
+        app.typeKey("w", modifierFlags: .command) // close Settings, back to the diff tab
+        Thread.sleep(forTimeInterval: 0.5)
+    }
+
+    func test_moreActionsWordWrap_togglesSettingsSwitch() {
+        openDiffTab()
+
+        toggleWordWrapFromMoreActions()
+        assertWordWrapSwitch(0, "word wrap defaults on; one toggle must turn it off")
+
+        toggleWordWrapFromMoreActions()
+        assertWordWrapSwitch(1, "a second toggle must turn word wrap back on")
     }
 }

@@ -56,6 +56,7 @@ struct DiffToolbarView: View {
     @State private var layoutPreference = DiffLayoutSettings.preference
     @State private var hideUnchangedRegions = DiffLayoutSettings.hideUnchangedRegionsEnabled
     @State private var ignoreTrimWhitespace = DiffLayoutSettings.ignoreTrimWhitespace
+    @State private var wordWrap = DiffLayoutSettings.wordWrap
 
     var body: some View {
         HStack(spacing: 8) {
@@ -194,6 +195,8 @@ struct DiffToolbarView: View {
                 .accessibilityIdentifier(AccessibilityID.Diff.collapseUnchangedItem)
             Toggle("Ignore Trim Whitespace", isOn: $ignoreTrimWhitespace)
                 .accessibilityIdentifier(AccessibilityID.Diff.ignoreTrimWhitespaceItem)
+            Toggle("Word Wrap", isOn: $wordWrap)
+                .accessibilityIdentifier(AccessibilityID.Diff.wordWrapItem)
         } label: {
             Image(systemName: "ellipsis.circle")
         }
@@ -215,10 +218,16 @@ struct DiffToolbarView: View {
                 DiffLayoutSettings.ignoreTrimWhitespace = newValue
             }
         }
+        .onChange(of: wordWrap) { _, newValue in
+            if DiffLayoutSettings.wordWrap != newValue {
+                DiffLayoutSettings.wordWrap = newValue
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .diffLayoutSettingChanged)) { _ in
             layoutPreference = DiffLayoutSettings.preference
             hideUnchangedRegions = DiffLayoutSettings.hideUnchangedRegionsEnabled
             ignoreTrimWhitespace = DiffLayoutSettings.ignoreTrimWhitespace
+            wordWrap = DiffLayoutSettings.wordWrap
         }
     }
 

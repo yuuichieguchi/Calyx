@@ -802,6 +802,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             DiffLayoutSettings.ignoreTrimWhitespace.toggle()
         })
         commandRegistry.register(PaletteCommand(
+            id: "diff.wordWrap.toggle", title: "Toggle Word Wrap", shortcut: "Opt+Z", category: "View",
+            isAvailable: isAvailable
+        ) {
+            DiffLayoutSettings.wordWrap.toggle()
+        })
+        commandRegistry.register(PaletteCommand(
             id: "diff.nextChange", title: "Go to Next Change", shortcut: "Opt+F5", category: "View",
             isAvailable: isAvailable
         ) { [weak self] in
@@ -823,6 +829,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func goToNextChange(_ sender: Any?) { goToChange(.next) }
     @objc func goToPreviousChange(_ sender: Any?) { goToChange(.previous) }
+
+    /// VS Code `editor.action.toggleWordWrap` (Alt+Z) for diff tabs.
+    @objc func toggleDiffWordWrap(_ sender: Any?) {
+        guard isDiffTabActive else { return }
+        DiffLayoutSettings.wordWrap.toggle()
+    }
 
     private func setupCommandRegistry() {
         commandRegistry.register(PaletteCommand(id: "tab.new", title: "New Tab", shortcut: "Cmd+T", category: "Tabs") { [weak self] in
@@ -5118,6 +5130,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             return false
         }
         if menuItem.action == #selector(goToNextChange(_:)) || menuItem.action == #selector(goToPreviousChange(_:)) {
+            return isDiffTabActive
+        }
+        if menuItem.action == #selector(toggleDiffWordWrap(_:)) {
+            menuItem.state = DiffLayoutSettings.wordWrap ? .on : .off
             return isDiffTabActive
         }
         if menuItem.action == #selector(jumpToMostRecentUnreadTab) {

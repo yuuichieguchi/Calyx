@@ -20,6 +20,7 @@ class SettingsWindowController: NSWindowController {
     private let diffHideUnchangedRegionsSwitch = NSSwitch()
     private let diffIgnoreTrimWhitespaceSwitch = NSSwitch()
     private let diffOverviewRulerSwitch = NSSwitch()
+    private let diffWordWrapSwitch = NSSwitch()
     private let colorWell = NSColorWell()
     private let hexField = NSTextField()
     /// The AI Agent IPC row's three controls -- stored so
@@ -242,7 +243,7 @@ class SettingsWindowController: NSWindowController {
         case .openConfigFileFooter:
             return SectionHeading(title: nil, subtitle: nil)
         case .glassOpacityCells, .gitDiffLayout, .gitDiffHideUnchangedRegions, .gitDiffIgnoreTrimWhitespace,
-             .gitDiffOverviewRuler,
+             .gitDiffOverviewRuler, .gitDiffWordWrap,
              .themeColorWell, .themeColorHex, .lspRequireConfirmation,
              .historyPersistence, .ipcWake, .agentResumeAutoExecute,
              .openSessionBrowserButton:
@@ -296,6 +297,8 @@ class SettingsWindowController: NSWindowController {
             return gitDiffIgnoreTrimWhitespaceRow()
         case .gitDiffOverviewRuler:
             return gitDiffOverviewRulerRow()
+        case .gitDiffWordWrap:
+            return gitDiffWordWrapRow()
         case .lspAutoInstall:
             return lspAutoInstallRow()
         case .lspRequireConfirmation:
@@ -436,6 +439,14 @@ class SettingsWindowController: NSWindowController {
         return controlRow(label: "Show overview ruler", control: diffOverviewRulerSwitch)
     }
 
+    private func gitDiffWordWrapRow() -> NSView {
+        diffWordWrapSwitch.setAccessibilityIdentifier(AccessibilityID.Settings.gitDiffWordWrapSwitch)
+        diffWordWrapSwitch.state = Self.sessionToggleInitialState(for: .gitDiffWordWrap) ? .on : .off
+        diffWordWrapSwitch.target = self
+        diffWordWrapSwitch.action = #selector(gitDiffWordWrapDidChange(_:))
+        return controlRow(label: "Word wrap", control: diffWordWrapSwitch)
+    }
+
     /// Index into `DiffLayoutPreference.allCases` of the persisted
     /// preference; the popup's items are built in that order.
     static func diffLayoutInitialSelectionIndex() -> Int {
@@ -493,6 +504,7 @@ class SettingsWindowController: NSWindowController {
         case .gitDiffHideUnchangedRegions: return DiffLayoutSettings.hideUnchangedRegionsEnabled
         case .gitDiffIgnoreTrimWhitespace: return DiffLayoutSettings.ignoreTrimWhitespace
         case .gitDiffOverviewRuler: return DiffLayoutSettings.renderOverviewRuler
+        case .gitDiffWordWrap: return DiffLayoutSettings.wordWrap
         default: return false
         }
     }
@@ -792,6 +804,10 @@ class SettingsWindowController: NSWindowController {
         DiffLayoutSettings.renderOverviewRuler = sender.state == .on
     }
 
+    @objc private func gitDiffWordWrapDidChange(_ sender: NSSwitch) {
+        DiffLayoutSettings.wordWrap = sender.state == .on
+    }
+
     /// Re-syncs the diff controls when a setting changes elsewhere while
     /// this window exists.
     @objc private func diffLayoutSettingDidChange(_ notification: Notification) {
@@ -799,6 +815,7 @@ class SettingsWindowController: NSWindowController {
         diffHideUnchangedRegionsSwitch.state = DiffLayoutSettings.hideUnchangedRegionsEnabled ? .on : .off
         diffIgnoreTrimWhitespaceSwitch.state = DiffLayoutSettings.ignoreTrimWhitespace ? .on : .off
         diffOverviewRulerSwitch.state = DiffLayoutSettings.renderOverviewRuler ? .on : .off
+        diffWordWrapSwitch.state = DiffLayoutSettings.wordWrap ? .on : .off
     }
 
     @objc private func lspAutoInstallDidChange(_ sender: NSSwitch) {

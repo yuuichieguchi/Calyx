@@ -231,4 +231,66 @@ struct DiffLayoutCommandsTests {
             #expect(DiffLayoutSettings.hideUnchangedRegionsEnabled == true)
         }
     }
+
+    // MARK: - Word wrap (addendum 2)
+
+    /// Runs body with `wordWrap` forced, restoring the original afterwards.
+    private func withWordWrap(_ value: Bool, _ body: () throws -> Void) rethrows {
+        let saved = DiffLayoutSettings.wordWrap
+        DiffLayoutSettings.wordWrap = value
+        defer { DiffLayoutSettings.wordWrap = saved }
+        try body()
+    }
+
+    @Test func wordWrapToggle_registeredWithTitleShortcutAndViewCategory() {
+        let (controller, _) = makeController()
+        let cmd = command("diff.wordWrap.toggle", in: controller)
+        #expect(cmd != nil, "missing diff.wordWrap.toggle")
+        #expect(cmd?.title == "Toggle Word Wrap")
+        #expect(cmd?.shortcut == "Opt+Z")
+        #expect(cmd?.category == "View")
+    }
+
+    @Test func wordWrapToggle_unavailableOnTerminal_availableOnDiff() throws {
+        let (controller, _) = makeController()
+        let cmd = try #require(command("diff.wordWrap.toggle", in: controller))
+        #expect(cmd.isAvailable() == false)
+        controller.openDiffTab(source: source, pinned: true)
+        #expect(cmd.isAvailable() == true)
+    }
+
+    @Test func wordWrapToggle_flips() throws {
+        try withWordWrap(true) {
+            let (controller, _) = makeController()
+            try run("diff.wordWrap.toggle", in: controller)
+            #expect(DiffLayoutSettings.wordWrap == false)
+            try run("diff.wordWrap.toggle", in: controller)
+            #expect(DiffLayoutSettings.wordWrap == true)
+        }
+    }
+
+    private func wordWrapMenuItem() -> NSMenuItem {
+        NSMenuItem(title: "Word Wrap", action: #selector(CalyxWindowController.toggleDiffWordWrap(_:)), keyEquivalent: "z")
+    }
+
+    @Test func validateMenuItem_wordWrap_disabledOnTerminalTab() {
+        let (controller, _) = makeController()
+        #expect(controller.validateMenuItem(wordWrapMenuItem()) == false)
+    }
+
+    @Test func validateMenuItem_wordWrap_enabledOnDiffTab_stateFollowsSetting() {
+        let (controller, _) = makeController()
+        controller.openDiffTab(source: source, pinned: true)
+        let item = wordWrapMenuItem()
+        withWordWrap(true) {
+            item.state = .off
+            #expect(controller.validateMenuItem(item) == true)
+            #expect(item.state == .on)
+        }
+        withWordWrap(false) {
+            item.state = .on
+            #expect(controller.validateMenuItem(item) == true)
+            #expect(item.state == .off)
+        }
+    }
 }

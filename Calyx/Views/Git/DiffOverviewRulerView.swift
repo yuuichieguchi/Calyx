@@ -4,8 +4,8 @@
 // The diff view's overview ruler (VS Code overviewRulerFeature.ts): a
 // 30 pt strip at the trailing edge with the original zones in the left
 // 15 pt column, the modified zones in the right column and a translucent
-// viewport slider. Pressing or dragging scrolls the panes so the row under
-// the pointer is centred.
+// viewport slider. Geometry is in pixels (rows may wrap). Pressing or
+// dragging scrolls the panes so the row under the pointer is centred.
 
 import AppKit
 
@@ -21,13 +21,19 @@ final class DiffOverviewRulerView: NSView {
     var zones = DiffOverviewZones(original: [], modified: []) {
         didSet { needsDisplay = true }
     }
-    var rowCount = 0 {
+    /// Top of each row in document coordinates (text inset excluded) of
+    /// the active pane; rows have measured, possibly wrapped heights.
+    var rowOffsets: [CGFloat] = [] {
         didSet { needsDisplay = true }
     }
-    /// First visible row and number of visible rows of the active pane.
-    var visibleRows: (first: Int, count: Int) = (0, 0) {
+    /// Height of all rows (text inset excluded).
+    var documentHeight: CGFloat = 0 {
+        didSet { needsDisplay = true }
+    }
+    /// Visible part of the document, in the same coordinates as `rowOffsets`.
+    var viewportRect: CGRect = .zero {
         didSet {
-            guard visibleRows != oldValue else { return }
+            guard viewportRect != oldValue else { return }
             needsDisplay = true
         }
     }
@@ -50,21 +56,25 @@ final class DiffOverviewRulerView: NSView {
     override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
-        guard rowCount > 0 else { return }
-        let scale = bounds.height / CGFloat(rowCount)
+        guard documentHeight > 0, !rowOffsets.isEmpty else { return }
+        let scale = bounds.height / documentHeight
         let column = DiffOverviewRuler.columnWidth
+        let offsets = rowOffsets
+        let total = documentHeight
+        func top(_ row: Int) -> CGFloat { row < offsets.count ? offsets[row] : total }
         func fill(_ ranges: [Range<Int>], x: CGFloat, color: NSColor) {
             color.setFill()
             for range in ranges {
-                let height = max(CGFloat(range.count) * scale, DiffOverviewRuler.minimumMarkHeight)
-                NSRect(x: x, y: CGFloat(range.lowerBound) * scale, width: column, height: height).fill()
+                let minY = top(range.lowerBound)
+                let height = max((top(range.upperBound) - minY) * scale, DiffOverviewRuler.minimumMarkHeight)
+                NSRect(x: x, y: minY * scale, width: column, height: height).fill()
             }
         }
         fill(zones.original, x: 0, color: Self.removedColor)
         fill(zones.modified, x: column, color: Self.insertedColor)
 
-        let slider = DiffOverviewRuler.viewport(firstVisibleRow: visibleRows.first, visibleRows: visibleRows.count,
-                                                rowCount: rowCount, height: bounds.height)
+        let slider = DiffOverviewRuler.viewport(visibleRect: viewportRect, documentHeight: documentHeight,
+                                                height: bounds.height)
         let rect = NSRect(x: 0, y: slider.minY, width: bounds.width, height: slider.height)
         Self.sliderFill.setFill()
         rect.fill()
@@ -85,9 +95,9 @@ final class DiffOverviewRulerView: NSView {
     }
 
     private func reveal(_ event: NSEvent) {
-        guard rowCount > 0, bounds.height > 0 else { return }
+        guard !rowOffsets.isEmpty, documentHeight > 0, bounds.height > 0 else { return }
         let y = convert(event.locationInWindow, from: nil).y
-        let row = Int(floor(y / bounds.height * CGFloat(rowCount)))
-        onRevealRow?(min(max(row, 0), rowCount - 1))
+        let documentY = y / bounds.height * documentHeight
+        onRevealRow?(DiffOverviewRuler.rowIndex(atDocumentY: documentY, rowOffsets: rowOffsets))
     }
 }

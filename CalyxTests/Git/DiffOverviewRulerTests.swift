@@ -130,3 +130,39 @@ struct DiffOverviewRulerViewportTests {
         #expect(rect.height == 20)
     }
 }
+
+// MARK: - Pixel geometry (addendum 2: word wrap)
+
+@Suite("DiffOverviewRuler pixel geometry")
+struct DiffOverviewRulerPixelGeometryTests {
+
+    /// scale = 200 / 2000 = 0.1: visible y 500 -> 50, visible height 200 -> 20.
+    @Test func viewport_pixel_proportionalToDocumentHeight() {
+        let rect = DiffOverviewRuler.viewport(visibleRect: CGRect(x: 0, y: 500, width: 600, height: 200),
+                                              documentHeight: 2000, height: 200)
+        #expect(rect.minY == 50)
+        #expect(rect.height == 20)
+    }
+
+    @Test func viewport_pixel_atTop_startsAtZero() {
+        let rect = DiffOverviewRuler.viewport(visibleRect: CGRect(x: 0, y: 0, width: 600, height: 200),
+                                              documentHeight: 2000, height: 200)
+        #expect(rect.minY == 0)
+        #expect(rect.height == 20)
+    }
+
+    /// Rows start at y 0, 20, 60.
+    @Test func rowIndex_atDocumentY_binarySearchesOffsets() {
+        let offsets: [CGFloat] = [0, 20, 60]
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 25, rowOffsets: offsets) == 1)
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 70, rowOffsets: offsets) == 2)
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 0, rowOffsets: offsets) == 0)
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 20, rowOffsets: offsets) == 1)
+    }
+
+    @Test func rowIndex_outOfRange_clamps() {
+        let offsets: [CGFloat] = [0, 20, 60]
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: -5, rowOffsets: offsets) == 0)
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 1000, rowOffsets: offsets) == 2)
+    }
+}

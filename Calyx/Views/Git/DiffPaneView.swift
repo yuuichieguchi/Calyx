@@ -2,12 +2,13 @@
 // Calyx
 //
 // One side of the diff view: a scroll view holding a `DiffTextView` and a
-// `DiffLineNumberView` ruler. Every row has the same height, so row
-// geometry and hit-testing are arithmetic (`inset + row * rowHeight`).
+// `DiffLineNumberView` ruler. Row geometry is measured: each row's frame
+// comes from the TextKit 1 layout manager (a wrapped row spans several
+// line fragments; an alignment pad adds paragraph spacing to a row).
 // Decorations follow VS Code's diffEditorDecorations.ts: full-row
 // deletion/addition backgrounds, stronger inner-change backgrounds, a thin
 // marker for empty inner changes, -/+ gutter indicators, hatched filler
-// rows and a flat band for collapsed unchanged regions.
+// rows and alignment pads, and a flat band for collapsed unchanged regions.
 
 import AppKit
 
@@ -18,6 +19,8 @@ enum DiffMetrics {
     static let boldFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
     static let gutterFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
     static let rowHeight: CGFloat = NSLayoutManager().defaultLineHeight(for: font)
+    /// Advance of one monospaced column.
+    static let columnWidth: CGFloat = ("0" as NSString).size(withAttributes: [.font: font]).width
     static let textInset = NSSize(width: 4, height: 4)
 
     static let deletionLineBackground = NSColor.systemRed.withAlphaComponent(0.08)
@@ -31,16 +34,95 @@ enum DiffMetrics {
     static let bannerBackground = NSColor.systemOrange.withAlphaComponent(0.1)
     static let fillerHatch = NSColor.secondaryLabelColor.withAlphaComponent(0.18)
 
-    /// Paragraph style that pins every row to `rowHeight`.
-    static let rowParagraphStyle: NSParagraphStyle = {
+    private struct StyleKey: Hashable {
+        let indentColumns: Int
+        let paragraphSpacing: CGFloat
+    }
+
+    private static var styleCache: [StyleKey: NSParagraphStyle] = [:]
+
+    /// Row paragraph style: every line fragment is `rowHeight` tall,
+    /// continuation lines are indented by `indentColumns` columns (VS Code
+    /// `wrappingIndent: same`), tabs advance 4 columns, and
+    /// `paragraphSpacing` is the row's alignment pad.
+    static func paragraphStyle(indentColumns: Int, paragraphSpacing: CGFloat) -> NSParagraphStyle {
+        let key = StyleKey(indentColumns: indentColumns, paragraphSpacing: paragraphSpacing)
+        if let cached = styleCache[key] { return cached }
         let style = NSMutableParagraphStyle()
         style.minimumLineHeight = rowHeight
         style.maximumLineHeight = rowHeight
+        style.firstLineHeadIndent = 0
+        style.headIndent = CGFloat(indentColumns) * columnWidth
+        style.tabStops = []
+        style.defaultTabInterval = CGFloat(DiffWrapIndent.tabSize) * columnWidth
+        style.paragraphSpacing = paragraphSpacing
+        // Never mutated after caching.
+        styleCache[key] = style
         return style
-    }()
+    }
+
+    /// Paragraph style that pins every row to `rowHeight` (no indent, no pad).
+    static let rowParagraphStyle: NSParagraphStyle = paragraphStyle(indentColumns: 0, paragraphSpacing: 0)
 
     static func collapsedLabel(hiddenCount: Int) -> String {
         "\u{22EF} \(hiddenCount) unchanged lines \u{22EF}"
+    }
+}
+
+/// Binary searches over ascending, contiguous row frames.
+enum DiffRowFrameSearch {
+    /// Index of the row containing `y`, nil above the first or below the last row.
+    static func row(containingY y: CGFloat, in frames: [CGRect]) -> Int? {
+        guard let first = frames.first, let last = frames.last,
+              y >= first.minY, y < last.maxY else { return nil }
+        return lastRow(startingAtOrBefore: y, in: frames)
+    }
+
+    /// Last row whose minY <= y, clamped to 0 (frames must be non-empty).
+    static func lastRow(startingAtOrBefore y: CGFloat, in frames: [CGRect]) -> Int {
+        var lo = 0
+        var hi = frames.count - 1
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2
+            if frames[mid].minY <= y { lo = mid } else { hi = mid - 1 }
+        }
+        return lo
+    }
+
+    /// Rows intersecting `minY..<maxY`: first row with maxY > minY through
+    /// the last row with minY < maxY.
+    static func rows(intersecting minY: CGFloat, _ maxY: CGFloat, in frames: [CGRect]) -> Range<Int> {
+        guard !frames.isEmpty, maxY > minY else { return 0..<0 }
+        // First row with maxY > minY.
+        var lo = 0
+        var hi = frames.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if frames[mid].maxY > minY { hi = mid } else { lo = mid + 1 }
+        }
+        let first = lo
+        // Number of rows with minY < maxY.
+        lo = first
+        hi = frames.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if frames[mid].minY < maxY { lo = mid + 1 } else { hi = mid }
+        }
+        return first < lo ? first..<lo : 0..<0
+    }
+}
+
+/// Gutter drawing geometry: numbers, indicators and markers sit in a row's
+/// first line fragment (continuation fragments stay blank).
+enum DiffGutterGeometry {
+    /// Baseline-box y of a gutter label in the row's first fragment.
+    static func labelY(rowFrame: CGRect, rowHeight: CGFloat, fontHeight: CGFloat) -> CGFloat {
+        rowFrame.minY + (rowHeight - fontHeight) / 2
+    }
+
+    /// Square marker of side `size` at `x`, centred in the row's first fragment.
+    static func markerRect(rowFrame: CGRect, rowHeight: CGFloat, x: CGFloat, size: CGFloat) -> CGRect {
+        CGRect(x: x, y: rowFrame.minY + (rowHeight - size) / 2, width: size, height: size)
     }
 }
 
@@ -90,15 +172,28 @@ final class DiffPaneView: NSView {
     var onBecameFirstResponder: (() -> Void)?
     /// The text view's selection changed (user or programmatic).
     var onSelectionChanged: (() -> Void)?
+    /// The viewport width changed in `layout()` (rows may have re-wrapped).
+    var onViewportWidthChanged: (() -> Void)?
+
+    /// Wrap lines at the viewport width (VS Code `wordWrap: on`). Applied
+    /// synchronously from the current viewport width.
+    var wordWrap: Bool {
+        didSet {
+            guard wordWrap != oldValue else { return }
+            applyWrapMode()
+        }
+    }
 
     private(set) var cells: [DiffCell?] = []
 
     init(side: DiffSide, gutterColumns: GutterColumns, accessibilitySuffix: String) {
         self.side = side
         self.gutterColumns = gutterColumns
-        self.lineNumberView = DiffLineNumberView(columns: gutterColumns)
+        self.lineNumberView = DiffLineNumberView(columns: gutterColumns, textView: textView)
+        self.wordWrap = DiffLayoutSettings.wordWrap
         super.init(frame: .zero)
         setupViews(accessibilitySuffix: accessibilitySuffix)
+        applyWrapMode()
     }
 
     @available(*, unavailable)
@@ -117,6 +212,7 @@ final class DiffPaneView: NSView {
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
         scrollView.contentView.postsBoundsChangedNotifications = true
+        scrollView.contentView.postsFrameChangedNotifications = true
         addSubview(scrollView)
 
         textView.isEditable = false
@@ -129,8 +225,10 @@ final class DiffPaneView: NSView {
         textView.textContainerInset = DiffMetrics.textInset
         textView.minSize = NSSize(width: 0, height: 0)
         textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.textContainer?.widthTracksTextView = false
-        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.container.widthTracksTextView = false
+        textView.container.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                                  height: CGFloat.greatestFiniteMagnitude)
+        textView.container.lineBreakMode = .byWordWrapping
         textView.drawsBackground = false
         textView.font = DiffMetrics.font
         textView.defaultParagraphStyle = DiffMetrics.rowParagraphStyle
@@ -161,6 +259,11 @@ final class DiffPaneView: NSView {
             name: NSView.frameDidChangeNotification, object: textView
         )
 
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(clipViewFrameDidChange(_:)),
+            name: NSView.frameDidChangeNotification, object: scrollView.contentView
+        )
+
         lineNumberView.onRowClicked = { [weak self] row in self?.onRowClicked?(row) }
         lineNumberView.onRangeSelected = { [weak self] lo, hi in self?.onRangeSelected?(lo, hi) }
         lineNumberView.onCollapsedRowAction = { [weak self] row, action in
@@ -178,14 +281,92 @@ final class DiffPaneView: NSView {
         onSelectionChanged?()
     }
 
+    // MARK: Wrap mode
+
+    /// Width available to text: the scroll view's content width minus the
+    /// line-number ruler (tiled inside the scroll view).
+    private var wrapViewportWidth: CGFloat {
+        let ruler = scrollView.rulersVisible && scrollView.hasVerticalRuler ? lineNumberView.requiredThickness : 0
+        return scrollView.contentSize.width - ruler
+    }
+
+    private func applyWrapMode() {
+        scrollView.hasHorizontalScroller = !wordWrap
+        textView.isHorizontallyResizable = !wordWrap
+        if !wordWrap {
+            textView.minSize = NSSize(width: scrollView.contentSize.width, height: textView.minSize.height)
+        }
+        _ = updateContainerWidth()
+    }
+
+    /// Sets the container width for the current mode and viewport; returns
+    /// whether it changed. Wrapping at a zero-width viewport is deferred
+    /// (infinite width) until the pane has a size.
+    private func updateContainerWidth() -> Bool {
+        let container = textView.container
+        let target: CGFloat
+        let viewport = wrapViewportWidth
+        if wordWrap {
+            target = viewport > 0
+                ? max(viewport - 2 * DiffMetrics.textInset.width, 8 * DiffMetrics.columnWidth)
+                : .greatestFiniteMagnitude
+        } else {
+            target = .greatestFiniteMagnitude
+        }
+        if wordWrap, viewport > 0, textView.minSize.width != viewport || textView.frame.width != viewport {
+            textView.minSize = NSSize(width: viewport, height: textView.minSize.height)
+            textView.setFrameSize(NSSize(width: viewport, height: textView.frame.height))
+        }
+        guard container.containerSize.width != target else { return false }
+        container.containerSize = NSSize(width: target, height: CGFloat.greatestFiniteMagnitude)
+        textView.invalidateRowFrames()
+        textView.sizeToFit()
+        return true
+    }
+
+    /// Columns available to wrapped text (VS Code `wrappingColumn`);
+    /// `.max` when not wrapping.
+    var wrappingColumns: Int {
+        let width = textView.container.containerSize.width
+        guard width < .greatestFiniteMagnitude else { return .max }
+        let usable = width - 2 * textView.container.lineFragmentPadding
+        return max(Int(usable / DiffMetrics.columnWidth), 0)
+    }
+
     override func layout() {
         super.layout()
-        // Keep the document at least as wide as the viewport so full-row
-        // backgrounds and filler hatching span the visible width.
-        let width = scrollView.contentSize.width
-        if textView.minSize.width != width {
-            textView.minSize = NSSize(width: width, height: 0)
-            textView.sizeToFit()
+        if wordWrap {
+            if updateContainerWidth() { onViewportWidthChanged?() }
+        } else {
+            // Keep the document at least as wide as the viewport so full-row
+            // backgrounds and filler hatching span the visible width.
+            let width = scrollView.contentSize.width
+            if textView.minSize.width != width {
+                textView.minSize = NSSize(width: width, height: textView.minSize.height)
+                textView.sizeToFit()
+                onViewportWidthChanged?()
+            }
+        }
+    }
+
+    /// A clip-view width update is queued for the next main-queue turn.
+    private var isClipWidthUpdatePending = false
+
+    /// The clip view's width can change without this view's frame changing
+    /// (a legacy scroller appearing or hiding after a pad changes the
+    /// document height). The notification arrives inside
+    /// `NSScrollView.tile()`, i.e. mid layout pass, so the container-width
+    /// update is deferred to the next main-queue turn (coalesced) instead of
+    /// re-marking layout during the pass, which loops the window's
+    /// constraint pass.
+    @objc private func clipViewFrameDidChange(_ notification: Notification) {
+        guard wordWrap, !isClipWidthUpdatePending else { return }
+        isClipWidthUpdatePending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isClipWidthUpdatePending = false
+            guard self.wordWrap, self.updateContainerWidth() else { return }
+            self.onViewportWidthChanged?()
         }
     }
 
@@ -218,10 +399,11 @@ final class DiffPaneView: NSView {
 
     // MARK: Geometry
 
-    /// Row rect in the gutter's coordinates (popover anchor).
+    /// The row's first line fragment in the gutter's coordinates (popover anchor).
     func rowRect(_ row: Int) -> NSRect {
-        NSRect(x: 0, y: lineNumberView.rowMinY(row),
-               width: lineNumberView.bounds.width, height: DiffMetrics.rowHeight)
+        let frame = textView.ensureRowFrames()[row]
+        let y = lineNumberView.convert(NSPoint(x: 0, y: frame.minY), from: textView).y
+        return NSRect(x: 0, y: y, width: lineNumberView.bounds.width, height: DiffMetrics.rowHeight)
     }
 
     /// Row at a y coordinate of the text view, nil outside the rows.
@@ -233,29 +415,36 @@ final class DiffPaneView: NSView {
         rowIndex(atY: scrollView.documentVisibleRect.minY)
     }
 
-    func scrollToRow(_ row: Int) {
+    /// Height of the text view's rows including the top inset.
+    var documentHeight: CGFloat {
+        textView.ensureRowFrames().last?.maxY ?? 0
+    }
+
+    /// Scrolls the document so `y` is at the top, clamped to the content.
+    func scroll(toY y: CGFloat) {
         let clip = scrollView.contentView
-        let docHeight = textView.frame.height
-        let maxY = max(docHeight - clip.bounds.height, 0)
-        let y = min(DiffTextView.rowMinY(row), maxY)
-        clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: y))
+        let maxY = max(textView.frame.height - clip.bounds.height, 0)
+        clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: min(max(y, 0), maxY)))
         scrollView.reflectScrolledClipView(clip)
+    }
+
+    func scrollToRow(_ row: Int) {
+        let frames = textView.ensureRowFrames()
+        scroll(toY: frames.indices.contains(row) ? frames[row].minY : 0)
     }
 
     /// Rows intersecting the visible rect (partially visible rows included).
     var visibleRowRange: Range<Int> {
         let rect = scrollView.documentVisibleRect
         guard !cells.isEmpty, rect.height > 0 else { return 0..<0 }
-        let first = Int(floor((rect.minY - DiffMetrics.textInset.height) / DiffMetrics.rowHeight))
-        let last = Int(ceil((rect.maxY - DiffMetrics.textInset.height) / DiffMetrics.rowHeight))
-        let lo = min(max(first, 0), cells.count)
-        let hi = min(max(last, lo), cells.count)
-        return lo..<hi
+        return DiffRowFrameSearch.rows(intersecting: rect.minY, rect.maxY, in: textView.ensureRowFrames())
     }
 
-    /// Whole rows that fit in the viewport.
-    var viewportRowCapacity: Int {
-        Int(floor(scrollView.contentView.bounds.height / DiffMetrics.rowHeight))
+    /// Row at the vertical pixel centre of the viewport (clamped to the rows).
+    var rowIndexAtViewportCentre: Int? {
+        let frames = textView.ensureRowFrames()
+        guard !frames.isEmpty else { return nil }
+        return DiffRowFrameSearch.lastRow(startingAtOrBefore: scrollView.documentVisibleRect.midY, in: frames)
     }
 
     /// Row containing the start of the text selection.
@@ -286,9 +475,53 @@ final class DiffTextView: NSTextView {
     private(set) var cells: [DiffCell?] = []
     /// UTF-16 range of each row's text (without the trailing "\n").
     private var rowRanges: [NSRange] = []
+    /// Wrap indent (columns) of each row as built by `attributedString`.
+    private var rowIndents: [Int] = []
+    private var maxRowIndent = 0
+    /// Rows whose wrap indent is zeroed because it leaves no room (VS Code
+    /// `computeWrappedTextIndentLength`'s no-room rule).
+    private var zeroedIndentRows: Set<Int> = []
+    /// Alignment pad (paragraph spacing) of each padded non-final row.
+    private(set) var appliedPadding: [Int: CGFloat] = [:]
+    /// Alignment pad of the final row: virtual (extends the document via
+    /// `alignedMinHeight`; an empty final paragraph cannot carry attributes).
+    private(set) var tailPadding: CGFloat = 0
 
-    static func rowMinY(_ row: Int) -> CGFloat {
-        DiffMetrics.textInset.height + CGFloat(row) * DiffMetrics.rowHeight
+    private var cachedRowFrames: [CGRect]?
+    private var cachedContainerWidth: CGFloat = 0
+
+    /// The TextKit 1 network is built here explicitly (the text view does
+    /// not retain its text storage).
+    private let ownedTextStorage: NSTextStorage
+    let container: NSTextContainer
+    private let textLayoutManager1: NSLayoutManager
+
+    init() {
+        let storage = NSTextStorage()
+        let layoutManager = NSLayoutManager()
+        storage.addLayoutManager(layoutManager)
+        let container = NSTextContainer(size: NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                                     height: CGFloat.greatestFiniteMagnitude))
+        layoutManager.addTextContainer(container)
+        ownedTextStorage = storage
+        textLayoutManager1 = layoutManager
+        self.container = container
+        super.init(frame: .zero, textContainer: container)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not supported")
+    }
+
+    /// Document height that carries the virtual tail pad. Not stored in
+    /// `minSize`: AppKit (`-[NSTextView _superviewClipViewFrameChanged:]`)
+    /// resets `minSize` to the clip size whenever the clip view's frame
+    /// changes (e.g. a legacy scroller appearing), which would drop the pad.
+    private var alignedMinHeight: CGFloat = 0
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(NSSize(width: newSize.width, height: max(newSize.height, alignedMinHeight)))
     }
 
     func setRows(cells: [DiffCell?], attributed: NSAttributedString) {
@@ -310,7 +543,19 @@ final class DiffTextView: NSTextView {
             }
         }
         rowRanges = ranges
-        textStorage?.setAttributedString(attributed)
+        rowIndents = ranges.map { range in
+            guard range.length > 0,
+                  let style = attributed.attribute(.paragraphStyle, at: range.location,
+                                                   effectiveRange: nil) as? NSParagraphStyle else { return 0 }
+            return Int((style.headIndent / DiffMetrics.columnWidth).rounded())
+        }
+        maxRowIndent = rowIndents.max() ?? 0
+        zeroedIndentRows = []
+        appliedPadding = [:]
+        tailPadding = 0
+        alignedMinHeight = 0
+        ownedTextStorage.setAttributedString(attributed)
+        invalidateRowFrames()
         needsDisplay = true
     }
 
@@ -332,10 +577,166 @@ final class DiffTextView: NSTextView {
         return lo
     }
 
+    // MARK: Measured geometry
+
+    func invalidateRowFrames() {
+        cachedRowFrames = nil
+    }
+
+    /// Frame of each row in view coordinates: from its first line fragment
+    /// to the next row's first fragment (the last row: to its last
+    /// fragment, plus `tailPadding`). Full view width.
+    @discardableResult
+    func ensureRowFrames() -> [CGRect] {
+        let width = container.containerSize.width
+        if let cached = cachedRowFrames, cachedContainerWidth == width { return cached }
+        let frames = measureRowFrames()
+        cachedRowFrames = frames
+        cachedContainerWidth = width
+        return frames
+    }
+
+    private func measureRowFrames() -> [CGRect] {
+        let count = rowRanges.count
+        guard count > 0 else { return [] }
+        let layoutManager = textLayoutManager1
+        layoutManager.ensureLayout(for: container)
+        var minYs = [CGFloat](repeating: .nan, count: count)
+        var maxYs = [CGFloat](repeating: 0, count: count)
+        var cursor = 0
+        let ranges = rowRanges
+        let glyphs = layoutManager.glyphRange(for: container)
+        layoutManager.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, glyphRange, _ in
+            let character = layoutManager.characterIndexForGlyph(at: glyphRange.location)
+            while cursor + 1 < count, ranges[cursor + 1].location <= character { cursor += 1 }
+            if minYs[cursor].isNaN { minYs[cursor] = rect.minY }
+            maxYs[cursor] = max(maxYs[cursor], rect.maxY)
+        }
+        if minYs[count - 1].isNaN {
+            // Empty final paragraph: laid out as the extra line fragment.
+            let extra = layoutManager.extraLineFragmentRect
+            minYs[count - 1] = extra.minY
+            maxYs[count - 1] = extra.maxY
+        }
+        let origin = textContainerOrigin
+        let width = bounds.width
+        var frames: [CGRect] = []
+        frames.reserveCapacity(count)
+        for row in 0..<count {
+            precondition(!minYs[row].isNaN, "row \(row) has no line fragment")
+            let bottom = row + 1 < count ? minYs[row + 1] : maxYs[row] + tailPadding
+            frames.append(CGRect(x: 0, y: minYs[row] + origin.y, width: width, height: bottom - minYs[row]))
+        }
+        return frames
+    }
+
+    /// Row heights without the alignment pads.
+    func naturalHeights() -> [CGFloat] {
+        let frames = ensureRowFrames()
+        let last = frames.count - 1
+        return frames.enumerated().map { row, frame in
+            frame.height - (row == last ? tailPadding : appliedPadding[row] ?? 0)
+        }
+    }
+
+    /// The pane carries alignment pads or zeroed indents that a realign
+    /// may have to undo.
+    var hasLayoutAdjustments: Bool {
+        !appliedPadding.isEmpty || tailPadding > 0 || !zeroedIndentRows.isEmpty
+    }
+
+    /// Zeroes the wrap indent of rows whose indent leaves no room within
+    /// `wrappingColumns` (VS Code `computeWrappedTextIndentLength`) and
+    /// restores the others. Must run before `naturalHeights()` is measured,
+    /// since it changes wrap counts. Only changed rows are touched, in one
+    /// edit batch; returns false (no edit) when nothing changes.
+    @discardableResult
+    func applyIndentZeroing(wrappingColumns: Int) -> Bool {
+        guard !rowRanges.isEmpty else { return false }
+        var newZeroed = Set<Int>()
+        if maxRowIndent + 2 > wrappingColumns {
+            let string = ownedTextStorage.string as NSString
+            for (row, indent) in rowIndents.enumerated() where indent > 0 {
+                let text = string.substring(with: rowRanges[row])
+                if DiffWrapIndent.columns(lineText: text, wrappingColumns: wrappingColumns) == 0 {
+                    newZeroed.insert(row)
+                }
+            }
+        }
+        let dirty = zeroedIndentRows.symmetricDifference(newZeroed)
+        guard !dirty.isEmpty else { return false }
+        zeroedIndentRows = newZeroed
+        restyle(rows: dirty)
+        return true
+    }
+
+    /// Applies alignment pads (row -> pad; the final row's pad is virtual).
+    /// Rows whose pad is unchanged are not touched; when nothing changes, no
+    /// edit happens and the result is false. Otherwise all attribute changes
+    /// are one edit batch.
+    @discardableResult
+    func applyPadding(_ pads: [Int: CGFloat]) -> Bool {
+        let last = rowRanges.count - 1
+        guard last >= 0 else { return false }
+        var rowPads = pads
+        let newTail = rowPads.removeValue(forKey: last) ?? 0
+
+        var dirty = Set<Int>()
+        var newPadding = appliedPadding
+        for row in Set(appliedPadding.keys).union(rowPads.keys) {
+            let old = appliedPadding[row] ?? 0
+            let new = rowPads[row] ?? 0
+            guard abs(old - new) > 0.5 else { continue }
+            dirty.insert(row)
+            newPadding[row] = new > 0 ? new : nil
+        }
+        let tailChanged = abs(tailPadding - newTail) > 0.5
+        guard !dirty.isEmpty || tailChanged else { return false }
+
+        appliedPadding = newPadding
+        if tailChanged { tailPadding = newTail }
+        if dirty.isEmpty {
+            refreshAfterGeometryChange()
+        } else {
+            restyle(rows: dirty)
+        }
+        return true
+    }
+
+    /// Re-applies the paragraph style (indent + pad) of `rows` in one edit
+    /// batch, then refreshes the measured geometry.
+    private func restyle(rows: Set<Int>) {
+        let last = rowRanges.count - 1
+        ownedTextStorage.beginEditing()
+        for row in rows.sorted() {
+            var range = rowRanges[row]
+            if row < last { range.length += 1 }
+            guard range.length > 0 else { continue }
+            let indent = zeroedIndentRows.contains(row) ? 0 : rowIndents[row]
+            let style = DiffMetrics.paragraphStyle(indentColumns: indent,
+                                                   paragraphSpacing: appliedPadding[row] ?? 0)
+            ownedTextStorage.addAttribute(.paragraphStyle, value: style, range: range)
+        }
+        ownedTextStorage.endEditing()
+        refreshAfterGeometryChange()
+    }
+
+    private func refreshAfterGeometryChange() {
+        invalidateRowFrames()
+        let frames = ensureRowFrames()
+        let alignedHeight = tailPadding > 0 ? (frames.last?.maxY ?? 0) + textContainerInset.height : 0
+        alignedMinHeight = alignedHeight
+        sizeToFit()
+        // sizeToFit skips setFrameSize when its own target equals the
+        // current frame, so the aligned height is enforced explicitly.
+        if frame.height < alignedMinHeight {
+            setFrameSize(NSSize(width: frame.width, height: alignedMinHeight))
+        }
+        needsDisplay = true
+    }
+
     func rowIndex(atY y: CGFloat) -> Int? {
-        let row = Int(floor((y - DiffMetrics.textInset.height) / DiffMetrics.rowHeight))
-        guard row >= 0, row < cells.count else { return nil }
-        return row
+        DiffRowFrameSearch.row(containingY: y, in: ensureRowFrames())
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -360,33 +761,48 @@ final class DiffTextView: NSTextView {
 
     // MARK: Drawing
 
+    /// Alignment pad at the bottom of `row`'s frame.
+    private func pad(ofRow row: Int, lastRow: Int) -> CGFloat {
+        row == lastRow ? tailPadding : appliedPadding[row] ?? 0
+    }
+
     override func draw(_ dirtyRect: NSRect) {
-        let rows = visibleRows(in: dirtyRect)
+        let frames = ensureRowFrames()
+        let rows = DiffRowFrameSearch.rows(intersecting: dirtyRect.minY, dirtyRect.maxY, in: frames)
+        let lastRow = frames.count - 1
         let fillX = dirtyRect.minX
         let fillWidth = dirtyRect.width
         for row in rows {
-            guard let cell = cells[row] else { continue }
-            let rect = NSRect(x: fillX, y: Self.rowMinY(row), width: fillWidth, height: DiffMetrics.rowHeight)
-            switch cell.kind {
-            case .line(.deletion):
-                DiffMetrics.deletionLineBackground.setFill()
-                rect.fill()
-            case .line(.addition):
-                DiffMetrics.additionLineBackground.setFill()
-                rect.fill()
-            case .comment:
-                DiffMetrics.commentBackground.setFill()
-                rect.fill()
-            case .banner:
-                DiffMetrics.bannerBackground.setFill()
-                rect.fill()
-            case .collapsedRegion:
-                DiffMetrics.collapsedBackground.setFill()
-                rect.fill()
-            case .filler:
-                drawHatch(in: rect)
-            case .line:
-                break
+            let frame = frames[row]
+            let pad = pad(ofRow: row, lastRow: lastRow)
+            let rowRect = NSRect(x: fillX, y: frame.minY, width: fillWidth, height: frame.height - pad)
+            if let cell = cells[row] {
+                switch cell.kind {
+                case .line(.deletion):
+                    DiffMetrics.deletionLineBackground.setFill()
+                    rowRect.fill()
+                case .line(.addition):
+                    DiffMetrics.additionLineBackground.setFill()
+                    rowRect.fill()
+                case .comment:
+                    DiffMetrics.commentBackground.setFill()
+                    rowRect.fill()
+                case .banner:
+                    DiffMetrics.bannerBackground.setFill()
+                    rowRect.fill()
+                case .collapsedRegion:
+                    DiffMetrics.collapsedBackground.setFill()
+                    rowRect.fill()
+                case .filler:
+                    drawHatch(in: NSRect(x: fillX, y: frame.minY, width: fillWidth, height: frame.height))
+                    continue
+                case .line:
+                    break
+                }
+            }
+            if pad > 0 {
+                // VS Code: every side-by-side alignment zone is `diagonal-fill`.
+                drawHatch(in: NSRect(x: fillX, y: frame.maxY - pad, width: fillWidth, height: pad))
             }
         }
 
@@ -396,23 +812,15 @@ final class DiffTextView: NSTextView {
             guard let cell = cells[row] else { continue }
             switch cell.kind {
             case .collapsedRegion(_, let hiddenCount):
-                drawCollapsedLabel(row: row, hiddenCount: hiddenCount)
+                let frame = frames[row]
+                drawCollapsedLabel(rowMinY: frame.minY, height: frame.height - pad(ofRow: row, lastRow: lastRow),
+                                   hiddenCount: hiddenCount)
             case .line(let type) where !cell.isWholeLineChange:
-                drawEmptyInnerMarkers(row: row, cell: cell, type: type)
+                drawEmptyInnerMarkers(row: row, rowMinY: frames[row].minY, cell: cell, type: type)
             default:
                 break
             }
         }
-    }
-
-    private func visibleRows(in rect: NSRect) -> Range<Int> {
-        guard !cells.isEmpty else { return 0..<0 }
-        let height = DiffMetrics.rowHeight
-        let inset = DiffMetrics.textInset.height
-        let first = max(Int(floor((rect.minY - inset) / height)), 0)
-        let last = min(Int(ceil((rect.maxY - inset) / height)), cells.count)
-        guard first < last else { return 0..<0 }
-        return first..<last
     }
 
     /// 45° hatch; lines satisfy x + y ≡ 0 (mod spacing) so they continue across rows.
@@ -434,7 +842,7 @@ final class DiffTextView: NSTextView {
         NSGraphicsContext.restoreGraphicsState()
     }
 
-    private func drawCollapsedLabel(row: Int, hiddenCount: Int) {
+    private func drawCollapsedLabel(rowMinY: CGFloat, height: CGFloat, hiddenCount: Int) {
         let visible = enclosingScrollView?.documentVisibleRect ?? visibleRect
         let label = DiffMetrics.collapsedLabel(hiddenCount: hiddenCount) as NSString
         let attrs: [NSAttributedString.Key: Any] = [
@@ -442,15 +850,16 @@ final class DiffTextView: NSTextView {
             .foregroundColor: NSColor.secondaryLabelColor,
         ]
         let size = label.size(withAttributes: attrs)
-        let y = Self.rowMinY(row) + (DiffMetrics.rowHeight - size.height) / 2
+        let y = rowMinY + (height - size.height) / 2
         label.draw(at: NSPoint(x: visible.midX - size.width / 2, y: y), withAttributes: attrs)
     }
 
-    /// VS Code `diffInsertedDecorationEmpty` / `diffDeletedDecorationEmpty`.
-    private func drawEmptyInnerMarkers(row: Int, cell: DiffCell, type: DiffLineType) {
+    /// VS Code `diffInsertedDecorationEmpty` / `diffDeletedDecorationEmpty`;
+    /// x and y come from the glyph's line fragment (it may be a continuation).
+    private func drawEmptyInnerMarkers(row: Int, rowMinY: CGFloat, cell: DiffCell, type: DiffLineType) {
         let empties = cell.innerRanges.filter { $0.length == 0 }
-        guard !empties.isEmpty, row < rowRanges.count,
-              let layoutManager, let textContainer else { return }
+        guard !empties.isEmpty, row < rowRanges.count else { return }
+        let layoutManager = textLayoutManager1
         let rowRange = rowRanges[row]
         let color: NSColor
         switch type {
@@ -459,21 +868,22 @@ final class DiffTextView: NSTextView {
         case .context, .hunkHeader, .meta: return
         }
         color.setFill()
+        let origin = textContainerOrigin
         for range in empties where range.location <= rowRange.length {
             let x: CGFloat
-            if range.location < rowRange.length {
-                let glyph = layoutManager.glyphIndexForCharacter(at: rowRange.location + range.location)
-                let rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer)
-                x = rect.minX
-            } else if rowRange.length > 0 {
-                let glyph = layoutManager.glyphIndexForCharacter(at: rowRange.location + rowRange.length - 1)
-                let rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer)
-                x = rect.maxX
+            let y: CGFloat
+            if rowRange.length > 0 {
+                let atEnd = range.location >= rowRange.length
+                let character = rowRange.location + (atEnd ? rowRange.length - 1 : range.location)
+                let glyph = layoutManager.glyphIndexForCharacter(at: character)
+                let rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: container)
+                x = atEnd ? rect.maxX : rect.minX
+                y = layoutManager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil).minY + origin.y
             } else {
-                x = textContainer.lineFragmentPadding
+                x = container.lineFragmentPadding
+                y = rowMinY
             }
-            NSRect(x: x + textContainerInset.width, y: Self.rowMinY(row),
-                   width: 1, height: DiffMetrics.rowHeight).fill()
+            NSRect(x: x + origin.x, y: y, width: 1, height: DiffMetrics.rowHeight).fill()
         }
     }
 }
@@ -483,6 +893,8 @@ final class DiffTextView: NSTextView {
 @MainActor
 final class DiffLineNumberView: NSRulerView {
     let columns: GutterColumns
+    /// The client text view: row frames come from its layout.
+    let textView: DiffTextView
     var rows: [GutterRow] = []
     /// Flat `[DiffLine]` indices that carry a comment (blue dot).
     var commentedLineIndices: Set<Int> = []
@@ -499,8 +911,9 @@ final class DiffLineNumberView: NSRulerView {
     }
     private var trackingArea: NSTrackingArea?
 
-    init(columns: GutterColumns) {
+    init(columns: GutterColumns, textView: DiffTextView) {
         self.columns = columns
+        self.textView = textView
         super.init(scrollView: nil, orientation: .verticalRuler)
     }
 
@@ -511,18 +924,20 @@ final class DiffLineNumberView: NSRulerView {
 
     override var requiredThickness: CGFloat { columns.thickness }
 
-    /// y of a row's top edge in this view; the single formula used by
-    /// drawing, hit-testing and `DiffPaneView.rowRect`.
-    func rowMinY(_ row: Int) -> CGFloat {
-        guard let clientView else { return DiffTextView.rowMinY(row) }
-        return convert(NSPoint(x: 0, y: DiffTextView.rowMinY(row)), from: clientView).y
+    /// Row frames in this view's coordinates (full gutter width): the
+    /// single source used by drawing and hit-testing.
+    private func rowFrames() -> [CGRect] {
+        let offset = convert(NSPoint.zero, from: textView).y
+        let width = bounds.width
+        return textView.ensureRowFrames().map {
+            CGRect(x: 0, y: $0.minY + offset, width: width, height: $0.height)
+        }
     }
 
     private func row(at point: NSPoint) -> Int? {
         guard !rows.isEmpty else { return nil }
-        let origin = rowMinY(0)
-        let row = Int(floor((point.y - origin) / DiffMetrics.rowHeight))
-        guard row >= 0, row < rows.count else { return nil }
+        let frames = rowFrames()
+        guard let row = DiffRowFrameSearch.row(containingY: point.y, in: frames), row < rows.count else { return nil }
         return row
     }
 
@@ -565,12 +980,8 @@ final class DiffLineNumberView: NSRulerView {
 
     override func drawHashMarksAndLabels(in rect: NSRect) {
         guard !rows.isEmpty else { return }
-        let height = DiffMetrics.rowHeight
-        let origin = rowMinY(0)
-        let first = max(Int(floor((rect.minY - origin) / height)), 0)
-        let last = min(Int(ceil((rect.maxY - origin) / height)), rows.count)
-        guard first < last else { return }
-
+        let frames = rowFrames()
+        let visible = DiffRowFrameSearch.rows(intersecting: rect.minY, rect.maxY, in: frames)
         let numberAttrs: [NSAttributedString.Key: Any] = [
             .font: DiffMetrics.gutterFont,
             .foregroundColor: NSColor.secondaryLabelColor,
@@ -580,10 +991,9 @@ final class DiffLineNumberView: NSRulerView {
             return min(s, c)...max(s, c)
         }()
 
-        for index in first..<last {
+        for index in visible where index < rows.count {
             let gutterRow = rows[index]
-            let y = origin + CGFloat(index) * height
-            let rowRect = NSRect(x: 0, y: y, width: bounds.width, height: height)
+            let rowRect = frames[index]
 
             if let dragRange, dragRange.contains(index) {
                 NSColor.systemBlue.withAlphaComponent(0.15).setFill()
@@ -593,28 +1003,30 @@ final class DiffLineNumberView: NSRulerView {
             switch gutterRow.kind {
             case .comment:
                 NSColor.systemBlue.withAlphaComponent(0.15).setFill()
-                NSRect(x: 0, y: y, width: bounds.width - 1, height: height).fill()
+                NSRect(x: 0, y: rowRect.minY, width: bounds.width - 1, height: rowRect.height).fill()
             case .collapsedRegion:
                 DiffMetrics.collapsedBackground.setFill()
                 rowRect.fill()
-                drawCollapsedAffordances(y: y)
+                drawCollapsedAffordances(midY: rowRect.midY)
             case .line:
-                drawLineRow(gutterRow, index: index, y: y, attrs: numberAttrs)
+                drawLineRow(gutterRow, index: index, rowFrame: rowRect, attrs: numberAttrs)
             case .filler, .banner, .none:
                 break
             }
         }
     }
 
-    private func drawLineRow(_ gutterRow: GutterRow, index: Int, y: CGFloat, attrs: [NSAttributedString.Key: Any]) {
+    private func drawLineRow(_ gutterRow: GutterRow, index: Int, rowFrame: CGRect,
+                             attrs: [NSAttributedString.Key: Any]) {
         let height = DiffMetrics.rowHeight
         if let lineIndex = gutterRow.lineIndex, commentedLineIndices.contains(lineIndex) {
             NSColor.systemBlue.setFill()
-            NSBezierPath(ovalIn: NSRect(x: 4, y: y + (height - 6) / 2, width: 6, height: 6)).fill()
+            let dot = DiffGutterGeometry.markerRect(rowFrame: rowFrame, rowHeight: height, x: 4, size: 6)
+            NSBezierPath(ovalIn: dot).fill()
         } else if Self.isCommentable(gutterRow.kind) && hoveredRow == index {
             // GitHub-style hover "+" button
-            let btnSize: CGFloat = min(16, height)
-            let btnRect = NSRect(x: 2, y: y + (height - btnSize) / 2, width: btnSize, height: btnSize)
+            let btnRect = DiffGutterGeometry.markerRect(rowFrame: rowFrame, rowHeight: height, x: 2,
+                                                        size: min(16, height))
             NSColor.systemBlue.setFill()
             NSBezierPath(roundedRect: btnRect, xRadius: 3, yRadius: 3).fill()
             let plusStr = "+" as NSString
@@ -627,7 +1039,8 @@ final class DiffLineNumberView: NSRulerView {
                                      y: btnRect.midY - plusSize.height / 2), withAttributes: plusAttrs)
         }
 
-        let numberY = y + (height - DiffMetrics.gutterFont.boundingRectForFont.height) / 2
+        let numberY = DiffGutterGeometry.labelY(rowFrame: rowFrame, rowHeight: height,
+                                                fontHeight: DiffMetrics.gutterFont.boundingRectForFont.height)
         func drawNumber(_ number: Int?, rightEdge: CGFloat) {
             guard let number else { return }
             let str = "\(number)" as NSString
@@ -665,7 +1078,7 @@ final class DiffLineNumberView: NSRulerView {
 
     private var affordanceWidth: CGFloat { bounds.width / CGFloat(Self.affordances.count) }
 
-    private func drawCollapsedAffordances(y: CGFloat) {
+    private func drawCollapsedAffordances(midY: CGFloat) {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 9),
             .foregroundColor: NSColor.secondaryLabelColor,
@@ -674,7 +1087,7 @@ final class DiffLineNumberView: NSRulerView {
             let str = item.glyph as NSString
             let size = str.size(withAttributes: attrs)
             let x = CGFloat(i) * affordanceWidth + (affordanceWidth - size.width) / 2
-            str.draw(at: NSPoint(x: x, y: y + (DiffMetrics.rowHeight - size.height) / 2), withAttributes: attrs)
+            str.draw(at: NSPoint(x: x, y: midY - size.height / 2), withAttributes: attrs)
         }
     }
 
@@ -708,11 +1121,13 @@ final class DiffLineNumberView: NSRulerView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard dragStartRow != nil else { return }
+        guard dragStartRow != nil, !rows.isEmpty else { return }
         let point = convert(event.locationInWindow, from: nil)
-        let origin = rowMinY(0)
-        let raw = Int(floor((point.y - origin) / DiffMetrics.rowHeight))
-        dragCurrentRow = min(max(raw, 0), rows.count - 1)
+        let frames = rowFrames()
+        guard !frames.isEmpty else { return }
+        // Above the rows clamps to the first, below to the last.
+        let row = DiffRowFrameSearch.lastRow(startingAtOrBefore: point.y, in: frames)
+        dragCurrentRow = min(row, rows.count - 1)
         needsDisplay = true
     }
 
