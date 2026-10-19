@@ -61,10 +61,13 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 
 ### Code review and agent coordination
 
-- **Git Source Control** -- working changes, staging state, commit graph, branch visualization, and inline diffs in the sidebar, as one collapsible section per repository the window can reach, including linked worktrees and checked-out submodules
+- **Git Source Control** -- working changes, staging state, commit graph, and branch visualization in the sidebar, as one collapsible section per repository the window can reach, including linked worktrees and checked-out submodules; a file's diff opens in a tab
 - **Commit Log Ref Picker** -- the commit graph uses an Auto scope modelled on VSCode's (the checked-out branch, its upstream, and the remote's default branch), with a per-repository picker for all references or any set of branches, remotes, and tags, and branch and tag badges on commit rows
 - **Diff Review Comments** -- comment on individual lines and submit a complete review directly to an agent pane ([demo video](https://www.youtube.com/watch?v=_O2Lr4oFf4c))
 - **Diff Preview Tab** -- a single click on a file in the Changes sidebar opens its diff in the group's one reusable preview tab (italic title, VS Code style); double-click the file or the tab, add a review comment, or choose **Keep Open** (also **Keep Tab Open** in the command palette) to keep it; Settings -> Appearance -> **Open diffs in a preview tab** turns the behavior off
+- **Diff View** -- whole-file diffs laid out **Inline**, **Side by Side**, or **Automatic** (the default: side by side while the diff area is wider than 900 pt), with the changed characters highlighted inside changed lines, **Collapse Unchanged Regions** (off by default), and **Ignore Trim Whitespace** (on by default); set from the diff toolbar's **…** menu, the command palette, or Settings -> Appearance -> **Changes**
+- **Diff Change Navigation** -- a diff opens scrolled to its first change, a clickable overview ruler along the right edge marks added and deleted lines (Settings -> Appearance -> **Show overview ruler**), and **Go to Next Change** / **Go to Previous Change** (`Option+F5` / `Option+Shift+F5`, or the up and down chevrons in the diff toolbar) wrap around the file
+- **Diff Word Wrap** -- on by default; **View -> Word Wrap** (`Option+Z`) toggles it for every diff tab, wrapping each pane at its own width with continuation lines indented to match
 - **Worktree Tasks** -- **File -> New Worktree Task…** (`Cmd+Shift+N`, also in the command palette and the **+** button of the Changes sidebar) creates a branch and a linked worktree under `~/.calyx/worktrees/`, launches Claude Code, Codex, OpenCode, Hermes, Grok, or pi there as the pane's own process with optional CLI arguments and an initial prompt, and offers **Merge into \<base>** and **Discard** from the Changes section header and the Mission Map card; when the agent exits, the pane continues as a shell in the worktree
 - **AI Agent IPC** -- built-in MCP messaging lets agents discover and communicate with peers across tabs and panes ([demo video](https://www.youtube.com/watch?v=Xty0ad9gGcM))
 - **LSP Proxy MCP** -- hover, definition, references, rename, diagnostics, and other language-server features for agents; missing servers can be installed from Settings
@@ -157,6 +160,16 @@ Calyx exposes panes, commands, captured output, browser tabs, language servers, 
 | `Cmd+Option+U` | Usage window |
 | `Cmd+?` | Calyx Help (opens the help center) |
 | `Cmd+Enter` / `Ctrl+Cmd+F` | Toggle full screen |
+
+### Diff Tabs
+
+| Shortcut | Action |
+|---|---|
+| `Option+F5` | Go to next change |
+| `Option+Shift+F5` | Go to previous change |
+| `Option+Z` | Toggle word wrap |
+
+Outside a diff tab, these keys reach the focused pane instead, so a terminal program still receives them.
 
 ### Compose Overlay
 
