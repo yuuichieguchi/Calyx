@@ -12,6 +12,24 @@ private func makeManyRowsRaw(_ count: Int) -> String {
     return out
 }
 
+private func makeLongLinesRaw() -> String {
+    var out = "diff --git a/l.txt b/l.txt\n--- a/l.txt\n+++ b/l.txt\n@@ -1,40 +1,40 @@\n"
+    for n in 1...40 {
+        let long = String(repeating: "wide words \(n) ", count: 40)
+        if n == 20 { out += "-old \(long)\n+new \(long)\n" } else { out += " \(long)\n" }
+    }
+    return out
+}
+
+private final class CursorInvalidationSpyWindow: NSWindow {
+    var invalidatedViews: [NSView] = []
+
+    override func invalidateCursorRects(for view: NSView) {
+        invalidatedViews.append(view)
+        super.invalidateCursorRects(for: view)
+    }
+}
+
 private func makeLinesRaw() -> String {
     var out = "diff --git a/l.txt b/l.txt\n--- a/l.txt\n+++ b/l.txt\n@@ -1,200 +1,200 @@\n"
     for n in 1...200 {
@@ -77,12 +95,16 @@ struct DiffLinesViewTests {
     }
 
     private func makeHosted(raw: String = makeLinesRaw(),
-                            configure: (DiffView, FileDiff) -> Void = { _, _ in }) async throws -> Hosted {
-        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 800, height: 400),
-                              styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+                            width: CGFloat = 800,
+                            configure: (DiffView, FileDiff) -> Void = { _, _ in },
+                            makeWindow: (NSRect) -> NSWindow = { rect in
+                                NSWindow(contentRect: rect, styleMask: [.titled, .resizable],
+                                         backing: .buffered, defer: false)
+                            }) async throws -> Hosted {
+        let window = makeWindow(NSRect(x: 100, y: 100, width: width, height: 400))
         window.isReleasedWhenClosed = false
         window.animationBehavior = .none
-        let view = DiffView(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
+        let view = DiffView(frame: NSRect(x: 0, y: 0, width: width, height: 400))
         view.autoresizingMask = [.width, .height]
         window.contentView = view
         window.orderFront(nil)
@@ -1362,6 +1384,89 @@ struct DiffLinesViewTests {
             let expected = NSAttributedString(string: lines.string).doubleClick(at: segmentLast)
             #expect(lines.selectedRange() == expected,
                     "lines selected \(lines.selectedRange()); doubleClick(segmentLast \(segmentLast)) = \(expected); next segment starts at \(NSMaxRange(segmentRange))")
+        }
+    }
+
+    @Test func cursorRects_onlyTheVisibleLayoutRegistersThem() async throws {
+        try await withSettings {
+            DiffLayoutSettings.preference = .sideBySide
+            let hosted = try await makeHosted(width: 1200)
+            defer { hosted.close() }
+            let view = hosted.view
+            #expect(view.inlinePaneForTesting.isHidden && !view.leftPaneForTesting.isHiddenOrHasHiddenAncestor)
+            #expect(view.inlinePaneForTesting.linesView.registeredCursorRegions.isEmpty,
+                    "the hidden inline pane must not register cursor rects in side-by-side")
+            #expect(!view.leftPaneForTesting.linesView.registeredCursorRegions.isEmpty)
+            #expect(!view.rightPaneForTesting.linesView.registeredCursorRegions.isEmpty)
+
+            DiffLayoutSettings.preference = .inline
+            try await settle(hosted.window)
+            #expect(!view.inlinePaneForTesting.isHidden)
+            #expect(!view.inlinePaneForTesting.linesView.registeredCursorRegions.isEmpty)
+            #expect(view.leftPaneForTesting.linesView.registeredCursorRegions.isEmpty,
+                    "the hidden left pane must not register cursor rects in inline")
+            #expect(view.rightPaneForTesting.linesView.registeredCursorRegions.isEmpty,
+                    "the hidden right pane must not register cursor rects in inline")
+        }
+    }
+
+    @Test(arguments: [true, false])
+    func cursorRects_neverCoverTheGutter(wordWrap: Bool) async throws {
+        try await withSettings(wordWrap: wordWrap) {
+            let hosted = try await makeHosted(raw: makeLongLinesRaw())
+            defer { hosted.close() }
+            let pane = hosted.pane
+            let lines = hosted.lines
+            if !wordWrap {
+                let clip = pane.scrollView.contentView
+                #expect(lines.frame.width > clip.bounds.width + 600)
+                clip.scroll(to: NSPoint(x: 600, y: clip.bounds.origin.y))
+                pane.scrollView.reflectScrolledClipView(clip)
+                try await settle(hosted.window)
+                #expect(clip.bounds.origin.x == 600)
+            }
+            let gutter = pane.lineNumberView.convert(pane.lineNumberView.bounds, to: nil)
+                .insetBy(dx: 0.5, dy: 0.5)
+            #expect(gutter.width > 0)
+            let regions = lines.registeredCursorRegions
+            #expect(!regions.isEmpty)
+            let covering = regions.map { lines.convert($0.rect, to: nil) }.filter { $0.intersects(gutter) }
+            #expect(covering.isEmpty, "cursor rects \(covering) overlap the gutter \(gutter)")
+        }
+    }
+
+    @Test func cursorRects_areInvalidatedWhenAPaneIsHiddenOrShown() async throws {
+        try await withSettings {
+            var spy: CursorInvalidationSpyWindow?
+            let hosted = try await makeHosted(width: 1200, makeWindow: { rect in
+                let window = CursorInvalidationSpyWindow(contentRect: rect, styleMask: [.titled, .resizable],
+                                                         backing: .buffered, defer: false)
+                spy = window
+                return window
+            })
+            defer { hosted.close() }
+            let window = try #require(spy)
+            let view = hosted.view
+            let inline = view.inlinePaneForTesting.linesView
+            let left = view.leftPaneForTesting.linesView
+            let right = view.rightPaneForTesting.linesView
+            func recorded(_ target: NSView) -> Bool { window.invalidatedViews.contains { $0 === target } }
+
+            window.invalidatedViews.removeAll()
+            DiffLayoutSettings.preference = .sideBySide
+            try await settle(window)
+            #expect(view.inlinePaneForTesting.isHidden)
+            #expect(recorded(inline), "hiding the inline pane must invalidate its cursor rects")
+            #expect(recorded(left), "showing the left pane must invalidate its cursor rects")
+            #expect(recorded(right), "showing the right pane must invalidate its cursor rects")
+
+            window.invalidatedViews.removeAll()
+            DiffLayoutSettings.preference = .inline
+            try await settle(window)
+            #expect(!view.inlinePaneForTesting.isHidden)
+            #expect(recorded(inline), "showing the inline pane must invalidate its cursor rects")
+            #expect(recorded(left), "hiding the left pane must invalidate its cursor rects")
+            #expect(recorded(right), "hiding the right pane must invalidate its cursor rects")
         }
     }
 

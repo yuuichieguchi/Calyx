@@ -130,7 +130,15 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
     }
 
     static func textAreaWidth(of clip: NSClipView) -> CGFloat {
-        max(clip.bounds.width - clip.contentInsets.left - clip.contentInsets.right, 0)
+        unobscuredBounds(of: clip).width
+    }
+
+    static func unobscuredBounds(of clip: NSClipView) -> NSRect {
+        let insets = clip.contentInsets
+        let bounds = clip.bounds
+        return NSRect(x: bounds.minX + insets.left, y: bounds.minY + insets.top,
+                      width: max(0, bounds.width - insets.left - insets.right),
+                      height: max(0, bounds.height - insets.top - insets.bottom))
     }
 
     override func viewWillMove(toSuperview newSuperview: NSView?) {
@@ -377,8 +385,25 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
         return regions
     }
 
+    var registeredCursorRegions: [(rect: NSRect, cursor: NSCursor)] { cursorRegions(in: unobscuredVisibleRect) }
+
+    private var unobscuredVisibleRect: NSRect {
+        guard let clip = enclosingScrollView?.contentView else { return visibleRect }
+        return visibleRect.intersection(convert(Self.unobscuredBounds(of: clip), from: clip))
+    }
+
     override func resetCursorRects() {
-        for region in cursorRegions(in: visibleRect) { addCursorRect(region.rect, cursor: region.cursor) }
+        for region in registeredCursorRegions { addCursorRect(region.rect, cursor: region.cursor) }
+    }
+
+    override func viewDidHide() {
+        super.viewDidHide()
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func viewDidUnhide() {
+        super.viewDidUnhide()
+        window?.invalidateCursorRects(for: self)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -727,10 +752,15 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
             if next.type == .leftMouseUp { break }
             if next.type == .leftMouseDragged { lastDrag = next }
             guard let drag = lastDrag else { continue }
-            autoscroll(with: drag)
+            if isOutsideUnobscuredClip(drag) { autoscroll(with: drag) }
             extendSelection(anchorRange: anchorRange, to: characterIndex(at: convert(drag.locationInWindow, from: nil)),
                             granularity: granularity)
         }
+    }
+
+    private func isOutsideUnobscuredClip(_ event: NSEvent) -> Bool {
+        guard let clip = enclosingScrollView?.contentView else { return true }
+        return !Self.unobscuredBounds(of: clip).contains(clip.convert(event.locationInWindow, from: nil))
     }
 
     private func range(at index: Int, granularity: Granularity) -> NSRange {
