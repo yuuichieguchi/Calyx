@@ -23,12 +23,12 @@ private let filler = cell(.filler)
 
 /// display/line: 0 ctx, 1 del, 2 add, 3 add, 4 add, 5 ctx  (replace 1 -> 3)
 private let replaceDiffLines: [DiffLine] = [
-    DiffLine(type: .context, text: " a", oldLineNumber: 1, newLineNumber: 1),
-    DiffLine(type: .deletion, text: "-b", oldLineNumber: 2, newLineNumber: nil),
-    DiffLine(type: .addition, text: "+x", oldLineNumber: nil, newLineNumber: 2),
-    DiffLine(type: .addition, text: "+y", oldLineNumber: nil, newLineNumber: 3),
-    DiffLine(type: .addition, text: "+z", oldLineNumber: nil, newLineNumber: 4),
-    DiffLine(type: .context, text: " c", oldLineNumber: 3, newLineNumber: 5),
+    DiffLine(type: .context, text: "a", oldLineNumber: 1, newLineNumber: 1),
+    DiffLine(type: .deletion, text: "b", oldLineNumber: 2, newLineNumber: nil),
+    DiffLine(type: .addition, text: "x", oldLineNumber: nil, newLineNumber: 2),
+    DiffLine(type: .addition, text: "y", oldLineNumber: nil, newLineNumber: 3),
+    DiffLine(type: .addition, text: "z", oldLineNumber: nil, newLineNumber: 4),
+    DiffLine(type: .context, text: "c", oldLineNumber: 3, newLineNumber: 5),
 ]
 
 private let replaceRows: [DiffLayoutRow] = [

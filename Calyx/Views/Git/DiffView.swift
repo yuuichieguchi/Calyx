@@ -643,9 +643,8 @@ final class DiffView: NSView {
     nonisolated private static func linePiece(_ line: DiffLine, side: DiffSide) -> LinePiece {
         let (text, contentLength) = displayedText(line, side: side)
         let units = Array(text.utf16)
-        let marker = units.isEmpty ? 0 : 1
         return LinePiece(text: text, contentLength: contentLength,
-                         row: DiffPaneRow(rowUnits: units, markerLength: marker, markerColumns: marker))
+                         row: DiffPaneRow(rowUnits: units, markerLength: 0, markerColumns: 0))
     }
 
     private struct LayoutRows {

@@ -33,9 +33,9 @@ struct DiffModifiedTextTests {
         #expect(result.changes.isEmpty)
         let lines = DiffLineGenerator.lines(content: c, changes: result.changes)
         #expect(lines == [
-            DiffLine(type: .context, text: " a", oldLineNumber: 1, newLineNumber: 1),
-            DiffLine(type: .context, text: "   b", oldLineNumber: 2, newLineNumber: 2, newText: " b  "),
-            DiffLine(type: .context, text: " c", oldLineNumber: 3, newLineNumber: 3),
+            DiffLine(type: .context, text: "a", oldLineNumber: 1, newLineNumber: 1),
+            DiffLine(type: .context, text: "  b", oldLineNumber: 2, newLineNumber: 2, newText: "b  "),
+            DiffLine(type: .context, text: "c", oldLineNumber: 3, newLineNumber: 3),
         ])
     }
 
@@ -45,12 +45,12 @@ struct DiffModifiedTextTests {
 
         let sbs = DiffRowBuilder.build(displayLines: displayLines, changes: [], layout: .sideBySide)
         #expect(sbs.count == 1)
-        #expect(displayed(sbs[0].left, displayLines) == "   b")
-        #expect(displayed(sbs[0].right, displayLines) == " b  ")
+        #expect(displayed(sbs[0].left, displayLines) == "  b")
+        #expect(displayed(sbs[0].right, displayLines) == "b  ")
 
         let inline = DiffRowBuilder.build(displayLines: displayLines, changes: [], layout: .inline)
         #expect(inline.count == 1)
-        #expect(displayed(inline[0].left, displayLines) == " b  ")
+        #expect(displayed(inline[0].left, displayLines) == "b  ")
     }
 
     @Test func parser_whitespaceOnlyChange_rightCellShowsNewText() {
@@ -67,8 +67,8 @@ struct DiffModifiedTextTests {
         #expect(diff.changes.isEmpty)
         let displayLines = diff.lines.map { DisplayLine.diff($0) }
         let rows = DiffRowBuilder.build(displayLines: displayLines, changes: diff.changes, layout: .sideBySide)
-        #expect(displayed(rows[1].left, displayLines) == "   y")
-        #expect(displayed(rows[1].right, displayLines) == " y\t")
+        #expect(displayed(rows[1].left, displayLines) == "  y")
+        #expect(displayed(rows[1].right, displayLines) == "y\t")
     }
 }
 
@@ -79,31 +79,31 @@ struct DiffUncomparedLinesTests {
         let c = content(["o1", "o2"], ["n1", "n2", "n3", "n4"])
         let lines = DiffLineGenerator.uncomparedLines(content: c)
         #expect(lines == [
-            DiffLine(type: .context, text: " o1", oldLineNumber: 1, newLineNumber: 1, newText: " n1"),
-            DiffLine(type: .context, text: " o2", oldLineNumber: 2, newLineNumber: 2, newText: " n2"),
-            DiffLine(type: .context, text: " n3", oldLineNumber: nil, newLineNumber: 3),
-            DiffLine(type: .context, text: " n4", oldLineNumber: nil, newLineNumber: 4),
+            DiffLine(type: .context, text: "o1", oldLineNumber: 1, newLineNumber: 1, newText: "n1"),
+            DiffLine(type: .context, text: "o2", oldLineNumber: 2, newLineNumber: 2, newText: "n2"),
+            DiffLine(type: .context, text: "n3", oldLineNumber: nil, newLineNumber: 3),
+            DiffLine(type: .context, text: "n4", oldLineNumber: nil, newLineNumber: 4),
         ])
         let displayLines = lines.map { DisplayLine.diff($0) }
 
         let sbs = DiffRowBuilder.build(displayLines: displayLines, changes: [], layout: .sideBySide)
-        #expect(sbs.map { displayed($0.left, displayLines) } == [" o1", " o2", nil, nil])
+        #expect(sbs.map { displayed($0.left, displayLines) } == ["o1", "o2", nil, nil])
         #expect(sbs[2].left?.kind == .filler && sbs[3].left?.kind == .filler)
-        #expect(sbs.map { displayed($0.right, displayLines) } == [" n1", " n2", " n3", " n4"])
+        #expect(sbs.map { displayed($0.right, displayLines) } == ["n1", "n2", "n3", "n4"])
         #expect(sbs.allSatisfy { [$0.left, $0.right].allSatisfy { $0?.kind == .filler || $0?.kind == .line(.context) } })
 
         let inline = DiffRowBuilder.build(displayLines: displayLines, changes: [], layout: .inline)
-        #expect(inline.map { displayed($0.left, displayLines) } == [" n1", " n2", " n3", " n4"])
+        #expect(inline.map { displayed($0.left, displayLines) } == ["n1", "n2", "n3", "n4"])
     }
 
     @Test func longerOriginal_rightPaddedWithFillers_inlineShowsNewOnly() {
         let lines = DiffLineGenerator.uncomparedLines(content: content(["o1", "o2", "o3"], ["n1"]))
         let displayLines = lines.map { DisplayLine.diff($0) }
         let sbs = DiffRowBuilder.build(displayLines: displayLines, changes: [], layout: .sideBySide)
-        #expect(sbs.map { displayed($0.left, displayLines) } == [" o1", " o2", " o3"])
+        #expect(sbs.map { displayed($0.left, displayLines) } == ["o1", "o2", "o3"])
         #expect(sbs.map { $0.right?.kind } == [.line(.context), .filler, .filler])
         let inline = DiffRowBuilder.build(displayLines: displayLines, changes: [], layout: .inline)
-        #expect(inline.map { displayed($0.left, displayLines) } == [" n1"])
+        #expect(inline.map { displayed($0.left, displayLines) } == ["n1"])
     }
 }
 
@@ -115,7 +115,7 @@ struct DiffViewDisplayTextTests {
     }
 
     @Test func breakCharacters_neverAddParagraphs() {
-        let texts = [" a\rb", " a\u{2028}b", " a\u{2029}b", " a\u{0085}b", " plain"]
+        let texts = ["a\rb", "a\u{2028}b", "a\u{2029}b", "a\u{0085}b", "plain"]
         let displayLines = texts.enumerated().map {
             DisplayLine.diff(DiffLine(type: .context, text: $0.element, oldLineNumber: $0.offset + 1, newLineNumber: $0.offset + 1))
         }
@@ -126,18 +126,15 @@ struct DiffViewDisplayTextTests {
         for separator: UInt16 in [0x0D, 0x2028, 0x2029, 0x85] {
             #expect(!units.contains(separator))
         }
-        #expect(string.components(separatedBy: "\n") == [" a\u{240D}b", " a\u{21B5}b", " a\u{00B6}b", " a\u{2424}b", " plain"])
+        #expect(string.components(separatedBy: "\n") == ["a\u{240D}b", "a\u{21B5}b", "a\u{00B6}b", "a\u{2424}b", "plain"])
     }
 
     @Test func truncation_byUTF16_innerRangesClampedBeforeSuffix() {
-        // 9_999 BMP + one emoji (2 units) straddling the limit + more text.
-        let body = String(repeating: "x", count: DiffView.maxDisplayedLineLength - 2) + "\u{1F600}" + "tail"
-        let text = "+" + body
+        let text = String(repeating: "x", count: DiffView.maxDisplayedLineLength - 1) + "\u{1F600}" + "tail"
         #expect(text.utf16.count > DiffView.maxDisplayedLineLength)
         let line = DiffLine(type: .addition, text: text, oldLineNumber: nil, newLineNumber: 1)
 
         let shown = DiffView.displayedText(line, side: .left)
-        // Cut before the surrogate pair: never splits it.
         #expect(shown.contentLength == DiffView.maxDisplayedLineLength - 1)
         #expect(shown.text == String(text.utf16.prefix(DiffView.maxDisplayedLineLength - 1))! + DiffView.truncationSuffix)
 

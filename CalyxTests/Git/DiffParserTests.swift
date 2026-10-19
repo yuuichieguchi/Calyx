@@ -123,9 +123,8 @@ struct DiffParserTests {
         +hello
         """
         let result = DiffParser.parse(diff, path: "new.swift")
-        // Header lines are skipped; only the file content becomes rows.
         #expect(!result.lines.contains { $0.type == .meta || $0.type == .hunkHeader })
-        #expect(result.lines == [DiffLine(type: .addition, text: "+hello", oldLineNumber: nil, newLineNumber: 1)])
+        #expect(result.lines == [DiffLine(type: .addition, text: "hello", oldLineNumber: nil, newLineNumber: 1)])
         #expect(result.oldLineCount == 0)
         #expect(result.newLineCount == 1)
     }
@@ -150,10 +149,9 @@ struct DiffParserTests {
         \\ No newline at end of file
         """
         let result = DiffParser.parse(diff, path: "test")
-        // The marker is not file content and produces no row.
         #expect(!result.lines.contains { $0.type == .meta })
         #expect(!result.lines.contains { $0.text.hasPrefix("\\") })
-        #expect(result.lines.map(\.text) == ["-old", "+new"])
+        #expect(result.lines.map(\.text) == ["old", "new"])
     }
 
     @Test func largeInputIsNotTruncated() {
@@ -171,15 +169,14 @@ struct DiffParserTests {
 
     @Test func trailingNewlineOfGitOutput_isNotALine() {
         let result = DiffParser.parse("@@ -1,1 +1,1 @@\n-old\n+new\n", path: "test")
-        #expect(result.lines.map(\.text) == ["-old", "+new"])
+        #expect(result.lines.map(\.text) == ["old", "new"])
         #expect(result.oldLineCount == 1)
         #expect(result.newLineCount == 1)
     }
 
     @Test func newFileWithSingleBlankLine_isOneAddition() {
-        // The diff computer treats [] like [""]; DiffParser restores the change.
         let result = DiffParser.parse("@@ -0,0 +1 @@\n+\n", path: "f")
-        #expect(result.lines == [DiffLine(type: .addition, text: "+", oldLineNumber: nil, newLineNumber: 1)])
+        #expect(result.lines == [DiffLine(type: .addition, text: "", oldLineNumber: nil, newLineNumber: 1)])
         #expect(result.changes.count == 1)
         #expect(result.oldLineCount == 0)
         #expect(result.newLineCount == 1)
@@ -199,8 +196,7 @@ struct DiffParserTests {
         +new content
         """
         let result = DiffParser.parse(diff, path: "new.swift")
-        // Rename headers are skipped; the content change is diffed.
         #expect(!result.lines.contains { $0.type == .meta })
-        #expect(result.lines.map(\.text) == ["-old content", "+new content"])
+        #expect(result.lines.map(\.text) == ["old content", "new content"])
     }
 }

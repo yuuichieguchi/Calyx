@@ -242,9 +242,9 @@ struct DiffReviewStoreDisplayLineTests {
     @Test func test_displayLines_noComments_matchesDiffLines() {
         let store = DiffReviewStore()
         let diffLines = [
-            makeDiffLine(type: .context, text: " unchanged", oldLineNumber: 1, newLineNumber: 1),
-            makeDiffLine(type: .addition, text: "+added", oldLineNumber: nil, newLineNumber: 2),
-            makeDiffLine(type: .deletion, text: "-removed", oldLineNumber: 2, newLineNumber: nil),
+            makeDiffLine(type: .context, text: "unchanged", oldLineNumber: 1, newLineNumber: 1),
+            makeDiffLine(type: .addition, text: "added", oldLineNumber: nil, newLineNumber: 2),
+            makeDiffLine(type: .deletion, text: "removed", oldLineNumber: 2, newLineNumber: nil),
         ]
 
         let result = store.buildDisplayLines(from: diffLines)
@@ -263,9 +263,9 @@ struct DiffReviewStoreDisplayLineTests {
     @Test func test_displayLines_commentInsertedAfterTargetLine() {
         let store = DiffReviewStore()
         let diffLines = [
-            makeDiffLine(type: .context, text: " line A", oldLineNumber: 1, newLineNumber: 1),
-            makeDiffLine(type: .addition, text: "+line B", oldLineNumber: nil, newLineNumber: 2),
-            makeDiffLine(type: .context, text: " line C", oldLineNumber: 2, newLineNumber: 3),
+            makeDiffLine(type: .context, text: "line A", oldLineNumber: 1, newLineNumber: 1),
+            makeDiffLine(type: .addition, text: "line B", oldLineNumber: nil, newLineNumber: 2),
+            makeDiffLine(type: .context, text: "line C", oldLineNumber: 2, newLineNumber: 3),
         ]
 
         // Add a comment on line index 1 (the addition line)
@@ -311,10 +311,10 @@ struct DiffReviewStoreDisplayLineTests {
     @Test func test_displayLines_multipleComments_correctOrder() {
         let store = DiffReviewStore()
         let diffLines = [
-            makeDiffLine(type: .context, text: " line 1", oldLineNumber: 1, newLineNumber: 1),
-            makeDiffLine(type: .addition, text: "+line 2", oldLineNumber: nil, newLineNumber: 2),
-            makeDiffLine(type: .addition, text: "+line 3", oldLineNumber: nil, newLineNumber: 3),
-            makeDiffLine(type: .context, text: " line 4", oldLineNumber: 2, newLineNumber: 4),
+            makeDiffLine(type: .context, text: "line 1", oldLineNumber: 1, newLineNumber: 1),
+            makeDiffLine(type: .addition, text: "line 2", oldLineNumber: nil, newLineNumber: 2),
+            makeDiffLine(type: .addition, text: "line 3", oldLineNumber: nil, newLineNumber: 3),
+            makeDiffLine(type: .context, text: "line 4", oldLineNumber: 2, newLineNumber: 4),
         ]
 
         // Comment on line index 1 and line index 2 (consecutive additions)
@@ -538,10 +538,10 @@ struct DiffReviewStoreRangeCommentTests {
         [
             makeDiffLine(type: .meta, text: "diff --git a/f b/f"),
             makeDiffLine(type: .hunkHeader, text: "@@ -1,3 +10,4 @@"),
-            makeDiffLine(type: .addition, text: "+line10", newLineNumber: 10),
-            makeDiffLine(type: .addition, text: "+line11", newLineNumber: 11),
-            makeDiffLine(type: .addition, text: "+line12", newLineNumber: 12),
-            makeDiffLine(type: .addition, text: "+line13", newLineNumber: 13),
+            makeDiffLine(type: .addition, text: "line10", newLineNumber: 10),
+            makeDiffLine(type: .addition, text: "line11", newLineNumber: 11),
+            makeDiffLine(type: .addition, text: "line12", newLineNumber: 12),
+            makeDiffLine(type: .addition, text: "line13", newLineNumber: 13),
         ]
     }
 
@@ -566,10 +566,10 @@ struct DiffReviewStoreRangeCommentTests {
     @Test func test_rangeComment_displayLines_insertedAfterLastLine() {
         let store = DiffReviewStore()
         let diffLines = [
-            makeDiffLine(type: .context, text: " line A", oldLineNumber: 1, newLineNumber: 1),
-            makeDiffLine(type: .addition, text: "+line B", newLineNumber: 2),
-            makeDiffLine(type: .addition, text: "+line C", newLineNumber: 3),
-            makeDiffLine(type: .context, text: " line D", oldLineNumber: 2, newLineNumber: 4),
+            makeDiffLine(type: .context, text: "line A", oldLineNumber: 1, newLineNumber: 1),
+            makeDiffLine(type: .addition, text: "line B", newLineNumber: 2),
+            makeDiffLine(type: .addition, text: "line C", newLineNumber: 3),
+            makeDiffLine(type: .context, text: "line D", oldLineNumber: 2, newLineNumber: 4),
         ]
 
         // Range comment spanning lineIndex 1 to 2
@@ -616,8 +616,8 @@ struct DiffReviewStoreRangeCommentTests {
     @Test func test_rangeComment_formatForSubmission_additionOnly() {
         let store = DiffReviewStore()
         let diffLines = [
-            makeDiffLine(type: .addition, text: "+a", newLineNumber: 10),
-            makeDiffLine(type: .addition, text: "+b", newLineNumber: 11),
+            makeDiffLine(type: .addition, text: "a", newLineNumber: 10),
+            makeDiffLine(type: .addition, text: "b", newLineNumber: 11),
         ]
 
         store.addRangeComment(
@@ -634,9 +634,9 @@ struct DiffReviewStoreRangeCommentTests {
     @Test func test_rangeComment_formatForSubmission_deletionOnly() {
         let store = DiffReviewStore()
         let diffLines = [
-            makeDiffLine(type: .deletion, text: "-a", oldLineNumber: 5),
-            makeDiffLine(type: .deletion, text: "-b", oldLineNumber: 6),
-            makeDiffLine(type: .deletion, text: "-c", oldLineNumber: 7),
+            makeDiffLine(type: .deletion, text: "a", oldLineNumber: 5),
+            makeDiffLine(type: .deletion, text: "b", oldLineNumber: 6),
+            makeDiffLine(type: .deletion, text: "c", oldLineNumber: 7),
         ]
 
         store.addRangeComment(
@@ -653,8 +653,8 @@ struct DiffReviewStoreRangeCommentTests {
     @Test func test_rangeComment_formatForSubmission_mixedTypes() {
         let store = DiffReviewStore()
         let diffLines = [
-            makeDiffLine(type: .deletion, text: "-old", oldLineNumber: 5),
-            makeDiffLine(type: .addition, text: "+new", newLineNumber: 11),
+            makeDiffLine(type: .deletion, text: "old", oldLineNumber: 5),
+            makeDiffLine(type: .addition, text: "new", newLineNumber: 11),
         ]
 
         // Range starting with deletion, ending with addition
@@ -679,26 +679,26 @@ struct DiffReviewStoreResolveDisplayRangeTests {
 
     private func makeTestDisplayLines() -> [DisplayLine] {
         [
-            .diff(makeDiffLine(type: .meta, text: "diff --git a/f b/f")),                                // 0
-            .diff(makeDiffLine(type: .hunkHeader, text: "@@ -1,3 +1,4 @@")),                              // 1
-            .diff(makeDiffLine(type: .context, text: " line1", oldLineNumber: 1, newLineNumber: 1)),      // 2
-            .diff(makeDiffLine(type: .deletion, text: "-line2", oldLineNumber: 2)),                        // 3
-            .diff(makeDiffLine(type: .addition, text: "+line2a", newLineNumber: 2)),                       // 4
-            .diff(makeDiffLine(type: .addition, text: "+line2b", newLineNumber: 3)),                       // 5
-            .diff(makeDiffLine(type: .context, text: " line3", oldLineNumber: 3, newLineNumber: 4)),       // 6
-            .diff(makeDiffLine(type: .hunkHeader, text: "@@ -10,2 +11,2 @@")),                            // 7
-            .diff(makeDiffLine(type: .context, text: " line10", oldLineNumber: 10, newLineNumber: 11)),    // 8
-            .diff(makeDiffLine(type: .addition, text: "+line11", newLineNumber: 12)),                      // 9
+            .diff(makeDiffLine(type: .meta, text: "diff --git a/f b/f")),
+            .diff(makeDiffLine(type: .hunkHeader, text: "@@ -1,3 +1,4 @@")),
+            .diff(makeDiffLine(type: .context, text: "line1", oldLineNumber: 1, newLineNumber: 1)),
+            .diff(makeDiffLine(type: .deletion, text: "line2", oldLineNumber: 2)),
+            .diff(makeDiffLine(type: .addition, text: "line2a", newLineNumber: 2)),
+            .diff(makeDiffLine(type: .addition, text: "line2b", newLineNumber: 3)),
+            .diff(makeDiffLine(type: .context, text: "line3", oldLineNumber: 3, newLineNumber: 4)),
+            .diff(makeDiffLine(type: .hunkHeader, text: "@@ -10,2 +11,2 @@")),
+            .diff(makeDiffLine(type: .context, text: "line10", oldLineNumber: 10, newLineNumber: 11)),
+            .diff(makeDiffLine(type: .addition, text: "line11", newLineNumber: 12)),
         ]
     }
 
     private func makeTestDisplayLinesWithComment() -> [DisplayLine] {
         [
-            .diff(makeDiffLine(type: .meta, text: "diff --git a/f b/f")),                                // display 0
-            .diff(makeDiffLine(type: .hunkHeader, text: "@@ -1,3 +1,4 @@")),                              // display 1
-            .diff(makeDiffLine(type: .context, text: " line1", oldLineNumber: 1, newLineNumber: 1)),      // display 2, orig 2
-            .diff(makeDiffLine(type: .deletion, text: "-line2", oldLineNumber: 2)),                        // display 3, orig 3
-            .diff(makeDiffLine(type: .addition, text: "+line2a", newLineNumber: 2)),                       // display 4, orig 4
+            .diff(makeDiffLine(type: .meta, text: "diff --git a/f b/f")),
+            .diff(makeDiffLine(type: .hunkHeader, text: "@@ -1,3 +1,4 @@")),
+            .diff(makeDiffLine(type: .context, text: "line1", oldLineNumber: 1, newLineNumber: 1)),
+            .diff(makeDiffLine(type: .deletion, text: "line2", oldLineNumber: 2)),
+            .diff(makeDiffLine(type: .addition, text: "line2a", newLineNumber: 2)),
             .commentBlock(ReviewComment(
                 id: UUID(),
                 lineIndex: 4,
@@ -706,12 +706,12 @@ struct DiffReviewStoreResolveDisplayRangeTests {
                 displayLineNumber: "L2",
                 lineType: .addition,
                 text: "existing"
-            )),                                                                                            // display 5
-            .diff(makeDiffLine(type: .addition, text: "+line2b", newLineNumber: 3)),                       // display 6, orig 5
-            .diff(makeDiffLine(type: .context, text: " line3", oldLineNumber: 3, newLineNumber: 4)),       // display 7, orig 6
-            .diff(makeDiffLine(type: .hunkHeader, text: "@@ -10,2 +11,2 @@")),                            // display 8, orig 7
-            .diff(makeDiffLine(type: .context, text: " line10", oldLineNumber: 10, newLineNumber: 11)),    // display 9, orig 8
-            .diff(makeDiffLine(type: .addition, text: "+line11", newLineNumber: 12)),                      // display 10, orig 9
+            )),
+            .diff(makeDiffLine(type: .addition, text: "line2b", newLineNumber: 3)),
+            .diff(makeDiffLine(type: .context, text: "line3", oldLineNumber: 3, newLineNumber: 4)),
+            .diff(makeDiffLine(type: .hunkHeader, text: "@@ -10,2 +11,2 @@")),
+            .diff(makeDiffLine(type: .context, text: "line10", oldLineNumber: 10, newLineNumber: 11)),
+            .diff(makeDiffLine(type: .addition, text: "line11", newLineNumber: 12)),
         ]
     }
 

@@ -187,7 +187,7 @@ final class DiffPaneView: NSView, NSUserInterfaceValidations {
                                scrollerStyle: NSScroller.Style) -> Int {
         let legacy = reservesLegacyScroller ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
         let overlay = scrollerStyle == .overlay ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay) : 0
-        let contentWidth = clipWidth - legacy - 2 * DiffMetrics.textInset.width - DiffMetrics.columnWidth
+        let contentWidth = clipWidth - legacy - 2 * DiffMetrics.textInset.width
         return max(1, Int(((contentWidth - overlay - 2) / DiffMetrics.columnWidth).rounded(.down)))
     }
 

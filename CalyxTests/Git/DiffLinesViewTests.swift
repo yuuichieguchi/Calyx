@@ -1470,5 +1470,165 @@ struct DiffLinesViewTests {
         }
     }
 
+    private func rawContentLines(_ raw: String, excluding excluded: Character? = nil) -> [String] {
+        raw.components(separatedBy: "\n")
+            .drop { !$0.hasPrefix("@@") }
+            .dropFirst()
+            .filter { !$0.isEmpty && $0.first != excluded }
+            .map { String($0.dropFirst()) }
+    }
+
+    @Test func paneStrings_inlineRowsAreTheFileContentWithoutMarkers() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let rows = hosted.lines.string.components(separatedBy: "\n")
+            #expect(rows == rawContentLines(makeLinesRaw()))
+            #expect(rows[4] == "plain line 5")
+            #expect(rows[99] == "old line 100")
+            #expect(rows[100] == "new line 100")
+        }
+    }
+
+    @Test func paneStrings_sideBySideRowsAreEachSidesContentWithoutMarkers() async throws {
+        try await withSettings {
+            DiffLayoutSettings.preference = .sideBySide
+            let hosted = try await makeHosted(width: 1200)
+            defer { hosted.close() }
+            let left = hosted.view.leftPaneForTesting.linesView.string.components(separatedBy: "\n")
+            let right = hosted.view.rightPaneForTesting.linesView.string.components(separatedBy: "\n")
+            #expect(left == rawContentLines(makeLinesRaw(), excluding: "+"))
+            #expect(right == rawContentLines(makeLinesRaw(), excluding: "-"))
+            #expect(left[4] == "plain line 5" && right[4] == "plain line 5")
+            #expect(left[99] == "old line 100")
+            #expect(right[99] == "new line 100")
+        }
+    }
+
+    @Test func selectAllCopy_writesContentWithoutMarkers() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            hosted.lines.selectAll(nil)
+            hosted.lines.copy(nil)
+            let copied = try #require(hosted.pasteboard.string(forType: .string))
+            let rows = copied.components(separatedBy: "\n")
+            #expect(rows == rawContentLines(makeLinesRaw()))
+            #expect(rows.first == "plain line 1")
+            #expect(rows[9] == "alpha needle omega 10")
+            #expect(rows[99] == "old line 100")
+            #expect(rows[100] == "new line 100")
+        }
+    }
+
+    @Test func accessibilityValue_hasNoMarkerAtRowStarts() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let value = try #require(hosted.lines.accessibilityValue() as? String)
+            let rows = value.components(separatedBy: "\n")
+            #expect(rows == rawContentLines(makeLinesRaw()))
+            #expect(!rows.contains { $0.hasPrefix("+") || $0.hasPrefix("-") || $0.hasPrefix(" ") })
+        }
+    }
+
+    @Test func tripleClickAddedLine_copiesItsContentAndLineBreak() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let added = try range(of: "new line 100", in: lines.string)
+            try await click(lines, at: try point(inside: added.location + 1, lines), clickCount: 3)
+            lines.copy(nil)
+            #expect(hosted.pasteboard.string(forType: .string) == "new line 100\n")
+        }
+    }
+
+    private func backgroundRuns(_ lines: DiffLinesView, in rowRange: NSRange) -> [NSRange] {
+        var found: [NSRange] = []
+        lines.text.attributed.enumerateAttribute(.backgroundColor, in: rowRange) { value, range, _ in
+            if value != nil { found.append(range) }
+        }
+        return found
+    }
+
+    @Test func innerChangeBackground_coversExactlyTheChangedWord() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            let oldRow = try range(of: "old line 100", in: lines.string)
+            let newRow = try range(of: "new line 100", in: lines.string)
+            #expect(ranges.contains(oldRow), "the deleted row is exactly its content")
+            #expect(ranges.contains(newRow), "the added row is exactly its content")
+            #expect(backgroundRuns(lines, in: oldRow) == [NSRange(location: oldRow.location, length: 3)])
+            #expect(backgroundRuns(lines, in: newRow) == [NSRange(location: newRow.location, length: 3)])
+            #expect(backgroundRuns(lines, in: oldRow) == [try range(of: "old", in: lines.string)])
+        }
+    }
+
+    @Test func wrappedLineRowContinuation_startsAtTheTextInsetPlusIndent() async throws {
+        try await withSettings(wordWrap: true) {
+            let hosted = try await makeHosted(raw: makeLongLinesRaw())
+            defer { hosted.close() }
+            let lines = hosted.lines
+            hosted.window.setContentSize(NSSize(width: 250, height: 400))
+            try await settle(hosted.window)
+            let ranges = rowRanges(lines.string)
+            let row = try #require(ranges.indices.first { (lines.projections[$0]?.segmentCount ?? 1) >= 2 })
+            let projection = try #require(lines.projections[row])
+            #expect(lines.rowTexts[row].markerLength == 0)
+            #expect(lines.rowTexts[row].markerColumns == 0)
+            #expect(projection.wrappedTextIndentLength == 0)
+            let breakIndex = ranges[row].location + projection.breakOffsets[0]
+            let rect = try characterRect(lines, breakIndex)
+            let expected = DiffMetrics.textInset.width + CGFloat(projection.wrappedTextIndentLength) * DiffMetrics.columnWidth
+            #expect(abs(rect.minX - expected) <= 0.5, "continuation starts at \(rect.minX), expected \(expected)")
+        }
+    }
+
+    @Test func wrappedCommentRowContinuation_keepsItsMarkerColumns() async throws {
+        try await withSettings(wordWrap: true) {
+            let note = String(repeating: "long review note ", count: 20)
+            var configured: Result<Void, Error> = .success(())
+            let hosted = try await makeHosted(raw: makeLongLinesRaw()) { view, diff in
+                configured = Result {
+                    let store = view.reviewStore ?? DiffReviewStore()
+                    view.reviewStore = store
+                    let index = try #require(diff.lines.firstIndex { $0.type == .context && $0.newLineNumber == 5 })
+                    store.addComment(lineIndex: index, lineNumber: 5, oldLineNumber: diff.lines[index].oldLineNumber,
+                                     lineType: .context, text: note)
+                }
+            }
+            defer { hosted.close() }
+            try configured.get()
+            let lines = hosted.lines
+            hosted.window.setContentSize(NSSize(width: 250, height: 400))
+            try await settle(hosted.window)
+            let ranges = rowRanges(lines.string)
+            let row = try #require(lines.cells.indices.first { lines.cells[$0]?.kind == .comment })
+            let projection = try #require(lines.projections[row])
+            #expect(projection.segmentCount >= 2)
+            #expect(lines.rowTexts[row].markerColumns == 3)
+            let breakIndex = ranges[row].location + lines.rowTexts[row].markerLength + projection.breakOffsets[0]
+            let rect = try characterRect(lines, breakIndex)
+            let expected = DiffMetrics.textInset.width
+                + CGFloat(3 + projection.wrappedTextIndentLength) * DiffMetrics.columnWidth
+            #expect(abs(rect.minX - expected) <= 0.5, "comment continuation starts at \(rect.minX), expected \(expected)")
+        }
+    }
+
+    @Test func blankAddedLine_isAZeroLengthRow() async throws {
+        try await withSettings {
+            let raw = "diff --git a/l.txt b/l.txt\n--- a/l.txt\n+++ b/l.txt\n@@ -1,2 +1,3 @@\n a\n+\n b\n"
+            let hosted = try await makeHosted(raw: raw)
+            defer { hosted.close() }
+            #expect(hosted.lines.string == "a\n\nb")
+            #expect(rowRanges(hosted.lines.string)[1].length == 0)
+            #expect(hosted.lines.rowTexts[1].markerLength == 0)
+        }
+    }
+
 }
 }

@@ -454,15 +454,9 @@ enum DiffLineType: Sendable {
 
 struct DiffLine: Equatable, Sendable {
     let type: DiffLineType
-    /// Line text with its one-character marker column. For a context line
-    /// this is the original side's text.
     let text: String
     let oldLineNumber: Int?
     let newLineNumber: Int?
-    /// Modified side's text (marker column included) of a context line whose
-    /// two sides differ (e.g. only in leading/trailing whitespace under
-    /// `ignoreTrimWhitespace`, or an uncompared too-large file); nil when the
-    /// modified text equals `text`.
     let newText: String?
 
     init(type: DiffLineType, text: String, oldLineNumber: Int?, newLineNumber: Int?, newText: String? = nil) {
@@ -473,7 +467,6 @@ struct DiffLine: Equatable, Sendable {
         self.newText = newText
     }
 
-    /// Text shown on the modified side (marker column included).
     var modifiedText: String { newText ?? text }
 }
 

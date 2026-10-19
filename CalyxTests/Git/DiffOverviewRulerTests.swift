@@ -11,15 +11,15 @@ import Testing
 @testable import Calyx
 
 private func ctx(_ text: String, _ old: Int, _ new: Int) -> DiffLine {
-    DiffLine(type: .context, text: " " + text, oldLineNumber: old, newLineNumber: new)
+    DiffLine(type: .context, text: text, oldLineNumber: old, newLineNumber: new)
 }
 
 private func del(_ text: String, _ old: Int) -> DiffLine {
-    DiffLine(type: .deletion, text: "-" + text, oldLineNumber: old, newLineNumber: nil)
+    DiffLine(type: .deletion, text: text, oldLineNumber: old, newLineNumber: nil)
 }
 
 private func add(_ text: String, _ new: Int) -> DiffLine {
-    DiffLine(type: .addition, text: "+" + text, oldLineNumber: nil, newLineNumber: new)
+    DiffLine(type: .addition, text: text, oldLineNumber: nil, newLineNumber: new)
 }
 
 private func mapping(orig: (Int, Int), mod: (Int, Int)) -> DetailedLineRangeMapping {
