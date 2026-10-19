@@ -333,6 +333,75 @@ struct DiffGutterDrawingTests {
         }
     }
 
+    private func contextRow(old: Int?, new: Int?) -> GutterRow {
+        GutterRow(oldNumber: old, newNumber: new, kind: .line(.context), displayIndex: 0, lineIndex: 0, indicator: nil)
+    }
+
+    @Test func sideBySideGutterWidth_followsEachPanesOwnSide() async throws {
+        try await withSettings(layout: .sideBySide, wrap: false) {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let view = hosted.host.diffView
+            let cases: [(label: String, pane: DiffPaneView, wide: GutterRow)] = [
+                ("left pane", view.leftPaneForTesting, contextRow(old: 100_000, new: 1)),
+                ("right pane", view.rightPaneForTesting, contextRow(old: 1, new: 100_000)),
+            ]
+            for (label, pane, wide) in cases {
+                let ruler = pane.lineNumberView
+                let original = ruler.rows
+                defer { ruler.rows = original }
+                ruler.rows = [contextRow(old: 1, new: 1)]
+                let narrowThickness = ruler.gutterLayout.thickness
+                ruler.rows = [wide]
+                let wideThickness = ruler.gutterLayout.thickness
+                #expect(wideThickness > narrowThickness,
+                        "\(label): 6-digit own-side number \(wide) gives \(wideThickness) pt, 1-digit gives \(narrowThickness) pt")
+            }
+        }
+    }
+
+    @Test func sideBySideGutter_drawsEachPanesOwnSideNumber() async throws {
+        try await withSettings(layout: .sideBySide, wrap: false) {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let view = hosted.host.diffView
+            let cases: [(label: String, pane: DiffPaneView, ownSideOnly: (old: Int?, new: Int?))] = [
+                ("left pane", view.leftPaneForTesting, (17, nil)),
+                ("right pane", view.rightPaneForTesting, (nil, 9)),
+            ]
+            for (label, pane, ownSideOnly) in cases {
+                let ruler = pane.lineNumberView
+                let original = ruler.rows
+                defer { ruler.rows = original }
+                let frames = rulerFrames(pane)
+                let row = try #require(original.indices.first {
+                    if case .line = original[$0].kind, original[$0].lineIndex != nil { return frames[$0].minY >= 0 && frames[$0].maxY <= ruler.bounds.height }
+                    return false
+                })
+                func rows(old: Int?, new: Int?) -> [GutterRow] {
+                    original.indices.map { index in
+                        let source = original[index]
+                        let shown = index == row
+                        return GutterRow(oldNumber: shown ? old : nil, newNumber: shown ? new : nil,
+                                         kind: source.kind, displayIndex: source.displayIndex,
+                                         lineIndex: source.lineIndex, indicator: nil)
+                    }
+                }
+                ruler.commentedLineIndices = []
+                try setHover(ruler, row: nil, frames: frames)
+                ruler.rows = rows(old: 17, new: 9)
+                let both = try inkPixels(ruler)
+                ruler.rows = rows(old: ownSideOnly.old, new: ownSideOnly.new)
+                let own = try inkPixels(ruler)
+                try #require(!own.points.isEmpty, "\(label): the own-side number must render")
+                let bothSet = Set(both.points.map { "\($0.x),\($0.y)" })
+                let ownSet = Set(own.points.map { "\($0.x),\($0.y)" })
+                #expect(bothSet == ownSet,
+                        "\(label): old 17/new 9 renders \(bothSet.count) px, own side \(ownSideOnly) renders \(ownSet.count) px, \(bothSet.symmetricDifference(ownSet).count) differ")
+            }
+        }
+    }
+
     @Test(arguments: [(DiffLayoutPreference.inline, true), (.sideBySide, false)], [300, 400])
     func overviewRuler_neverDrawsOutsideItsFrame(layoutWrap: (DiffLayoutPreference, Bool),
                                                   changedLine: Int) async throws {

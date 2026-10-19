@@ -60,7 +60,15 @@ struct GutterRow: Equatable {
 
 enum GutterColumns {
     case dual
-    case single
+    case single(DiffSide)
+
+    var lineNumbers: [KeyPath<GutterRow, Int?>] {
+        switch self {
+        case .dual: [\.oldNumber, \.newNumber]
+        case .single(.left): [\.oldNumber]
+        case .single(.right): [\.newNumber]
+        }
+    }
 }
 
 struct GutterLayout: Equatable {
@@ -75,14 +83,9 @@ struct GutterLayout: Equatable {
     let thickness: CGFloat
 
     init(columns: GutterColumns, rows: [GutterRow], digitWidth: CGFloat) {
-        func width(_ numbers: (GutterRow) -> Int?) -> CGFloat {
-            let largest = rows.reduce(0) { max($0, numbers($1) ?? 0) }
+        let widths = columns.lineNumbers.map { number in
+            let largest = rows.reduce(0) { max($0, $1[keyPath: number] ?? 0) }
             return (CGFloat(max(String(largest).count, Self.minimumDigits)) * digitWidth).rounded()
-        }
-        let widths: [CGFloat]
-        switch columns {
-        case .dual: widths = [width(\.oldNumber), width(\.newNumber)]
-        case .single: widths = [width { $0.oldNumber ?? $0.newNumber }]
         }
         var edges: [CGFloat] = []
         var x = Self.markerLaneWidth
@@ -498,13 +501,8 @@ final class DiffLineNumberView: NSRulerView {
             let size = str.size(withAttributes: attrs)
             str.draw(at: NSPoint(x: rightEdge - size.width, y: numberY), withAttributes: attrs)
         }
-        let edges = gutterLayout.numberRightEdges
-        switch columns {
-        case .dual:
-            drawNumber(gutterRow.oldNumber, rightEdge: edges[0])
-            drawNumber(gutterRow.newNumber, rightEdge: edges[1])
-        case .single:
-            drawNumber(gutterRow.oldNumber ?? gutterRow.newNumber, rightEdge: edges[0])
+        for (number, rightEdge) in zip(columns.lineNumbers, gutterLayout.numberRightEdges) {
+            drawNumber(gutterRow[keyPath: number], rightEdge: rightEdge)
         }
 
         if let indicator = gutterRow.indicator {
