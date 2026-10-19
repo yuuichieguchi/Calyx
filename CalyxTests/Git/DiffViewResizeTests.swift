@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import Synchronization
 import Testing
 @testable import Calyx
 
@@ -429,9 +430,20 @@ struct DiffViewResizeTests {
         }
     }
 
+    private struct LoggedResponders {
+        let identifiers: [ObjectIdentifier]
 
-    private final class ResponderLog {
-        var responders: [NSResponder?] = []
+        func strays(besides expected: NSResponder?) -> [ObjectIdentifier] {
+            identifiers.filter { $0 != expected.map(ObjectIdentifier.init) }
+        }
+    }
+
+    private func findField(in view: NSView) -> NSSearchField? {
+        for subview in view.subviews {
+            if let field = subview as? NSSearchField { return field }
+            if let field = findField(in: subview) { return field }
+        }
+        return nil
     }
 
     private func hostedFocusView(startingIn layout: DiffLayout) async throws -> (ResizeTestWindow, DiffView) {
@@ -451,14 +463,20 @@ struct DiffViewResizeTests {
         #expect(view.currentModifiedLine() == modifiedLine)
     }
 
-    private func crossLoggingResponders(_ window: NSWindow, to width: CGFloat) -> [NSResponder?] {
-        let log = ResponderLog()
+    private func loggingResponders(_ window: NSWindow, during body: () -> Void) -> LoggedResponders {
+        let log = Mutex<[ObjectIdentifier]>([])
         let observation = window.observe(\.firstResponder, options: [.new]) { observed, _ in
-            log.responders.append(observed.firstResponder)
+            guard let responder = observed.firstResponder, !(responder is NSWindow) else { return }
+            let identifier = ObjectIdentifier(responder)
+            log.withLock { $0.append(identifier) }
         }
-        setWidth(window, width)
+        body()
         observation.invalidate()
-        return log.responders
+        return LoggedResponders(identifiers: log.withLock { $0 })
+    }
+
+    private func crossLoggingResponders(_ window: NSWindow, to width: CGFloat) -> LoggedResponders {
+        loggingResponders(window) { setWidth(window, width) }
     }
 
     @Test func layoutSwitch_inlineFocus_movesToCaretPaneOnTheSameLine() async throws {
@@ -471,7 +489,7 @@ struct DiffViewResizeTests {
             let target = view.rightPaneForTesting.linesView
             #expect(window.firstResponder === target, "first responder \(String(describing: window.firstResponder))")
             #expect(view.currentModifiedLine() == changedModifiedLines[1])
-            let strays = responders.compactMap { $0 }.filter { !($0 is NSWindow) && $0 !== target }
+            let strays = responders.strays(besides: target)
             #expect(strays.isEmpty, "responders in between: \(strays)")
         }
     }
@@ -488,7 +506,7 @@ struct DiffViewResizeTests {
             let target = view.inlinePaneForTesting.linesView
             #expect(window.firstResponder === target, "first responder \(String(describing: window.firstResponder))")
             #expect(view.currentModifiedLine() == changedModifiedLines[1])
-            let strays = responders.compactMap { $0 }.filter { !($0 is NSWindow) && $0 !== target }
+            let strays = responders.strays(besides: target)
             #expect(strays.isEmpty, "responders in between: \(strays)")
         }
     }
@@ -498,14 +516,63 @@ struct DiffViewResizeTests {
         try await withSettings(.automatic) {
             let (window, view) = try await hostedFocusView(startingIn: start)
             defer { window.orderOut(nil); window.close() }
+            let container = NSView(frame: view.frame)
+            container.autoresizingMask = [.width, .height]
+            window.contentView = container
+            view.frame = container.bounds
+            container.addSubview(view)
             let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 80, height: 22))
-            view.addSubview(field)
+            container.addSubview(field)
+            try await settle(window)
+            #expect(view.currentLayout == start)
+            #expect(!field.isDescendant(of: view))
             #expect(window.makeFirstResponder(field))
             let focused = window.firstResponder
             let responders = crossLoggingResponders(window, to: start == .inline ? 1035 : 880)
             #expect(view.currentLayout != start)
             #expect(window.firstResponder === focused, "first responder \(String(describing: window.firstResponder))")
-            let strays = responders.compactMap { $0 }.filter { !($0 is NSWindow) && $0 !== focused }
+            let strays = responders.strays(besides: focused)
+            #expect(strays.isEmpty, "responders in between: \(strays)")
+        }
+    }
+
+    @Test func displayingABinaryDiff_movesSideBySideFocusToTheInlinePane() async throws {
+        try await withSettings(.automatic) {
+            let (window, view) = try await hostedFocusView(startingIn: .sideBySide)
+            defer { window.orderOut(nil); window.close() }
+            try focusCaret(window, view.rightPaneForTesting, view, modifiedLine: changedModifiedLines[1])
+            let binary = DiffParser.parse("Binary files a/r.txt and b/r.txt differ", path: "r.txt")
+            #expect(binary.isBinary)
+            let responders = loggingResponders(window) { view.display(diff: binary) }
+            #expect(view.currentLayout == .inline)
+            let target = view.inlinePaneForTesting.linesView
+            #expect(window.firstResponder === target, "first responder \(String(describing: window.firstResponder))")
+            let strays = responders.strays(besides: target)
+            #expect(strays.isEmpty, "responders in between: \(strays)")
+        }
+    }
+
+    @Test func layoutSwitch_focusInTheOutgoingFindBar_movesToTheCaretPane() async throws {
+        try await withSettings(.automatic) {
+            let (window, view) = try await hostedFocusView(startingIn: .sideBySide)
+            defer { window.orderOut(nil); window.close() }
+            let pane = view.rightPaneForTesting
+            try focusCaret(window, pane, view, modifiedLine: changedModifiedLines[1])
+            let item = NSMenuItem()
+            item.tag = NSTextFinder.Action.showFindInterface.rawValue
+            pane.performTextFinderAction(item)
+            try await settle(window)
+            #expect(pane.scrollView.isFindBarVisible)
+            let field = try #require(findField(in: pane.scrollView))
+            #expect(window.makeFirstResponder(field))
+            let editor = try #require(window.firstResponder as? NSView)
+            #expect(editor.isDescendant(of: pane))
+            let responders = crossLoggingResponders(window, to: 880)
+            #expect(view.currentLayout == .inline)
+            let target = view.inlinePaneForTesting.linesView
+            #expect(window.firstResponder === target, "first responder \(String(describing: window.firstResponder))")
+            #expect(view.currentModifiedLine() == changedModifiedLines[1])
+            let strays = responders.strays(besides: target)
             #expect(strays.isEmpty, "responders in between: \(strays)")
         }
     }

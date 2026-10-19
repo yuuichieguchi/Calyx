@@ -1,14 +1,6 @@
-// DiffBlockAlignment.swift
-// Calyx
-//
-// Row model with alignment blocks, and the per-block height padding that
-// keeps both panes of a wrapped side-by-side diff aligned.
-
 import CoreGraphics
 import Foundation
 
-/// Rows plus alignment blocks: ascending, contiguous row-index ranges that
-/// partition `rows`. Each block's total height must match on both sides.
 struct DiffRowLayout: Equatable, Sendable {
     var rows: [DiffLayoutRow]
     var blocks: [Range<Int>]
@@ -27,7 +19,8 @@ enum DiffBlockAlignment {
         leftHeights.withUnsafeBufferPointer { leftHeights in
             rightHeights.withUnsafeBufferPointer { rightHeights in
                 for block in blocks where !block.isEmpty {
-                    precondition(block.upperBound <= leftHeights.count && block.upperBound <= rightHeights.count,
+                    precondition(block.lowerBound >= 0 && block.upperBound <= leftHeights.count
+                                 && block.upperBound <= rightHeights.count,
                                  "every block lies within both sides' rows")
                     var left: CGFloat = 0
                     var right: CGFloat = 0

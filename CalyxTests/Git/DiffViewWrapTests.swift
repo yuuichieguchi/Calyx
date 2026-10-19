@@ -329,6 +329,32 @@ struct DiffViewWrapTests {
         }
     }
 
+    @Test(arguments: [CGFloat(0), 3])
+    func wrappingColumn_textAreaWithNoRoom_clampsToOneColumn(textAreaWidth: CGFloat) {
+        for style in [NSScroller.Style.legacy, .overlay] {
+            for reserves in [false, true] {
+                #expect(DiffPaneView.wrappingColumn(textAreaWidth: textAreaWidth, reservesLegacyScroller: reserves,
+                                                    scrollerStyle: style) == 1,
+                        "width \(textAreaWidth), style \(style.rawValue), reserves \(reserves)")
+            }
+        }
+    }
+
+    @Test(arguments: [CGFloat(300), 240])
+    func narrowSideBySide_panesKeepMinimumWidthAndKeepWrapping(width: CGFloat) async throws {
+        try await withIsolatedSettings {
+            let view = try await makeView(makeF5(), width: width)
+            #expect(view.currentLayout == .sideBySide)
+            for pane in [view.leftPaneForTesting, view.rightPaneForTesting] {
+                #expect(pane.frame.width >= DiffView.splitViewMinPaneWidth, "pane \(pane.frame)")
+                let target = try #require(pane.targetWrappingColumn, "word wrap stays on in a narrow pane \(pane.frame)")
+                #expect(target >= 1)
+                #expect(pane.linesView.wrappingColumn == target)
+            }
+            #expect(abs(view.leftPaneForTesting.frame.width - view.rightPaneForTesting.frame.width) <= 1)
+        }
+    }
+
     @Test func narrowView_deepIndentZeroed_blocksAlignedInOnePass() async throws {
         try await withIsolatedSettings {
             let view = try await makeView(makeF5(), width: 300)

@@ -32,7 +32,7 @@ struct DiffTextStyle {
 @MainActor
 final class DiffView: NSView {
     static let splitViewDefaultRatio: CGFloat = 0.5
-    static let splitViewMinPaneWidth: CGFloat = 200
+    static let splitViewMinPaneWidth: CGFloat = 100
 
     private struct Build {
         let layout: DiffLayout
@@ -196,8 +196,7 @@ final class DiffView: NSView {
         activePopover?.close()
         if let window, let focused = window.firstResponder as? NSView,
            let outgoing = currentLayout.map(layoutContainer(for:)), focused.isDescendant(of: outgoing) {
-            window.makeFirstResponder(nil)
-            needsFocusInCaretPane = true
+            needsFocusInCaretPane = window.makeFirstResponder(nil)
         }
         inlinePane.isHidden = layout != .inline
         splitView.isHidden = layout != .sideBySide
@@ -600,9 +599,26 @@ final class DiffView: NSView {
         let results: UnsafeMutableBufferPointer<(cells: [DiffCell?], text: DiffPaneText)?>
     }
 
-    private static let linesPerPieceChunk = 64
+    nonisolated private static let linesPerPieceChunk = 64
 
-    private static func linePieces(_ displayLines: [DisplayLine]) -> LinePieces {
+    nonisolated private static func paneTexts(cells paneCells: [[DiffCell?]], displayLines: [DisplayLine],
+                                              bannerMessage: String?,
+                                              style: DiffTextStyle) -> [(cells: [DiffCell?], text: DiffPaneText)?] {
+        let pieces = linePieces(displayLines)
+        var results = [(cells: [DiffCell?], text: DiffPaneText)?](repeating: nil, count: paneCells.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            let job = PaneTextJob(cells: paneCells, displayLines: displayLines, pieces: pieces,
+                                  bannerMessage: bannerMessage, style: style, results: buffer)
+            DispatchQueue.concurrentPerform(iterations: paneCells.count) { index in
+                job.results[index] = paneText(cells: job.cells[index], displayLines: job.displayLines,
+                                              pieces: job.pieces, bannerMessage: job.bannerMessage,
+                                              style: job.style)
+            }
+        }
+        return results
+    }
+
+    nonisolated private static func linePieces(_ displayLines: [DisplayLine]) -> LinePieces {
         var original = [LinePiece?](repeating: nil, count: displayLines.count)
         var modified = [LinePiece?](repeating: nil, count: displayLines.count)
         original.withUnsafeMutableBufferPointer { original in
@@ -642,17 +658,8 @@ final class DiffView: NSView {
         guard !diff.isBinary else { return [.inline: Self.binaryBuild()] }
         let layoutRows = layouts.map { makeRows(diff: diff, layout: $0, shared: shared) }
         let paneCells = layoutRows.flatMap(\.sideCells)
-        let pieces = Self.linePieces(shared.displayLines)
-        var results = [(cells: [DiffCell?], text: DiffPaneText)?](repeating: nil, count: paneCells.count)
-        results.withUnsafeMutableBufferPointer { buffer in
-            let job = PaneTextJob(cells: paneCells, displayLines: shared.displayLines, pieces: pieces,
-                                  bannerMessage: shared.bannerMessage, style: .current, results: buffer)
-            DispatchQueue.concurrentPerform(iterations: paneCells.count) { index in
-                job.results[index] = Self.paneText(cells: job.cells[index], displayLines: job.displayLines,
-                                                   pieces: job.pieces, bannerMessage: job.bannerMessage,
-                                                   style: job.style)
-            }
-        }
+        let results = Self.paneTexts(cells: paneCells, displayLines: shared.displayLines,
+                                     bannerMessage: shared.bannerMessage, style: .current)
         var next = 0
         var builds: [DiffLayout: Build] = [:]
         for entry in layoutRows {

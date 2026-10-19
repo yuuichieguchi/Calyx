@@ -291,9 +291,9 @@ struct DiffGutterDrawingTests {
                 if case .line = original[$0].kind, original[$0].lineIndex != nil { return frames[$0].minY >= 0 && frames[$0].maxY <= ruler.bounds.height }
                 return false
             }
-            let targets = Array(lineRows.prefix(3))
-            try #require(targets.count == 3)
-            for (row, number) in zip(targets, [123, 1234, 12345]) {
+            let targets = Array(lineRows.prefix(4))
+            try #require(targets.count == 4)
+            for (row, number) in zip(targets, [123, 1234, 12345, 123_456]) {
                 let base = original[row]
                 func rows(numbered: Bool) -> [GutterRow] {
                     original.indices.map { index in

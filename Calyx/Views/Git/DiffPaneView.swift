@@ -180,7 +180,6 @@ final class DiffPaneView: NSView, NSUserInterfaceValidations {
         linesView.onSelectionChanged = { [weak self] in self?.onSelectionChanged?() }
     }
 
-
     static func wrappingColumn(textAreaWidth clipWidth: CGFloat, reservesLegacyScroller: Bool,
                                scrollerStyle: NSScroller.Style) -> Int {
         let legacy = reservesLegacyScroller ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
@@ -194,8 +193,8 @@ final class DiffPaneView: NSView, NSUserInterfaceValidations {
     }
 
     var targetWrappingColumn: Int? {
+        guard wordWrap, scrollView.frame.width > 0 else { return nil }
         let clipWidth = textAreaWidth
-        guard wordWrap, clipWidth > 0 else { return nil }
         let reservesLegacy = scrollView.scrollerStyle == .legacy && (scrollView.verticalScroller?.isHidden ?? true)
         return Self.wrappingColumn(textAreaWidth: clipWidth, reservesLegacyScroller: reservesLegacy,
                                    scrollerStyle: scrollView.scrollerStyle)
