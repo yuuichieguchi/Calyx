@@ -274,7 +274,6 @@ struct MainContentView: View {
                                             reviewStore: activeDiffReviewStore,
                                             revealState: activeDiffRevealState
                                         )
-                                            .accessibilityIdentifier(AccessibilityID.Diff.content)
                                     case .error(let message):
                                         VStack(spacing: 12) {
                                             Spacer()
@@ -430,6 +429,7 @@ struct DiffGlassContentView: NSViewRepresentable {
         host.diffView.reviewStore = reviewStore
         host.diffView.revealState = revealState
         host.diffView.display(diff: diff)
+        host.updateAccessibilityLabel(for: diff)
         return host
     }
 
@@ -442,6 +442,7 @@ struct DiffGlassContentView: NSViewRepresentable {
         nsView.diffView.revealState = revealState
         if nsView.diffView.currentDiff != diff {
             nsView.diffView.display(diff: diff)
+            nsView.updateAccessibilityLabel(for: diff)
         } else {
             // Diff unchanged but comments may have changed (submit/discard)
             nsView.diffView.redisplayWithComments()
@@ -468,6 +469,14 @@ final class DiffGlassHostView: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
 
+        // SwiftUI's .accessibilityIdentifier on the representable is dropped
+        // because a plain NSView is ignored by accessibility; expose the host
+        // itself as a group element so the diff content is addressable.
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityIdentifier(AccessibilityID.Diff.content)
+        setAccessibilityLabel("Diff")
+
         diffView.translatesAutoresizingMaskIntoConstraints = false
         addSubview(diffView)
         NSLayoutConstraint.activate([
@@ -476,6 +485,12 @@ final class DiffGlassHostView: NSView {
             diffView.topAnchor.constraint(equalTo: topAnchor),
             diffView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+    }
+
+    /// Names the group after the displayed file so VoiceOver does not
+    /// announce a bare "group".
+    func updateAccessibilityLabel(for diff: FileDiff) {
+        setAccessibilityLabel(diff.path.isEmpty ? "Diff" : "Diff of \(diff.path)")
     }
 
     /// Leaving a window: its controller must not keep routing change

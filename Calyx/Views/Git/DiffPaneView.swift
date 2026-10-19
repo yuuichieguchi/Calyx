@@ -1,23 +1,13 @@
-// DiffPaneView.swift
-// Calyx
-//
-// One side of the diff view: a scroll view holding a `DiffTextView` and a
-// `DiffLineNumberView` ruler. Every row has the same height, so row
-// geometry and hit-testing are arithmetic (`inset + row * rowHeight`).
-// Decorations follow VS Code's diffEditorDecorations.ts: full-row
-// deletion/addition backgrounds, stronger inner-change backgrounds, a thin
-// marker for empty inner changes, -/+ gutter indicators, hatched filler
-// rows and a flat band for collapsed unchanged regions.
-
 import AppKit
 
-/// Shared fonts, colours and row metrics of the diff panes.
 @MainActor
 enum DiffMetrics {
     static let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
     static let boldFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
     static let gutterFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+    static let gutterDigitWidth: CGFloat = ("0" as NSString).size(withAttributes: [.font: gutterFont]).width
     static let rowHeight: CGFloat = NSLayoutManager().defaultLineHeight(for: font)
+    static let columnWidth: CGFloat = ("0" as NSString).size(withAttributes: [.font: font]).width
     static let textInset = NSSize(width: 4, height: 4)
 
     static let deletionLineBackground = NSColor.systemRed.withAlphaComponent(0.08)
@@ -31,12 +21,11 @@ enum DiffMetrics {
     static let bannerBackground = NSColor.systemOrange.withAlphaComponent(0.1)
     static let fillerHatch = NSColor.secondaryLabelColor.withAlphaComponent(0.18)
 
-    /// Paragraph style that pins every row to `rowHeight`.
-    static let rowParagraphStyle: NSParagraphStyle = {
-        let style = NSMutableParagraphStyle()
-        style.minimumLineHeight = rowHeight
-        style.maximumLineHeight = rowHeight
-        return style
+    static let commentSymbol: NSImage? = {
+        let config = NSImage.SymbolConfiguration(pointSize: font.pointSize, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(hierarchicalColor: .systemBlue))
+        return NSImage(systemSymbolName: "text.bubble", accessibilityDescription: "Comment")?
+            .withSymbolConfiguration(config)
     }()
 
     static func collapsedLabel(hiddenCount: Int) -> String {
@@ -44,28 +33,67 @@ enum DiffMetrics {
     }
 }
 
-/// One gutter row; parallel to the pane's cells.
+enum DiffGutterGeometry {
+    static func labelY(rowFrame: CGRect, rowHeight: CGFloat, fontHeight: CGFloat) -> CGFloat {
+        rowFrame.minY + (rowHeight - fontHeight) / 2
+    }
+
+    static func markerRect(rowFrame: CGRect, rowHeight: CGFloat, x: CGFloat, size: CGFloat) -> CGRect {
+        CGRect(x: x, y: rowFrame.minY + (rowHeight - size) / 2, width: size, height: size)
+    }
+
+    static func rowsToDraw(geometry: DiffRowGeometry, offsetY: CGFloat, in rect: CGRect, bounds: CGRect) -> Range<Int> {
+        let area = rect.intersection(bounds)
+        guard !area.isNull, !area.isEmpty else { return 0..<0 }
+        return geometry.rows(intersecting: area.minY - offsetY, area.maxY - offsetY)
+    }
+}
+
 struct GutterRow: Equatable {
     let oldNumber: Int?
     let newNumber: Int?
     let kind: DiffCellKind?
     let displayIndex: Int?
     let lineIndex: Int?
-    /// "-" / "+" on changed lines (VS Code `renderIndicators`).
     let indicator: String?
 }
 
 enum GutterColumns {
-    /// Old and new numbers (inline, 80 pt).
     case dual
-    /// One number column (side-by-side, 44 pt).
     case single
+}
 
-    var thickness: CGFloat {
-        switch self {
-        case .dual: return 80
-        case .single: return 44
+struct GutterLayout: Equatable {
+    static let markerLaneWidth: CGFloat = 22
+    static let minimumDigits = 5
+    static let columnGap: CGFloat = 4
+    static let indicatorGap: CGFloat = 2
+    static let trailingPadding: CGFloat = 4
+
+    let numberRightEdges: [CGFloat]
+    let indicatorX: CGFloat
+    let thickness: CGFloat
+
+    init(columns: GutterColumns, rows: [GutterRow], digitWidth: CGFloat) {
+        func width(_ numbers: (GutterRow) -> Int?) -> CGFloat {
+            let largest = rows.reduce(0) { max($0, numbers($1) ?? 0) }
+            return (CGFloat(max(String(largest).count, Self.minimumDigits)) * digitWidth).rounded()
         }
+        let widths: [CGFloat]
+        switch columns {
+        case .dual: widths = [width(\.oldNumber), width(\.newNumber)]
+        case .single: widths = [width { $0.oldNumber ?? $0.newNumber }]
+        }
+        var edges: [CGFloat] = []
+        var x = Self.markerLaneWidth
+        for (index, columnWidth) in widths.enumerated() {
+            if index > 0 { x += Self.columnGap }
+            x += columnWidth
+            edges.append(x)
+        }
+        numberRightEdges = edges
+        indicatorX = x + Self.indicatorGap
+        thickness = indicatorX + digitWidth.rounded(.up) + Self.trailingPadding
     }
 }
 
@@ -75,28 +103,37 @@ enum CollapsedAction {
     case expandAll
 }
 
+struct DiffPaneContent {
+    let cells: [DiffCell?]
+    let text: DiffPaneText
+    let gutterRows: [GutterRow]
+}
+
 @MainActor
-final class DiffPaneView: NSView {
+final class DiffPaneView: NSView, NSUserInterfaceValidations {
     let side: DiffSide
     let gutterColumns: GutterColumns
     let scrollView = NSScrollView()
-    let textView = DiffTextView()
+    let linesView = DiffLinesView(frame: .zero)
     let lineNumberView: DiffLineNumberView
 
     var onRowClicked: ((Int) -> Void)?
     var onRangeSelected: ((Int, Int) -> Void)?
     var onCollapsedRowAction: ((Int, CollapsedAction) -> Void)?
-    /// The text view became first responder (used to clear the other pane's selection).
     var onBecameFirstResponder: (() -> Void)?
-    /// The text view's selection changed (user or programmatic).
     var onSelectionChanged: (() -> Void)?
 
-    private(set) var cells: [DiffCell?] = []
+    var wordWrap: Bool {
+        didSet { scrollView.hasHorizontalScroller = !wordWrap }
+    }
+
+    var cells: [DiffCell?] { linesView.cells }
 
     init(side: DiffSide, gutterColumns: GutterColumns, accessibilitySuffix: String) {
         self.side = side
         self.gutterColumns = gutterColumns
-        self.lineNumberView = DiffLineNumberView(columns: gutterColumns)
+        self.lineNumberView = DiffLineNumberView(columns: gutterColumns, linesView: linesView)
+        self.wordWrap = DiffLayoutSettings.wordWrap
         super.init(frame: .zero)
         setupViews(accessibilitySuffix: accessibilitySuffix)
     }
@@ -110,381 +147,193 @@ final class DiffPaneView: NSView {
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
 
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.frame = bounds
+        scrollView.autoresizingMask = [.width, .height]
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
+        scrollView.hasHorizontalScroller = !wordWrap
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = false
         scrollView.contentView.postsBoundsChangedNotifications = true
+        scrollView.contentView.postsFrameChangedNotifications = true
+        scrollView.documentView = linesView
         addSubview(scrollView)
-
-        textView.isEditable = false
-        textView.isSelectable = true
-        textView.isRichText = true
-        textView.usesFindBar = true
-        textView.isVerticallyResizable = true
-        textView.isHorizontallyResizable = true
-        textView.autoresizingMask = [.width]
-        textView.textContainerInset = DiffMetrics.textInset
-        textView.minSize = NSSize(width: 0, height: 0)
-        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.textContainer?.widthTracksTextView = false
-        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
-        textView.drawsBackground = false
-        textView.font = DiffMetrics.font
-        textView.defaultParagraphStyle = DiffMetrics.rowParagraphStyle
-        textView.typingAttributes = [
-            .font: DiffMetrics.font,
-            .paragraphStyle: DiffMetrics.rowParagraphStyle,
-        ]
-        scrollView.documentView = textView
 
         scrollView.rulersVisible = true
         scrollView.hasVerticalRuler = true
         scrollView.verticalRulerView = lineNumberView
-        lineNumberView.clientView = textView
-        lineNumberView.ruleThickness = gutterColumns.thickness
+        lineNumberView.clientView = linesView
+        lineNumberView.ruleThickness = lineNumberView.gutterLayout.thickness
         lineNumberView.setAccessibilityElement(true)
         lineNumberView.setAccessibilityRole(.group)
         lineNumberView.setAccessibilityIdentifier(AccessibilityID.Diff.lineNumberGutter + accessibilitySuffix)
 
-        NSLayoutConstraint.activate([
-            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            scrollView.topAnchor.constraint(equalTo: topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(textViewFrameDidChange(_:)),
-            name: NSView.frameDidChangeNotification, object: textView
-        )
+        linesView.textFinder.findBarContainer = scrollView
 
         lineNumberView.onRowClicked = { [weak self] row in self?.onRowClicked?(row) }
         lineNumberView.onRangeSelected = { [weak self] lo, hi in self?.onRangeSelected?(lo, hi) }
         lineNumberView.onCollapsedRowAction = { [weak self] row, action in
             self?.onCollapsedRowAction?(row, action)
         }
-        textView.onRowClicked = { [weak self] row in self?.onRowClicked?(row) }
-        textView.onBecameFirstResponder = { [weak self] in self?.onBecameFirstResponder?() }
-        NotificationCenter.default.addObserver(
-            self, selector: #selector(textViewSelectionDidChange(_:)),
-            name: NSTextView.didChangeSelectionNotification, object: textView
-        )
+        linesView.onRowClicked = { [weak self] row in self?.onRowClicked?(row) }
+        linesView.onBecameFirstResponder = { [weak self] in self?.onBecameFirstResponder?() }
+        linesView.onSelectionChanged = { [weak self] in self?.onSelectionChanged?() }
     }
 
-    @objc private func textViewSelectionDidChange(_ notification: Notification) {
-        onSelectionChanged?()
+    static func wrappingColumn(textAreaWidth clipWidth: CGFloat, reservesLegacyScroller: Bool,
+                               scrollerStyle: NSScroller.Style) -> Int {
+        let legacy = reservesLegacyScroller ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) : 0
+        let overlay = scrollerStyle == .overlay ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay) : 0
+        let contentWidth = clipWidth - legacy - 2 * DiffMetrics.textInset.width - DiffMetrics.columnWidth
+        return max(1, Int(((contentWidth - overlay - 2) / DiffMetrics.columnWidth).rounded(.down)))
     }
 
-    override func layout() {
-        super.layout()
-        // Keep the document at least as wide as the viewport so full-row
-        // backgrounds and filler hatching span the visible width.
-        let width = scrollView.contentSize.width
-        if textView.minSize.width != width {
-            textView.minSize = NSSize(width: width, height: 0)
-            textView.sizeToFit()
-        }
+    var textAreaWidth: CGFloat {
+        DiffLinesView.textAreaWidth(of: scrollView.contentView)
     }
 
-    @objc private func textViewFrameDidChange(_ notification: Notification) {
+    var targetWrappingColumn: Int? {
+        guard wordWrap, scrollView.frame.width > 0 else { return nil }
+        let clipWidth = textAreaWidth
+        let reservesLegacy = scrollView.scrollerStyle == .legacy && (scrollView.verticalScroller?.isHidden ?? true)
+        return Self.wrappingColumn(textAreaWidth: clipWidth, reservesLegacyScroller: reservesLegacy,
+                                   scrollerStyle: scrollView.scrollerStyle)
+    }
+
+    func tileForGeometry() {
+        if scrollView.frame != bounds { scrollView.frame = bounds }
+        scrollView.tile()
+    }
+
+
+    func setGutter(rows: [GutterRow], commentedLineIndices: Set<Int>) {
+        lineNumberView.rows = rows
+        lineNumberView.commentedLineIndices = commentedLineIndices
         lineNumberView.needsDisplay = true
     }
 
-    // MARK: Content
-
-    /// `cells`, the attributed string's rows (joined with "\n") and
-    /// `gutterRows` must have the same count.
-    func setRows(cells: [DiffCell?], attributed: NSAttributedString, gutterRows: [GutterRow]) {
-        self.cells = cells
-        textView.setRows(cells: cells, attributed: attributed)
-        lineNumberView.rows = gutterRows
+    func apply(content: DiffPaneContent, wrap: DiffPaneWrap, geometry: DiffRowGeometry,
+               textChanged: Bool, rewrapped: Bool) {
+        linesView.apply(DiffPaneLayout(cells: content.cells, text: content.text, wrap: wrap, geometry: geometry),
+                        textChanged: textChanged, rewrapped: rewrapped)
         lineNumberView.needsDisplay = true
     }
 
-    /// Plain message without rows (binary files).
-    func showMessage(_ attributed: NSAttributedString) {
-        cells = []
-        textView.setRows(cells: [], attributed: attributed)
-        lineNumberView.rows = []
-        lineNumberView.needsDisplay = true
-    }
 
-    func setCommentedLineIndices(_ indices: Set<Int>) {
-        lineNumberView.commentedLineIndices = indices
-    }
-
-    // MARK: Geometry
-
-    /// Row rect in the gutter's coordinates (popover anchor).
     func rowRect(_ row: Int) -> NSRect {
-        NSRect(x: 0, y: lineNumberView.rowMinY(row),
-               width: lineNumberView.bounds.width, height: DiffMetrics.rowHeight)
-    }
-
-    /// Row at a y coordinate of the text view, nil outside the rows.
-    func rowIndex(atY y: CGFloat) -> Int? {
-        textView.rowIndex(atY: y)
+        let y = lineNumberView.convert(NSPoint(x: 0, y: linesView.geometry.rowTop(row)), from: linesView).y
+        return NSRect(x: 0, y: y, width: lineNumberView.bounds.width, height: DiffMetrics.rowHeight)
     }
 
     var firstVisibleRow: Int? {
-        rowIndex(atY: scrollView.documentVisibleRect.minY)
+        let geometry = linesView.geometry
+        let y = scrollView.documentVisibleRect.minY
+        guard !cells.isEmpty, y >= geometry.rowTop(0), y < geometry.documentHeight else { return nil }
+        return geometry.row(atY: y)
     }
 
-    func scrollToRow(_ row: Int) {
+    func scroll(toY y: CGFloat) {
         let clip = scrollView.contentView
-        let docHeight = textView.frame.height
-        let maxY = max(docHeight - clip.bounds.height, 0)
-        let y = min(DiffTextView.rowMinY(row), maxY)
-        clip.scroll(to: NSPoint(x: clip.bounds.origin.x, y: y))
+        let x = wordWrap ? -clip.contentInsets.left : clip.bounds.origin.x
+        let proposed = NSRect(origin: NSPoint(x: x, y: y), size: clip.bounds.size)
+        clip.scroll(to: clip.constrainBoundsRect(proposed).origin)
         scrollView.reflectScrolledClipView(clip)
     }
 
-    /// Rows intersecting the visible rect (partially visible rows included).
+    func scrollToTop() {
+        let clip = scrollView.contentView
+        let origin = NSPoint(x: -clip.contentInsets.left, y: -clip.contentInsets.top)
+        clip.scroll(to: clip.constrainBoundsRect(NSRect(origin: origin, size: clip.bounds.size)).origin)
+        scrollView.reflectScrolledClipView(clip)
+    }
+
+    func scrollToRow(_ row: Int) {
+        let geometry = linesView.geometry
+        scroll(toY: row < geometry.rowCount ? geometry.rowTop(row) : 0)
+    }
+
+    func viewportStart() -> DiffViewportStart? {
+        DiffStableViewport.capture(scrollY: scrollView.documentVisibleRect.minY, geometry: linesView.geometry,
+                                   projections: linesView.projections)
+    }
+
+    func scrollY(for start: DiffViewportStart) -> CGFloat {
+        DiffStableViewport.recover(start, geometry: linesView.geometry, projections: linesView.projections)
+    }
+
     var visibleRowRange: Range<Int> {
         let rect = scrollView.documentVisibleRect
         guard !cells.isEmpty, rect.height > 0 else { return 0..<0 }
-        let first = Int(floor((rect.minY - DiffMetrics.textInset.height) / DiffMetrics.rowHeight))
-        let last = Int(ceil((rect.maxY - DiffMetrics.textInset.height) / DiffMetrics.rowHeight))
-        let lo = min(max(first, 0), cells.count)
-        let hi = min(max(last, lo), cells.count)
-        return lo..<hi
+        return linesView.geometry.rows(intersecting: rect.minY, rect.maxY)
     }
 
-    /// Whole rows that fit in the viewport.
-    var viewportRowCapacity: Int {
-        Int(floor(scrollView.contentView.bounds.height / DiffMetrics.rowHeight))
+    var rowIndexAtViewportCentre: Int? {
+        guard !cells.isEmpty else { return nil }
+        return linesView.geometry.row(atY: scrollView.documentVisibleRect.midY)
     }
 
-    /// Row containing the start of the text selection.
     var selectionStartRow: Int? {
-        textView.row(containingCharacterAt: textView.selectedRange().location)
+        guard !cells.isEmpty else { return nil }
+        return linesView.row(containingCharacterAt: linesView.selectedRange().location)
     }
 
-    /// Moves the insertion point to the start of `row`'s text without scrolling.
     func placeInsertionPoint(atRow row: Int) {
-        guard let location = textView.textStart(ofRow: row) else { return }
-        textView.setSelectedRange(NSRange(location: location, length: 0))
+        guard row < linesView.rowRanges.count else { return }
+        linesView.setSelectedRange(NSRange(location: linesView.rowRanges[row].location, length: 0))
     }
 
     func clearSelection() {
-        let location = textView.selectedRange().location
-        textView.setSelectedRange(NSRange(location: min(location, textView.string.utf16.count), length: 0))
+        linesView.setSelectedRange(NSRange(location: linesView.selectedRange().location, length: 0))
+    }
+
+    func validateUserInterfaceItem(_ item: any NSValidatedUserInterfaceItem) -> Bool {
+        switch item.action {
+        case #selector(performTextFinderAction(_:)), #selector(performFindPanelAction(_:)):
+            guard let action = NSTextFinder.Action(rawValue: item.tag) else { return false }
+            return linesView.textFinder.validateAction(action)
+        case #selector(performFindAction(_:)):
+            return linesView.textFinder.validateAction(.showFindInterface)
+        case #selector(findNext(_:)):
+            return linesView.textFinder.validateAction(.nextMatch)
+        case #selector(findPrevious(_:)):
+            return linesView.textFinder.validateAction(.previousMatch)
+        default:
+            return false
+        }
+    }
+
+    override func performTextFinderAction(_ sender: Any?) {
+        guard let tag = (sender as? NSValidatedUserInterfaceItem)?.tag,
+              let action = NSTextFinder.Action(rawValue: tag) else { return }
+        linesView.textFinder.performAction(action)
+    }
+
+    @objc func performFindPanelAction(_ sender: Any?) {
+        performTextFinderAction(sender)
+    }
+
+    @objc func performFindAction(_ sender: Any?) {
+        linesView.textFinder.performAction(.showFindInterface)
+    }
+
+    @objc func findNext(_ sender: Any?) {
+        linesView.textFinder.performAction(.nextMatch)
+    }
+
+    @objc func findPrevious(_ sender: Any?) {
+        linesView.textFinder.performAction(.previousMatch)
     }
 }
 
-// MARK: - DiffTextView
-
-@MainActor
-final class DiffTextView: NSTextView {
-    /// Called when a comment or collapsed row is clicked in the text.
-    var onRowClicked: ((Int) -> Void)?
-    var onBecameFirstResponder: (() -> Void)?
-
-    private(set) var cells: [DiffCell?] = []
-    /// UTF-16 range of each row's text (without the trailing "\n").
-    private var rowRanges: [NSRange] = []
-
-    static func rowMinY(_ row: Int) -> CGFloat {
-        DiffMetrics.textInset.height + CGFloat(row) * DiffMetrics.rowHeight
-    }
-
-    func setRows(cells: [DiffCell?], attributed: NSAttributedString) {
-        self.cells = cells
-        var ranges: [NSRange] = []
-        ranges.reserveCapacity(cells.count)
-        let string = attributed.string as NSString
-        var location = 0
-        if !cells.isEmpty {
-            while true {
-                let newline = string.range(of: "\n", options: .literal,
-                                           range: NSRange(location: location, length: string.length - location))
-                if newline.location == NSNotFound {
-                    ranges.append(NSRange(location: location, length: string.length - location))
-                    break
-                }
-                ranges.append(NSRange(location: location, length: newline.location - location))
-                location = newline.location + 1
-            }
-        }
-        rowRanges = ranges
-        textStorage?.setAttributedString(attributed)
-        needsDisplay = true
-    }
-
-    /// UTF-16 location of the start of `row`'s text.
-    func textStart(ofRow row: Int) -> Int? {
-        guard row >= 0, row < rowRanges.count else { return nil }
-        return rowRanges[row].location
-    }
-
-    /// Row whose text (or trailing newline) holds the UTF-16 `location`.
-    func row(containingCharacterAt location: Int) -> Int? {
-        guard !rowRanges.isEmpty else { return nil }
-        var lo = 0
-        var hi = rowRanges.count - 1
-        while lo < hi {
-            let mid = (lo + hi + 1) / 2
-            if rowRanges[mid].location <= location { lo = mid } else { hi = mid - 1 }
-        }
-        return lo
-    }
-
-    func rowIndex(atY y: CGFloat) -> Int? {
-        let row = Int(floor((y - DiffMetrics.textInset.height) / DiffMetrics.rowHeight))
-        guard row >= 0, row < cells.count else { return nil }
-        return row
-    }
-
-    override func becomeFirstResponder() -> Bool {
-        let accepted = super.becomeFirstResponder()
-        if accepted { onBecameFirstResponder?() }
-        return accepted
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        if let row = rowIndex(atY: point.y), let cell = cells[row] {
-            switch cell.kind {
-            case .comment, .collapsedRegion:
-                onRowClicked?(row)
-                return
-            case .line, .filler, .banner:
-                break
-            }
-        }
-        super.mouseDown(with: event)
-    }
-
-    // MARK: Drawing
-
-    override func draw(_ dirtyRect: NSRect) {
-        let rows = visibleRows(in: dirtyRect)
-        let fillX = dirtyRect.minX
-        let fillWidth = dirtyRect.width
-        for row in rows {
-            guard let cell = cells[row] else { continue }
-            let rect = NSRect(x: fillX, y: Self.rowMinY(row), width: fillWidth, height: DiffMetrics.rowHeight)
-            switch cell.kind {
-            case .line(.deletion):
-                DiffMetrics.deletionLineBackground.setFill()
-                rect.fill()
-            case .line(.addition):
-                DiffMetrics.additionLineBackground.setFill()
-                rect.fill()
-            case .comment:
-                DiffMetrics.commentBackground.setFill()
-                rect.fill()
-            case .banner:
-                DiffMetrics.bannerBackground.setFill()
-                rect.fill()
-            case .collapsedRegion:
-                DiffMetrics.collapsedBackground.setFill()
-                rect.fill()
-            case .filler:
-                drawHatch(in: rect)
-            case .line:
-                break
-            }
-        }
-
-        super.draw(dirtyRect)
-
-        for row in rows {
-            guard let cell = cells[row] else { continue }
-            switch cell.kind {
-            case .collapsedRegion(_, let hiddenCount):
-                drawCollapsedLabel(row: row, hiddenCount: hiddenCount)
-            case .line(let type) where !cell.isWholeLineChange:
-                drawEmptyInnerMarkers(row: row, cell: cell, type: type)
-            default:
-                break
-            }
-        }
-    }
-
-    private func visibleRows(in rect: NSRect) -> Range<Int> {
-        guard !cells.isEmpty else { return 0..<0 }
-        let height = DiffMetrics.rowHeight
-        let inset = DiffMetrics.textInset.height
-        let first = max(Int(floor((rect.minY - inset) / height)), 0)
-        let last = min(Int(ceil((rect.maxY - inset) / height)), cells.count)
-        guard first < last else { return 0..<0 }
-        return first..<last
-    }
-
-    /// 45° hatch; lines satisfy x + y ≡ 0 (mod spacing) so they continue across rows.
-    private func drawHatch(in rect: NSRect) {
-        let spacing: CGFloat = 8
-        NSGraphicsContext.saveGraphicsState()
-        rect.clip()
-        let path = NSBezierPath()
-        path.lineWidth = 1
-        var c = floor((rect.minX + rect.minY) / spacing) * spacing
-        let end = rect.maxX + rect.maxY
-        while c <= end {
-            path.move(to: NSPoint(x: c - rect.minY, y: rect.minY))
-            path.line(to: NSPoint(x: c - rect.maxY, y: rect.maxY))
-            c += spacing
-        }
-        DiffMetrics.fillerHatch.setStroke()
-        path.stroke()
-        NSGraphicsContext.restoreGraphicsState()
-    }
-
-    private func drawCollapsedLabel(row: Int, hiddenCount: Int) {
-        let visible = enclosingScrollView?.documentVisibleRect ?? visibleRect
-        let label = DiffMetrics.collapsedLabel(hiddenCount: hiddenCount) as NSString
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: DiffMetrics.font,
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        let size = label.size(withAttributes: attrs)
-        let y = Self.rowMinY(row) + (DiffMetrics.rowHeight - size.height) / 2
-        label.draw(at: NSPoint(x: visible.midX - size.width / 2, y: y), withAttributes: attrs)
-    }
-
-    /// VS Code `diffInsertedDecorationEmpty` / `diffDeletedDecorationEmpty`.
-    private func drawEmptyInnerMarkers(row: Int, cell: DiffCell, type: DiffLineType) {
-        let empties = cell.innerRanges.filter { $0.length == 0 }
-        guard !empties.isEmpty, row < rowRanges.count,
-              let layoutManager, let textContainer else { return }
-        let rowRange = rowRanges[row]
-        let color: NSColor
-        switch type {
-        case .deletion: color = DiffMetrics.deletionMarker
-        case .addition: color = DiffMetrics.additionMarker
-        case .context, .hunkHeader, .meta: return
-        }
-        color.setFill()
-        for range in empties where range.location <= rowRange.length {
-            let x: CGFloat
-            if range.location < rowRange.length {
-                let glyph = layoutManager.glyphIndexForCharacter(at: rowRange.location + range.location)
-                let rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer)
-                x = rect.minX
-            } else if rowRange.length > 0 {
-                let glyph = layoutManager.glyphIndexForCharacter(at: rowRange.location + rowRange.length - 1)
-                let rect = layoutManager.boundingRect(forGlyphRange: NSRange(location: glyph, length: 1), in: textContainer)
-                x = rect.maxX
-            } else {
-                x = textContainer.lineFragmentPadding
-            }
-            NSRect(x: x + textContainerInset.width, y: Self.rowMinY(row),
-                   width: 1, height: DiffMetrics.rowHeight).fill()
-        }
-    }
-}
-
-// MARK: - Line Number Ruler
 
 @MainActor
 final class DiffLineNumberView: NSRulerView {
     let columns: GutterColumns
-    var rows: [GutterRow] = []
-    /// Flat `[DiffLine]` indices that carry a comment (blue dot).
+    let linesView: DiffLinesView
+    var rows: [GutterRow] = [] {
+        didSet { updateGutterLayout() }
+    }
+    private(set) var gutterLayout: GutterLayout
     var commentedLineIndices: Set<Int> = []
     var onRowClicked: ((Int) -> Void)?
     var onRangeSelected: ((Int, Int) -> Void)?
@@ -499,9 +348,12 @@ final class DiffLineNumberView: NSRulerView {
     }
     private var trackingArea: NSTrackingArea?
 
-    init(columns: GutterColumns) {
+    init(columns: GutterColumns, linesView: DiffLinesView) {
         self.columns = columns
+        self.linesView = linesView
+        self.gutterLayout = GutterLayout(columns: columns, rows: [], digitWidth: DiffMetrics.gutterDigitWidth)
         super.init(scrollView: nil, orientation: .verticalRuler)
+        clipsToBounds = true
     }
 
     @available(*, unavailable)
@@ -509,21 +361,38 @@ final class DiffLineNumberView: NSRulerView {
         fatalError("init(coder:) is not supported")
     }
 
-    override var requiredThickness: CGFloat { columns.thickness }
+    override var requiredThickness: CGFloat { gutterLayout.thickness }
 
-    /// y of a row's top edge in this view; the single formula used by
-    /// drawing, hit-testing and `DiffPaneView.rowRect`.
-    func rowMinY(_ row: Int) -> CGFloat {
-        guard let clientView else { return DiffTextView.rowMinY(row) }
-        return convert(NSPoint(x: 0, y: DiffTextView.rowMinY(row)), from: clientView).y
+    private func updateGutterLayout() {
+        let layout = GutterLayout(columns: columns, rows: rows, digitWidth: DiffMetrics.gutterDigitWidth)
+        guard layout != gutterLayout else { return }
+        gutterLayout = layout
+        ruleThickness = layout.thickness
+        scrollView?.tile()
+        needsDisplay = true
+    }
+
+    private var offsetY: CGFloat {
+        convert(NSPoint.zero, from: linesView).y
+    }
+
+    private func rowFrame(_ row: Int, offsetY: CGFloat) -> CGRect {
+        let geometry = linesView.geometry
+        return CGRect(x: 0, y: geometry.rowTop(row) + offsetY, width: bounds.width, height: geometry.rowHeight(row))
+    }
+
+    func rowsToDraw(in rect: CGRect) -> Range<Int> {
+        DiffGutterGeometry.rowsToDraw(geometry: linesView.geometry, offsetY: offsetY, in: rect, bounds: bounds)
+            .clamped(to: 0..<rows.count)
     }
 
     private func row(at point: NSPoint) -> Int? {
         guard !rows.isEmpty else { return nil }
-        let origin = rowMinY(0)
-        let row = Int(floor((point.y - origin) / DiffMetrics.rowHeight))
-        guard row >= 0, row < rows.count else { return nil }
-        return row
+        let geometry = linesView.geometry
+        let y = point.y - offsetY
+        guard y >= geometry.rowTop(0), y < geometry.documentHeight else { return nil }
+        let row = geometry.row(atY: y)
+        return row < rows.count ? row : nil
     }
 
     private func row(at event: NSEvent) -> Int? {
@@ -559,18 +428,12 @@ final class DiffLineNumberView: NSRulerView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        // Override default NSRulerView drawing entirely (no background, no border)
         drawHashMarksAndLabels(in: dirtyRect)
     }
 
     override func drawHashMarksAndLabels(in rect: NSRect) {
         guard !rows.isEmpty else { return }
-        let height = DiffMetrics.rowHeight
-        let origin = rowMinY(0)
-        let first = max(Int(floor((rect.minY - origin) / height)), 0)
-        let last = min(Int(ceil((rect.maxY - origin) / height)), rows.count)
-        guard first < last else { return }
-
+        let offset = offsetY
         let numberAttrs: [NSAttributedString.Key: Any] = [
             .font: DiffMetrics.gutterFont,
             .foregroundColor: NSColor.secondaryLabelColor,
@@ -580,10 +443,9 @@ final class DiffLineNumberView: NSRulerView {
             return min(s, c)...max(s, c)
         }()
 
-        for index in first..<last {
+        for index in rowsToDraw(in: rect) {
             let gutterRow = rows[index]
-            let y = origin + CGFloat(index) * height
-            let rowRect = NSRect(x: 0, y: y, width: bounds.width, height: height)
+            let rowRect = rowFrame(index, offsetY: offset)
 
             if let dragRange, dragRange.contains(index) {
                 NSColor.systemBlue.withAlphaComponent(0.15).setFill()
@@ -593,28 +455,29 @@ final class DiffLineNumberView: NSRulerView {
             switch gutterRow.kind {
             case .comment:
                 NSColor.systemBlue.withAlphaComponent(0.15).setFill()
-                NSRect(x: 0, y: y, width: bounds.width - 1, height: height).fill()
+                NSRect(x: 0, y: rowRect.minY, width: bounds.width - 1, height: rowRect.height).fill()
             case .collapsedRegion:
                 DiffMetrics.collapsedBackground.setFill()
                 rowRect.fill()
-                drawCollapsedAffordances(y: y)
+                drawCollapsedAffordances(midY: rowRect.midY)
             case .line:
-                drawLineRow(gutterRow, index: index, y: y, attrs: numberAttrs)
+                drawLineRow(gutterRow, index: index, rowFrame: rowRect, attrs: numberAttrs)
             case .filler, .banner, .none:
                 break
             }
         }
     }
 
-    private func drawLineRow(_ gutterRow: GutterRow, index: Int, y: CGFloat, attrs: [NSAttributedString.Key: Any]) {
+    private func drawLineRow(_ gutterRow: GutterRow, index: Int, rowFrame: CGRect,
+                             attrs: [NSAttributedString.Key: Any]) {
         let height = DiffMetrics.rowHeight
         if let lineIndex = gutterRow.lineIndex, commentedLineIndices.contains(lineIndex) {
             NSColor.systemBlue.setFill()
-            NSBezierPath(ovalIn: NSRect(x: 4, y: y + (height - 6) / 2, width: 6, height: 6)).fill()
+            let dot = DiffGutterGeometry.markerRect(rowFrame: rowFrame, rowHeight: height, x: 4, size: 6)
+            NSBezierPath(ovalIn: dot).fill()
         } else if Self.isCommentable(gutterRow.kind) && hoveredRow == index {
-            // GitHub-style hover "+" button
-            let btnSize: CGFloat = min(16, height)
-            let btnRect = NSRect(x: 2, y: y + (height - btnSize) / 2, width: btnSize, height: btnSize)
+            let btnRect = DiffGutterGeometry.markerRect(rowFrame: rowFrame, rowHeight: height, x: 2,
+                                                        size: min(16, height))
             NSColor.systemBlue.setFill()
             NSBezierPath(roundedRect: btnRect, xRadius: 3, yRadius: 3).fill()
             let plusStr = "+" as NSString
@@ -627,22 +490,21 @@ final class DiffLineNumberView: NSRulerView {
                                      y: btnRect.midY - plusSize.height / 2), withAttributes: plusAttrs)
         }
 
-        let numberY = y + (height - DiffMetrics.gutterFont.boundingRectForFont.height) / 2
+        let numberY = DiffGutterGeometry.labelY(rowFrame: rowFrame, rowHeight: height,
+                                                fontHeight: DiffMetrics.gutterFont.boundingRectForFont.height)
         func drawNumber(_ number: Int?, rightEdge: CGFloat) {
             guard let number else { return }
             let str = "\(number)" as NSString
             let size = str.size(withAttributes: attrs)
             str.draw(at: NSPoint(x: rightEdge - size.width, y: numberY), withAttributes: attrs)
         }
-        let indicatorX: CGFloat
+        let edges = gutterLayout.numberRightEdges
         switch columns {
         case .dual:
-            drawNumber(gutterRow.oldNumber, rightEdge: 34)
-            drawNumber(gutterRow.newNumber, rightEdge: 72)
-            indicatorX = 73
+            drawNumber(gutterRow.oldNumber, rightEdge: edges[0])
+            drawNumber(gutterRow.newNumber, rightEdge: edges[1])
         case .single:
-            drawNumber(gutterRow.oldNumber ?? gutterRow.newNumber, rightEdge: 34)
-            indicatorX = 36
+            drawNumber(gutterRow.oldNumber ?? gutterRow.newNumber, rightEdge: edges[0])
         }
 
         if let indicator = gutterRow.indicator {
@@ -651,11 +513,9 @@ final class DiffLineNumberView: NSRulerView {
                 .font: DiffMetrics.gutterFont,
                 .foregroundColor: color,
             ]
-            (indicator as NSString).draw(at: NSPoint(x: indicatorX, y: numberY), withAttributes: indicatorAttrs)
+            (indicator as NSString).draw(at: NSPoint(x: gutterLayout.indicatorX, y: numberY), withAttributes: indicatorAttrs)
         }
     }
-
-    // MARK: Collapsed region affordances (▲ show more above, ▼ show more below, ↕ show all)
 
     private static let affordances: [(glyph: String, action: CollapsedAction)] = [
         ("\u{25B2}", .expandTop),
@@ -665,7 +525,7 @@ final class DiffLineNumberView: NSRulerView {
 
     private var affordanceWidth: CGFloat { bounds.width / CGFloat(Self.affordances.count) }
 
-    private func drawCollapsedAffordances(y: CGFloat) {
+    private func drawCollapsedAffordances(midY: CGFloat) {
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 9),
             .foregroundColor: NSColor.secondaryLabelColor,
@@ -674,7 +534,7 @@ final class DiffLineNumberView: NSRulerView {
             let str = item.glyph as NSString
             let size = str.size(withAttributes: attrs)
             let x = CGFloat(i) * affordanceWidth + (affordanceWidth - size.width) / 2
-            str.draw(at: NSPoint(x: x, y: y + (DiffMetrics.rowHeight - size.height) / 2), withAttributes: attrs)
+            str.draw(at: NSPoint(x: x, y: midY - size.height / 2), withAttributes: attrs)
         }
     }
 
@@ -682,8 +542,6 @@ final class DiffLineNumberView: NSRulerView {
         let zone = min(max(Int(x / affordanceWidth), 0), Self.affordances.count - 1)
         return Self.affordances[zone].action
     }
-
-    // MARK: Mouse
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
@@ -708,11 +566,10 @@ final class DiffLineNumberView: NSRulerView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard dragStartRow != nil else { return }
+        guard dragStartRow != nil, !rows.isEmpty else { return }
         let point = convert(event.locationInWindow, from: nil)
-        let origin = rowMinY(0)
-        let raw = Int(floor((point.y - origin) / DiffMetrics.rowHeight))
-        dragCurrentRow = min(max(raw, 0), rows.count - 1)
+        let row = linesView.geometry.row(atY: point.y - offsetY)
+        dragCurrentRow = min(row, rows.count - 1)
         needsDisplay = true
     }
 

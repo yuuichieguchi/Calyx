@@ -1,44 +1,9 @@
 // DiffContainerView.swift
 // Calyx
 //
-// SwiftUI wrapper for the diff viewer with toolbar.
+// Toolbar shown above the diff viewer.
 
 import SwiftUI
-
-struct DiffContainerView: View {
-    let source: DiffSource
-    let loadState: DiffLoadState
-
-    var body: some View {
-        VStack(spacing: 0) {
-            DiffToolbarView(source: source)
-
-            switch loadState {
-            case .loading:
-                VStack {
-                    Spacer()
-                    ProgressView("Loading diff...")
-                    Spacer()
-                }
-            case .success(let diff):
-                DiffViewRepresentable(diff: diff)
-                    .accessibilityIdentifier(AccessibilityID.Diff.content)
-            case .error(let message):
-                VStack(spacing: 12) {
-                    Spacer()
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
-                    Text(message)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier(AccessibilityID.Diff.container)
-    }
-}
 
 struct DiffToolbarView: View {
     let source: DiffSource
@@ -56,6 +21,7 @@ struct DiffToolbarView: View {
     @State private var layoutPreference = DiffLayoutSettings.preference
     @State private var hideUnchangedRegions = DiffLayoutSettings.hideUnchangedRegionsEnabled
     @State private var ignoreTrimWhitespace = DiffLayoutSettings.ignoreTrimWhitespace
+    @State private var wordWrap = DiffLayoutSettings.wordWrap
 
     var body: some View {
         HStack(spacing: 8) {
@@ -194,6 +160,8 @@ struct DiffToolbarView: View {
                 .accessibilityIdentifier(AccessibilityID.Diff.collapseUnchangedItem)
             Toggle("Ignore Trim Whitespace", isOn: $ignoreTrimWhitespace)
                 .accessibilityIdentifier(AccessibilityID.Diff.ignoreTrimWhitespaceItem)
+            Toggle("Word Wrap", isOn: $wordWrap)
+                .accessibilityIdentifier(AccessibilityID.Diff.wordWrapItem)
         } label: {
             Image(systemName: "ellipsis.circle")
         }
@@ -215,10 +183,16 @@ struct DiffToolbarView: View {
                 DiffLayoutSettings.ignoreTrimWhitespace = newValue
             }
         }
+        .onChange(of: wordWrap) { _, newValue in
+            if DiffLayoutSettings.wordWrap != newValue {
+                DiffLayoutSettings.wordWrap = newValue
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .diffLayoutSettingChanged)) { _ in
             layoutPreference = DiffLayoutSettings.preference
             hideUnchangedRegions = DiffLayoutSettings.hideUnchangedRegionsEnabled
             ignoreTrimWhitespace = DiffLayoutSettings.ignoreTrimWhitespace
+            wordWrap = DiffLayoutSettings.wordWrap
         }
     }
 
@@ -232,25 +206,6 @@ struct DiffToolbarView: View {
     }
 }
 
-struct DiffViewRepresentable: NSViewRepresentable {
-    let diff: FileDiff
-    var reviewStore: DiffReviewStore?
-
-    func makeNSView(context: Context) -> DiffView {
-        let view = DiffView(frame: .zero)
-        view.reviewStore = reviewStore
-        view.display(diff: diff)
-        return view
-    }
-
-    func updateNSView(_ nsView: DiffView, context: Context) {
-        nsView.reviewStore = reviewStore
-        // Only re-render if diff changed
-        if nsView.currentDiff != diff {
-            nsView.display(diff: diff)
-        }
-    }
-}
 extension DiffLoadState {
     /// Number of changes of a loaded diff; 0 while loading or on error.
     var changeCount: Int {

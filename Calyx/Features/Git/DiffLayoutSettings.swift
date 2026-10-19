@@ -48,6 +48,7 @@ struct DiffLayoutSettings: Sendable {
     static let hideUnchangedRegionsKey = "calyx.diff.hideUnchangedRegions"
     static let ignoreTrimWhitespaceKey = "calyx.diff.ignoreTrimWhitespace"
     static let renderOverviewRulerKey = "calyx.diff.renderOverviewRuler"
+    static let wordWrapKey = "calyx.diff.wordWrap"
 
     /// VS Code `renderSideBySideInlineBreakpoint`.
     static let sideBySideInlineBreakpoint: CGFloat = 900
@@ -106,6 +107,15 @@ struct DiffLayoutSettings: Sendable {
         set {
             store.set(newValue, forKey: renderOverviewRulerKey)
             postChanged(key: renderOverviewRulerKey)
+        }
+    }
+
+    /// Default true (VS Code `diffEditor.wordWrap` inherits `on` here).
+    static var wordWrap: Bool {
+        get { store.object(forKey: wordWrapKey) as? Bool ?? true }
+        set {
+            store.set(newValue, forKey: wordWrapKey)
+            postChanged(key: wordWrapKey)
         }
     }
 

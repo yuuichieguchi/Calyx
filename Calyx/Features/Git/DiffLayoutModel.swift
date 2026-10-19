@@ -63,10 +63,19 @@ enum DiffRowBuilder {
 
     static func build(displayLines: [DisplayLine], changes: [DetailedLineRangeMapping],
                       layout: DiffLayout) -> [DiffLayoutRow] {
+        buildLayout(displayLines: displayLines, changes: changes, layout: layout).rows
+    }
+
+    /// Rows plus alignment blocks: row-index ranges partitioning the rows.
+    /// Side by side, every aligned group (with its interleaved comment rows)
+    /// is one block; outside a group each row is its own block. Inline rows
+    /// are all singletons.
+    static func buildLayout(displayLines: [DisplayLine], changes: [DetailedLineRangeMapping],
+                            layout: DiffLayout) -> DiffRowLayout {
         let entries = makeEntries(displayLines)
         var builder = Builder(layout: layout, entries: entries, changes: changes)
         builder.run()
-        return builder.rows
+        return DiffRowLayout(rows: builder.rows, blocks: builder.blocks)
     }
 
     private static func makeEntries(_ displayLines: [DisplayLine]) -> [Entry] {
@@ -101,6 +110,9 @@ enum DiffRowBuilder {
         let entries: [Entry]
         let changes: [DetailedLineRangeMapping]
         var rows: [DiffLayoutRow] = []
+        var blocks: [Range<Int>] = []
+        /// True while `emitGroup` appends rows; the group closes one block.
+        private var inGroup = false
 
         /// Text without marker, keyed by original line number (context + deletion).
         let originalText: [Int: String]
@@ -286,6 +298,12 @@ enum DiffRowBuilder {
         // MARK: Rows
 
         private mutating func emitGroup(left: [(DiffCell, Entry)], right: [(DiffCell, Entry)]) {
+            let start = rows.count
+            inGroup = layout == .sideBySide
+            defer {
+                if inGroup, rows.count > start { blocks.append(start..<rows.count) }
+                inGroup = false
+            }
             for k in 0..<max(left.count, right.count) {
                 let l = k < left.count ? left[k] : nil
                 let r = k < right.count ? right[k] : nil
@@ -297,14 +315,20 @@ enum DiffRowBuilder {
         /// Appends a row, then the comment rows of the entries it holds
         /// (left entry's comments on the left, right entry's on the right).
         private mutating func appendRow(left: DiffCell, right: DiffCell?, leftEntry: Entry?, rightEntry: Entry?) {
-            rows.append(DiffLayoutRow(left: left, right: right))
+            push(DiffLayoutRow(left: left, right: right))
             let isInline = layout == .inline
             for d in leftEntry?.commentDisplayIndices ?? [] {
-                rows.append(DiffLayoutRow(left: commentCell(d), right: isInline ? nil : .filler))
+                push(DiffLayoutRow(left: commentCell(d), right: isInline ? nil : .filler))
             }
             for d in rightEntry?.commentDisplayIndices ?? [] {
-                rows.append(DiffLayoutRow(left: .filler, right: commentCell(d)))
+                push(DiffLayoutRow(left: .filler, right: commentCell(d)))
             }
+        }
+
+        /// Appends one row; outside a group it is its own block.
+        private mutating func push(_ row: DiffLayoutRow) {
+            rows.append(row)
+            if !inGroup { blocks.append((rows.count - 1)..<rows.count) }
         }
 
         private func lineCell(_ e: Entry, inner: [NSRange], whole: Bool) -> DiffCell {

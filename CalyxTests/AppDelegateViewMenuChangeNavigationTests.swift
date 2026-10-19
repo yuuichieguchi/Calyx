@@ -53,4 +53,25 @@ final class AppDelegateViewMenuChangeNavigationTests: XCTestCase {
         XCTAssertTrue(viewMenu.performKeyEquivalent(with: try f5Event([.option, .shift, .function])))
         XCTAssertEqual(recorder.calls, ["next", "previous"])
     }
+
+    /// A disabled item must not consume Option+F5 / Option+Shift+F5, so
+    /// terminal tabs still receive the keys.
+    func test_viewMenu_optionF5_disabledItems_doNotConsumeEvent() throws {
+        let appDelegate = AppDelegate()
+        appDelegate.setupMainMenu()
+        let mainMenu = try XCTUnwrap(NSApp.mainMenu)
+        let viewMenu = try XCTUnwrap(mainMenu.items.compactMap(\.submenu).first { $0.title == "View" })
+        let next = try XCTUnwrap(viewMenu.items.first { $0.title == "Go to Next Change" })
+        let previous = try XCTUnwrap(viewMenu.items.first { $0.title == "Go to Previous Change" })
+        let recorder = ChangeNavigationRecorder()
+        viewMenu.autoenablesItems = false
+        next.target = recorder
+        previous.target = recorder
+        next.isEnabled = false
+        previous.isEnabled = false
+
+        XCTAssertFalse(viewMenu.performKeyEquivalent(with: try f5Event([.option, .function])))
+        XCTAssertFalse(viewMenu.performKeyEquivalent(with: try f5Event([.option, .shift, .function])))
+        XCTAssertEqual(recorder.calls, [])
+    }
 }

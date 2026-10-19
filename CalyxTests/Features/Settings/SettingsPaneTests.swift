@@ -100,6 +100,7 @@ final class SettingsPaneTests: XCTestCase {
         ("gitDiffHideUnchangedRegions", .appearance),
         ("gitDiffIgnoreTrimWhitespace", .appearance),
         ("gitDiffOverviewRuler", .appearance),
+        ("gitDiffWordWrap", .appearance),
         ("lspAutoInstall", .lsp),
         ("lspRequireConfirmation", .lsp),
         ("persistentSessions", .sessions),

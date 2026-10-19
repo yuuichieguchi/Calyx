@@ -1,0 +1,985 @@
+import AppKit
+import Foundation
+import Testing
+@testable import Calyx
+
+private let wordRowText = "foo_bar it's 3.14 かなカナ漢字ひらがな end"
+private let clusterRowText = "a 𝑥y 😀b e\u{301}x 👍🏽 q 👨‍👩‍👧 z 漢字かな\tq end"
+
+private func makeManyRowsRaw(_ count: Int) -> String {
+    var out = "diff --git a/l.txt b/l.txt\n--- a/l.txt\n+++ b/l.txt\n@@ -1,\(count) +1,\(count) @@\n"
+    for n in 1...count { out += " row \(n) of many plain words\n" }
+    return out
+}
+
+private func makeLinesRaw() -> String {
+    var out = "diff --git a/l.txt b/l.txt\n--- a/l.txt\n+++ b/l.txt\n@@ -1,200 +1,200 @@\n"
+    for n in 1...200 {
+        switch n {
+        case 10: out += " alpha needle omega \(n)\n"
+        case 30: out += " \(clusterRowText) \(n)\n"
+        case 50: out += " \(wordRowText) \(n)\n"
+        case 150: out += " second needle here \(n)\n"
+        case 100: out += "-old line \(n)\n+new line \(n)\n"
+        default: out += " plain line \(n)\n"
+        }
+    }
+    return out
+}
+
+extension DiffViewWindowedSuites {
+
+@MainActor
+@Suite(.serialized)
+struct DiffLinesViewTests {
+
+    private let suiteName = "com.calyx.tests.DiffLinesViewTests"
+
+    private struct Hosted {
+        let window: NSWindow
+        let view: DiffView
+        let pane: DiffPaneView
+        let lines: DiffLinesView
+        let pasteboard: NSPasteboard
+
+        @MainActor func close() {
+            pasteboard.releaseGlobally()
+            window.orderOut(nil)
+            window.close()
+        }
+    }
+
+    private func withSettings(wordWrap: Bool = false, _ body: () async throws -> Void) async rethrows {
+        DiffLayoutSettings._testUseSuite(named: suiteName)
+        defer { DiffLayoutSettings._testTeardownSuite(named: suiteName) }
+        DiffLayoutSettings.preference = .inline
+        DiffLayoutSettings.hideUnchangedRegionsEnabled = false
+        DiffLayoutSettings.wordWrap = wordWrap
+        try await body()
+    }
+
+    private func drain() async throws {
+        try await Task.sleep(for: .milliseconds(50))
+    }
+
+    private func settle(_ window: NSWindow) async throws {
+        for _ in 0..<3 {
+            window.layoutIfNeeded()
+            window.displayIfNeeded()
+            try await drain()
+        }
+    }
+
+    private func descendants<T: NSView>(of view: NSView, _ type: T.Type) -> [T] {
+        view.subviews.flatMap { sub -> [T] in
+            ((sub as? T).map { [$0] } ?? []) + descendants(of: sub, type)
+        }
+    }
+
+    private func makeHosted(raw: String = makeLinesRaw()) async throws -> Hosted {
+        let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 800, height: 400),
+                              styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
+        let view = DiffView(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
+        view.autoresizingMask = [.width, .height]
+        window.contentView = view
+        window.orderFront(nil)
+        view.display(diff: DiffParser.parse(raw, path: "l.txt"))
+        try await settle(window)
+        let pane = view.inlinePaneForTesting
+        let lines = pane.linesView
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("calyx.tests.\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        lines.pasteboard = pasteboard
+        pane.scroll(toY: 0)
+        try await settle(window)
+        return Hosted(window: window, view: view, pane: pane, lines: lines, pasteboard: pasteboard)
+    }
+
+    private func rowRanges(_ string: String) -> [NSRange] {
+        var ranges: [NSRange] = []
+        var location = 0
+        for row in string.components(separatedBy: "\n") {
+            let length = row.utf16.count
+            ranges.append(NSRange(location: location, length: length))
+            location += length + 1
+        }
+        return ranges
+    }
+
+    private func range(of token: String, in string: String) throws -> NSRange {
+        let found = (string as NSString).range(of: token)
+        try #require(found.location != NSNotFound, "\(token) must be in the pane text")
+        return found
+    }
+
+    private func row(containing location: Int, _ ranges: [NSRange]) -> Int? {
+        ranges.firstIndex { location >= $0.location && location <= NSMaxRange($0) }
+    }
+
+    private func characterRect(_ lines: DiffLinesView, _ location: Int) throws -> NSRect {
+        let rects = lines.rects(forCharacterRange: NSRange(location: location, length: 1)) ?? []
+        return try #require(rects.first?.rectValue)
+    }
+
+    private func point(inside location: Int, _ lines: DiffLinesView) throws -> NSPoint {
+        let rect = try characterRect(lines, location)
+        return NSPoint(x: rect.midX, y: rect.midY)
+    }
+
+    private func mouseEvent(_ type: NSEvent.EventType, at point: NSPoint, in lines: DiffLinesView,
+                            clickCount: Int = 1, modifiers: NSEvent.ModifierFlags = []) throws -> NSEvent {
+        let window = try #require(lines.window)
+        let location = lines.convert(point, to: nil)
+        return try #require(NSEvent.mouseEvent(
+            with: type, location: location, modifierFlags: modifiers, timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: clickCount,
+            pressure: type == .leftMouseUp ? 0 : 1))
+    }
+
+    private func click(_ lines: DiffLinesView, at point: NSPoint, clickCount: Int = 1,
+                       modifiers: NSEvent.ModifierFlags = [], dragTo end: NSPoint? = nil) async throws {
+        let target = end ?? point
+        if let end {
+            NSApp.postEvent(try mouseEvent(.leftMouseDragged, at: end, in: lines, clickCount: clickCount, modifiers: modifiers), atStart: false)
+        }
+        NSApp.postEvent(try mouseEvent(.leftMouseUp, at: target, in: lines, clickCount: clickCount, modifiers: modifiers), atStart: false)
+        lines.mouseDown(with: try mouseEvent(.leftMouseDown, at: point, in: lines, clickCount: clickCount, modifiers: modifiers))
+        try await drain()
+    }
+
+    @Test func pane_containsNoTextView() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            #expect(descendants(of: hosted.view, NSTextView.self).isEmpty)
+            #expect(descendants(of: hosted.pane, DiffLinesView.self).count == 1)
+            #expect(hosted.pane.scrollView.documentView === hosted.lines)
+        }
+    }
+
+    @Test func textStartsRightOfTheGutter() async throws {
+        for wrap in [false, true] {
+            try await withSettings(wordWrap: wrap) {
+                let hosted = try await makeHosted()
+                defer { hosted.close() }
+                let clip = hosted.pane.scrollView.contentView
+                #expect(clip.contentInsets.left >= hosted.pane.lineNumberView.requiredThickness - 0.5)
+                #expect(abs(clip.bounds.minX + clip.contentInsets.left) <= 0.5,
+                        "wrap \(wrap): document x 0 sits at the gutter's trailing edge, clip \(clip.bounds)")
+                let gutterEdge = hosted.pane.lineNumberView.convert(NSPoint(x: hosted.pane.lineNumberView.bounds.maxX, y: 0),
+                                                                    to: hosted.lines).x
+                let first = try characterRect(hosted.lines, hosted.lines.rowRanges[0].location)
+                #expect(first.minX >= gutterEdge, "the first character \(first) is not under the gutter edge \(gutterEdge)")
+            }
+        }
+    }
+
+    @Test func string_isRowsJoinedByNewline() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let ranges = rowRanges(hosted.lines.string)
+            #expect(ranges.count == hosted.lines.geometry.rowCount)
+            #expect(ranges.count == 201)
+            let needle = try range(of: "alpha needle omega 10", in: hosted.lines.string)
+            #expect(row(containing: needle.location, ranges) == 9)
+        }
+    }
+
+    @Test func rectsForCharacterRange_followGeometryAndColumns() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            let needle = try range(of: "needle", in: lines.string)
+            let rects = lines.rects(forCharacterRange: needle) ?? []
+            #expect(rects.count == 1)
+            let rect = try #require(rects.first?.rectValue)
+            #expect(abs(rect.height - DiffMetrics.rowHeight) <= 0.5)
+            #expect(abs(rect.width - 6 * DiffMetrics.columnWidth) <= 0.5)
+            #expect(abs(rect.minY - lines.geometry.rowTop(9)) <= 0.5)
+            let rowStartRect = try characterRect(lines, ranges[9].location)
+            let column = needle.location - ranges[9].location
+            #expect(abs(rect.minX - rowStartRect.minX - CGFloat(column) * DiffMetrics.columnWidth) <= 0.5)
+            var effective = NSRange()
+            #expect(lines.contentView(at: needle.location, effectiveCharacterRange: &effective) === lines)
+            #expect(NSLocationInRange(needle.location, effective))
+        }
+    }
+
+    @Test func click_placesInsertionPoint() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let needle = try range(of: "needle", in: lines.string)
+            let rect = try characterRect(lines, needle.location + 2)
+            try await click(lines, at: NSPoint(x: rect.minX + 1, y: rect.midY))
+            #expect(lines.selectedRange() == NSRange(location: needle.location + 2, length: 0))
+            #expect(hosted.window.firstResponder === lines)
+        }
+    }
+
+    @Test func drag_selectsBetweenPoints() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let needle = try range(of: "alpha needle omega", in: lines.string)
+            let start = try characterRect(lines, needle.location)
+            let end = try characterRect(lines, needle.location + 12)
+            try await click(lines, at: NSPoint(x: start.minX + 1, y: start.midY),
+                            dragTo: NSPoint(x: end.minX + 1, y: end.midY))
+            #expect(lines.selectedRange() == NSRange(location: needle.location, length: 12))
+        }
+    }
+
+    @Test func dragAcrossRows_selectsAcrossNewline() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            let start = try characterRect(lines, ranges[2].location + 1)
+            let end = try characterRect(lines, ranges[4].location + 3)
+            try await click(lines, at: NSPoint(x: start.minX + 1, y: start.midY),
+                            dragTo: NSPoint(x: end.minX + 1, y: end.midY))
+            #expect(lines.selectedRange() == NSRange(location: ranges[2].location + 1,
+                                                     length: ranges[4].location + 3 - ranges[2].location - 1))
+        }
+    }
+
+    @Test func shiftClick_extendsSelection() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            let first = try characterRect(lines, ranges[3].location + 2)
+            let second = try characterRect(lines, ranges[6].location + 4)
+            try await click(lines, at: NSPoint(x: first.minX + 1, y: first.midY))
+            try await click(lines, at: NSPoint(x: second.minX + 1, y: second.midY), modifiers: .shift)
+            #expect(lines.selectedRange() == NSRange(location: ranges[3].location + 2,
+                                                     length: ranges[6].location + 4 - ranges[3].location - 2))
+        }
+    }
+
+    @Test func doubleClick_selectsWord() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let needle = try range(of: "needle", in: lines.string)
+            try await click(lines, at: try point(inside: needle.location + 3, lines), clickCount: 2)
+            #expect(lines.selectedRange() == needle)
+        }
+    }
+
+    @Test func tripleClick_selectsRowIncludingLineBreak() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            let needle = try range(of: "needle", in: lines.string)
+            try await click(lines, at: try point(inside: needle.location + 3, lines), clickCount: 3)
+            #expect(lines.selectedRange() == NSRange(location: ranges[9].location, length: ranges[9].length + 1))
+        }
+    }
+
+    @Test func selectAll_selectsWholeString() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            hosted.lines.selectAll(nil)
+            #expect(hosted.lines.selectedRange() == NSRange(location: 0, length: hosted.lines.string.utf16.count))
+        }
+    }
+
+    @Test func copy_writesSelectedSubstringToInjectedPasteboard() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            let needle = try range(of: "alpha needle", in: lines.string)
+            let selection = NSRange(location: needle.location, length: NSMaxRange(ranges[10]) - needle.location)
+            lines.setSelectedRange(selection)
+            lines.copy(nil)
+            let expected = (lines.string as NSString).substring(with: selection)
+            #expect(expected.contains("\n"))
+            #expect(hosted.pasteboard.string(forType: .string) == expected)
+        }
+    }
+
+    @Test func textFinderClient_reportsStringAndSelection() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let needle = try range(of: "needle", in: lines.string)
+            lines.setSelectedRange(needle)
+            let client: NSTextFinderClient = lines
+            #expect(client.string == lines.string)
+            #expect(client.firstSelectedRange == needle)
+            #expect(client.isSelectable == true)
+            #expect(client.isEditable == false)
+        }
+    }
+
+    @Test func textFinderClient_scrollRangeToVisible_movesClipView() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let target = try range(of: "second needle here 150", in: lines.string)
+            #expect(row(containing: target.location, rowRanges(lines.string)) == 150)
+            hosted.pane.scroll(toY: 0)
+            let targetTop = lines.geometry.rowTop(150)
+            #expect(!hosted.pane.scrollView.documentVisibleRect.contains(NSPoint(x: 1, y: targetTop + 1)))
+            lines.scrollRangeToVisible(target)
+            let visible = hosted.pane.scrollView.documentVisibleRect
+            #expect(visible.minY <= targetTop && targetTop + DiffMetrics.rowHeight <= visible.maxY,
+                    "row 150 at \(targetTop) must be visible in \(visible)")
+        }
+    }
+
+    @Test func performTextFinderAction_showsFindBar() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let item = NSMenuItem()
+            item.tag = NSTextFinder.Action.showFindInterface.rawValue
+            hosted.pane.performTextFinderAction(item)
+            try await drain()
+            #expect(hosted.pane.scrollView.isFindBarVisible)
+        }
+    }
+
+    private func performThroughResponderChain(_ action: Selector, from origin: NSResponder) -> Bool {
+        var candidate: NSResponder? = origin
+        while let responder = candidate {
+            if responder.responds(to: action) {
+                let item = NSMenuItem(title: "", action: action, keyEquivalent: "")
+                guard let validator = responder as? NSUserInterfaceValidations,
+                      validator.validateUserInterfaceItem(item) else { return false }
+                _ = responder.perform(action, with: item)
+                return true
+            }
+            candidate = responder.nextResponder
+        }
+        return false
+    }
+
+    @Test func findShortcuts_reachDiffFinderFromFindFieldAndLinesView() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let string = lines.string as NSString
+            let first = try range(of: "needle", in: lines.string)
+            let afterFirst = NSRange(location: NSMaxRange(first), length: string.length - NSMaxRange(first))
+            let second = string.range(of: "needle", range: afterFirst)
+            try #require(second.location != NSNotFound)
+            #expect(hosted.window.makeFirstResponder(lines))
+            lines.setSelectedRange(first)
+            lines.textFinder.performAction(.setSearchString)
+            #expect(performThroughResponderChain(#selector(SurfaceView.performFindAction(_:)), from: lines))
+            try await drain()
+            #expect(hosted.pane.scrollView.isFindBarVisible)
+            let field = try #require(descendants(of: hosted.pane.scrollView, NSSearchField.self).first)
+
+            let focusField: () throws -> NSResponder = {
+                #expect(hosted.window.makeFirstResponder(field))
+                return try #require(hosted.window.firstResponder)
+            }
+            let focusLines: () throws -> NSResponder = {
+                #expect(hosted.window.makeFirstResponder(lines))
+                return try #require(hosted.window.firstResponder)
+            }
+            for focus in [focusField, focusLines] {
+                lines.setSelectedRange(first)
+                let origin = try focus()
+                #expect(performThroughResponderChain(#selector(SurfaceView.findNext(_:)), from: origin))
+                try await drain()
+                #expect(lines.selectedRange() == second, "\(origin) findNext")
+                #expect(performThroughResponderChain(#selector(SurfaceView.findPrevious(_:)), from: origin))
+                try await drain()
+                #expect(lines.selectedRange() == first, "\(origin) findPrevious")
+                #expect(performThroughResponderChain(#selector(SurfaceView.performFindAction(_:)), from: origin))
+                try await drain()
+                #expect(hosted.pane.scrollView.isFindBarVisible)
+            }
+        }
+    }
+
+    @Test func accessibility_roleValueAndSelection() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            #expect(lines.isAccessibilityElement())
+            #expect(lines.accessibilityRole() == .textArea)
+            #expect(lines.accessibilityValue() as? String == lines.string)
+            let needle = try range(of: "needle", in: lines.string)
+            lines.setSelectedRange(needle)
+            #expect(lines.accessibilitySelectedTextRange() == needle)
+            #expect(lines.accessibilitySelectedText() == "needle")
+            #expect(lines.accessibilityNumberOfCharacters() == lines.string.utf16.count)
+        }
+    }
+
+    @Test func accessibility_linesAndStrings() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            let needle = try range(of: "needle", in: lines.string)
+            #expect(lines.accessibilityLine(for: needle.location) == 9)
+            #expect(lines.accessibilityLine(for: ranges[0].location) == 0)
+            #expect(lines.accessibilityRange(forLine: 9) == NSRange(location: ranges[9].location, length: ranges[9].length + 1))
+            #expect(lines.accessibilityString(for: needle) == "needle")
+        }
+    }
+
+    @Test func accessibility_visibleCharacterRange_coversViewport() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            hosted.pane.scroll(toY: lines.geometry.rowTop(40) + 1)
+            let visibleRows = hosted.pane.visibleRowRange
+            #expect(visibleRows.lowerBound == 40)
+            let range = lines.accessibilityVisibleCharacterRange()
+            #expect(range.location == ranges[40].location)
+            let last = visibleRows.upperBound - 1
+            #expect(NSMaxRange(range) >= NSMaxRange(ranges[last]))
+            #expect(NSMaxRange(range) <= NSMaxRange(ranges[last]) + 1)
+            #expect(!NSLocationInRange(ranges[39].location, range))
+        }
+    }
+
+    @Test func accessibility_frameForRange_isOnScreenRowRect() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let needle = try range(of: "needle", in: lines.string)
+            let local = try #require(lines.rects(forCharacterRange: needle)?.first?.rectValue)
+            let window = try #require(lines.window)
+            let expected = window.convertToScreen(lines.convert(local, to: nil))
+            let frame = lines.accessibilityFrame(for: needle)
+            #expect(abs(frame.minX - expected.minX) <= 0.5)
+            #expect(abs(frame.minY - expected.minY) <= 0.5)
+            #expect(abs(frame.width - 6 * DiffMetrics.columnWidth) <= 0.5)
+            #expect(abs(frame.height - DiffMetrics.rowHeight) <= 0.5)
+        }
+    }
+
+    @Test func validateUserInterfaceItem_copyNeedsSelection() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let copy = NSMenuItem(title: "Copy", action: #selector(DiffLinesView.copy(_:)), keyEquivalent: "c")
+            lines.setSelectedRange(NSRange(location: 3, length: 0))
+            #expect(!lines.validateUserInterfaceItem(copy))
+            lines.setSelectedRange(NSRange(location: 3, length: 4))
+            #expect(lines.validateUserInterfaceItem(copy))
+            let selectAll = NSMenuItem(title: "Select All", action: #selector(NSResponder.selectAll(_:)), keyEquivalent: "a")
+            #expect(lines.validateUserInterfaceItem(selectAll))
+        }
+    }
+
+    private func inkPixels(_ rep: NSBitmapImageRep, in rect: NSRect, origin: NSRect) -> Int {
+        let scale = CGFloat(rep.pixelsWide) / origin.width
+        let minX = max(Int((rect.minX - origin.minX) * scale), 0)
+        let maxX = min(Int((rect.maxX - origin.minX) * scale), rep.pixelsWide)
+        let minY = max(Int((rect.minY - origin.minY) * scale), 0)
+        let maxY = min(Int((rect.maxY - origin.minY) * scale), rep.pixelsHigh)
+        guard minX < maxX, minY < maxY else {
+            Issue.record("\(rect) is outside the \(rep.pixelsWide)x\(rep.pixelsHigh) px render of \(origin)")
+            return 0
+        }
+        var count = 0
+        for y in minY..<maxY {
+            for x in minX..<maxX {
+                if let color = rep.colorAt(x: x, y: y), color.alphaComponent > 0.05 { count += 1 }
+            }
+        }
+        return count
+    }
+
+    @Test func draw_rendersGlyphsInsideTheirCharacterRects() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let ranges = rowRanges(lines.string)
+            lines.setSelectedRange(NSRange(location: 0, length: 0))
+            let visible = lines.visibleRect
+            let rep = try #require(lines.bitmapImageRepForCachingDisplay(in: visible))
+            lines.cacheDisplay(in: visible, to: rep)
+            let needle = try #require(lines.rects(forCharacterRange: try range(of: "needle", in: lines.string))?.first?.rectValue)
+            #expect(inkPixels(rep, in: needle, origin: visible) > 20, "the glyphs of \"needle\" are drawn in \(needle)")
+            let rowEnd = try #require(lines.rects(forCharacterRange: NSRange(location: NSMaxRange(ranges[9]), length: 0))?
+                .first?.rectValue)
+            let blank = NSRect(x: rowEnd.maxX + DiffMetrics.columnWidth, y: rowEnd.minY,
+                               width: 20 * DiffMetrics.columnWidth, height: rowEnd.height)
+            #expect(inkPixels(rep, in: blank, origin: visible) == 0, "nothing is drawn past the end of row 9")
+        }
+    }
+
+    private struct Reference {
+        let window: NSWindow
+        let scrollView: NSScrollView
+        let textView: NSTextView
+        let storage: NSTextStorage
+
+        @MainActor func close() {
+            window.orderOut(nil)
+            window.close()
+        }
+    }
+
+    private func makeReference(_ string: String) -> Reference {
+        let window = NSWindow(contentRect: NSRect(x: 120, y: 120, width: 800, height: 400),
+                              styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        let storage = NSTextStorage()
+        let layoutManager = NSLayoutManager()
+        storage.addLayoutManager(layoutManager)
+        let container = NSTextContainer(size: NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                                     height: CGFloat.greatestFiniteMagnitude))
+        layoutManager.addTextContainer(container)
+        let textView = NSTextView(frame: scrollView.bounds, textContainer: container)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.usesFindBar = true
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = true
+        textView.textContainerInset = DiffMetrics.textInset
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude,
+                                                       height: CGFloat.greatestFiniteMagnitude)
+        textView.font = DiffMetrics.font
+        textView.string = string
+        scrollView.documentView = textView
+        window.contentView = scrollView
+        window.orderFront(nil)
+        window.makeFirstResponder(textView)
+        layoutManager.ensureLayout(for: container)
+        let used = layoutManager.usedRect(for: container)
+        textView.frame = NSRect(x: 0, y: 0, width: max(scrollView.contentSize.width, used.width + 2 * DiffMetrics.textInset.width),
+                                height: max(scrollView.contentSize.height, used.height + 2 * DiffMetrics.textInset.height))
+        window.layoutIfNeeded()
+        return Reference(window: window, scrollView: scrollView, textView: textView, storage: storage)
+    }
+
+    private func referencePoint(_ reference: Reference, _ location: Int) throws -> NSPoint {
+        let textView = reference.textView
+        let layoutManager = try #require(textView.layoutManager)
+        let container = try #require(textView.textContainer)
+        let glyphs = layoutManager.glyphRange(forCharacterRange: NSRange(location: location, length: 1), actualCharacterRange: nil)
+        let rect = layoutManager.boundingRect(forGlyphRange: glyphs, in: container)
+            .offsetBy(dx: textView.textContainerOrigin.x, dy: textView.textContainerOrigin.y)
+        return NSPoint(x: rect.minX + 0.5, y: rect.midY)
+    }
+
+    private func clickReference(_ reference: Reference, at point: NSPoint, modifiers: NSEvent.ModifierFlags = []) throws {
+        let location = reference.textView.convert(point, to: nil)
+        func event(_ type: NSEvent.EventType) throws -> NSEvent {
+            try #require(NSEvent.mouseEvent(
+                with: type, location: location, modifierFlags: modifiers, timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: reference.window.windowNumber, context: nil, eventNumber: 0, clickCount: 1,
+                pressure: type == .leftMouseUp ? 0 : 1))
+        }
+        NSApp.postEvent(try event(.leftMouseUp), atStart: false)
+        reference.textView.mouseDown(with: try event(.leftMouseDown))
+    }
+
+    private func clusterRow(_ lines: DiffLinesView) throws -> (row: Int, range: NSRange) {
+        let ranges = rowRanges(lines.string)
+        let found = try range(of: clusterRowText, in: lines.string)
+        let row = try #require(row(containing: found.location, ranges))
+        #expect(row == 29)
+        return (row, ranges[row])
+    }
+
+    private func isClusterBoundary(_ index: Int, in string: String) -> Bool {
+        let text = string as NSString
+        guard index > 0, index < text.length else { return true }
+        return text.rangeOfComposedCharacterSequence(at: index).location == index
+    }
+
+    private func clusterRects(_ lines: DiffLinesView, _ token: String) throws -> (cluster: NSRect, next: NSRect) {
+        let found = try range(of: token, in: lines.string)
+        let cluster = try #require(lines.rects(forCharacterRange: found)?.first?.rectValue)
+        let next = try characterRect(lines, NSMaxRange(found))
+        return (cluster, next)
+    }
+
+    @Test func graphemes_hitTestingReturnsClusterBoundaries() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let (row, rowRange) = try clusterRow(lines)
+            let y = lines.geometry.rowTop(row) + DiffMetrics.rowHeight / 2
+            var x: CGFloat = 0
+            var seen = Set<Int>()
+            while x < 600 {
+                let index = lines.characterIndex(at: NSPoint(x: x, y: y))
+                #expect(index >= rowRange.location && index <= NSMaxRange(rowRange))
+                #expect(isClusterBoundary(index, in: lines.string), "x \(x) hit \(index) inside a cluster")
+                seen.insert(index)
+                x += 1
+            }
+            #expect(seen.count > 20)
+        }
+    }
+
+    @Test func graphemes_followingCharactersSitRightAfterTheCluster() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let cw = DiffMetrics.columnWidth
+            let accent = try clusterRects(lines, "e\u{301}")
+            #expect(abs(accent.next.minX - accent.cluster.minX - cw) <= 0.5, "e + combining acute is one column: \(accent)")
+            for token in ["👍🏽", "👨‍👩‍👧", "😀"] {
+                let emoji = try clusterRects(lines, token)
+                let advance = emoji.next.minX - emoji.cluster.minX
+                #expect(advance > cw && advance < 3 * cw, "\(token) renders as one glyph: advance \(advance)")
+                #expect(abs(emoji.cluster.maxX - emoji.next.minX) <= 0.5, "no gap or overlap after \(token)")
+            }
+            let math = try clusterRects(lines, "𝑥")
+            #expect(abs(math.cluster.maxX - math.next.minX) <= 0.5)
+            let (row, rowRange) = try clusterRow(lines)
+            let tab = try range(of: "\tq end", in: lines.string)
+            let tabRect = try characterRect(lines, tab.location)
+            let qRect = try characterRect(lines, tab.location + 1)
+            let offset = tab.location - rowRange.location - lines.rowTexts[row].markerLength
+            let columns = lines.rowTexts[row].columns
+            let tabColumns = CGFloat(columns[offset + 1] - columns[offset])
+            #expect(abs(qRect.minX - tabRect.minX - tabColumns * cw) <= 0.5,
+                    "the tab after CJK expands to \(tabColumns) columns")
+            let cjk = try clusterRects(lines, "漢字かな")
+            #expect(abs(cjk.cluster.maxX - cjk.next.minX) <= 0.5)
+        }
+    }
+
+    @Test func graphemes_pixelsDrawnWhereTheRectsAre() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let (row, _) = try clusterRow(lines)
+            hosted.pane.scroll(toY: lines.geometry.rowTop(row) - 20)
+            lines.setSelectedRange(NSRange(location: 0, length: 0))
+            let visible = lines.visibleRect
+            let rep = try #require(lines.bitmapImageRepForCachingDisplay(in: visible))
+            lines.cacheDisplay(in: visible, to: rep)
+            for token in ["e\u{301}", "x", "👍🏽", "q", "👨‍👩‍👧", "z", "漢字かな", "end"] {
+                let found = try range(of: token, in: lines.string)
+                for rect in lines.rects(forCharacterRange: found)?.map(\.rectValue) ?? [] {
+                    #expect(inkPixels(rep, in: rect, origin: visible) > 5, "\(token.debugDescription) drawn in \(rect)")
+                }
+            }
+            let accent = try range(of: "e\u{301}x", in: lines.string)
+            let afterX = try characterRect(lines, NSMaxRange(accent))
+            #expect(inkPixels(rep, in: afterX.insetBy(dx: 1, dy: 1), origin: visible) == 0, "the space after éx is empty")
+        }
+    }
+
+    @Test func graphemes_selectionCopyAndDragKeepClusters() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let family = try range(of: "👨‍👩‍👧", in: lines.string)
+            lines.setSelectedRange(NSRange(location: family.location + 2, length: 1))
+            lines.copy(nil)
+            #expect(hosted.pasteboard.string(forType: .string) == "👨‍👩‍👧")
+            let accent = try range(of: "e\u{301}", in: lines.string)
+            lines.setSelectedRange(NSRange(location: accent.location + 1, length: 0))
+            #expect(lines.selectedRange() == NSRange(location: accent.location, length: 0))
+            let rect = try #require(lines.rects(forCharacterRange: family)?.first?.rectValue)
+            try await click(lines, at: NSPoint(x: rect.minX + 1, y: rect.midY),
+                            dragTo: NSPoint(x: rect.minX + rect.width * 0.4, y: rect.midY))
+            let selected = lines.selectedRange()
+            #expect(isClusterBoundary(selected.location, in: lines.string) && isClusterBoundary(NSMaxRange(selected), in: lines.string))
+            #expect(lines.accessibilityString(for: NSRange(location: family.location + 1, length: 1)) == "👨‍👩‍👧")
+        }
+    }
+
+    @Test func draw_reusesCachedLines() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let visible = lines.visibleRect
+            lines.display(visible)
+            let built = lines.lineBuildCount
+            #expect(built > 0)
+            lines.display(visible)
+            lines.setSelectedRange(NSRange(location: 3, length: 40))
+            lines.display(visible)
+            #expect(lines.lineBuildCount == built, "drawing the same rows again builds no new lines")
+        }
+    }
+
+    private func checkVisualLineModel(string: NSString, lineCount: Int, line: (Int) -> Int, range: (Int) -> NSRange,
+                                      label: String) {
+        var location = 0
+        for index in 0..<lineCount {
+            let lineRange = range(index)
+            #expect(lineRange.location == location, "\(label) line \(index) starts at \(location): \(lineRange)")
+            let end = NSMaxRange(lineRange)
+            #expect(line(lineRange.location + 1) == index, "\(label) line(for: \(lineRange.location + 1))")
+            #expect(line(end) == index, "\(label) the index after a line's last character belongs to that line")
+            location = end
+        }
+        #expect(location == string.length, "\(label) lines cover the text")
+    }
+
+    @Test func accessibility_wrappedSegmentsAreLinesLikeReference() async throws {
+        try await withSettings(wordWrap: true) {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            hosted.window.setContentSize(NSSize(width: 250, height: 400))
+            try await settle(hosted.window)
+            let string = lines.string as NSString
+            let segments = lines.segmentCounts.reduce(0, +)
+            #expect(segments > lines.geometry.rowCount, "some rows wrap")
+            checkVisualLineModel(string: string, lineCount: segments, line: lines.accessibilityLine(for:),
+                                 range: lines.accessibilityRange(forLine:), label: "lines")
+            let wrapped = try #require(lines.segmentCounts.firstIndex { $0 > 1 })
+            let first = lines.accessibilityLine(for: lines.rowRanges[wrapped].location + 1)
+            let firstRange = lines.accessibilityRange(forLine: first)
+            #expect(string.character(at: NSMaxRange(firstRange) - 1) != 0x0A, "a non-final segment has no newline")
+            lines.setSelectedRange(NSRange(location: NSMaxRange(firstRange), length: 0))
+            #expect(lines.accessibilityInsertionPointLineNumber() == first + 1)
+            let reference = makeReference("short\nalpha beta gamma delta epsilon zeta\nend")
+            defer { reference.close() }
+            let textView = reference.textView
+            textView.isHorizontallyResizable = false
+            textView.textContainer?.widthTracksTextView = true
+            textView.setFrameSize(NSSize(width: 120, height: 400))
+            textView.textContainer?.containerSize = NSSize(width: 120, height: CGFloat.greatestFiniteMagnitude)
+            reference.window.layoutIfNeeded()
+            let referenceString = textView.string as NSString
+            let referenceLines = textView.accessibilityLine(for: referenceString.length) + 1
+            #expect(referenceLines > 3, "the reference wraps")
+            checkVisualLineModel(string: referenceString, lineCount: referenceLines, line: textView.accessibilityLine(for:),
+                                 range: textView.accessibilityRange(forLine:), label: "NSTextView")
+        }
+    }
+
+    @Test func shiftClick_matchesReferenceAnchorRule() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let reference = makeReference(lines.string)
+            defer { reference.close() }
+            let base = rowRanges(lines.string)[5].location
+            enum Step { case set(Int, Int), click(Int), shift(Int) }
+            let cases: [[Step]] = [
+                [.set(100, 20), .shift(50)], [.set(100, 20), .shift(150)], [.set(100, 0), .shift(50)], [.set(100, 0), .shift(150)],
+                [.click(100), .shift(120), .shift(50)], [.click(100), .shift(50), .shift(150)],
+                [.set(100, 20), .shift(110), .shift(60)], [.set(100, 20), .shift(110), .shift(150)],
+                [.set(100, 20), .shift(105)], [.set(100, 20), .shift(115)], [.click(100), .shift(110), .shift(105)],
+            ]
+            for steps in cases {
+                var label = ""
+                for step in steps {
+                    switch step {
+                    case let .set(location, length):
+                        let range = NSRange(location: base + location, length: length)
+                        reference.textView.setSelectedRange(range)
+                        lines.setSelectedRange(range)
+                        label += "set \(location),\(length) "
+                    case let .click(location):
+                        try clickReference(reference, at: try referencePoint(reference, base + location))
+                        try await click(lines, at: try leadingPoint(base + location, lines))
+                        label += "click \(location) "
+                    case let .shift(location):
+                        try clickReference(reference, at: try referencePoint(reference, base + location), modifiers: [.shift])
+                        try await click(lines, at: try leadingPoint(base + location, lines), modifiers: [.shift])
+                        label += "shift \(location) "
+                    }
+                    #expect(lines.selectedRange() == reference.textView.selectedRange(),
+                            "\(label): lines \(lines.selectedRange()) vs NSTextView \(reference.textView.selectedRange())")
+                }
+            }
+        }
+    }
+
+    private func leadingPoint(_ location: Int, _ lines: DiffLinesView) throws -> NSPoint {
+        let rect = try characterRect(lines, location)
+        return NSPoint(x: rect.minX + 0.5, y: rect.midY)
+    }
+
+    @Test func dragSelect_keepsAutoscrollingWhileTheMouseIsHeldOutside() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let clip = hosted.pane.scrollView.contentView
+            let window = hosted.window
+            @MainActor func run(periodicEvents: Int) throws -> CGFloat {
+                hosted.pane.scroll(toY: 0)
+                let start = try point(inside: rowRanges(lines.string)[2].location + 1, lines)
+                let outside = NSPoint(x: start.x, y: clip.bounds.maxY + 40)
+                NSApp.postEvent(try mouseEvent(.leftMouseDragged, at: outside, in: lines), atStart: false)
+                for _ in 0..<periodicEvents {
+                    let periodic = try #require(NSEvent.otherEvent(
+                        with: .periodic, location: .zero, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                        windowNumber: window.windowNumber, context: nil, subtype: 0, data1: 0, data2: 0))
+                    NSApp.postEvent(periodic, atStart: false)
+                }
+                NSApp.postEvent(try mouseEvent(.leftMouseUp, at: outside, in: lines), atStart: false)
+                lines.mouseDown(with: try mouseEvent(.leftMouseDown, at: start, in: lines))
+                while let leftover = NSApp.nextEvent(matching: .any, until: Date(), inMode: .default, dequeue: true) { _ = leftover }
+                return clip.bounds.minY
+            }
+            let once = try run(periodicEvents: 0)
+            let held = try run(periodicEvents: 5)
+            #expect(once > 0, "dragging outside autoscrolls")
+            #expect(held > once + 1, "held outside the view the clip keeps moving: \(held) vs \(once)")
+        }
+    }
+
+    @Test func findIndicator_clipsToEachMatchRect() async throws {
+        try await withSettings(wordWrap: true) {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            hosted.window.setContentSize(NSSize(width: 250, height: 400))
+            try await settle(hosted.window)
+            let ranges = rowRanges(lines.string)
+            let row = try #require(ranges.indices.first { (lines.projections[$0]?.segmentCount ?? 1) >= 2 })
+            let markerLength = lines.rowTexts[row].markerLength
+            let breakIndex = ranges[row].location + markerLength + (try #require(lines.projections[row])).breakOffsets[0]
+            let match = NSRange(location: breakIndex - 2, length: 4)
+            let rects = lines.rects(in: match)
+            #expect(rects.count == 2)
+            let union = rects.reduce(NSRect.null) { $0.union($1) }
+            let scale: CGFloat = 2
+            let bitmap = try #require(NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: Int(lines.bounds.width * scale), pixelsHigh: Int(lines.bounds.height * scale),
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                bytesPerRow: 0, bitsPerPixel: 0))
+            bitmap.size = lines.bounds.size
+            let context = try #require(NSGraphicsContext(bitmapImageRep: bitmap))
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = context
+            let flip = NSAffineTransform()
+            flip.translateX(by: 0, yBy: lines.bounds.height)
+            flip.scaleX(by: 1, yBy: -1)
+            flip.concat()
+            lines.drawCharacters(in: match, forContentView: lines)
+            NSGraphicsContext.restoreGraphicsState()
+            var inkOutside = 0
+            var inkInside = 0
+            var y = union.minY + 1
+            while y < union.maxY - 1 {
+                var x = union.minX + 1
+                while x < union.maxX - 1 {
+                    let alpha = bitmap.colorAt(x: Int(x * scale), y: Int(y * scale))?.alphaComponent ?? 0
+                    if alpha > 0.1 {
+                        if rects.contains(where: { $0.contains(NSPoint(x: x, y: y)) }) { inkInside += 1 } else { inkOutside += 1 }
+                    }
+                    x += 0.5
+                }
+                y += 0.5
+            }
+            #expect(inkInside > 0, "the match is drawn")
+            #expect(inkOutside == 0, "nothing is drawn between the match rects: \(inkOutside) samples")
+        }
+    }
+
+    @Test func pageDown_scrollsThroughTheResponderChain() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let clip = hosted.pane.scrollView.contentView
+            hosted.window.makeKeyAndOrderFront(nil)
+            #expect(hosted.window.makeFirstResponder(lines))
+            let selection = lines.selectedRange()
+            let topY = clip.bounds.minY
+            let pageDown = String(Character(UnicodeScalar(NSPageDownFunctionKey)!))
+            let event = try #require(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: [.function], timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: hosted.window.windowNumber, context: nil, characters: pageDown,
+                charactersIgnoringModifiers: pageDown, isARepeat: false, keyCode: 121))
+            lines.keyDown(with: event)
+            try await drain()
+            #expect(clip.bounds.minY - topY > clip.bounds.height / 2, "Page Down scrolls the pane: clip y \(clip.bounds.minY)")
+            #expect(lines.selectedRange() == selection, "scrolling keeps the selection")
+        }
+    }
+
+    @Test func lineCache_staysNearTheViewport() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted(raw: makeManyRowsRaw(20_000))
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let pane = hosted.pane
+            let bound = lines.lineCacheBoundForTesting
+            let step = pane.scrollView.documentVisibleRect.height
+            var y: CGFloat = 0
+            while y < lines.frame.height {
+                pane.scroll(toY: y)
+                hosted.window.displayIfNeeded()
+                #expect(lines.lineCacheCountForTesting <= bound, "scrolled to \(y): \(lines.lineCacheCountForTesting) > \(bound)")
+                y += step
+            }
+            lines.selectAll(nil)
+            let whole = NSRange(location: 0, length: (lines.string as NSString).length)
+            let rects = try #require(lines.rects(forCharacterRange: whole))
+            #expect(rects.count >= 20_000)
+            _ = lines.characterIndex(at: NSPoint(x: 40, y: 3))
+            #expect(lines.lineCacheCountForTesting <= bound, "select-all and far queries: \(lines.lineCacheCountForTesting) > \(bound)")
+            pane.scroll(toY: lines.frame.height / 2)
+            hosted.window.displayIfNeeded()
+            let builds = lines.lineBuildCount
+            lines.needsDisplay = true
+            hosted.window.displayIfNeeded()
+            #expect(lines.lineBuildCount == builds, "redrawing the viewport reuses cached lines")
+        }
+    }
+
+    @Test func rewrap_clearsProjectionsOfRowsThatFit() async throws {
+        try await withSettings(wordWrap: true) {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let text = hosted.lines.text
+            var wrap = DiffPaneWrap.unwrapped(rowCount: text.rowCount)
+            for column in [8, 13, 5, 200, 9, 400] {
+                wrap = text.rewrapped(wrap, column: column)
+                for row in 0..<wrap.projections.count {
+                    let count = wrap.segmentCounts[row]
+                    #expect((wrap.projections[row] == nil) == (count == 1), "column \(column) row \(row): \(count) segments")
+                    #expect(count == (wrap.projections[row]?.segmentCount ?? 1))
+                }
+            }
+            #expect(wrap.projections.allSatisfy { $0 == nil }, "every row fits at 400 columns")
+        }
+    }
+}
+}

@@ -2665,7 +2665,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         // View menu
         let viewMenuItem = NSMenuItem()
         mainMenu.addItem(viewMenuItem)
-        let viewMenu = NSMenu(title: "View")
+        let viewMenu = KeyEquivalentPassThroughMenu(title: "View")
         viewMenuItem.submenu = viewMenu
 
         let toggleSidebarItem = NSMenuItem(
@@ -2695,6 +2695,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         )
         previousChangeItem.keyEquivalentModifierMask = [.option, .shift]
         viewMenu.addItem(previousChangeItem)
+
+        // VS Code editor.action.toggleWordWrap (Alt+Z), diff tabs only.
+        let wordWrapItem = NSMenuItem(
+            title: "Word Wrap",
+            action: #selector(CalyxWindowController.toggleDiffWordWrap(_:)),
+            keyEquivalent: "z"
+        )
+        wordWrapItem.keyEquivalentModifierMask = [.option]
+        viewMenu.addItem(wordWrapItem)
 
         viewMenu.addItem(.separator())
 

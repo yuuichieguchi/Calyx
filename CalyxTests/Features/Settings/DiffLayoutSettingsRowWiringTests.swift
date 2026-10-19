@@ -173,4 +173,36 @@ final class DiffLayoutSettingsRowWiringTests: XCTestCase {
         XCTAssertEqual(all.firstIndex(of: .gitDiffOverviewRuler), trim + 1)
         XCTAssertNil(SettingsWindowController.sectionHeading(for: .gitDiffOverviewRuler))
     }
+
+    // MARK: - Word wrap row (addendum 2)
+
+    func test_wordWrapSwitch_accessibilityIdentifier() {
+        XCTAssertEqual(AccessibilityID.Settings.gitDiffWordWrapSwitch,
+                       "calyx.settings.appearance.gitDiffWordWrapSwitch")
+    }
+
+    func test_wordWrapSwitch_existsWithTargetAndAction() throws {
+        let toggle = try XCTUnwrap(
+            find(NSSwitch.self, identifier: AccessibilityID.Settings.gitDiffWordWrapSwitch, in: try appearancePaneView())
+        )
+        XCTAssertTrue(toggle.target === SettingsWindowController.shared)
+        XCTAssertNotNil(toggle.action)
+    }
+
+    func test_sessionToggleInitialState_wordWrap_readsSetting() {
+        XCTAssertTrue(SettingsWindowController.sessionToggleInitialState(for: .gitDiffWordWrap),
+                      "default is true")
+        DiffLayoutSettings.wordWrap = false
+        XCTAssertFalse(SettingsWindowController.sessionToggleInitialState(for: .gitDiffWordWrap))
+        DiffLayoutSettings.wordWrap = true
+        XCTAssertTrue(SettingsWindowController.sessionToggleInitialState(for: .gitDiffWordWrap))
+    }
+
+    func test_wordWrapRow_appearancePane_afterOverviewRuler_noHeading() throws {
+        XCTAssertEqual(SettingsRow.gitDiffWordWrap.pane, .appearance)
+        let all = SettingsRow.allCases
+        let ruler = try XCTUnwrap(all.firstIndex(of: .gitDiffOverviewRuler))
+        XCTAssertEqual(all.firstIndex(of: .gitDiffWordWrap), ruler + 1)
+        XCTAssertNil(SettingsWindowController.sectionHeading(for: .gitDiffWordWrap))
+    }
 }

@@ -1,26 +1,72 @@
-// DiffView.swift
-// Calyx
-//
-// Container of the diff panes: one inline `DiffPaneView`, or an
-// `NSSplitView` with the original (left) and modified (right) panes.
-// Rows come from `DiffRowBuilder` (+ `UnchangedRegions` when collapsing
-// is enabled); the effective layout follows `DiffLayoutSettings`.
-
 import AppKit
+
+struct DiffTextStyle {
+    let font: NSFont
+    let boldFont: NSFont
+    let additionText: NSColor
+    let deletionText: NSColor
+    let additionInnerBackground: NSColor
+    let deletionInnerBackground: NSColor
+    let contextText: NSColor
+    let metaText: NSColor
+    let hunkHeaderText: NSColor
+    let hunkHeaderBackground: NSColor
+    let commentText: NSColor
+    let bannerText: NSColor
+
+    @MainActor static var current: DiffTextStyle {
+        DiffTextStyle(font: DiffMetrics.font, boldFont: DiffMetrics.boldFont,
+                      additionText: NSColor(named: "diffAdditionText") ?? NSColor.systemGreen,
+                      deletionText: NSColor(named: "diffDeletionText") ?? NSColor.systemRed,
+                      additionInnerBackground: DiffMetrics.additionInnerBackground,
+                      deletionInnerBackground: DiffMetrics.deletionInnerBackground,
+                      contextText: NSColor.labelColor,
+                      metaText: NSColor.secondaryLabelColor,
+                      hunkHeaderText: NSColor.systemCyan,
+                      hunkHeaderBackground: NSColor.systemCyan.withAlphaComponent(0.06),
+                      commentText: NSColor.systemBlue,
+                      bannerText: NSColor.systemOrange)
+    }
+}
 
 @MainActor
 final class DiffView: NSView {
     static let splitViewDefaultRatio: CGFloat = 0.5
-    static let splitViewMinPaneWidth: CGFloat = 200
+    static let splitViewMinPaneWidth: CGFloat = 100
+
+    private struct Build {
+        let layout: DiffLayout
+        let rows: [DiffLayoutRow]
+        let blocks: [Range<Int>]
+        let panes: [DiffPaneContent]
+        let zones: DiffOverviewZones
+    }
+
+    private struct SharedContent {
+        let displayLines: [DisplayLine]
+        let commentedLineIndices: Set<Int>
+        let regions: [UnchangedRegion]?
+        let revealSnapshot: DiffRevealSnapshot
+        let forcedVisibleDisplayIndices: Set<Int>
+        let bannerMessage: String?
+    }
+
+    private struct ContentAnchor {
+        let displayIndex: Int
+        let offset: Int
+        let delta: CGFloat
+    }
+
+    private enum ScrollTarget {
+        case top
+        case preserved(ContentAnchor?)
+    }
 
     private let inlinePane = DiffPaneView(side: .left, gutterColumns: .dual, accessibilitySuffix: ".inline")
     private let leftPane = DiffPaneView(side: .left, gutterColumns: .single, accessibilitySuffix: ".old")
     private let rightPane = DiffPaneView(side: .right, gutterColumns: .single, accessibilitySuffix: ".new")
     private let splitView = NSSplitView()
     private let rulerView = DiffOverviewRulerView(frame: .zero)
-    /// Trailing constraint of the installed content (inline pane or split
-    /// view): inset by the ruler's width while the ruler is shown.
-    private var contentTrailingConstraint: NSLayoutConstraint?
 
     private(set) var currentDiff: FileDiff?
     var reviewStore: DiffReviewStore?
@@ -33,24 +79,25 @@ final class DiffView: NSView {
             }
         }
     }
-    /// A width-driven layout switch detected in `layout()` is applied on
-    /// the next main-queue turn, outside the layout pass.
-    private var isLayoutSwitchPending = false
     private(set) var displayLines: [DisplayLine] = []
     private(set) var rows: [DiffLayoutRow] = []
+    private(set) var blocks: [Range<Int>] = []
     private(set) var currentLayout: DiffLayout?
+    private var build: Build?
+    private var builds: [DiffLayout: Build] = [:]
+    private var wrapsByLayout: [DiffLayout: [DiffPaneWrap]] = [:]
+    private var geometriesByLayout: [DiffLayout: [DiffRowGeometry]] = [:]
+    private var commentedLineIndices: Set<Int> = []
     private var activePopover: NSPopover?
     private var isSyncingScroll = false
     private var needsInitialDividerPosition = false
-    /// Index into `currentDiff.changes` of the change last navigated to.
     private(set) var currentChangeIndex: Int?
-    /// The panes' selection was placed by navigation or by the user since
-    /// the last rebuild (a rebuild replaces the text and its selection).
     private var hasCaret = false
-    /// Change to reveal once the view has a size and its final layout
-    /// (a new diff is displayed before SwiftUI sizes the view).
     private var pendingRevealChangeIndex: Int?
     private var isRevealScheduled = false
+    private var isUpdatingPanes = false
+    private var needsFocusInCaretPane = false
+    private(set) var geometryPassCountForTesting = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -62,10 +109,19 @@ final class DiffView: NSView {
         fatalError("init(coder:) is not supported")
     }
 
+    var leftPaneForTesting: DiffPaneView { leftPane }
+    var rightPaneForTesting: DiffPaneView { rightPane }
+    var inlinePaneForTesting: DiffPaneView { inlinePane }
+    var blocksForTesting: [Range<Int>] { blocks }
+
     private var activePanes: [DiffPaneView] {
-        switch currentLayout {
+        panes(for: currentLayout ?? .inline)
+    }
+
+    private func panes(for layout: DiffLayout) -> [DiffPaneView] {
+        switch layout {
         case .sideBySide: return [leftPane, rightPane]
-        case .inline, .none: return [inlinePane]
+        case .inline: return [inlinePane]
         }
     }
 
@@ -76,11 +132,8 @@ final class DiffView: NSView {
         splitView.isVertical = true
         splitView.dividerStyle = .thin
         splitView.delegate = self
-        splitView.translatesAutoresizingMaskIntoConstraints = false
         splitView.addSubview(leftPane)
         splitView.addSubview(rightPane)
-
-        inlinePane.translatesAutoresizingMaskIntoConstraints = false
 
         for pane in [inlinePane, leftPane, rightPane] {
             pane.onRowClicked = { [weak self, weak pane] row in
@@ -100,9 +153,6 @@ final class DiffView: NSView {
             self?.rightPane.clearSelection()
             self?.hasCaret = true
         }
-        // VS Code's goToDiff reads only the modified editor's cursor: a
-        // selection the user makes in the original pane moves the modified
-        // pane's caret to the same row.
         leftPane.onSelectionChanged = { [weak self] in self?.mirrorLeftSelectionToCaretPane() }
         rightPane.onBecameFirstResponder = { [weak self] in
             self?.leftPane.clearSelection()
@@ -110,14 +160,11 @@ final class DiffView: NSView {
         }
         inlinePane.onBecameFirstResponder = { [weak self] in self?.hasCaret = true }
 
-        rulerView.translatesAutoresizingMaskIntoConstraints = false
+        inlinePane.isHidden = true
+        splitView.isHidden = true
+        addSubview(inlinePane)
+        addSubview(splitView)
         addSubview(rulerView)
-        NSLayoutConstraint.activate([
-            rulerView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            rulerView.topAnchor.constraint(equalTo: topAnchor),
-            rulerView.bottomAnchor.constraint(equalTo: bottomAnchor),
-            rulerView.widthAnchor.constraint(equalToConstant: DiffOverviewRuler.width),
-        ])
         rulerView.onRevealRow = { [weak self] row in
             guard let self else { return }
             self.cancelPendingReveal()
@@ -139,8 +186,6 @@ final class DiffView: NSView {
         install(resolvedLayout())
     }
 
-    // MARK: Layout
-
     private func resolvedLayout() -> DiffLayout {
         if currentDiff?.isBinary == true { return .inline }
         return DiffLayoutSettings.effectiveLayout(preference: DiffLayoutSettings.preference, width: bounds.width)
@@ -149,62 +194,58 @@ final class DiffView: NSView {
     private func install(_ layout: DiffLayout) {
         guard layout != currentLayout else { return }
         activePopover?.close()
-        let view: NSView
-        switch layout {
-        case .inline:
-            splitView.removeFromSuperview()
-            view = inlinePane
-        case .sideBySide:
-            inlinePane.removeFromSuperview()
-            view = splitView
-            needsInitialDividerPosition = true
+        if let window, let focused = window.firstResponder as? NSView,
+           let outgoing = currentLayout.map(layoutContainer(for:)), focused.isDescendant(of: outgoing) {
+            needsFocusInCaretPane = window.makeFirstResponder(nil)
         }
-        addSubview(view, positioned: .below, relativeTo: rulerView)
-        let trailing = view.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -rulerInset)
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: leadingAnchor),
-            trailing,
-            view.topAnchor.constraint(equalTo: topAnchor),
-            view.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
-        contentTrailingConstraint = trailing
+        inlinePane.isHidden = layout != .inline
+        splitView.isHidden = layout != .sideBySide
+        if layout == .sideBySide { needsInitialDividerPosition = true }
         currentLayout = layout
+    }
+
+    private func layoutContainer(for layout: DiffLayout) -> NSView {
+        layout == .inline ? inlinePane : splitView
+    }
+
+    private func restoreFocusAfterInstall() {
+        guard needsFocusInCaretPane else { return }
+        needsFocusInCaretPane = false
+        window?.makeFirstResponder(caretPane.linesView)
     }
 
     private var rulerInset: CGFloat {
         rulerView.isHidden ? 0 : DiffOverviewRuler.width
     }
 
-    /// Shows or hides the ruler per `DiffLayoutSettings.renderOverviewRuler`.
-    private func applyRulerVisibility() {
-        rulerView.isHidden = !DiffLayoutSettings.renderOverviewRuler
-        contentTrailingConstraint?.constant = -rulerInset
+    private func positionSubviews() {
+        let content = NSRect(x: 0, y: 0, width: max(bounds.width - rulerInset, 0), height: bounds.height)
+        let ruler = NSRect(x: bounds.width - DiffOverviewRuler.width, y: 0, width: DiffOverviewRuler.width,
+                           height: bounds.height)
+        if rulerView.frame != ruler { rulerView.frame = ruler }
+        switch currentLayout {
+        case .sideBySide:
+            if splitView.frame != content { splitView.frame = content }
+            if needsInitialDividerPosition, content.width > 0 {
+                needsInitialDividerPosition = false
+                splitView.adjustSubviews()
+                splitView.setPosition((content.width - splitView.dividerThickness) * Self.splitViewDefaultRatio,
+                                      ofDividerAt: 0)
+            }
+        case .inline, .none:
+            if inlinePane.frame != content { inlinePane.frame = content }
+        }
+        for pane in activePanes { pane.tileForGeometry() }
+    }
+
+    override func resizeSubviews(withOldSize oldSize: NSSize) {
+        refreshPanes()
     }
 
     override func layout() {
         super.layout()
-        // Swapping subviews, constraints and text storage must not happen
-        // during the layout pass: schedule the switch once.
-        if resolvedLayout() != currentLayout, !isLayoutSwitchPending {
-            isLayoutSwitchPending = true
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.isLayoutSwitchPending = false
-                self.applyEffectiveLayout(preserveScroll: true, forceRebuild: false)
-                // The next layout pass runs a reveal deferred until the layout settled.
-                if self.pendingRevealChangeIndex != nil { self.needsLayout = true }
-            }
-        }
-        if needsInitialDividerPosition, currentLayout == .sideBySide, splitView.bounds.width > 0 {
-            needsInitialDividerPosition = false
-            splitView.layoutSubtreeIfNeeded()
-            splitView.setPosition(
-                (splitView.bounds.width - splitView.dividerThickness) * Self.splitViewDefaultRatio,
-                ofDividerAt: 0
-            )
-        }
+        refreshPanes()
         updateRulerViewport()
-        // Reveal outside the layout pass, once the layout is final.
         if pendingRevealChangeIndex != nil, !isRevealScheduled, canRevealNow {
             isRevealScheduled = true
             DispatchQueue.main.async { [weak self] in
@@ -216,7 +257,7 @@ final class DiffView: NSView {
     }
 
     private var canRevealNow: Bool {
-        bounds.height > 0 && !isLayoutSwitchPending && resolvedLayout() == currentLayout
+        bounds.height > 0 && resolvedLayout() == currentLayout
     }
 
     private func performPendingReveal() {
@@ -228,44 +269,241 @@ final class DiffView: NSView {
     @objc private func layoutSettingDidChange(_ notification: Notification) {
         let key = notification.userInfo?[DiffLayoutSettings.changedKeyUserInfoKey] as? String
         if key == DiffLayoutSettings.renderOverviewRulerKey {
-            // The ruler only changes the content inset: no rebuild, so the
-            // caret and scroll position stay.
-            applyRulerVisibility()
-            needsLayout = true
+            rulerView.isHidden = !DiffLayoutSettings.renderOverviewRuler
+            refreshPanes()
+        } else if key == DiffLayoutSettings.wordWrapKey {
+            let wrap = DiffLayoutSettings.wordWrap
+            for pane in [inlinePane, leftPane, rightPane] { pane.wordWrap = wrap }
+            refreshPanes()
+        } else if key == DiffLayoutSettings.layoutPreferenceKey {
+            refreshPanes()
         } else {
-            applyEffectiveLayout(preserveScroll: true, forceRebuild: true)
+            rebuild(preserveScroll: true)
         }
     }
 
-    /// Installs the effective layout and rebuilds. The scroll anchor is read
-    /// from the pane active before the switch, so it survives the switch.
-    private func applyEffectiveLayout(preserveScroll: Bool, forceRebuild: Bool) {
-        let effective = resolvedLayout()
-        let changed = effective != currentLayout
-        guard changed || forceRebuild else { return }
-        let anchor = preserveScroll ? firstVisibleDisplayIndex() : nil
-        let caret = caretDisplayIndex()
-        install(effective)
-        rebuild(anchor: anchor, caretDisplayIndex: caret)
+    private var anchorPane: DiffPaneView { activePanes[activePanes.count - 1] }
+
+    private func refreshPanes() {
+        guard !isUpdatingPanes else { return }
+        isUpdatingPanes = true
+        defer { isUpdatingPanes = false }
+        let layout = resolvedLayout()
+        if currentDiff != nil, layout != currentLayout {
+            switchLayout(to: layout)
+            return
+        }
+        let start = anchorPane.viewportStart()
+        positionSubviews()
+        let panes = activePanes
+        guard let build, let wraps = wrapsByLayout[build.layout] else { return }
+        precondition(wraps.count == panes.count, "one wrap per active pane")
+        let targets = panes.map(\.targetWrappingColumn)
+        let rewrapped = zip(wraps, targets).map { $0.column != $1 }
+        guard rewrapped.contains(true) else {
+            for pane in panes { pane.linesView.updateFrameSize() }
+            return
+        }
+        let newWraps = Self.rewrap(build, wraps, targets: targets, rewrapped: rewrapped)
+        apply(build, wraps: newWraps, textChanged: false, rewrapped: rewrapped)
+        geometryPassCountForTesting += 1
+        if let start {
+            scrollActivePanes(toY: anchorPane.scrollY(for: start))
+        } else {
+            for pane in activePanes { pane.scrollToTop() }
+        }
+        updateRulerViewport()
     }
 
-    // MARK: Scroll sync (side-by-side)
+    private static func rewrap(_ build: Build, _ wraps: [DiffPaneWrap], targets: [Int?],
+                               rewrapped: [Bool]) -> [DiffPaneWrap] {
+        build.panes.indices.map { index in
+            rewrapped[index] ? build.panes[index].text.rewrapped(wraps[index], column: targets[index]) : wraps[index]
+        }
+    }
 
-    /// Both axes follow the other pane, as VS Code's diff editor syncs
-    /// scrollTop and scrollLeft between its two editors.
+    private func switchLayout(to layout: DiffLayout) {
+        guard let build = builds[layout], let wraps = wrapsByLayout[layout],
+              let geometries = geometriesByLayout[layout] else {
+            preconditionFailure("every resolvable layout is built per content generation")
+        }
+        let caret = caretDisplayIndex()
+        let anchor = captureContentAnchor()
+        hasCaret = false
+        install(layout)
+        positionSubviews()
+        let targets = activePanes.map(\.targetWrappingColumn)
+        let rewrapped = zip(wraps, targets).map { $0.column != $1 }
+        if rewrapped.contains(true) {
+            apply(build, wraps: Self.rewrap(build, wraps, targets: targets, rewrapped: rewrapped),
+                  textChanged: false, rewrapped: rewrapped)
+        } else {
+            for pane in activePanes { pane.linesView.updateFrameSize() }
+            adopt(build, geometry: geometries[0])
+        }
+        rulerView.zones = build.zones
+        geometryPassCountForTesting += 1
+        restoreCaret(caret)
+        restoreFocusAfterInstall()
+        scroll(to: .preserved(anchor))
+        updateRulerViewport()
+    }
+
+    private func restoreCaret(_ caret: Int?) {
+        guard let caret, let caretRow = rows.firstIndex(where: {
+            $0.left?.displayIndex == caret || $0.right?.displayIndex == caret
+        }) else { return }
+        caretPane.placeInsertionPoint(atRow: caretRow)
+        hasCaret = true
+    }
+
+    private func scroll(to target: ScrollTarget) {
+        switch target {
+        case .preserved(let anchor?):
+            scrollActivePanes(toY: scrollY(for: anchor))
+        case .top, .preserved(nil):
+            for pane in activePanes { pane.scrollToTop() }
+        }
+    }
+
+    private func rebuild(preserveScroll: Bool) {
+        update(scroll: preserveScroll ? .preserved(captureContentAnchor()) : .top)
+    }
+
+    private func update(scroll: ScrollTarget) {
+        guard let diff = currentDiff, !isUpdatingPanes else { return }
+        isUpdatingPanes = true
+        defer { isUpdatingPanes = false }
+        let caret = caretDisplayIndex()
+        hasCaret = false
+        install(resolvedLayout())
+        let shared = makeSharedContent(diff: diff)
+        let layouts: [DiffLayout] = diff.isBinary ? [.inline] : [.inline, .sideBySide]
+        let newBuilds = makeBuilds(diff: diff, layouts: layouts, shared: shared)
+        displayLines = shared.displayLines
+        commentedLineIndices = shared.commentedLineIndices
+        builds = newBuilds
+        for (layout, layoutBuild) in newBuilds {
+            for (pane, content) in zip(panes(for: layout), layoutBuild.panes) {
+                pane.setGutter(rows: content.gutterRows, commentedLineIndices: shared.commentedLineIndices)
+            }
+        }
+        positionSubviews()
+        let layout = currentLayout ?? resolvedLayout()
+        for (otherLayout, otherBuild) in newBuilds where otherLayout != layout {
+            let panes = panes(for: otherLayout)
+            let wraps = Self.initialWraps(otherBuild, panes: panes)
+            applyContent(otherBuild, to: panes, wraps: wraps, textChanged: true,
+                         rewrapped: Array(repeating: true, count: panes.count))
+        }
+        guard let newBuild = newBuilds[layout] else {
+            preconditionFailure("the installed layout is built")
+        }
+        apply(newBuild, wraps: Self.initialWraps(newBuild, panes: activePanes), textChanged: true,
+              rewrapped: Array(repeating: true, count: activePanes.count))
+        rulerView.zones = newBuild.zones
+        geometryPassCountForTesting += 1
+        restoreCaret(caret)
+        restoreFocusAfterInstall()
+        self.scroll(to: scroll)
+        updateRulerViewport()
+    }
+
+    private static func initialWraps(_ build: Build, panes: [DiffPaneView]) -> [DiffPaneWrap] {
+        zip(build.panes, panes).map { content, pane in
+            content.text.rewrapped(.unwrapped(rowCount: content.text.rowCount), column: pane.targetWrappingColumn)
+        }
+    }
+
+    @discardableResult
+    private func applyContent(_ build: Build, to panes: [DiffPaneView], wraps newWraps: [DiffPaneWrap],
+                              textChanged: Bool, rewrapped: [Bool]) -> [DiffRowGeometry] {
+        precondition(build.panes.count == panes.count && newWraps.count == panes.count, "one wrap per pane")
+        let geometries = Self.geometries(blocks: build.blocks, wraps: newWraps)
+        for (index, pane) in panes.enumerated() {
+            pane.apply(content: build.panes[index], wrap: newWraps[index], geometry: geometries[index],
+                       textChanged: textChanged, rewrapped: rewrapped[index])
+        }
+        wrapsByLayout[build.layout] = newWraps
+        geometriesByLayout[build.layout] = geometries
+        return geometries
+    }
+
+    private func apply(_ build: Build, wraps newWraps: [DiffPaneWrap], textChanged: Bool, rewrapped: [Bool]) {
+        let geometries = applyContent(build, to: activePanes, wraps: newWraps, textChanged: textChanged,
+                                      rewrapped: rewrapped)
+        adopt(build, geometry: geometries[0])
+    }
+
+    private func adopt(_ build: Build, geometry: DiffRowGeometry) {
+        self.build = build
+        rows = build.rows
+        blocks = build.blocks
+        let inset = DiffMetrics.textInset.height
+        rulerView.rowOffsets = (0..<min(build.rows.count, geometry.rowCount)).map { geometry.rowTop($0) - inset }
+        rulerView.documentHeight = build.rows.isEmpty ? 0 : max(geometry.documentHeight - inset, 0)
+    }
+
+    private static func geometries(blocks: [Range<Int>], wraps: [DiffPaneWrap]) -> [DiffRowGeometry] {
+        let rowHeight = DiffMetrics.rowHeight
+        var pads = wraps.map { [CGFloat](repeating: 0, count: $0.segmentCounts.count) }
+        if wraps.count == 2 {
+            let left = wraps[0].segmentCounts.map { CGFloat($0) * rowHeight }
+            let right = wraps[1].segmentCounts.map { CGFloat($0) * rowHeight }
+            for pad in DiffBlockAlignment.padding(blocks: blocks, leftHeights: left, rightHeights: right) {
+                pads[pad.side == .left ? 0 : 1][pad.row] = pad.pad
+            }
+        }
+        return zip(wraps, pads).map { wrap, pads in
+            DiffRowGeometry(segmentCounts: wrap.segmentCounts, pads: pads, rowHeight: rowHeight,
+                            topInset: DiffMetrics.textInset.height)
+        }
+    }
+
+    private func scrollActivePanes(toY y: CGFloat) {
+        for pane in activePanes { pane.scroll(toY: y) }
+    }
+
+    private func displayIndex(ofRow row: Int) -> Int? {
+        rows[row].right?.displayIndex ?? rows[row].left?.displayIndex
+    }
+
+    private func captureContentAnchor() -> ContentAnchor? {
+        guard build != nil, let start = anchorPane.viewportStart() else { return nil }
+        var row = start.row
+        while row < rows.count, displayIndex(ofRow: row) == nil { row += 1 }
+        guard row < rows.count, let index = displayIndex(ofRow: row) else { return nil }
+        guard row != start.row else {
+            return ContentAnchor(displayIndex: index, offset: start.offset, delta: start.delta)
+        }
+        let scrollY = anchorPane.scrollView.documentVisibleRect.minY
+        return ContentAnchor(displayIndex: index, offset: 0, delta: scrollY - anchorPane.linesView.geometry.rowTop(row))
+    }
+
+    private func scrollY(for anchor: ContentAnchor) -> CGFloat {
+        guard !rows.isEmpty else { return 0 }
+        let exact = rows.firstIndex { $0.right?.displayIndex == anchor.displayIndex || $0.left?.displayIndex == anchor.displayIndex }
+        let row = exact ?? rows.firstIndex { row in
+            [row.left?.displayIndex, row.right?.displayIndex].contains { ($0 ?? -1) >= anchor.displayIndex }
+        } ?? rows.count - 1
+        let start = DiffViewportStart(row: row, offset: exact == nil ? 0 : anchor.offset, delta: anchor.delta)
+        return anchorPane.scrollY(for: start)
+    }
+
     @objc private func clipViewBoundsDidChange(_ notification: Notification) {
-        if let source = notification.object as? NSClipView,
-           source === activePanes.first?.scrollView.contentView {
+        guard !isUpdatingPanes, let source = notification.object as? NSClipView else { return }
+        if source === activePanes.first?.scrollView.contentView {
             updateRulerViewport()
         }
-        guard !isSyncingScroll, currentLayout == .sideBySide,
-              let source = notification.object as? NSClipView else { return }
-        let target = source === leftPane.scrollView.contentView ? rightPane : leftPane
+        guard !isSyncingScroll, currentLayout == .sideBySide else { return }
+        let sourcePane = source === leftPane.scrollView.contentView ? leftPane : rightPane
+        let target = sourcePane === leftPane ? rightPane : leftPane
         let targetClip = target.scrollView.contentView
-        // Each pane clamps to its own content (the panes' widths differ), as
-        // each VS Code editor clamps scrollLeft to its own scrollWidth.
+        let proposed = sourcePane.wordWrap
+            ? NSPoint(x: targetClip.bounds.origin.x, y: source.bounds.origin.y)
+            : source.bounds.origin
         let origin = targetClip.constrainBoundsRect(
-            NSRect(origin: source.bounds.origin, size: targetClip.bounds.size)).origin
+            NSRect(origin: proposed, size: targetClip.bounds.size)).origin
         guard targetClip.bounds.origin != origin else { return }
         isSyncingScroll = true
         targetClip.scroll(to: origin)
@@ -273,21 +511,13 @@ final class DiffView: NSView {
         isSyncingScroll = false
     }
 
-    // MARK: Display
-
     func display(diff: FileDiff) {
         let isNewFile = currentDiff?.path != diff.path
-        // Anchor from the pane shown before `diff` may change the layout.
-        let anchor = isNewFile ? nil : firstVisibleDisplayIndex()
-        let caret = isNewFile ? nil : caretDisplayIndex()
+        let anchor = isNewFile ? nil : captureContentAnchor()
         currentDiff = diff
-        install(resolvedLayout())
-        rebuild(anchor: anchor, caretDisplayIndex: caret)
+        update(scroll: isNewFile ? .top : .preserved(anchor))
         if isNewFile {
-            // VS Code revealFirstDiff: a newly opened diff starts at its first change.
             currentChangeIndex = nil
-            // Always deferred to layout() -> main queue: display(diff:) runs
-            // inside SwiftUI's updateNSView, where no layout may be forced.
             pendingRevealChangeIndex = diff.changes.isEmpty ? nil : 0
             needsLayout = true
         }
@@ -298,60 +528,37 @@ final class DiffView: NSView {
         rebuild(preserveScroll: true)
     }
 
-    private func rebuild(preserveScroll: Bool) {
-        rebuild(anchor: preserveScroll ? firstVisibleDisplayIndex() : nil, caretDisplayIndex: caretDisplayIndex())
-    }
-
-    /// Display index of the cursor's row, read before a rebuild replaces
-    /// the text (and its selection) so the caret stays on its line.
     private func caretDisplayIndex() -> Int? {
-        guard hasCaret else { return nil }
-        return caretPane.selectionStartRow.flatMap { rowDisplayIndex($0, cells: caretPane.cells) }
+        guard hasCaret, let row = caretPane.selectionStartRow, row < rows.count else { return nil }
+        return rows[row].left?.displayIndex ?? rows[row].right?.displayIndex
     }
 
-    private func rebuild(anchor: Int?, caretDisplayIndex: Int?) {
-        guard let diff = currentDiff else { return }
-        hasCaret = false
-
-        if diff.isBinary {
-            displayLines = []
-            rows = []
-            rulerView.zones = DiffOverviewRuler.zones(rows: [])
-            rulerView.rowCount = 0
-            inlinePane.setCommentedLineIndices([])
-            displayBinaryMessage()
-            return
+    private func makeSharedContent(diff: FileDiff) -> SharedContent {
+        guard !diff.isBinary else {
+            return SharedContent(displayLines: [], commentedLineIndices: [], regions: nil,
+                                 revealSnapshot: DiffRevealSnapshot(counts: [:], isAllRevealed: false),
+                                 forcedVisibleDisplayIndices: [], bannerMessage: nil)
         }
-
-        let layout = currentLayout ?? resolvedLayout()
-        displayLines = reviewStore?.buildDisplayLines(from: diff.lines) ?? diff.lines.map { .diff($0) }
-
+        let displayLines = reviewStore?.buildDisplayLines(from: diff.lines) ?? diff.lines.map { .diff($0) }
         var commentedLineIndices = Set<Int>()
         for comment in reviewStore?.comments ?? [] {
             let end = comment.endLineIndex ?? comment.lineIndex
             guard comment.lineIndex <= end else { continue }
             commentedLineIndices.formUnion(comment.lineIndex...end)
         }
-
-        var built = DiffRowBuilder.build(displayLines: displayLines, changes: diff.changes, layout: layout)
-
-        // A too-large file was not compared: no line is known to be unchanged.
+        var regions: [UnchangedRegion]?
+        var forced = Set<Int>()
         if DiffLayoutSettings.hideUnchangedRegionsEnabled && !diff.isTooLarge {
-            let regions = UnchangedRegions.fromDiffs(
+            let computed = UnchangedRegions.fromDiffs(
                 changes: diff.changes,
                 originalLineCount: diff.oldLineCount,
                 modifiedLineCount: diff.newLineCount
             )
-            revealState?.updateRegions(regions)
-            let snapshot = revealState?.snapshot ?? DiffRevealSnapshot(counts: [:], isAllRevealed: false)
-            built = UnchangedRegions.apply(
-                rows: built,
-                regions: regions,
-                reveal: snapshot,
-                forcedVisibleDisplayIndices: forcedVisibleDisplayIndices(commentedLineIndices: commentedLineIndices)
-            )
+            revealState?.updateRegions(computed)
+            regions = computed
+            forced = Self.forcedVisibleDisplayIndices(displayLines: displayLines,
+                                                      commentedLineIndices: commentedLineIndices)
         }
-
         let bannerMessage: String?
         if diff.isTooLarge {
             bannerMessage = "File too large to compare (> 50 MB)"
@@ -360,73 +567,295 @@ final class DiffView: NSView {
         } else {
             bannerMessage = nil
         }
-        if bannerMessage != nil {
-            let banner = DiffCell(displayIndex: nil, lineIndex: nil, kind: .banner,
-                                  innerRanges: [], isWholeLineChange: false)
-            built.append(DiffLayoutRow(left: banner, right: layout == .sideBySide ? banner : nil))
-        }
-        rows = built
-        rulerView.zones = DiffOverviewRuler.zones(rows: rows)
-        rulerView.rowCount = rows.count
-
-        // An uncompared file's inline view is the modified file alone.
-        let showsOldNumbers = !(diff.isTooLarge && layout == .inline)
-        for pane in activePanes {
-            let cells = rows.map { row -> DiffCell? in
-                let cell = pane.side == .left ? row.left : row.right
-                return cell.map { Self.clampedToDisplayedText($0, displayLines: displayLines) }
-            }
-            let attributed = Self.attributedString(cells: cells, displayLines: displayLines, bannerMessage: bannerMessage)
-            let gutterRows = cells.map { gutterRow(for: $0, lines: diff.lines, showsOldNumbers: showsOldNumbers) }
-            pane.setCommentedLineIndices(commentedLineIndices)
-            pane.setRows(cells: cells, attributed: attributed, gutterRows: gutterRows)
-        }
-        if let caretDisplayIndex, let caretRow = rows.firstIndex(where: {
-            $0.left?.displayIndex == caretDisplayIndex || $0.right?.displayIndex == caretDisplayIndex
-        }) {
-            caretPane.placeInsertionPoint(atRow: caretRow)
-            hasCaret = true
-        }
-
-        if let anchor {
-            restoreScroll(toDisplayIndex: anchor)
-        } else {
-            for pane in activePanes { pane.scrollToRow(0) }
-        }
-        updateRulerViewport()
+        return SharedContent(displayLines: displayLines, commentedLineIndices: commentedLineIndices,
+                             regions: regions,
+                             revealSnapshot: revealState?.snapshot ?? DiffRevealSnapshot(counts: [:], isAllRevealed: false),
+                             forcedVisibleDisplayIndices: forced, bannerMessage: bannerMessage)
     }
 
-    // MARK: Overview ruler
+    private struct LinePiece: Sendable {
+        let text: String
+        let contentLength: Int
+        let row: DiffPaneRow
+    }
+
+    private struct LinePieces: Sendable {
+        let original: [LinePiece?]
+        let modified: [LinePiece?]
+    }
+
+    private struct LinePieceJob: @unchecked Sendable {
+        let displayLines: [DisplayLine]
+        let original: UnsafeMutableBufferPointer<LinePiece?>
+        let modified: UnsafeMutableBufferPointer<LinePiece?>
+    }
+
+    private struct PaneTextJob: @unchecked Sendable {
+        let cells: [[DiffCell?]]
+        let displayLines: [DisplayLine]
+        let pieces: LinePieces
+        let bannerMessage: String?
+        let style: DiffTextStyle
+        let results: UnsafeMutableBufferPointer<(cells: [DiffCell?], text: DiffPaneText)?>
+    }
+
+    nonisolated private static let linesPerPieceChunk = 64
+
+    nonisolated private static func paneTexts(cells paneCells: [[DiffCell?]], displayLines: [DisplayLine],
+                                              bannerMessage: String?,
+                                              style: DiffTextStyle) -> [(cells: [DiffCell?], text: DiffPaneText)?] {
+        let pieces = linePieces(displayLines)
+        var results = [(cells: [DiffCell?], text: DiffPaneText)?](repeating: nil, count: paneCells.count)
+        results.withUnsafeMutableBufferPointer { buffer in
+            let job = PaneTextJob(cells: paneCells, displayLines: displayLines, pieces: pieces,
+                                  bannerMessage: bannerMessage, style: style, results: buffer)
+            DispatchQueue.concurrentPerform(iterations: paneCells.count) { index in
+                job.results[index] = paneText(cells: job.cells[index], displayLines: job.displayLines,
+                                              pieces: job.pieces, bannerMessage: job.bannerMessage,
+                                              style: job.style)
+            }
+        }
+        return results
+    }
+
+    nonisolated private static func linePieces(_ displayLines: [DisplayLine]) -> LinePieces {
+        var original = [LinePiece?](repeating: nil, count: displayLines.count)
+        var modified = [LinePiece?](repeating: nil, count: displayLines.count)
+        original.withUnsafeMutableBufferPointer { original in
+            modified.withUnsafeMutableBufferPointer { modified in
+                let job = LinePieceJob(displayLines: displayLines, original: original, modified: modified)
+                let count = displayLines.count
+                let chunks = (count + linesPerPieceChunk - 1) / linesPerPieceChunk
+                DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
+                    let lower = chunk * linesPerPieceChunk
+                    for index in lower..<min(lower + linesPerPieceChunk, count) {
+                        guard case .diff(let line) = job.displayLines[index] else { continue }
+                        let piece = linePiece(line, side: .left)
+                        job.original[index] = piece
+                        job.modified[index] = line.newText == nil ? piece : linePiece(line, side: .right)
+                    }
+                }
+            }
+        }
+        return LinePieces(original: original, modified: modified)
+    }
+
+    nonisolated private static func linePiece(_ line: DiffLine, side: DiffSide) -> LinePiece {
+        let (text, contentLength) = displayedText(line, side: side)
+        let units = Array(text.utf16)
+        let marker = units.isEmpty ? 0 : 1
+        return LinePiece(text: text, contentLength: contentLength,
+                         row: DiffPaneRow(rowUnits: units, markerLength: marker, markerColumns: marker))
+    }
+
+    private struct LayoutRows {
+        let layout: DiffLayout
+        let rows: DiffRowLayout
+        let sideCells: [[DiffCell?]]
+    }
+
+    private func makeBuilds(diff: FileDiff, layouts: [DiffLayout], shared: SharedContent) -> [DiffLayout: Build] {
+        guard !diff.isBinary else { return [.inline: Self.binaryBuild()] }
+        let layoutRows = layouts.map { makeRows(diff: diff, layout: $0, shared: shared) }
+        let paneCells = layoutRows.flatMap(\.sideCells)
+        let results = Self.paneTexts(cells: paneCells, displayLines: shared.displayLines,
+                                     bannerMessage: shared.bannerMessage, style: .current)
+        var next = 0
+        var builds: [DiffLayout: Build] = [:]
+        for entry in layoutRows {
+            let showsOldNumbers = !(diff.isTooLarge && entry.layout == .inline)
+            let panes = entry.sideCells.indices.map { _ -> DiffPaneContent in
+                guard let built = results[next] else { preconditionFailure("every pane text is built") }
+                next += 1
+                let gutterRows = built.cells.map { gutterRow(for: $0, lines: diff.lines, showsOldNumbers: showsOldNumbers) }
+                return DiffPaneContent(cells: built.cells, text: built.text, gutterRows: gutterRows)
+            }
+            builds[entry.layout] = Build(layout: entry.layout, rows: entry.rows.rows, blocks: entry.rows.blocks,
+                                         panes: panes, zones: DiffOverviewRuler.zones(rows: entry.rows.rows))
+        }
+        return builds
+    }
+
+    private static func binaryBuild() -> Build {
+        let message = "Binary file \u{2014} cannot display diff"
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .medium),
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        let attributed = NSAttributedString(string: "\n\n\t\(message)", attributes: attrs)
+        let pane = DiffPaneContent(cells: [], text: DiffPaneText(cells: [], attributed: attributed), gutterRows: [])
+        return Build(layout: .inline, rows: [], blocks: [], panes: [pane], zones: DiffOverviewRuler.zones(rows: []))
+    }
+
+    private func makeRows(diff: FileDiff, layout: DiffLayout, shared: SharedContent) -> LayoutRows {
+        var built = DiffRowBuilder.buildLayout(displayLines: shared.displayLines, changes: diff.changes, layout: layout)
+        if let regions = shared.regions {
+            built = UnchangedRegions.apply(
+                layout: built,
+                regions: regions,
+                reveal: shared.revealSnapshot,
+                forcedVisibleDisplayIndices: shared.forcedVisibleDisplayIndices
+            )
+        }
+        if shared.bannerMessage != nil {
+            let banner = DiffCell(displayIndex: nil, lineIndex: nil, kind: .banner,
+                                  innerRanges: [], isWholeLineChange: false)
+            built.rows.append(DiffLayoutRow(left: banner, right: layout == .sideBySide ? banner : nil))
+            built.blocks.append((built.rows.count - 1)..<built.rows.count)
+        }
+        let sides: [DiffSide] = layout == .sideBySide ? [.left, .right] : [.left]
+        let sideCells = sides.map { side in built.rows.map { side == .left ? $0.left : $0.right } }
+        return LayoutRows(layout: layout, rows: built, sideCells: sideCells)
+    }
+
+    nonisolated private static func paneText(cells rawCells: [DiffCell?], displayLines: [DisplayLine],
+                                             pieces: LinePieces, bannerMessage: String?,
+                                             style: DiffTextStyle) -> (cells: [DiffCell?], text: DiffPaneText) {
+        let cells = rawCells.map { cell in cell.map { clampedToDisplayedText($0, displayLines: displayLines) } }
+        guard !cells.isEmpty else {
+            return (cells, DiffPaneText(cells: [], attributed: NSAttributedString()))
+        }
+        let attributes = LineAttributes(style: style)
+        var string = ""
+        var rows: [DiffPaneRow] = []
+        rows.reserveCapacity(cells.count)
+        var runs: [(range: NSRange, attributes: [NSAttributedString.Key: Any])] = []
+        var innerRuns: [(range: NSRange, color: NSColor)] = []
+        var location = 0
+        for (index, cell) in cells.enumerated() {
+            if index > 0 {
+                string.append("\n")
+                location += 1
+            }
+            guard let cell else {
+                rows.append(.empty)
+                continue
+            }
+            let row: DiffPaneRow
+            switch cell.kind {
+            case .line(let type):
+                guard let d = cell.displayIndex, d < displayLines.count, case .diff = displayLines[d] else {
+                    rows.append(.empty)
+                    continue
+                }
+                guard let piece = (cell.textSide == .right ? pieces.modified : pieces.original)[d] else {
+                    preconditionFailure("every diff line has its pieces")
+                }
+                string.append(piece.text)
+                row = piece.row
+                runs.append((NSRange(location: location, length: row.length), attributes.line(type)))
+                if let innerColor = attributes.innerColor(type), !cell.isWholeLineChange {
+                    for range in cell.innerRanges where range.length > 0 && range.location < piece.contentLength {
+                        let length = min(range.length, piece.contentLength - range.location)
+                        innerRuns.append((NSRange(location: location + range.location, length: length), innerColor))
+                    }
+                }
+            case .comment:
+                guard let d = cell.displayIndex, d < displayLines.count,
+                      case .commentBlock(let comment) = displayLines[d] else {
+                    rows.append(.empty)
+                    continue
+                }
+                let text = commentText(comment)
+                let units = Array(text.utf16)
+                let marker = DiffPaneText.marker(cell: cell, range: NSRange(location: 0, length: units.count),
+                                                 units: units)
+                string.append(text)
+                row = DiffPaneRow(rowUnits: units, markerLength: marker.length, markerColumns: marker.columns)
+                runs.append((NSRange(location: location, length: row.length), attributes.comment))
+            case .banner:
+                let text = bannerMessage ?? ""
+                string.append(text)
+                row = DiffPaneRow(rowUnits: Array(text.utf16), markerLength: 0, markerColumns: 0)
+                runs.append((NSRange(location: location, length: row.length), attributes.banner))
+            case .filler, .collapsedRegion:
+                row = .empty
+            }
+            rows.append(row)
+            location += row.length
+        }
+        let attributed = NSMutableAttributedString(string: string, attributes: [.font: style.font])
+        attributed.beginEditing()
+        for run in runs where run.range.length > 0 {
+            attributed.setAttributes(run.attributes, range: run.range)
+        }
+        for run in innerRuns {
+            attributed.addAttribute(.backgroundColor, value: run.color, range: run.range)
+        }
+        attributed.endEditing()
+        return (cells, DiffPaneText(attributed: attributed, rows: rows))
+    }
+
+    private struct LineAttributes {
+        let addition: [NSAttributedString.Key: Any]
+        let deletion: [NSAttributedString.Key: Any]
+        let hunkHeader: [NSAttributedString.Key: Any]
+        let meta: [NSAttributedString.Key: Any]
+        let context: [NSAttributedString.Key: Any]
+        let comment: [NSAttributedString.Key: Any]
+        let banner: [NSAttributedString.Key: Any]
+        let style: DiffTextStyle
+
+        nonisolated init(style: DiffTextStyle) {
+            self.style = style
+            addition = DiffView.lineAttributes(.addition, style: style)
+            deletion = DiffView.lineAttributes(.deletion, style: style)
+            hunkHeader = DiffView.lineAttributes(.hunkHeader, style: style)
+            meta = DiffView.lineAttributes(.meta, style: style)
+            context = DiffView.lineAttributes(.context, style: style)
+            comment = DiffView.commentAttributes(style: style)
+            banner = DiffView.bannerAttributes(style: style)
+        }
+
+        nonisolated func line(_ type: DiffLineType) -> [NSAttributedString.Key: Any] {
+            switch type {
+            case .addition: return addition
+            case .deletion: return deletion
+            case .hunkHeader: return hunkHeader
+            case .meta: return meta
+            case .context: return context
+            }
+        }
+
+        nonisolated func innerColor(_ type: DiffLineType) -> NSColor? {
+            DiffView.innerColor(type, style: style)
+        }
+    }
 
     private func updateRulerViewport() {
         guard let pane = activePanes.first else { return }
-        let range = pane.visibleRowRange
-        rulerView.visibleRows = (range.lowerBound, range.count)
+        rulerView.viewportRect = pane.scrollView.documentVisibleRect
+            .offsetBy(dx: 0, dy: -DiffMetrics.textInset.height)
+        let description = visibleLinesDescription
+        if rulerView.accessibilityValue() as? String != description {
+            rulerView.setAccessibilityValue(description)
+            NSAccessibility.post(element: rulerView, notification: .valueChanged)
+        }
     }
 
-    // MARK: Change navigation (VS Code DiffEditorWidget goToDiff / _goTo)
+    var visibleLinesDescription: String? {
+        let range = visibleRowRange
+        guard let diff = currentDiff, !range.isEmpty, range.upperBound <= rows.count,
+              let first = modifiedLineForCursor(atRow: range.lowerBound),
+              let last = modifiedLineForCursor(atRow: range.upperBound - 1) else { return nil }
+        return "lines \(first)\u{2013}\(last) of \(diff.newLineCount)"
+    }
 
-    /// Rows of the active pane intersecting its viewport.
     var visibleRowRange: Range<Int> {
         activePanes.first?.visibleRowRange ?? 0..<0
     }
 
-    /// The pane holding the modified editor's cursor.
     private var caretPane: DiffPaneView {
         currentLayout == .sideBySide ? rightPane : inlinePane
     }
 
-    /// Places the modified pane's caret on the row of the user's selection
-    /// in the original pane (side-by-side rows are aligned).
     private func mirrorLeftSelectionToCaretPane() {
-        guard currentLayout == .sideBySide, window?.firstResponder === leftPane.textView,
+        guard currentLayout == .sideBySide, window?.firstResponder === leftPane.linesView,
               let row = leftPane.selectionStartRow else { return }
         rightPane.placeInsertionPoint(atRow: row)
         hasCaret = true
     }
 
-    /// Row showing modified line `line` (right cell side-by-side, the
-    /// single cell inline).
     func row(forModifiedLine line: Int) -> Int? {
         rows.indices.first { modifiedLine(ofRow: $0) == line }
     }
@@ -445,7 +874,6 @@ final class DiffView: NSView {
         lineNumbers(of: rows[row].right ?? rows[row].left)?.newLineNumber
     }
 
-    /// Rows showing the mapping's original or modified lines.
     private func rowRange(for mapping: DetailedLineRangeMapping) -> Range<Int>? {
         let original = mapping.original.startLineNumber..<mapping.original.endLineNumberExclusive
         let modified = mapping.modified.startLineNumber..<mapping.modified.endLineNumberExclusive
@@ -462,11 +890,6 @@ final class DiffView: NSView {
         return lo..<(hi + 1)
     }
 
-    /// Modified line of `row`: its modified cell's line, else the modified
-    /// start of the mapping holding its original line, else the nearest
-    /// row above (then below) that has one (filler, comment, collapsed rows).
-    /// Clamped to the last line, as Monaco clamps cursor positions (a pure
-    /// deletion at the end of the file starts at `newLineCount + 1`).
     private func modifiedLineForCursor(atRow row: Int) -> Int? {
         guard let diff = currentDiff, let line = unclampedModifiedLineForCursor(atRow: row) else { return nil }
         return min(line, max(diff.newLineCount, 1))
@@ -490,22 +913,17 @@ final class DiffView: NSView {
         return nil
     }
 
-    /// The modified editor's cursor line: from the modified (right / inline)
-    /// pane's caret, or the row at the vertical centre of the viewport
-    /// without one.
     func currentModifiedLine() -> Int? {
         let row: Int?
         if hasCaret {
             row = caretPane.selectionStartRow
         } else {
-            let visible = visibleRowRange
-            row = visible.isEmpty ? nil : (visible.lowerBound + visible.upperBound - 1) / 2
+            row = activePanes.first?.rowIndexAtViewportCentre
         }
         return row.flatMap(modifiedLineForCursor(atRow:))
     }
 
     func goToDiff(_ direction: DiffChangeNavigator.Direction) {
-        // User navigation wins over a reveal still waiting for layout.
         cancelPendingReveal()
         guard let diff = currentDiff, let line = currentModifiedLine(),
               let target = DiffChangeNavigator.target(changes: diff.changes, currentModifiedLine: line,
@@ -518,14 +936,10 @@ final class DiffView: NSView {
         pendingRevealChangeIndex = nil
     }
 
-    /// Port of `_goTo`: the modified cursor moves to the mapping's modified
-    /// start (clamped to the last line, as Monaco clamps positions), then
-    /// the mapping's rows are revealed in the centre.
     private func goTo(changeIndex index: Int) {
         guard let diff = currentDiff, diff.changes.indices.contains(index) else { return }
         let mapping = diff.changes[index]
         currentChangeIndex = index
-        // The viewport capacity and row geometry must be current.
         layoutSubtreeIfNeeded()
         let caretLine = min(mapping.modified.startLineNumber, max(diff.newLineCount, 1))
         if let caretRow = row(forModifiedLine: caretLine) {
@@ -537,20 +951,21 @@ final class DiffView: NSView {
         }
     }
 
-    /// Centres `range` vertically in every active pane; a range taller than
-    /// the viewport starts at the top (VS Code revealRangeInCenter).
     private func revealRowsInCenter(_ range: Range<Int>) {
-        guard let capacity = activePanes.first?.viewportRowCapacity else { return }
-        let top = range.count >= capacity
-            ? range.lowerBound
-            : range.lowerBound - (capacity - range.count) / 2
-        for pane in activePanes { pane.scrollToRow(max(top, 0)) }
+        guard let pane = activePanes.first else { return }
+        let geometry = pane.linesView.geometry
+        let lo = min(max(range.lowerBound, 0), geometry.rowCount)
+        let hi = min(max(range.upperBound, lo), geometry.rowCount)
+        guard lo < hi else { return }
+        let top = geometry.rowTop(lo)
+        let height = geometry.rowBottom(hi - 1) - top
+        let clipHeight = pane.scrollView.contentView.bounds.height
+        scrollActivePanes(toY: height >= clipHeight ? top : top - (clipHeight - height) / 2)
         updateRulerViewport()
     }
 
-    /// Display indices of commented lines and of comment rows: the
-    /// unchanged regions containing them stay expanded.
-    private func forcedVisibleDisplayIndices(commentedLineIndices: Set<Int>) -> Set<Int> {
+    private static func forcedVisibleDisplayIndices(displayLines: [DisplayLine],
+                                                    commentedLineIndices: Set<Int>) -> Set<Int> {
         var result = Set<Int>()
         var lineIndex = 0
         for (displayIndex, displayLine) in displayLines.enumerated() {
@@ -586,113 +1001,57 @@ final class DiffView: NSView {
                          displayIndex: cell.displayIndex, lineIndex: cell.lineIndex, indicator: indicator)
     }
 
-    // MARK: Scroll preservation
-
-    private func firstVisibleDisplayIndex() -> Int? {
-        guard let pane = activePanes.first, let first = pane.firstVisibleRow else { return nil }
-        let paneCells = pane.cells
-        for row in first..<paneCells.count {
-            if let d = rowDisplayIndex(row, cells: paneCells) { return d }
-        }
-        return nil
-    }
-
-    /// Display index of the row from either side (rows of the pane's
-    /// `cells` correspond to `rows`).
-    private func rowDisplayIndex(_ row: Int, cells: [DiffCell?]) -> Int? {
-        if row < rows.count {
-            return rows[row].left?.displayIndex ?? rows[row].right?.displayIndex
-        }
-        return row < cells.count ? cells[row]?.displayIndex : nil
-    }
-
-    private func restoreScroll(toDisplayIndex anchor: Int) {
-        var target: Int?
-        for (index, row) in rows.enumerated() {
-            let indices = [row.left?.displayIndex, row.right?.displayIndex].compactMap { $0 }
-            if indices.contains(where: { $0 >= anchor }) {
-                target = index
-                break
-            }
-        }
-        let row = target ?? max(rows.count - 1, 0)
-        for pane in activePanes { pane.scrollToRow(row) }
-    }
-
-    // MARK: Attributed string
-
-    private func displayBinaryMessage() {
-        let message = "Binary file — cannot display diff"
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedSystemFont(ofSize: 14, weight: .medium),
-            .foregroundColor: NSColor.secondaryLabelColor,
-        ]
-        inlinePane.showMessage(NSAttributedString(string: "\n\n\t\(message)", attributes: attrs))
-    }
-
-    /// One paragraph per cell, joined by "\n" (the panes' row arithmetic
-    /// depends on it: no other paragraph separator may appear).
     static func attributedString(cells: [DiffCell?], displayLines: [DisplayLine],
                                  bannerMessage: String?) -> NSAttributedString {
-        let result = NSMutableAttributedString()
-        let paragraph = DiffMetrics.rowParagraphStyle
-        let newline = NSAttributedString(string: "\n", attributes: [.font: DiffMetrics.font, .paragraphStyle: paragraph])
+        attributedString(cells: cells, displayLines: displayLines, bannerMessage: bannerMessage, style: .current)
+    }
 
+    nonisolated static func attributedString(cells: [DiffCell?], displayLines: [DisplayLine],
+                                             bannerMessage: String?, style: DiffTextStyle) -> NSAttributedString {
+        let result = NSMutableAttributedString()
         for (index, cell) in cells.enumerated() {
-            if index > 0 { result.append(newline) }
-            guard let cell else {
-                result.append(NSAttributedString(string: "", attributes: [.paragraphStyle: paragraph]))
-                continue
-            }
-            switch cell.kind {
-            case .line(let type):
-                guard let d = cell.displayIndex, d < displayLines.count, case .diff(let line) = displayLines[d] else {
-                    continue
+            if let cell {
+                switch cell.kind {
+                case .line(let type):
+                    if let d = cell.displayIndex, d < displayLines.count, case .diff(let line) = displayLines[d] {
+                        result.append(lineString(line, type: type, cell: cell, style: style))
+                    }
+                case .comment:
+                    if let d = cell.displayIndex, d < displayLines.count,
+                       case .commentBlock(let comment) = displayLines[d] {
+                        result.append(commentString(comment, style: style))
+                    }
+                case .banner:
+                    result.append(NSAttributedString(string: bannerMessage ?? "",
+                                                     attributes: bannerAttributes(style: style)))
+                case .filler, .collapsedRegion:
+                    break
                 }
-                result.append(lineString(line, type: type, cell: cell, paragraph: paragraph))
-            case .comment:
-                guard let d = cell.displayIndex, d < displayLines.count,
-                      case .commentBlock(let comment) = displayLines[d] else { continue }
-                result.append(commentString(comment, paragraph: paragraph))
-            case .banner:
-                let attrs: [NSAttributedString.Key: Any] = [
-                    .font: DiffMetrics.boldFont,
-                    .foregroundColor: NSColor.systemOrange,
-                    .paragraphStyle: paragraph,
-                ]
-                result.append(NSAttributedString(string: bannerMessage ?? "", attributes: attrs))
-            case .filler, .collapsedRegion:
-                // Drawn by DiffTextView (hatch / band + centred label).
-                break
+            }
+            if index < cells.count - 1 {
+                result.append(NSAttributedString(string: "\n", attributes: [.font: style.font]))
             }
         }
         return result
     }
 
-    static let maxDisplayedLineLength = 10_000
-    static let truncationSuffix = " [truncated]"
+    nonisolated static let maxDisplayedLineLength = 10_000
+    nonisolated static let truncationSuffix = " [truncated]"
 
-    /// A line cell's text as displayed: the cell's side of the line,
-    /// truncated to `maxDisplayedLineLength` UTF-16 units (very long lines,
-    /// e.g. minified files), with the characters NSTextView treats as
-    /// line/paragraph breaks replaced one UTF-16 unit for one by visible
-    /// symbols, so UTF-16 inner-range offsets stay valid. `contentLength`
-    /// excludes the truncation suffix.
-    static func displayedText(_ line: DiffLine, side: DiffSide) -> (text: String, contentLength: Int) {
+    nonisolated static func displayedText(_ line: DiffLine, side: DiffSide) -> (text: String, contentLength: Int) {
         var units = Array((side == .left ? line.text : line.modifiedText).utf16)
         let isTruncated = units.count > maxDisplayedLineLength
         if isTruncated {
             var end = maxDisplayedLineLength
-            // Do not split a surrogate pair.
             if UTF16.isTrailSurrogate(units[end]) { end -= 1 }
             units.removeSubrange(end...)
         }
         for i in units.indices {
             switch units[i] {
-            case 0x000D: units[i] = 0x240D // CR -> SYMBOL FOR CARRIAGE RETURN
-            case 0x2028: units[i] = 0x21B5 // LINE SEPARATOR -> DOWNWARDS ARROW WITH CORNER LEFTWARDS
-            case 0x2029: units[i] = 0x00B6 // PARAGRAPH SEPARATOR -> PILCROW SIGN
-            case 0x0085: units[i] = 0x2424 // NEXT LINE -> SYMBOL FOR NEWLINE
+            case 0x000D: units[i] = 0x240D
+            case 0x2028: units[i] = 0x21B5
+            case 0x2029: units[i] = 0x00B6
+            case 0x0085: units[i] = 0x2424
             default: break
             }
         }
@@ -700,9 +1059,7 @@ final class DiffView: NSView {
         return (isTruncated ? content + truncationSuffix : content, units.count)
     }
 
-    /// `cell` with inner ranges (and empty markers) clamped to the displayed
-    /// content of its line, truncation suffix excluded.
-    static func clampedToDisplayedText(_ cell: DiffCell, displayLines: [DisplayLine]) -> DiffCell {
+    nonisolated static func clampedToDisplayedText(_ cell: DiffCell, displayLines: [DisplayLine]) -> DiffCell {
         guard case .line = cell.kind, !cell.innerRanges.isEmpty,
               let d = cell.displayIndex, d < displayLines.count, case .diff(let line) = displayLines[d] else {
             return cell
@@ -716,32 +1073,11 @@ final class DiffView: NSView {
         return clamped
     }
 
-    private static func lineString(_ line: DiffLine, type: DiffLineType, cell: DiffCell,
-                                   paragraph: NSParagraphStyle) -> NSAttributedString {
+    nonisolated private static func lineString(_ line: DiffLine, type: DiffLineType, cell: DiffCell,
+                                               style: DiffTextStyle) -> NSAttributedString {
         let (text, contentLength) = displayedText(line, side: cell.textSide)
-        var attrs: [NSAttributedString.Key: Any] = [.font: DiffMetrics.font, .paragraphStyle: paragraph]
-        let innerColor: NSColor?
-        switch type {
-        case .addition:
-            attrs[.foregroundColor] = NSColor(named: "diffAdditionText") ?? NSColor.systemGreen
-            innerColor = DiffMetrics.additionInnerBackground
-        case .deletion:
-            attrs[.foregroundColor] = NSColor(named: "diffDeletionText") ?? NSColor.systemRed
-            innerColor = DiffMetrics.deletionInnerBackground
-        case .hunkHeader:
-            attrs[.font] = DiffMetrics.boldFont
-            attrs[.foregroundColor] = NSColor.systemCyan
-            attrs[.backgroundColor] = NSColor.systemCyan.withAlphaComponent(0.06)
-            innerColor = nil
-        case .meta:
-            attrs[.foregroundColor] = NSColor.secondaryLabelColor
-            attrs[.obliqueness] = 0.1 as NSNumber
-            innerColor = nil
-        case .context:
-            attrs[.foregroundColor] = NSColor.labelColor
-            innerColor = nil
-        }
-        let string = NSMutableAttributedString(string: text, attributes: attrs)
+        let string = NSMutableAttributedString(string: text, attributes: lineAttributes(type, style: style))
+        let innerColor = innerColor(type, style: style)
         if let innerColor, !cell.isWholeLineChange {
             for range in cell.innerRanges where range.length > 0 && range.location < contentLength {
                 let clamped = NSRange(location: range.location, length: min(range.length, contentLength - range.location))
@@ -751,34 +1087,48 @@ final class DiffView: NSView {
         return string
     }
 
-    private static func commentString(_ comment: ReviewComment, paragraph: NSParagraphStyle) -> NSAttributedString {
-        let font = DiffMetrics.font
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.systemBlue,
-            .paragraphStyle: paragraph,
-        ]
-        let result = NSMutableAttributedString()
-        let config = NSImage.SymbolConfiguration(pointSize: font.pointSize, weight: .regular)
-            .applying(NSImage.SymbolConfiguration(hierarchicalColor: .systemBlue))
-        if let image = NSImage(systemSymbolName: "text.bubble", accessibilityDescription: "Comment")?
-            .withSymbolConfiguration(config) {
-            let attachment = NSTextAttachment()
-            attachment.image = image
-            let side = min(font.ascender - font.descender, DiffMetrics.rowHeight)
-            let width = image.size.height > 0 ? side * image.size.width / image.size.height : side
-            attachment.bounds = NSRect(x: 0, y: font.descender, width: width, height: side)
-            let attachmentString = NSMutableAttributedString(attachment: attachment)
-            attachmentString.addAttributes(attrs, range: NSRange(location: 0, length: attachmentString.length))
-            result.append(attachmentString)
-            result.append(NSAttributedString(string: " ", attributes: attrs))
+    nonisolated private static func lineAttributes(_ type: DiffLineType,
+                                                   style: DiffTextStyle) -> [NSAttributedString.Key: Any] {
+        switch type {
+        case .addition:
+            return [.font: style.font, .foregroundColor: style.additionText]
+        case .deletion:
+            return [.font: style.font, .foregroundColor: style.deletionText]
+        case .hunkHeader:
+            return [.font: style.boldFont, .foregroundColor: style.hunkHeaderText,
+                    .backgroundColor: style.hunkHeaderBackground]
+        case .meta:
+            return [.font: style.font, .foregroundColor: style.metaText, .obliqueness: 0.1 as NSNumber]
+        case .context:
+            return [.font: style.font, .foregroundColor: style.contextText]
         }
-        let prefix = comment.endLineIndex != nil ? "[\(comment.displayLineNumber)] " : ""
-        result.append(NSAttributedString(string: "\(prefix)\(comment.text)", attributes: attrs))
-        return result
     }
 
-    // MARK: - Comment Interaction
+    nonisolated private static func innerColor(_ type: DiffLineType, style: DiffTextStyle) -> NSColor? {
+        switch type {
+        case .addition: return style.additionInnerBackground
+        case .deletion: return style.deletionInnerBackground
+        case .hunkHeader, .meta, .context: return nil
+        }
+    }
+
+    nonisolated private static func commentAttributes(style: DiffTextStyle) -> [NSAttributedString.Key: Any] {
+        [.font: style.font, .foregroundColor: style.commentText]
+    }
+
+    nonisolated private static func bannerAttributes(style: DiffTextStyle) -> [NSAttributedString.Key: Any] {
+        [.font: style.boldFont, .foregroundColor: style.bannerText]
+    }
+
+    nonisolated private static func commentText(_ comment: ReviewComment) -> String {
+        let symbol = String(utf16CodeUnits: [DiffPaneText.commentSymbol], count: 1)
+        let prefix = comment.endLineIndex != nil ? "[\(comment.displayLineNumber)] " : ""
+        return "\(symbol) \(prefix)\(comment.text)"
+    }
+
+    nonisolated private static func commentString(_ comment: ReviewComment, style: DiffTextStyle) -> NSAttributedString {
+        NSAttributedString(string: commentText(comment), attributes: commentAttributes(style: style))
+    }
 
     private func cell(pane: DiffPaneView, row: Int) -> DiffCell? {
         guard row >= 0, row < pane.cells.count else { return nil }
@@ -806,7 +1156,6 @@ final class DiffView: NSView {
     private func handleCollapsedRowAction(pane: DiffPaneView, row: Int, action: CollapsedAction) {
         guard let cell = cell(pane: pane, row: row),
               case .collapsedRegion(let regionID, _) = cell.kind else { return }
-        // revealState.onChanged triggers the rebuild.
         switch action {
         case .expandTop: revealState?.showMoreAbove(regionID: regionID, count: 20)
         case .expandBottom: revealState?.showMoreBelow(regionID: regionID, count: 20)
@@ -905,9 +1254,11 @@ final class DiffView: NSView {
     }
 }
 
-// MARK: - NSSplitViewDelegate
-
 extension DiffView: NSSplitViewDelegate {
+    func splitViewDidResizeSubviews(_ notification: Notification) {
+        refreshPanes()
+    }
+
     func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat,
                    ofSubviewAt dividerIndex: Int) -> CGFloat {
         max(proposedMinimumPosition, Self.splitViewMinPaneWidth)

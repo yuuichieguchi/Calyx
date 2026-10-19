@@ -26,6 +26,8 @@ enum SettingsRow: String, CaseIterable {
     case gitDiffIgnoreTrimWhitespace
     /// Overview ruler at the diff view's trailing edge (VS Code `renderOverviewRuler`).
     case gitDiffOverviewRuler
+    /// Word wrap in the diff view (VS Code `diffEditor.wordWrap`).
+    case gitDiffWordWrap
     case lspAutoInstall
     case lspRequireConfirmation
     case persistentSessions
@@ -47,6 +49,7 @@ enum SettingsRow: String, CaseIterable {
         case .themeColorPreset, .themeColorWell, .themeColorHex,
              .glassOpacity, .glassOpacityCells, .smoothScrolling, .gitDiffPreviewTab,
              .gitDiffLayout, .gitDiffHideUnchangedRegions, .gitDiffIgnoreTrimWhitespace, .gitDiffOverviewRuler,
+             .gitDiffWordWrap,
              .openConfigFileFooter:
             return .appearance
         case .lspAutoInstall, .lspRequireConfirmation:

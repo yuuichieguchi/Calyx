@@ -130,3 +130,78 @@ struct DiffOverviewRulerViewportTests {
         #expect(rect.height == 20)
     }
 }
+
+// MARK: - Pixel geometry (addendum 2: word wrap)
+
+@Suite("DiffOverviewRuler pixel geometry")
+struct DiffOverviewRulerPixelGeometryTests {
+
+    /// scale = 200 / 2000 = 0.1: visible y 500 -> 50, visible height 200 -> 20.
+    @Test func viewport_pixel_proportionalToDocumentHeight() {
+        let rect = DiffOverviewRuler.viewport(visibleRect: CGRect(x: 0, y: 500, width: 600, height: 200),
+                                              documentHeight: 2000, height: 200)
+        #expect(rect.minY == 50)
+        #expect(rect.height == 20)
+    }
+
+    @Test func viewport_pixel_atTop_startsAtZero() {
+        let rect = DiffOverviewRuler.viewport(visibleRect: CGRect(x: 0, y: 0, width: 600, height: 200),
+                                              documentHeight: 2000, height: 200)
+        #expect(rect.minY == 0)
+        #expect(rect.height == 20)
+    }
+
+    /// The viewport includes the text insets (document y -inset at the top,
+    /// documentHeight + inset at the end): the slider stays inside the ruler.
+    @Test func viewport_pixel_pastDocumentEdges_staysInsideRuler() {
+        let top = DiffOverviewRuler.viewport(visibleRect: CGRect(x: 0, y: -4, width: 600, height: 200),
+                                             documentHeight: 2000, height: 200)
+        #expect(top == CGRect(x: 0, y: 0, width: DiffOverviewRuler.width, height: 19.6))
+        let end = DiffOverviewRuler.viewport(visibleRect: CGRect(x: 0, y: 1804, width: 600, height: 200),
+                                             documentHeight: 2000, height: 200)
+        #expect(abs(end.minY - 180.4) < 1e-9)
+        #expect(end.maxY == 200)
+        let beyond = DiffOverviewRuler.viewport(visibleRect: CGRect(x: 0, y: 2100, width: 600, height: 200),
+                                                documentHeight: 2000, height: 200)
+        #expect(beyond.height == 0 && beyond.maxY <= 200)
+    }
+
+    /// Zones shorter than the minimum mark height grow to it; a mark at the
+    /// bottom edge is moved up so it stays inside the ruler.
+    @Test func zoneRect_minimumHeight_staysInsideRuler() {
+        let x = DiffOverviewRuler.columnWidth
+        let mid = DiffOverviewRuler.zoneRect(top: 100, bottom: 105, scale: 0.1, x: x, height: 200)
+        #expect(mid == CGRect(x: x, y: 10, width: DiffOverviewRuler.columnWidth,
+                              height: DiffOverviewRuler.minimumMarkHeight))
+        let last = DiffOverviewRuler.zoneRect(top: 1995, bottom: 2000, scale: 0.1, x: x, height: 200)
+        #expect(last.maxY == 200)
+        #expect(last.height == DiffOverviewRuler.minimumMarkHeight)
+        let tall = DiffOverviewRuler.zoneRect(top: 500, bottom: 1000, scale: 0.1, x: 0, height: 200)
+        #expect(tall == CGRect(x: 0, y: 50, width: DiffOverviewRuler.columnWidth, height: 50))
+    }
+
+    /// A ruler shorter than the minimum mark height clamps the mark to the
+    /// ruler (it never extends below it).
+    @Test(arguments: [CGFloat(1), 0])
+    func zoneRect_rulerShorterThanMinimum_staysInsideRuler(height: CGFloat) {
+        let rect = DiffOverviewRuler.zoneRect(top: 0, bottom: 5, scale: 0.1, x: 0, height: height)
+        #expect(rect.minY >= 0)
+        #expect(rect.maxY <= height)
+        #expect(rect.height == height)
+    }
+
+    /// Rows start at y 0, 20, 60.
+    @Test func rowIndex_atDocumentY_binarySearchesOffsets() {
+        let offsets: [CGFloat] = [0, 20, 60]
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 25, rowOffsets: offsets) == 1)
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 70, rowOffsets: offsets) == 2)
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 0, rowOffsets: offsets) == 0)
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 20, rowOffsets: offsets) == 1)
+    }
+
+    @Test func rowIndex_outOfRange_clamps() {
+        let offsets: [CGFloat] = [0, 20, 60]
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: -5, rowOffsets: offsets) == 0)
+        #expect(DiffOverviewRuler.rowIndex(atDocumentY: 1000, rowOffsets: offsets) == 2)
+    }
+}
