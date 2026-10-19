@@ -164,10 +164,10 @@ struct UnchangedRegionsApplyTests {
 
     private func makeFixture() -> Fixture {
         var lines: [DiffLine] = []
-        for n in 1...9 { lines.append(DiffLine(type: .context, text: " l\(n)", oldLineNumber: n, newLineNumber: n)) }
-        lines.append(DiffLine(type: .deletion, text: "-old10", oldLineNumber: 10, newLineNumber: nil))
-        lines.append(DiffLine(type: .addition, text: "+new10", oldLineNumber: nil, newLineNumber: 10))
-        for n in 11...20 { lines.append(DiffLine(type: .context, text: " l\(n)", oldLineNumber: n, newLineNumber: n)) }
+        for n in 1...9 { lines.append(DiffLine(type: .context, text: "l\(n)", oldLineNumber: n, newLineNumber: n)) }
+        lines.append(DiffLine(type: .deletion, text: "old10", oldLineNumber: 10, newLineNumber: nil))
+        lines.append(DiffLine(type: .addition, text: "new10", oldLineNumber: nil, newLineNumber: 10))
+        for n in 11...20 { lines.append(DiffLine(type: .context, text: "l\(n)", oldLineNumber: n, newLineNumber: n)) }
         let changes = [mapping(orig: (10, 11), mod: (10, 11))]
         let displayLines = DiffReviewStore().buildDisplayLines(from: lines)
         let rows = DiffRowBuilder.build(displayLines: displayLines, changes: changes, layout: .sideBySide)

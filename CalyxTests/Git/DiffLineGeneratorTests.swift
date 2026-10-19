@@ -32,8 +32,8 @@ struct DiffLineGeneratorTests {
     @Test func noChanges_allContextWithBothNumbers() {
         let result = DiffLineGenerator.lines(content: content(["a", "b"], ["a", "b"]), changes: [])
         #expect(result == [
-            DiffLine(type: .context, text: " a", oldLineNumber: 1, newLineNumber: 1),
-            DiffLine(type: .context, text: " b", oldLineNumber: 2, newLineNumber: 2),
+            DiffLine(type: .context, text: "a", oldLineNumber: 1, newLineNumber: 1),
+            DiffLine(type: .context, text: "b", oldLineNumber: 2, newLineNumber: 2),
         ])
     }
 
@@ -43,11 +43,11 @@ struct DiffLineGeneratorTests {
             changes: [mapping(2, 3, 2, 4)]
         )
         #expect(result == [
-            DiffLine(type: .context, text: " a", oldLineNumber: 1, newLineNumber: 1),
-            DiffLine(type: .deletion, text: "-b", oldLineNumber: 2, newLineNumber: nil),
-            DiffLine(type: .addition, text: "+x", oldLineNumber: nil, newLineNumber: 2),
-            DiffLine(type: .addition, text: "+y", oldLineNumber: nil, newLineNumber: 3),
-            DiffLine(type: .context, text: " c", oldLineNumber: 3, newLineNumber: 4),
+            DiffLine(type: .context, text: "a", oldLineNumber: 1, newLineNumber: 1),
+            DiffLine(type: .deletion, text: "b", oldLineNumber: 2, newLineNumber: nil),
+            DiffLine(type: .addition, text: "x", oldLineNumber: nil, newLineNumber: 2),
+            DiffLine(type: .addition, text: "y", oldLineNumber: nil, newLineNumber: 3),
+            DiffLine(type: .context, text: "c", oldLineNumber: 3, newLineNumber: 4),
         ])
     }
 
@@ -57,9 +57,9 @@ struct DiffLineGeneratorTests {
             changes: [mapping(2, 2, 2, 3)]
         )
         #expect(result == [
-            DiffLine(type: .context, text: " a", oldLineNumber: 1, newLineNumber: 1),
-            DiffLine(type: .addition, text: "+b", oldLineNumber: nil, newLineNumber: 2),
-            DiffLine(type: .context, text: " c", oldLineNumber: 2, newLineNumber: 3),
+            DiffLine(type: .context, text: "a", oldLineNumber: 1, newLineNumber: 1),
+            DiffLine(type: .addition, text: "b", oldLineNumber: nil, newLineNumber: 2),
+            DiffLine(type: .context, text: "c", oldLineNumber: 2, newLineNumber: 3),
         ])
     }
 
@@ -69,9 +69,9 @@ struct DiffLineGeneratorTests {
             changes: [mapping(2, 3, 2, 2)]
         )
         #expect(result == [
-            DiffLine(type: .context, text: " a", oldLineNumber: 1, newLineNumber: 1),
-            DiffLine(type: .deletion, text: "-b", oldLineNumber: 2, newLineNumber: nil),
-            DiffLine(type: .context, text: " c", oldLineNumber: 3, newLineNumber: 2),
+            DiffLine(type: .context, text: "a", oldLineNumber: 1, newLineNumber: 1),
+            DiffLine(type: .deletion, text: "b", oldLineNumber: 2, newLineNumber: nil),
+            DiffLine(type: .context, text: "c", oldLineNumber: 3, newLineNumber: 2),
         ])
     }
 
@@ -81,11 +81,11 @@ struct DiffLineGeneratorTests {
             changes: [mapping(1, 1, 1, 2), mapping(2, 3, 3, 3), mapping(4, 4, 4, 5)]
         )
         #expect(result == [
-            DiffLine(type: .addition, text: "+z", oldLineNumber: nil, newLineNumber: 1),
-            DiffLine(type: .context, text: " a", oldLineNumber: 1, newLineNumber: 2),
-            DiffLine(type: .deletion, text: "-b", oldLineNumber: 2, newLineNumber: nil),
-            DiffLine(type: .context, text: " c", oldLineNumber: 3, newLineNumber: 3),
-            DiffLine(type: .addition, text: "+d", oldLineNumber: nil, newLineNumber: 4),
+            DiffLine(type: .addition, text: "z", oldLineNumber: nil, newLineNumber: 1),
+            DiffLine(type: .context, text: "a", oldLineNumber: 1, newLineNumber: 2),
+            DiffLine(type: .deletion, text: "b", oldLineNumber: 2, newLineNumber: nil),
+            DiffLine(type: .context, text: "c", oldLineNumber: 3, newLineNumber: 3),
+            DiffLine(type: .addition, text: "d", oldLineNumber: nil, newLineNumber: 4),
         ])
     }
 
@@ -95,8 +95,8 @@ struct DiffLineGeneratorTests {
             changes: [mapping(1, 1, 1, 3)]
         )
         #expect(result == [
-            DiffLine(type: .addition, text: "+a", oldLineNumber: nil, newLineNumber: 1),
-            DiffLine(type: .addition, text: "+b", oldLineNumber: nil, newLineNumber: 2),
+            DiffLine(type: .addition, text: "a", oldLineNumber: nil, newLineNumber: 1),
+            DiffLine(type: .addition, text: "b", oldLineNumber: nil, newLineNumber: 2),
         ])
     }
 

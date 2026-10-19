@@ -12,6 +12,7 @@
 // is opened with the "Show Git Changes" palette command, and the file row
 // calyx.git.file.<path> is clicked.
 
+import AppKit
 import XCTest
 
 final class DiffLayoutE2ETests: CalyxUITestCase {
@@ -309,7 +310,7 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
                       "[\(step)] More Actions menu must close", file: file, line: line)
     }
 
-    func test_longDiff_inline_scrollLayoutAndWrapSmoke() {
+    private func openLongDiffInline() {
         waitForMainWindow()
         let pane = terminalPane()
         XCTAssertTrue(waitFor(pane, timeout: 10), "terminal pane not found")
@@ -325,7 +326,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         )
         XCTAssertEqual(setup, "ready", "fixture repo setup failed: \(setup)")
         typeIntoPane("cd \(repoDir)\n")
-        // shell() waits for its own completion marker, so this runs after the cd.
         XCTAssertEqual(shell("pwd"), repoDir, "pane cwd must be the fixture repo")
 
         openCommandPaletteViaMenu()
@@ -340,7 +340,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         XCTAssertTrue(waitFor(longRow, timeout: 20), "long.txt row must appear")
         shot("00-before-open")
 
-        // Set inline on a small diff first so the long diff opens inline.
         notesRow.click()
         XCTAssertTrue(waitFor(element("calyx.diff.toolbar"), timeout: 10), "a diff tab must open")
         chooseDiffView("Inline")
@@ -348,6 +347,10 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
                       "notes.txt must switch to the inline gutter")
 
         longRow.click()
+    }
+
+    func test_longDiff_inline_scrollLayoutAndWrapSmoke() {
+        openLongDiffInline()
         let content = longDiffContent()
         XCTAssertTrue(waitFor(content, timeout: 10),
                       "[open] the diff tab must show long.txt (AX label \"Diff of …long.txt\")")
@@ -407,5 +410,107 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         XCTAssertTrue(app.state == .runningForeground || app.state == .runningBackground,
                       "[automatic] app must still be running (state: \(app.state.rawValue))")
         shot("07-automatic")
+    }
+
+    func test_diffBody_contextMenu_opensOnRightClickAndControlClick() {
+        openLongDiffInline()
+        let content = longDiffContent()
+        XCTAssertTrue(waitFor(content, timeout: 10), "the diff tab must show long.txt")
+        XCTAssertTrue(waitUntil { visibleLines()?.total == 3000 }, "the long diff must be laid out")
+        let copy = app.menuItems["calyx.diff.contextMenu.copy"]
+        let selectAll = app.menuItems["calyx.diff.contextMenu.selectAll"]
+        let target = content.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.5))
+
+        target.rightClick()
+        XCTAssertTrue(waitFor(copy, timeout: 5), "right-click must show Copy")
+        XCTAssertTrue(waitFor(selectAll, timeout: 5), "right-click must show Select All")
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(waitUntil(timeout: 5) { !copy.exists && !selectAll.exists }, "Escape must close the right-click menu")
+
+        XCUIElement.perform(withKeyModifiers: .control) { target.click() }
+        XCTAssertTrue(waitFor(copy, timeout: 5), "Control-click must show Copy")
+        XCTAssertTrue(waitFor(selectAll, timeout: 5), "Control-click must show Select All")
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(waitUntil(timeout: 5) { !copy.exists && !selectAll.exists }, "Escape must close the Control-click menu")
+    }
+
+    private func verticalScrollValue(_ content: XCUIElement) -> String {
+        content.scrollViews.allElementsBoundByIndex
+            .map { scrollView in String(describing: scrollView.scrollBars.allElementsBoundByIndex.map { $0.value }) }
+            .joined(separator: " | ")
+    }
+
+    private func assertDragSelectionKeepsViewport(_ step: String, in content: XCUIElement,
+                                                  from start: CGVector, to end: CGVector,
+                                                  file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(waitUntil { visibleLines()?.total == 3000 }, "[\(step)] the long diff must be laid out",
+                      file: file, line: line)
+        Thread.sleep(forTimeInterval: 1.0)
+        guard let before = visibleLines() else {
+            XCTFail("[\(step)] overview ruler must report the visible lines", file: file, line: line)
+            return
+        }
+        let scrollBefore = verticalScrollValue(content)
+        NSPasteboard.general.clearContents()
+        let from = content.coordinate(withNormalizedOffset: start)
+        let to = content.coordinate(withNormalizedOffset: end)
+        from.click(forDuration: 0.3, thenDragTo: to, withVelocity: .slow, thenHoldForDuration: 1.5)
+        Thread.sleep(forTimeInterval: 0.5)
+        let after = visibleLines()
+        let scrollAfter = verticalScrollValue(content)
+        app.typeKey("c", modifierFlags: .command)
+        XCTAssertTrue(waitUntil(timeout: 3) { !(NSPasteboard.general.string(forType: .string) ?? "").isEmpty },
+                      "[\(step)] the drag must select text that Copy puts on the pasteboard", file: file, line: line)
+        XCTAssertTrue(after.map { $0.first == before.first && $0.last == before.last } ?? false,
+                      "[\(step)] drag-selecting inside the body must not scroll: before \(before) after \(String(describing: after)); scrollers before \(scrollBefore) after \(scrollAfter)",
+                      file: file, line: line)
+    }
+
+    private func openLongDiffShowingEdit() -> XCUIElement {
+        openLongDiffInline()
+        let content = longDiffContent()
+        XCTAssertTrue(waitFor(content, timeout: 10), "the diff tab must show long.txt")
+        XCTAssertTrue(waitUntil { visibleLines().map { $0.total == 3000 && ($0.first...$0.last).contains(2700) } ?? false },
+                      "the viewport must show line 2700 (ruler: \(String(describing: overviewRuler().value)))")
+        return content
+    }
+
+    func test_diffBody_dragSelect_inline_keepsViewport() {
+        let content = openLongDiffShowingEdit()
+        assertDragSelectionKeepsViewport("inline", in: content,
+                                         from: CGVector(dx: 0.3, dy: 0.45), to: CGVector(dx: 0.6, dy: 0.55))
+    }
+
+    func test_diffBody_dragSelect_inlineWithoutWordWrap_keepsViewport() {
+        let content = openLongDiffShowingEdit()
+        toggleWordWrapFromMoreActions()
+        waitForMenuClosed(item: "Word Wrap", "wrap off")
+        assertDragSelectionKeepsViewport("inline wrap off", in: content,
+                                         from: CGVector(dx: 0.3, dy: 0.45), to: CGVector(dx: 0.6, dy: 0.55))
+    }
+
+    func test_diffBody_dragSelect_sideBySide_keepsViewport() {
+        let content = openLongDiffShowingEdit()
+        chooseDiffView("Side by Side")
+        XCTAssertTrue(waitFor(element("calyx.diff.lineNumbers.new"), timeout: 5), "Side by Side must show the new gutter")
+        assertDragSelectionKeepsViewport("side by side right", in: content,
+                                         from: CGVector(dx: 0.62, dy: 0.45), to: CGVector(dx: 0.8, dy: 0.55))
+        assertDragSelectionKeepsViewport("side by side left", in: content,
+                                         from: CGVector(dx: 0.15, dy: 0.45), to: CGVector(dx: 0.35, dy: 0.55))
+    }
+
+    func test_diffBody_dragSelect_afterAddCommentButton_keepsViewport() {
+        let content = openLongDiffShowingEdit()
+        let gutter = element("calyx.diff.lineNumbers.inline")
+        XCTAssertTrue(waitFor(gutter, timeout: 5), "the inline gutter must exist")
+        let plus = gutter.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0.5)).withOffset(CGVector(dx: 10, dy: 0))
+        plus.hover()
+        Thread.sleep(forTimeInterval: 0.5)
+        plus.click()
+        Thread.sleep(forTimeInterval: 1.0)
+        app.typeKey(.escape, modifierFlags: [])
+        Thread.sleep(forTimeInterval: 0.5)
+        assertDragSelectionKeepsViewport("after + then Escape", in: content,
+                                         from: CGVector(dx: 0.3, dy: 0.45), to: CGVector(dx: 0.6, dy: 0.55))
     }
 }

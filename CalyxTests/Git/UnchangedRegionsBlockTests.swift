@@ -32,10 +32,10 @@ private struct Fixture {
 @MainActor
 private func makeOneToOne() -> Fixture {
     var lines: [DiffLine] = []
-    for n in 1...9 { lines.append(DiffLine(type: .context, text: " l\(n)", oldLineNumber: n, newLineNumber: n)) }
-    lines.append(DiffLine(type: .deletion, text: "-old10", oldLineNumber: 10, newLineNumber: nil))
-    lines.append(DiffLine(type: .addition, text: "+new10", oldLineNumber: nil, newLineNumber: 10))
-    for n in 11...20 { lines.append(DiffLine(type: .context, text: " l\(n)", oldLineNumber: n, newLineNumber: n)) }
+    for n in 1...9 { lines.append(DiffLine(type: .context, text: "l\(n)", oldLineNumber: n, newLineNumber: n)) }
+    lines.append(DiffLine(type: .deletion, text: "old10", oldLineNumber: 10, newLineNumber: nil))
+    lines.append(DiffLine(type: .addition, text: "new10", oldLineNumber: nil, newLineNumber: 10))
+    for n in 11...20 { lines.append(DiffLine(type: .context, text: "l\(n)", oldLineNumber: n, newLineNumber: n)) }
     let changes = [mapping(orig: (10, 11), mod: (10, 11))]
     let displayLines = DiffReviewStore().buildDisplayLines(from: lines)
     let layout = DiffRowBuilder.buildLayout(displayLines: displayLines, changes: changes, layout: .sideBySide)
@@ -49,10 +49,10 @@ private func makeOneToOne() -> Fixture {
 @MainActor
 private func makeOneToThree() -> Fixture {
     var lines: [DiffLine] = []
-    for n in 1...9 { lines.append(DiffLine(type: .context, text: " l\(n)", oldLineNumber: n, newLineNumber: n)) }
-    lines.append(DiffLine(type: .deletion, text: "-old10", oldLineNumber: 10, newLineNumber: nil))
-    for n in 10...12 { lines.append(DiffLine(type: .addition, text: "+new\(n)", oldLineNumber: nil, newLineNumber: n)) }
-    for n in 11...20 { lines.append(DiffLine(type: .context, text: " l\(n)", oldLineNumber: n, newLineNumber: n + 2)) }
+    for n in 1...9 { lines.append(DiffLine(type: .context, text: "l\(n)", oldLineNumber: n, newLineNumber: n)) }
+    lines.append(DiffLine(type: .deletion, text: "old10", oldLineNumber: 10, newLineNumber: nil))
+    for n in 10...12 { lines.append(DiffLine(type: .addition, text: "new\(n)", oldLineNumber: nil, newLineNumber: n)) }
+    for n in 11...20 { lines.append(DiffLine(type: .context, text: "l\(n)", oldLineNumber: n, newLineNumber: n + 2)) }
     let changes = [mapping(orig: (10, 11), mod: (10, 13))]
     let displayLines = DiffReviewStore().buildDisplayLines(from: lines)
     let layout = DiffRowBuilder.buildLayout(displayLines: displayLines, changes: changes, layout: .sideBySide)

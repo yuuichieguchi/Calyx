@@ -124,12 +124,10 @@ struct DiffPaneText {
     static func marker(cell: DiffCell?, range: NSRange, units: [UInt16]) -> (length: Int, columns: Int) {
         guard let cell, range.length > 0 else { return (0, 0) }
         switch cell.kind {
-        case .line:
-            return (1, 1)
         case .comment:
             guard range.length >= 2, units[range.location] == commentSymbol else { return (0, 0) }
             return (2, commentSymbolColumns + 1)
-        case .filler, .collapsedRegion, .banner:
+        case .line, .filler, .collapsedRegion, .banner:
             return (0, 0)
         }
     }

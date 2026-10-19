@@ -12,15 +12,15 @@ import Testing
 // MARK: - Helpers
 
 private func ctx(_ text: String, _ old: Int, _ new: Int) -> DiffLine {
-    DiffLine(type: .context, text: " " + text, oldLineNumber: old, newLineNumber: new)
+    DiffLine(type: .context, text: text, oldLineNumber: old, newLineNumber: new)
 }
 
 private func del(_ text: String, _ old: Int) -> DiffLine {
-    DiffLine(type: .deletion, text: "-" + text, oldLineNumber: old, newLineNumber: nil)
+    DiffLine(type: .deletion, text: text, oldLineNumber: old, newLineNumber: nil)
 }
 
 private func add(_ text: String, _ new: Int) -> DiffLine {
-    DiffLine(type: .addition, text: "+" + text, oldLineNumber: nil, newLineNumber: new)
+    DiffLine(type: .addition, text: text, oldLineNumber: nil, newLineNumber: new)
 }
 
 private func mapping(
@@ -195,19 +195,17 @@ struct DiffRowBuilderSideBySideTests {
         let rows = build(Self.innerLines, Self.innerChanges, .sideBySide)
         expectRows(rows, [
             (.line(display: 0, line: 0, .context), .line(display: 0, line: 0, .context)),
-            (.line(display: 1, line: 1, .deletion, inner: [NSRange(location: 5, length: 3)]),
-             .line(display: 4, line: 4, .addition, inner: [NSRange(location: 5, length: 4)])),
+            (.line(display: 1, line: 1, .deletion, inner: [NSRange(location: 4, length: 3)]),
+             .line(display: 4, line: 4, .addition, inner: [NSRange(location: 4, length: 4)])),
             (.line(display: 2, line: 2, .deletion), .line(display: 5, line: 5, .addition)),
             (.filler, .line(display: 6, line: 6, .addition)),
-            (.line(display: 3, line: 3, .deletion, inner: [NSRange(location: 1, length: 9)]),
-             .line(display: 7, line: 7, .addition, inner: [NSRange(location: 1, length: 11)])),
+            (.line(display: 3, line: 3, .deletion, inner: [NSRange(location: 0, length: 9)]),
+             .line(display: 7, line: 7, .addition, inner: [NSRange(location: 0, length: 11)])),
             (.line(display: 8, line: 8, .context), .line(display: 8, line: 8, .context)),
         ])
     }
 
     @Test func emptyInnerRange_preservedAsZeroLength() {
-        // orig line 3 "abcXdef", mod line 3 "abcdef": X deleted.
-        // orig 3:4-3:5 <-> mod 3:4-3:4 (insertion point on the modified side).
         let lines = [ctx("a", 1, 1), ctx("b", 2, 2), del("abcXdef", 3), add("abcdef", 3)]
         let changes = [mapping(orig: (3, 4), mod: (3, 4),
                                inner: [inner(orig: (3, 4, 3, 5), mod: (3, 4, 3, 4))])]
@@ -215,8 +213,8 @@ struct DiffRowBuilderSideBySideTests {
         expectRows(rows, [
             (.line(display: 0, line: 0, .context), .line(display: 0, line: 0, .context)),
             (.line(display: 1, line: 1, .context), .line(display: 1, line: 1, .context)),
-            (.line(display: 2, line: 2, .deletion, inner: [NSRange(location: 4, length: 1)]),
-             .line(display: 3, line: 3, .addition, inner: [NSRange(location: 4, length: 0)])),
+            (.line(display: 2, line: 2, .deletion, inner: [NSRange(location: 3, length: 1)]),
+             .line(display: 3, line: 3, .addition, inner: [NSRange(location: 3, length: 0)])),
         ])
     }
 }
@@ -244,13 +242,13 @@ struct DiffRowBuilderInlineTests {
                          DiffRowBuilderSideBySideTests.innerChanges, .inline)
         expectRows(rows, [
             (.line(display: 0, line: 0, .context), .absent),
-            (.line(display: 1, line: 1, .deletion, inner: [NSRange(location: 5, length: 3)]), .absent),
+            (.line(display: 1, line: 1, .deletion, inner: [NSRange(location: 4, length: 3)]), .absent),
             (.line(display: 2, line: 2, .deletion), .absent),
-            (.line(display: 3, line: 3, .deletion, inner: [NSRange(location: 1, length: 9)]), .absent),
-            (.line(display: 4, line: 4, .addition, inner: [NSRange(location: 5, length: 4)]), .absent),
+            (.line(display: 3, line: 3, .deletion, inner: [NSRange(location: 0, length: 9)]), .absent),
+            (.line(display: 4, line: 4, .addition, inner: [NSRange(location: 4, length: 4)]), .absent),
             (.line(display: 5, line: 5, .addition), .absent),
             (.line(display: 6, line: 6, .addition), .absent),
-            (.line(display: 7, line: 7, .addition, inner: [NSRange(location: 1, length: 11)]), .absent),
+            (.line(display: 7, line: 7, .addition, inner: [NSRange(location: 0, length: 11)]), .absent),
             (.line(display: 8, line: 8, .context), .absent),
         ])
     }

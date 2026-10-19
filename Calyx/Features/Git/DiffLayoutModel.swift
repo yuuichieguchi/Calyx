@@ -25,20 +25,11 @@ enum DiffCellKind: Equatable, Sendable {
 }
 
 struct DiffCell: Equatable, Sendable {
-    /// Index into `displayLines` (lines and comment rows); nil for filler,
-    /// collapsed and banner cells.
     let displayIndex: Int?
-    /// Index into the flat `[DiffLine]` (comment rows excluded); nil for
-    /// non-line cells.
     let lineIndex: Int?
     let kind: DiffCellKind
-    /// UTF-16 ranges in the line text including its leading marker column.
     var innerRanges: [NSRange]
     var isWholeLineChange: Bool
-    /// Which side's text a line cell shows: `.left` = `DiffLine.text`
-    /// (original), `.right` = `DiffLine.modifiedText`. Context cells on the
-    /// right pane and in the inline view (VS Code's modified editor) show
-    /// the modified text.
     var textSide: DiffSide = .left
 
     static let filler = DiffCell(displayIndex: nil, lineIndex: nil, kind: .filler,
@@ -125,11 +116,11 @@ enum DiffRowBuilder {
             var orig: [Int: String] = [:]
             var mod: [Int: String] = [:]
             for e in entries {
-                let text = String(e.line.text.dropFirst())
+                let text = e.line.text
                 switch e.line.type {
                 case .context:
                     if let n = e.line.oldLineNumber { orig[n] = text }
-                    if let n = e.line.newLineNumber { mod[n] = String(e.line.modifiedText.dropFirst()) }
+                    if let n = e.line.newLineNumber { mod[n] = e.line.modifiedText }
                 case .deletion:
                     if let n = e.line.oldLineNumber { orig[n] = text }
                 case .addition:
@@ -276,19 +267,18 @@ enum DiffRowBuilder {
             return result
         }
 
-        /// Splits text ranges into per-line UTF-16 ranges (marker column included).
         private func innerRangesByLine(_ ranges: [DiffTextRange], text: [Int: String]) -> [Int: [NSRange]] {
             var out: [Int: [NSRange]] = [:]
             for r in ranges {
                 if r.startLineNumber == r.endLineNumber {
                     out[r.startLineNumber, default: []].append(
-                        NSRange(location: r.startColumn, length: r.endColumn - r.startColumn))
+                        NSRange(location: r.startColumn - 1, length: r.endColumn - r.startColumn))
                     continue
                 }
                 for n in r.startLineNumber...r.endLineNumber {
-                    let maxColumn = (text[n]?.utf16.count ?? 0) + 1
-                    let start = n == r.startLineNumber ? r.startColumn : 1
-                    let end = n == r.endLineNumber ? r.endColumn : maxColumn
+                    let lineLength = text[n]?.utf16.count ?? 0
+                    let start = n == r.startLineNumber ? r.startColumn - 1 : 0
+                    let end = n == r.endLineNumber ? r.endColumn - 1 : lineLength
                     out[n, default: []].append(NSRange(location: start, length: max(end - start, 0)))
                 }
             }

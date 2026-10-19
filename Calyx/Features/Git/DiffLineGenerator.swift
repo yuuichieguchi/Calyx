@@ -30,11 +30,11 @@ enum DiffLineGenerator {
             emitContext(untilOld: change.original.startLineNumber, untilNew: change.modified.startLineNumber)
 
             for n in change.original.startLineNumber..<change.original.endLineNumberExclusive {
-                result.append(DiffLine(type: .deletion, text: "-" + content.oldLines[n - 1],
+                result.append(DiffLine(type: .deletion, text: content.oldLines[n - 1],
                                        oldLineNumber: n, newLineNumber: nil))
             }
             for n in change.modified.startLineNumber..<change.modified.endLineNumberExclusive {
-                result.append(DiffLine(type: .addition, text: "+" + content.newLines[n - 1],
+                result.append(DiffLine(type: .addition, text: content.newLines[n - 1],
                                        oldLineNumber: nil, newLineNumber: n))
             }
             oldLine = change.original.endLineNumberExclusive
@@ -45,10 +45,6 @@ enum DiffLineGenerator {
         return result
     }
 
-    /// Lines of a file whose two sides were not compared (too large): line k
-    /// pairs original line k with modified line k, numbered independently.
-    /// Past the shorter side a line carries only the longer side's number and
-    /// text (`text` is then that side's text, `newText` nil).
     static func uncomparedLines(content: DiffContent) -> [DiffLine] {
         let count = max(content.oldLines.count, content.newLines.count)
         var result: [DiffLine] = []
@@ -60,9 +56,9 @@ enum DiffLineGenerator {
             case let (old?, new?):
                 result.append(contextLine(old: old, new: new, oldLineNumber: index + 1, newLineNumber: index + 1))
             case let (old?, nil):
-                result.append(DiffLine(type: .context, text: " " + old, oldLineNumber: index + 1, newLineNumber: nil))
+                result.append(DiffLine(type: .context, text: old, oldLineNumber: index + 1, newLineNumber: nil))
             case let (nil, new?):
-                result.append(DiffLine(type: .context, text: " " + new, oldLineNumber: nil, newLineNumber: index + 1))
+                result.append(DiffLine(type: .context, text: new, oldLineNumber: nil, newLineNumber: index + 1))
             case (nil, nil):
                 preconditionFailure("index is below the longer side's count")
             }
@@ -71,9 +67,8 @@ enum DiffLineGenerator {
     }
 
     private static func contextLine(old: String, new: String, oldLineNumber: Int, newLineNumber: Int) -> DiffLine {
-        // Compared by UTF-16 code units, as the diff computer does.
         let differs = !old.utf16.elementsEqual(new.utf16)
-        return DiffLine(type: .context, text: " " + old, oldLineNumber: oldLineNumber,
-                        newLineNumber: newLineNumber, newText: differs ? " " + new : nil)
+        return DiffLine(type: .context, text: old, oldLineNumber: oldLineNumber,
+                        newLineNumber: newLineNumber, newText: differs ? new : nil)
     }
 }

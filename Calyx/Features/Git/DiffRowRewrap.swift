@@ -41,7 +41,7 @@ enum DiffRowRewrap {
         var row = rows.lowerBound
         while row < rows.upperBound {
             defer { row += 1 }
-            let rowColumn = max(column + 1 - input.markerColumns[row], 1)
+            let rowColumn = max(column - input.markerColumns[row], 1)
             if input.totalColumns[row] <= Double(rowColumn) {
                 if lines[row] != nil {
                     lines[row] = nil
