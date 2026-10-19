@@ -309,7 +309,7 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
                       "[\(step)] More Actions menu must close", file: file, line: line)
     }
 
-    func test_longDiff_inline_scrollLayoutAndWrapSmoke() {
+    private func openLongDiffInline() {
         waitForMainWindow()
         let pane = terminalPane()
         XCTAssertTrue(waitFor(pane, timeout: 10), "terminal pane not found")
@@ -325,7 +325,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         )
         XCTAssertEqual(setup, "ready", "fixture repo setup failed: \(setup)")
         typeIntoPane("cd \(repoDir)\n")
-        // shell() waits for its own completion marker, so this runs after the cd.
         XCTAssertEqual(shell("pwd"), repoDir, "pane cwd must be the fixture repo")
 
         openCommandPaletteViaMenu()
@@ -340,7 +339,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         XCTAssertTrue(waitFor(longRow, timeout: 20), "long.txt row must appear")
         shot("00-before-open")
 
-        // Set inline on a small diff first so the long diff opens inline.
         notesRow.click()
         XCTAssertTrue(waitFor(element("calyx.diff.toolbar"), timeout: 10), "a diff tab must open")
         chooseDiffView("Inline")
@@ -348,6 +346,10 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
                       "notes.txt must switch to the inline gutter")
 
         longRow.click()
+    }
+
+    func test_longDiff_inline_scrollLayoutAndWrapSmoke() {
+        openLongDiffInline()
         let content = longDiffContent()
         XCTAssertTrue(waitFor(content, timeout: 10),
                       "[open] the diff tab must show long.txt (AX label \"Diff of …long.txt\")")
@@ -407,5 +409,27 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         XCTAssertTrue(app.state == .runningForeground || app.state == .runningBackground,
                       "[automatic] app must still be running (state: \(app.state.rawValue))")
         shot("07-automatic")
+    }
+
+    func test_diffBody_contextMenu_opensOnRightClickAndControlClick() {
+        openLongDiffInline()
+        let content = longDiffContent()
+        XCTAssertTrue(waitFor(content, timeout: 10), "the diff tab must show long.txt")
+        XCTAssertTrue(waitUntil { visibleLines()?.total == 3000 }, "the long diff must be laid out")
+        let copy = app.menuItems["calyx.diff.contextMenu.copy"]
+        let selectAll = app.menuItems["calyx.diff.contextMenu.selectAll"]
+        let target = content.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.5))
+
+        target.rightClick()
+        XCTAssertTrue(waitFor(copy, timeout: 5), "right-click must show Copy")
+        XCTAssertTrue(waitFor(selectAll, timeout: 5), "right-click must show Select All")
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(waitUntil(timeout: 5) { !copy.exists && !selectAll.exists }, "Escape must close the right-click menu")
+
+        XCUIElement.perform(withKeyModifiers: .control) { target.click() }
+        XCTAssertTrue(waitFor(copy, timeout: 5), "Control-click must show Copy")
+        XCTAssertTrue(waitFor(selectAll, timeout: 5), "Control-click must show Select All")
+        app.typeKey(.escape, modifierFlags: [])
+        XCTAssertTrue(waitUntil(timeout: 5) { !copy.exists && !selectAll.exists }, "Escape must close the Control-click menu")
     }
 }

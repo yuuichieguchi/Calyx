@@ -101,6 +101,7 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
         }
         updateFrameSize()
         needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
 
     private static func prefixSums(_ counts: [Int]) -> [Int] {
@@ -122,7 +123,10 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
             ? clipWidth
             : max(clipWidth, 2 * inset.width + CGFloat(text.widestRowColumns) * DiffMetrics.columnWidth)
         let size = NSSize(width: width, height: geometry.documentHeight + inset.height)
-        if frame.size != size { setFrameSize(size) }
+        if frame.size != size {
+            setFrameSize(size)
+            window?.invalidateCursorRects(for: self)
+        }
     }
 
     static func textAreaWidth(of clip: NSClipView) -> CGFloat {
@@ -148,6 +152,7 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
 
     @objc private func clipBoundsDidChange(_ notification: Notification) {
         pruneLineCache()
+        window?.invalidateCursorRects(for: self)
     }
 
     @objc private func clipFrameDidChange(_ notification: Notification) {
@@ -316,6 +321,18 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
         return text.rowRanges[row].location + localIndex(row: row, segment: segment, x: point.x)
     }
 
+    private func characterIndexUnder(_ point: NSPoint) -> Int {
+        let (row, segment) = geometry.segment(atY: point.y)
+        let line = segmentLines(row)[segment]
+        let rowLocation = text.rowRanges[row].location
+        let boundary = localIndex(row: row, segment: segment, x: point.x)
+        let isWrappedSegmentEnd = boundary == line.localEnd && segment < wrap.segmentCounts[row] - 1
+        guard boundary > line.localStart, isWrappedSegmentEnd || x(of: line, local: boundary) > point.x else {
+            return rowLocation + boundary
+        }
+        return text.nsString.rangeOfComposedCharacterSequence(at: rowLocation + boundary - 1).location
+    }
+
     private func localIndex(row: Int, segment: Int, x px: CGFloat) -> Int {
         let line = segmentLines(row)[segment]
         let found = CTLineGetStringIndexForPosition(line.line, CGPoint(x: px - line.originX, y: 0))
@@ -327,6 +344,62 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
         let before = max(cluster.location - rowLocation, line.localStart)
         let after = min(NSMaxRange(cluster) - rowLocation, line.localEnd)
         return px - x(of: line, local: before) <= x(of: line, local: after) - px ? before : after
+    }
+
+    private func isActionRow(_ row: Int) -> Bool {
+        switch cell(row)?.kind {
+        case .comment, .collapsedRegion: return true
+        default: return false
+        }
+    }
+
+    private func actionRow(at point: NSPoint) -> Int? {
+        guard point.y >= geometry.rowTop(0), point.y < geometry.documentHeight else { return nil }
+        let row = geometry.row(atY: point.y)
+        return isActionRow(row) ? row : nil
+    }
+
+    func cursorRegions(in rect: NSRect) -> [(rect: NSRect, cursor: NSCursor)] {
+        guard geometry.rowCount > 0 else { return [] }
+        var regions: [(rect: NSRect, cursor: NSCursor)] = []
+        let lastRow = geometry.rowCount - 1
+        for row in geometry.row(atY: rect.minY)...geometry.row(atY: rect.maxY) {
+            let top = max(row == 0 ? 0 : geometry.rowTop(row), rect.minY)
+            let bottom = min(row == lastRow ? bounds.maxY : geometry.rowBottom(row), rect.maxY)
+            guard bottom > top else { continue }
+            let cursor = isActionRow(row) ? NSCursor.arrow : NSCursor.iBeam
+            if let previous = regions.last, previous.cursor === cursor, previous.rect.maxY >= top {
+                regions[regions.count - 1].rect.size.height = bottom - previous.rect.minY
+            } else {
+                regions.append((NSRect(x: rect.minX, y: top, width: rect.width, height: bottom - top), cursor))
+            }
+        }
+        return regions
+    }
+
+    override func resetCursorRects() {
+        for region in cursorRegions(in: visibleRect) { addCursorRect(region.rect, cursor: region.cursor) }
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let point = convert(event.locationInWindow, from: nil)
+        if actionRow(at: point) == nil {
+            window?.makeFirstResponder(self)
+            let insertion = characterIndex(at: point)
+            if !(selection.location <= insertion && insertion <= NSMaxRange(selection)) {
+                setSelectedRange(range(at: characterIndexUnder(point), granularity: .word))
+            }
+        }
+        let menu = NSMenu()
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
+        copyItem.target = self
+        copyItem.setAccessibilityIdentifier(AccessibilityID.Diff.contextMenuCopy)
+        let selectAllItem = NSMenuItem(title: "Select All", action: #selector(selectAll(_:)), keyEquivalent: "")
+        selectAllItem.target = self
+        selectAllItem.setAccessibilityIdentifier(AccessibilityID.Diff.contextMenuSelectAll)
+        menu.addItem(copyItem)
+        menu.addItem(selectAllItem)
+        return menu
     }
 
     func rects(in range: NSRange) -> [NSRect] {
@@ -624,17 +697,9 @@ final class DiffLinesView: NSView, NSUserInterfaceValidations {
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        if point.y >= geometry.rowTop(0), point.y < geometry.documentHeight {
-            let row = geometry.row(atY: point.y)
-            if let cell = cell(row) {
-                switch cell.kind {
-                case .comment, .collapsedRegion:
-                    onRowClicked?(row)
-                    return
-                case .line, .filler, .banner:
-                    break
-                }
-            }
+        if let row = actionRow(at: point) {
+            onRowClicked?(row)
+            return
         }
         window?.makeFirstResponder(self)
         let granularity: Granularity

@@ -303,6 +303,8 @@ enum AccessibilityID {
         static let collapseUnchangedItem = "calyx.diff.collapseUnchangedItem"
         static let ignoreTrimWhitespaceItem = "calyx.diff.ignoreTrimWhitespaceItem"
         static let wordWrapItem = "calyx.diff.wordWrapItem"
+        static let contextMenuCopy = "calyx.diff.contextMenu.copy"
+        static let contextMenuSelectAll = "calyx.diff.contextMenu.selectAll"
         static let nextChangeButton = "calyx.diff.nextChange"
         static let previousChangeButton = "calyx.diff.previousChange"
         static let overviewRuler = "calyx.diff.overviewRuler"

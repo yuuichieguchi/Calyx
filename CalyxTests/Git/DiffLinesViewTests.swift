@@ -76,7 +76,8 @@ struct DiffLinesViewTests {
         }
     }
 
-    private func makeHosted(raw: String = makeLinesRaw()) async throws -> Hosted {
+    private func makeHosted(raw: String = makeLinesRaw(),
+                            configure: (DiffView, FileDiff) -> Void = { _, _ in }) async throws -> Hosted {
         let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 800, height: 400),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
@@ -85,7 +86,9 @@ struct DiffLinesViewTests {
         view.autoresizingMask = [.width, .height]
         window.contentView = view
         window.orderFront(nil)
-        view.display(diff: DiffParser.parse(raw, path: "l.txt"))
+        let diff = DiffParser.parse(raw, path: "l.txt")
+        configure(view, diff)
+        view.display(diff: diff)
         try await settle(window)
         let pane = view.inlinePaneForTesting
         let lines = pane.linesView
@@ -981,5 +984,386 @@ struct DiffLinesViewTests {
             #expect(wrap.projections.allSatisfy { $0 == nil }, "every row fits at 400 columns")
         }
     }
+
+    private func rightClick(_ lines: DiffLinesView, at point: NSPoint,
+                            modifiers: NSEvent.ModifierFlags = []) throws -> NSMenu? {
+        lines.menu(for: try mouseEvent(.rightMouseDown, at: point, in: lines, modifiers: modifiers))
+    }
+
+    private func rightClickReference(_ reference: Reference, at point: NSPoint) throws -> NSMenu? {
+        let event = try #require(NSEvent.mouseEvent(
+            with: .rightMouseDown, location: reference.textView.convert(point, to: nil), modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: reference.window.windowNumber,
+            context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        return reference.textView.menu(for: event)
+    }
+
+    private func referenceCharacterRect(_ reference: Reference, _ location: Int) throws -> NSRect {
+        let textView = reference.textView
+        let layoutManager = try #require(textView.layoutManager)
+        let container = try #require(textView.textContainer)
+        let glyphs = layoutManager.glyphRange(forCharacterRange: NSRange(location: location, length: 1), actualCharacterRange: nil)
+        return layoutManager.boundingRect(forGlyphRange: glyphs, in: container)
+            .offsetBy(dx: textView.textContainerOrigin.x, dy: textView.textContainerOrigin.y)
+    }
+
+    private func fractionPoint(_ rect: NSRect, _ fraction: CGFloat) -> NSPoint {
+        NSPoint(x: rect.minX + rect.width * fraction, y: rect.midY)
+    }
+
+    private func copyItem(_ menu: NSMenu) throws -> NSMenuItem {
+        try #require(menu.items.first { $0.action == #selector(DiffLinesView.copy(_:)) })
+    }
+
+    private func selectAllItem(_ menu: NSMenu) throws -> NSMenuItem {
+        try #require(menu.items.first { $0.action == #selector(NSResponder.selectAll(_:)) })
+    }
+
+    private func isActionRow(_ cell: DiffCell?) -> Bool {
+        switch cell?.kind {
+        case .comment?, .collapsedRegion?: return true
+        default: return false
+        }
+    }
+
+    private func addContextComment(_ view: DiffView, _ diff: FileDiff, newLine: Int) throws {
+        let store = view.reviewStore ?? DiffReviewStore()
+        view.reviewStore = store
+        let index = try #require(diff.lines.firstIndex { $0.type == .context && $0.newLineNumber == newLine })
+        store.addComment(lineIndex: index, lineNumber: newLine, oldLineNumber: diff.lines[index].oldLineNumber,
+                         lineType: .context, text: "note \(newLine)")
+    }
+
+    private func makeActionRowsHosted() async throws -> Hosted {
+        DiffLayoutSettings.hideUnchangedRegionsEnabled = true
+        var configured: Result<Void, Error> = .success(())
+        let hosted = try await makeHosted { view, diff in
+            configured = Result { try addContextComment(view, diff, newLine: 106) }
+        }
+        try configured.get()
+        return hosted
+    }
+
+    @Test func contextMenu_offersCopyAndSelectAllTargetingTheLinesView() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let needle = try range(of: "needle", in: lines.string)
+            let menu = try #require(try rightClick(lines, at: try point(inside: needle.location + 2, lines)))
+            #expect(menu.items.count == 2)
+            #expect(!menu.items.contains { $0.isSeparatorItem })
+            #expect(menu.items.map(\.title) == ["Copy", "Select All"])
+            let copy = try copyItem(menu)
+            let selectAll = try selectAllItem(menu)
+            #expect(menu.items.first === copy)
+            #expect(copy.target === lines)
+            #expect(selectAll.target === lines)
+            #expect(copy.keyEquivalent == "")
+            #expect(selectAll.keyEquivalent == "")
+            #expect(copy.accessibilityIdentifier() == AccessibilityID.Diff.contextMenuCopy)
+            #expect(selectAll.accessibilityIdentifier() == AccessibilityID.Diff.contextMenuSelectAll)
+        }
+    }
+
+    @Test func contextMenu_rightClickSelectionMatchesReference() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let reference = makeReference(lines.string)
+            defer { reference.close() }
+            let ranges = rowRanges(lines.string)
+            let needle = try range(of: "needle", in: lines.string)
+            let omega = try range(of: "omega", in: lines.string)
+            let pi = try range(of: "3.14", in: lines.string)
+            let its = try range(of: "it's", in: lines.string)
+            let fooBar = try range(of: "foo_bar", in: lines.string)
+            let kana = try range(of: "かなカナ漢字ひらがな", in: lines.string)
+            let elsewhere = NSRange(location: ranges[3].location + 2, length: 0)
+            let rowEnd = NSMaxRange(ranges[9]) - 1
+            struct Case { let label: String; let selection: NSRange; let index: Int; let fraction: CGFloat; let beyondRowEnd: Bool }
+            var cases: [Case] = []
+            func add(_ label: String, _ selection: NSRange, _ index: Int, fractions: [CGFloat] = [0.25, 0.75],
+                     beyondRowEnd: Bool = false) {
+                for fraction in fractions {
+                    cases.append(Case(label: label, selection: selection, index: index, fraction: fraction,
+                                      beyondRowEnd: beyondRowEnd))
+                }
+            }
+            add("caret elsewhere, word character", elsewhere, needle.location + 2)
+            add("word selected, click inside it", needle, needle.location + 3)
+            add("word selected, click another word", needle, omega.location + 1)
+            add("caret elsewhere, space", elsewhere, needle.location - 1)
+            add("caret elsewhere, period of 3.14", elsewhere, pi.location + 1)
+            add("caret elsewhere, apostrophe of it's", elsewhere, its.location + 2)
+            add("caret elsewhere, underscore of foo_bar", elsewhere, fooBar.location + 3)
+            add("word selected, first character", needle, needle.location)
+            add("word selected, last character", needle, NSMaxRange(needle) - 1)
+            add("caret at the character's left boundary", NSRange(location: needle.location + 2, length: 0), needle.location + 2)
+            add("caret elsewhere, right of a row end", elsewhere, rowEnd, fractions: [0.25], beyondRowEnd: true)
+            add("caret elsewhere, kana", elsewhere, kana.location + 1)
+            add("caret elsewhere, katakana", elsewhere, kana.location + 2)
+            add("caret elsewhere, kanji", elsewhere, kana.location + 4)
+            add("caret elsewhere, hiragana after kanji", elsewhere, kana.location + 6)
+            for entry in cases {
+                lines.setSelectedRange(entry.selection)
+                reference.textView.setSelectedRange(entry.selection)
+                var linesPoint = fractionPoint(try characterRect(lines, entry.index), entry.fraction)
+                var referencePoint = fractionPoint(try referenceCharacterRect(reference, entry.index), entry.fraction)
+                if entry.beyondRowEnd {
+                    linesPoint.x = try characterRect(lines, entry.index).maxX + 100
+                    referencePoint.x = try referenceCharacterRect(reference, entry.index).maxX + 100
+                }
+                _ = try rightClickReference(reference, at: referencePoint)
+                _ = try rightClick(lines, at: linesPoint)
+                #expect(lines.selectedRange() == reference.textView.selectedRange(),
+                        "\(entry.label) at \(entry.fraction): lines \(lines.selectedRange()) vs NSTextView \(reference.textView.selectedRange())")
+            }
+        }
+    }
+
+    @Test func contextMenu_enablementFollowsSelection() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let needle = try range(of: "needle", in: lines.string)
+            let caret = NSRange(location: needle.location + 2, length: 0)
+            lines.setSelectedRange(caret)
+            let kept = try #require(try rightClick(lines, at: fractionPoint(try characterRect(lines, caret.location), 0.25)))
+            kept.update()
+            #expect(lines.selectedRange() == caret)
+            #expect(try !copyItem(kept).isEnabled)
+            #expect(try selectAllItem(kept).isEnabled)
+
+            lines.setSelectedRange(NSRange(location: rowRanges(lines.string)[3].location, length: 0))
+            let word = try #require(try rightClick(lines, at: try point(inside: needle.location + 2, lines)))
+            word.update()
+            #expect(try copyItem(word).isEnabled)
+            #expect(try selectAllItem(word).isEnabled)
+        }
+    }
+
+    @Test func contextMenu_copyItemCopiesTheRightClickedWord() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            lines.setSelectedRange(NSRange(location: rowRanges(lines.string)[3].location, length: 0))
+            let needle = try range(of: "needle", in: lines.string)
+            let menu = try #require(try rightClick(lines, at: try point(inside: needle.location + 2, lines)))
+            let index = try #require(menu.items.firstIndex { $0.action == #selector(DiffLinesView.copy(_:)) })
+            menu.performActionForItem(at: index)
+            #expect(hosted.pasteboard.string(forType: .string) == "needle")
+        }
+    }
+
+    @Test func contextMenu_rightClickOnATextRowMakesLinesFirstResponder() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            hosted.window.makeFirstResponder(nil)
+            #expect(hosted.window.firstResponder !== lines)
+            let needle = try range(of: "needle", in: lines.string)
+            _ = try rightClick(lines, at: try point(inside: needle.location + 2, lines))
+            #expect(hosted.window.firstResponder === lines)
+        }
+    }
+
+    @Test func contextMenu_onCommentAndCollapsedRowsKeepsSelection() async throws {
+        try await withSettings {
+            let hosted = try await makeActionRowsHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let kinds = lines.cells.map(\.?.kind)
+            let commentRow = try #require(kinds.firstIndex { $0 == .comment })
+            let collapsedRow = try #require(kinds.firstIndex {
+                if case .collapsedRegion? = $0 { return true }
+                return false
+            })
+            let textRow = try #require(lines.cells.indices.first { !isActionRow(lines.cells[$0]) && lines.rowRanges[$0].length > 3 })
+            for (label, row) in [("comment", commentRow), ("collapsed", collapsedRow)] {
+                lines.scrollToVisible(NSRect(x: 0, y: lines.geometry.rowTop(row), width: 1,
+                                             height: lines.geometry.contentHeight(row)))
+                try await settle(hosted.window)
+                let selection = NSRange(location: lines.rowRanges[textRow].location, length: 3)
+                lines.setSelectedRange(selection)
+                hosted.window.makeFirstResponder(nil)
+                let responder = hosted.window.firstResponder
+                let y = lines.geometry.rowTop(row) + lines.geometry.contentHeight(row) / 2
+                let menu = try rightClick(lines, at: NSPoint(x: lines.visibleRect.midX, y: y))
+                #expect(menu != nil, "\(label) row \(row) offers the menu")
+                #expect(lines.selectedRange() == selection, "\(label) row keeps the selection: \(lines.selectedRange())")
+                #expect(hosted.window.firstResponder === responder, "\(label) row keeps the first responder")
+            }
+        }
+    }
+
+    private func checkCursorRegions(_ lines: DiffLinesView, label: String) {
+        let rect = lines.visibleRect
+        let regions = lines.cursorRegions(in: rect)
+        let rows = Array(lines.geometry.rows(intersecting: rect.minY, rect.maxY))
+        #expect(!rows.isEmpty, "\(label): rows intersect \(rect)")
+        for region in regions {
+            #expect(region.rect.minX <= rect.minX + 0.5 && region.rect.maxX >= rect.maxX - 0.5,
+                    "\(label): region \(region.rect) spans the x-range of \(rect)")
+        }
+        for (i, a) in regions.enumerated() {
+            for b in regions[(i + 1)...] {
+                let overlap = a.rect.intersection(b.rect)
+                #expect(overlap.isNull || overlap.height <= 0.5 || overlap.width <= 0.5,
+                        "\(label): regions \(a.rect) and \(b.rect) overlap")
+            }
+        }
+        for row in rows {
+            let top = max(lines.geometry.rowTop(row), rect.minY)
+            let bottom = min(lines.geometry.rowTop(row) + lines.geometry.contentHeight(row) + lines.geometry.pads[row], rect.maxY)
+            let probe = NSPoint(x: rect.midX, y: (top + bottom) / 2)
+            let hits = regions.filter { $0.rect.contains(probe) }
+            #expect(hits.count == 1, "\(label): row \(row) probe \(probe) is in \(hits.count) regions")
+            let expected = isActionRow(lines.cells[row]) ? NSCursor.arrow : NSCursor.iBeam
+            if let hit = hits.first {
+                #expect(hit.cursor === expected, "\(label): row \(row) \(String(describing: lines.cells[row]?.kind)) cursor")
+            }
+        }
+        var runs = 0
+        var previous: Bool?
+        for row in rows {
+            let action = isActionRow(lines.cells[row])
+            if action != previous { runs += 1 }
+            previous = action
+        }
+        #expect(regions.count == runs, "\(label): \(regions.count) regions for \(runs) same-kind runs")
+    }
+
+    @Test func cursorRegions_iBeamOnTextRowsArrowOnActionRows() async throws {
+        try await withSettings {
+            let hosted = try await makeActionRowsHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let rect = lines.visibleRect
+            let rows = lines.geometry.rows(intersecting: rect.minY, rect.maxY)
+            let kinds = lines.cells.map { $0.map { "\($0.kind)" } ?? "nil" }
+            #expect(rows.contains { lines.cells[$0]?.kind == .comment }, "a comment row is visible in \(rows) of \(kinds)")
+            #expect(rows.contains { if case .collapsedRegion? = lines.cells[$0]?.kind { return true } else { return false } },
+                    "a collapsed row is visible")
+            #expect(rows.contains { !isActionRow(lines.cells[$0]) }, "a text row is visible")
+            checkCursorRegions(lines, label: "top")
+        }
+    }
+
+    @Test func cursorRegions_followTheViewportAfterScrolling() async throws {
+        try await withSettings {
+            var configured: Result<Void, Error> = .success(())
+            let hosted = try await makeHosted { view, diff in
+                configured = Result {
+                    try addContextComment(view, diff, newLine: 5)
+                    try addContextComment(view, diff, newLine: 160)
+                }
+            }
+            try configured.get()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            checkCursorRegions(lines, label: "top")
+            let farRow = try #require(lines.cells.indices.first { lines.cells[$0]?.kind == .comment && $0 > 100 })
+            hosted.pane.scroll(toY: lines.geometry.rowTop(farRow) - 60)
+            try await settle(hosted.window)
+            let rect = lines.visibleRect
+            #expect(lines.geometry.rows(intersecting: rect.minY, rect.maxY).contains(farRow), "scrolled to row \(farRow)")
+            checkCursorRegions(lines, label: "scrolled")
+        }
+    }
+
+    private func checkInsetCursorRegions(_ lines: DiffLinesView, label: String) throws {
+        let geometry = lines.geometry
+        let lastRow = geometry.rowCount - 1
+        let firstCursor = isActionRow(lines.cells[0]) ? NSCursor.arrow : NSCursor.iBeam
+        let lastCursor = isActionRow(lines.cells[lastRow]) ? NSCursor.arrow : NSCursor.iBeam
+        let topRect = NSRect(x: 0, y: 0, width: lines.bounds.width, height: geometry.rowTop(0) - 1)
+        try #require(topRect.height > 0, "\(label): top inset exists")
+        let top = lines.cursorRegions(in: topRect)
+        #expect(top.count == 1, "\(label): \(top.count) regions inside the top inset \(topRect)")
+        #expect(top.first?.rect == topRect, "\(label): top region \(String(describing: top.first?.rect)) vs \(topRect)")
+        #expect(top.first?.cursor === firstCursor, "\(label): top inset cursor follows row 0 \(String(describing: lines.cells[0]?.kind))")
+        let bottomRect = NSRect(x: 0, y: geometry.documentHeight + 1, width: lines.bounds.width,
+                                height: lines.bounds.maxY - geometry.documentHeight - 2)
+        try #require(bottomRect.height > 0, "\(label): bottom inset exists below \(geometry.documentHeight) in \(lines.bounds)")
+        let bottom = lines.cursorRegions(in: bottomRect)
+        #expect(bottom.count == 1, "\(label): \(bottom.count) regions inside the bottom inset \(bottomRect)")
+        #expect(bottom.first?.rect == bottomRect, "\(label): bottom region \(String(describing: bottom.first?.rect)) vs \(bottomRect)")
+        #expect(bottom.first?.cursor === lastCursor,
+                "\(label): bottom inset cursor follows row \(lastRow) \(String(describing: lines.cells[lastRow]?.kind))")
+    }
+
+    @Test func cursorRegions_coverRectsInsideTheTextInsets() async throws {
+        try await withSettings {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            try checkInsetCursorRegions(hosted.lines, label: "default")
+        }
+        try await withSettings {
+            let hosted = try await makeActionRowsHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            let lastRow = lines.geometry.rowCount - 1
+            #expect(isActionRow(lines.cells[0]) || isActionRow(lines.cells[lastRow]),
+                    "an edge row is an action row: \(String(describing: lines.cells[0]?.kind)) / \(String(describing: lines.cells[lastRow]?.kind))")
+            try checkInsetCursorRegions(lines, label: "action rows")
+        }
+    }
+
+    @Test func contextMenu_rightClickPastAWrappedSegmentEnd_followsReference() async throws {
+        try await withSettings(wordWrap: true) {
+            let reference = makeReference("alpha beta gamma delta epsilon zeta eta theta")
+            defer { reference.close() }
+            let textView = reference.textView
+            textView.isHorizontallyResizable = false
+            textView.textContainer?.widthTracksTextView = true
+            textView.setFrameSize(NSSize(width: 120, height: 400))
+            textView.textContainer?.containerSize = NSSize(width: 120, height: CGFloat.greatestFiniteMagnitude)
+            reference.window.layoutIfNeeded()
+            let layoutManager = try #require(textView.layoutManager)
+            var fragmentGlyphs = NSRange()
+            let usedRect = layoutManager.lineFragmentUsedRect(forGlyphAt: 0, effectiveRange: &fragmentGlyphs)
+            let fragmentChars = layoutManager.characterRange(forGlyphRange: fragmentGlyphs, actualGlyphRange: nil)
+            try #require(NSMaxRange(fragmentChars) < reference.storage.length, "the reference wraps")
+            let lastChar = NSMaxRange(fragmentChars) - 1
+            let origin = textView.textContainerOrigin
+            let referenceX = min(usedRect.maxX + origin.x + 4, textView.bounds.maxX - 1)
+            try #require(referenceX > usedRect.maxX + origin.x, "click lands right of the fragment end")
+            textView.setSelectedRange(NSRange(location: 0, length: 0))
+            _ = try rightClickReference(reference, at: NSPoint(x: referenceX, y: usedRect.midY + origin.y))
+            let referenceExpected = reference.storage.doubleClick(at: lastChar)
+            #expect(textView.selectedRange() == referenceExpected,
+                    "NSTextView selected \(textView.selectedRange()); doubleClick(lastChar \(lastChar)) = \(referenceExpected); next fragment starts at \(NSMaxRange(fragmentChars))")
+
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let lines = hosted.lines
+            hosted.window.setContentSize(NSSize(width: 250, height: 400))
+            try await settle(hosted.window)
+            let wrapped = try #require(lines.segmentCounts.firstIndex { $0 > 1 })
+            hosted.pane.scroll(toY: max(lines.geometry.rowTop(wrapped) - 40, 0))
+            try await settle(hosted.window)
+            let first = lines.accessibilityLine(for: lines.rowRanges[wrapped].location + 1)
+            let segmentRange = lines.accessibilityRange(forLine: first)
+            let segmentLast = NSMaxRange(segmentRange) - 1
+            let string = lines.string as NSString
+            try #require(string.character(at: segmentLast) != 0x0A, "a non-final segment has no newline")
+            let lastRect = try characterRect(lines, segmentLast)
+            try #require(lines.visibleRect.intersects(lastRect), "segment \(lastRect) is visible in \(lines.visibleRect)")
+            let x = min(lastRect.maxX + 4, lines.bounds.maxX - 1)
+            try #require(x > lastRect.maxX, "click lands right of the segment end")
+            let elsewhere = wrapped == 0 ? lines.rowRanges[1].location : 0
+            lines.setSelectedRange(NSRange(location: elsewhere, length: 0))
+            _ = try rightClick(lines, at: NSPoint(x: x, y: lastRect.midY))
+            let expected = NSAttributedString(string: lines.string).doubleClick(at: segmentLast)
+            #expect(lines.selectedRange() == expected,
+                    "lines selected \(lines.selectedRange()); doubleClick(segmentLast \(segmentLast)) = \(expected); next segment starts at \(NSMaxRange(segmentRange))")
+        }
+    }
+
 }
 }
