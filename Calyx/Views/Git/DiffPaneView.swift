@@ -5,6 +5,7 @@ enum DiffMetrics {
     static let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
     static let boldFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .bold)
     static let gutterFont = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+    static let gutterDigitWidth: CGFloat = ("0" as NSString).size(withAttributes: [.font: gutterFont]).width
     static let rowHeight: CGFloat = NSLayoutManager().defaultLineHeight(for: font)
     static let columnWidth: CGFloat = ("0" as NSString).size(withAttributes: [.font: font]).width
     static let textInset = NSSize(width: 4, height: 4)
@@ -60,12 +61,39 @@ struct GutterRow: Equatable {
 enum GutterColumns {
     case dual
     case single
+}
 
-    var thickness: CGFloat {
-        switch self {
-        case .dual: return 80
-        case .single: return 44
+struct GutterLayout: Equatable {
+    static let markerLaneWidth: CGFloat = 22
+    static let minimumDigits = 5
+    static let columnGap: CGFloat = 4
+    static let indicatorGap: CGFloat = 2
+    static let trailingPadding: CGFloat = 4
+
+    let numberRightEdges: [CGFloat]
+    let indicatorX: CGFloat
+    let thickness: CGFloat
+
+    init(columns: GutterColumns, rows: [GutterRow], digitWidth: CGFloat) {
+        func width(_ numbers: (GutterRow) -> Int?) -> CGFloat {
+            let largest = rows.reduce(0) { max($0, numbers($1) ?? 0) }
+            return (CGFloat(max(String(largest).count, Self.minimumDigits)) * digitWidth).rounded()
         }
+        let widths: [CGFloat]
+        switch columns {
+        case .dual: widths = [width(\.oldNumber), width(\.newNumber)]
+        case .single: widths = [width { $0.oldNumber ?? $0.newNumber }]
+        }
+        var edges: [CGFloat] = []
+        var x = Self.markerLaneWidth
+        for (index, columnWidth) in widths.enumerated() {
+            if index > 0 { x += Self.columnGap }
+            x += columnWidth
+            edges.append(x)
+        }
+        numberRightEdges = edges
+        indicatorX = x + Self.indicatorGap
+        thickness = indicatorX + digitWidth.rounded(.up) + Self.trailingPadding
     }
 }
 
@@ -135,7 +163,7 @@ final class DiffPaneView: NSView, NSUserInterfaceValidations {
         scrollView.hasVerticalRuler = true
         scrollView.verticalRulerView = lineNumberView
         lineNumberView.clientView = linesView
-        lineNumberView.ruleThickness = gutterColumns.thickness
+        lineNumberView.ruleThickness = lineNumberView.gutterLayout.thickness
         lineNumberView.setAccessibilityElement(true)
         lineNumberView.setAccessibilityRole(.group)
         lineNumberView.setAccessibilityIdentifier(AccessibilityID.Diff.lineNumberGutter + accessibilitySuffix)
@@ -179,12 +207,16 @@ final class DiffPaneView: NSView, NSUserInterfaceValidations {
     }
 
 
+    func setGutter(rows: [GutterRow], commentedLineIndices: Set<Int>) {
+        lineNumberView.rows = rows
+        lineNumberView.commentedLineIndices = commentedLineIndices
+        lineNumberView.needsDisplay = true
+    }
+
     func apply(content: DiffPaneContent, wrap: DiffPaneWrap, geometry: DiffRowGeometry,
-               commentedLineIndices: Set<Int>, textChanged: Bool, rewrapped: Bool) {
+               textChanged: Bool, rewrapped: Bool) {
         linesView.apply(DiffPaneLayout(cells: content.cells, text: content.text, wrap: wrap, geometry: geometry),
                         textChanged: textChanged, rewrapped: rewrapped)
-        lineNumberView.rows = content.gutterRows
-        lineNumberView.commentedLineIndices = commentedLineIndices
         lineNumberView.needsDisplay = true
     }
 
@@ -299,7 +331,10 @@ final class DiffPaneView: NSView, NSUserInterfaceValidations {
 final class DiffLineNumberView: NSRulerView {
     let columns: GutterColumns
     let linesView: DiffLinesView
-    var rows: [GutterRow] = []
+    var rows: [GutterRow] = [] {
+        didSet { updateGutterLayout() }
+    }
+    private(set) var gutterLayout: GutterLayout
     var commentedLineIndices: Set<Int> = []
     var onRowClicked: ((Int) -> Void)?
     var onRangeSelected: ((Int, Int) -> Void)?
@@ -317,6 +352,7 @@ final class DiffLineNumberView: NSRulerView {
     init(columns: GutterColumns, linesView: DiffLinesView) {
         self.columns = columns
         self.linesView = linesView
+        self.gutterLayout = GutterLayout(columns: columns, rows: [], digitWidth: DiffMetrics.gutterDigitWidth)
         super.init(scrollView: nil, orientation: .verticalRuler)
         clipsToBounds = true
     }
@@ -326,7 +362,16 @@ final class DiffLineNumberView: NSRulerView {
         fatalError("init(coder:) is not supported")
     }
 
-    override var requiredThickness: CGFloat { columns.thickness }
+    override var requiredThickness: CGFloat { gutterLayout.thickness }
+
+    private func updateGutterLayout() {
+        let layout = GutterLayout(columns: columns, rows: rows, digitWidth: DiffMetrics.gutterDigitWidth)
+        guard layout != gutterLayout else { return }
+        gutterLayout = layout
+        ruleThickness = layout.thickness
+        scrollView?.tile()
+        needsDisplay = true
+    }
 
     private var offsetY: CGFloat {
         convert(NSPoint.zero, from: linesView).y
@@ -454,15 +499,13 @@ final class DiffLineNumberView: NSRulerView {
             let size = str.size(withAttributes: attrs)
             str.draw(at: NSPoint(x: rightEdge - size.width, y: numberY), withAttributes: attrs)
         }
-        let indicatorX: CGFloat
+        let edges = gutterLayout.numberRightEdges
         switch columns {
         case .dual:
-            drawNumber(gutterRow.oldNumber, rightEdge: 34)
-            drawNumber(gutterRow.newNumber, rightEdge: 72)
-            indicatorX = 73
+            drawNumber(gutterRow.oldNumber, rightEdge: edges[0])
+            drawNumber(gutterRow.newNumber, rightEdge: edges[1])
         case .single:
-            drawNumber(gutterRow.oldNumber ?? gutterRow.newNumber, rightEdge: 34)
-            indicatorX = 36
+            drawNumber(gutterRow.oldNumber ?? gutterRow.newNumber, rightEdge: edges[0])
         }
 
         if let indicator = gutterRow.indicator {
@@ -471,7 +514,7 @@ final class DiffLineNumberView: NSRulerView {
                 .font: DiffMetrics.gutterFont,
                 .foregroundColor: color,
             ]
-            (indicator as NSString).draw(at: NSPoint(x: indicatorX, y: numberY), withAttributes: indicatorAttrs)
+            (indicator as NSString).draw(at: NSPoint(x: gutterLayout.indicatorX, y: numberY), withAttributes: indicatorAttrs)
         }
     }
 

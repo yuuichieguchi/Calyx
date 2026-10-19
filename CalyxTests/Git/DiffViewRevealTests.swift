@@ -292,7 +292,7 @@ struct DiffViewRevealTests {
                 window.close()
             }
             try await settle(view)
-            let linesViews = descendants(of: view, DiffLinesView.self)
+            let linesViews = descendants(of: view, DiffLinesView.self).filter { !$0.isHiddenOrHasHiddenAncestor }
             #expect(linesViews.count == 2)
             let left = try #require(linesViews.first)
             #expect(window.makeFirstResponder(left))

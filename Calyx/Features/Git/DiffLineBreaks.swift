@@ -62,7 +62,12 @@ struct WrappingCharacterClassifier: Sendable {
     }
 
     func classify(_ units: [UInt16]) -> [UInt8] {
-        units.map { get(Int($0)).rawValue }
+        asciiMap.withUnsafeBufferPointer { ascii in
+            units.map { unit in
+                let charCode = Int(unit)
+                return charCode < 256 ? ascii[charCode].rawValue : get(charCode).rawValue
+            }
+        }
     }
 }
 

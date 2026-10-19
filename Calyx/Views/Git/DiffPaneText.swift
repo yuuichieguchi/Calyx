@@ -9,6 +9,30 @@ struct DiffRowText: Equatable, Sendable {
     var totalColumns: Double { columns[columns.count - 1] }
 }
 
+struct DiffPaneRow: Sendable {
+    let length: Int
+    let markerLength: Int
+    let markerColumns: Int
+    let content: [UInt16]
+    let columns: [Double]
+    let classes: [UInt8]
+
+    static let empty = DiffPaneRow(rowUnits: [], markerLength: 0, markerColumns: 0)
+
+    init(rowUnits: [UInt16], markerLength: Int, markerColumns: Int) {
+        self.init(rowUnits: rowUnits[...], markerLength: markerLength, markerColumns: markerColumns)
+    }
+
+    init(rowUnits: ArraySlice<UInt16>, markerLength: Int, markerColumns: Int) {
+        length = rowUnits.count
+        self.markerLength = markerLength
+        self.markerColumns = markerColumns
+        content = Array(rowUnits[(rowUnits.startIndex + markerLength)...])
+        columns = DiffPaneText.columns(of: content)
+        classes = DiffLineBreaks.defaultClassifier.classify(content)
+    }
+}
+
 struct DiffPaneWrap: Equatable, Sendable {
     let column: Int?
     let projections: [DiffLineProjection?]
@@ -40,41 +64,56 @@ struct DiffPaneText {
     private let rowMarkerColumns: [Int]
 
     init(cells: [DiffCell?], attributed: NSAttributedString) {
+        let units = Array(attributed.string.utf16)
+        var rows: [DiffPaneRow] = []
+        var location = 0
+        func appendRow(endingAt end: Int) {
+            let range = NSRange(location: location, length: end - location)
+            let marker = Self.marker(cell: rows.count < cells.count ? cells[rows.count] : nil, range: range, units: units)
+            rows.append(DiffPaneRow(rowUnits: units[range.location..<end], markerLength: marker.length,
+                                    markerColumns: marker.columns))
+            location = end + 1
+        }
+        for (index, unit) in units.enumerated() where unit == 0x0A {
+            appendRow(endingAt: index)
+        }
+        appendRow(endingAt: units.count)
+        self.init(attributed: attributed, rows: rows)
+    }
+
+    init(attributed: NSAttributedString, rows: [DiffPaneRow]) {
+        precondition(!rows.isEmpty, "a pane text has at least one row")
         self.attributed = attributed
         string = attributed.string
         nsString = attributed.string as NSString
-        let units = Array(string.utf16)
         var ranges: [NSRange] = []
-        var location = 0
-        for (index, unit) in units.enumerated() where unit == 0x0A {
-            ranges.append(NSRange(location: location, length: index - location))
-            location = index + 1
-        }
-        ranges.append(NSRange(location: location, length: units.count - location))
-        rowRanges = ranges
-
+        ranges.reserveCapacity(rows.count)
         var texts: [DiffRowText] = []
-        texts.reserveCapacity(ranges.count)
+        texts.reserveCapacity(rows.count)
         var flatUnits: [UInt16] = []
-        flatUnits.reserveCapacity(units.count)
+        var flatClasses: [UInt8] = []
         var starts: [Int] = []
-        starts.reserveCapacity(ranges.count + 1)
+        starts.reserveCapacity(rows.count + 1)
         var widest: Double = 0
-        for (row, range) in ranges.enumerated() {
-            let marker = Self.marker(cell: row < cells.count ? cells[row] : nil, range: range, units: units)
-            let content = Array(units[(range.location + marker.length)..<NSMaxRange(range)])
-            let text = DiffRowText(markerLength: marker.length, markerColumns: marker.columns, units: content,
-                                   columns: Self.columns(of: content))
-            widest = max(widest, Double(marker.columns) + text.totalColumns)
+        var location = 0
+        for row in rows {
+            ranges.append(NSRange(location: location, length: row.length))
+            location += row.length + 1
+            let text = DiffRowText(markerLength: row.markerLength, markerColumns: row.markerColumns,
+                                   units: row.content, columns: row.columns)
+            widest = max(widest, Double(row.markerColumns) + text.totalColumns)
             starts.append(flatUnits.count)
-            flatUnits.append(contentsOf: content)
+            flatUnits.append(contentsOf: row.content)
+            flatClasses.append(contentsOf: row.classes)
             texts.append(text)
         }
         starts.append(flatUnits.count)
+        precondition(location - 1 == nsString.length, "the rows cover the attributed string")
+        rowRanges = ranges
         rowTexts = texts
         widestRowColumns = widest
         contentUnits = flatUnits
-        contentClasses = DiffLineBreaks.defaultClassifier.classify(flatUnits)
+        contentClasses = flatClasses
         contentStarts = starts
         totalColumns = texts.map(\.totalColumns)
         rowMarkerColumns = texts.map(\.markerColumns)
@@ -82,7 +121,7 @@ struct DiffPaneText {
 
     var rowCount: Int { rowRanges.count }
 
-    private static func marker(cell: DiffCell?, range: NSRange, units: [UInt16]) -> (length: Int, columns: Int) {
+    static func marker(cell: DiffCell?, range: NSRange, units: [UInt16]) -> (length: Int, columns: Int) {
         guard let cell, range.length > 0 else { return (0, 0) }
         switch cell.kind {
         case .line:

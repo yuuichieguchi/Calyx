@@ -236,6 +236,103 @@ struct DiffGutterDrawingTests {
         return count
     }
 
+    private enum GutterMarker: CustomStringConvertible {
+        case commentDot
+        case hoverButton
+        var description: String { self == .commentDot ? "comment dot" : "hover button" }
+    }
+
+    private struct PixelBox {
+        var minX = Int.max
+        var maxX = Int.min
+        var minY = Int.max
+        var maxY = Int.min
+        var isEmpty: Bool { minX > maxX }
+        mutating func include(x: Int, y: Int) {
+            minX = min(minX, x); maxX = max(maxX, x); minY = min(minY, y); maxY = max(maxY, y)
+        }
+        func contains(x: Int, y: Int) -> Bool { x >= minX && x <= maxX && y >= minY && y <= maxY }
+    }
+
+    private func inkPixels(_ ruler: NSView) throws -> (points: [(x: Int, y: Int)], scale: CGFloat) {
+        ruler.needsDisplay = true
+        let rep = try #require(ruler.bitmapImageRepForCachingDisplay(in: ruler.bounds))
+        ruler.cacheDisplay(in: ruler.bounds, to: rep)
+        var points: [(x: Int, y: Int)] = []
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide {
+                if let color = rep.colorAt(x: x, y: y), color.alphaComponent > 0.05 { points.append((x, y)) }
+            }
+        }
+        return (points, CGFloat(rep.pixelsWide) / ruler.bounds.width)
+    }
+
+    private func setHover(_ ruler: DiffLineNumberView, row: Int?, frames: [CGRect]) throws {
+        let window = try #require(ruler.window)
+        let y = row.map { frames[$0].midY } ?? -1_000_000
+        let location = ruler.convert(NSPoint(x: 5, y: y), to: nil)
+        let event = try #require(NSEvent.mouseEvent(with: .mouseMoved, location: location, modifierFlags: [],
+                                                    timestamp: 0, windowNumber: window.windowNumber, context: nil,
+                                                    eventNumber: 0, clickCount: 0, pressure: 0))
+        ruler.mouseMoved(with: event)
+    }
+
+    @Test(arguments: [DiffLayoutPreference.inline, .sideBySide], [GutterMarker.commentDot, .hoverButton])
+    private func gutterMarker_keepsTwoPointsClearOfLineNumbers(layout: DiffLayoutPreference,
+                                                               marker: GutterMarker) async throws {
+        try await withSettings(layout: layout, wrap: false) {
+            let hosted = try await makeHosted()
+            defer { hosted.close() }
+            let pane = panes(hosted.host.diffView, layout: layout)[layout == .inline ? 0 : 1]
+            let ruler = pane.lineNumberView
+            let original = ruler.rows
+            let frames = rulerFrames(pane)
+            let lineRows = original.indices.filter {
+                if case .line = original[$0].kind, original[$0].lineIndex != nil { return frames[$0].minY >= 0 && frames[$0].maxY <= ruler.bounds.height }
+                return false
+            }
+            let targets = Array(lineRows.prefix(3))
+            try #require(targets.count == 3)
+            for (row, number) in zip(targets, [123, 1234, 12345]) {
+                let base = original[row]
+                func rows(numbered: Bool) -> [GutterRow] {
+                    original.indices.map { index in
+                        let source = original[index]
+                        let shown = index == row && numbered
+                        return GutterRow(oldNumber: shown ? number : nil, newNumber: shown ? number : nil,
+                                         kind: source.kind, displayIndex: source.displayIndex,
+                                         lineIndex: source.lineIndex, indicator: nil)
+                    }
+                }
+                ruler.rows = rows(numbered: true)
+                ruler.commentedLineIndices = []
+                try setHover(ruler, row: nil, frames: frames)
+                let numbers = try inkPixels(ruler)
+                ruler.rows = rows(numbered: false)
+                switch marker {
+                case .commentDot: ruler.commentedLineIndices = [try #require(base.lineIndex)]
+                case .hoverButton: try setHover(ruler, row: row, frames: frames)
+                }
+                let markers = try inkPixels(ruler)
+                ruler.commentedLineIndices = []
+                try setHover(ruler, row: nil, frames: frames)
+                var markerBox = PixelBox()
+                for point in markers.points { markerBox.include(x: point.x, y: point.y) }
+                var numberBox = PixelBox()
+                for point in numbers.points { numberBox.include(x: point.x, y: point.y) }
+                let label = "\(layout) \(marker), \(String(number).count)-digit number \(number)"
+                try #require(!markerBox.isEmpty, "\(label): the marker must render")
+                try #require(!numberBox.isEmpty, "\(label): the number must render")
+                let scale = markers.scale
+                let gap = CGFloat(numberBox.minX - markerBox.maxX - 1) / scale
+                #expect(gap >= 2, "\(label): marker right edge \(CGFloat(markerBox.maxX + 1) / scale) pt, number left edge \(CGFloat(numberBox.minX) / scale) pt, gap \(gap) pt")
+                let inside = numbers.points.filter { markerBox.contains(x: $0.x, y: $0.y) }.count
+                #expect(inside == 0, "\(label): \(inside) number pixels fall inside the marker rect")
+            }
+            ruler.rows = original
+        }
+    }
+
     @Test(arguments: [(DiffLayoutPreference.inline, true), (.sideBySide, false)], [300, 400])
     func overviewRuler_neverDrawsOutsideItsFrame(layoutWrap: (DiffLayoutPreference, Bool),
                                                   changedLine: Int) async throws {

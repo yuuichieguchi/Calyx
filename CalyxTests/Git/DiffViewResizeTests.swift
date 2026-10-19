@@ -377,6 +377,138 @@ struct DiffViewResizeTests {
     @Test func automaticSwitch_inlineToSideBySide_inTheResizeFrame() async throws {
         try await crossBreakpoint(from: .inline, to: 1035)
     }
+
+    @Test func automaticSwitch_oscillatingCrossings_medianUnder8msMaxUnder16msOnePassEach() async throws {
+        try await withSettings(.automatic) {
+            let (window, view, _) = try await prepare(.automatic)
+            defer { window.orderOut(nil); window.close() }
+            #expect(view.currentLayout == .sideBySide)
+            let clock = ContinuousClock()
+            let downSweep = Array(stride(from: startWidth - 15, through: 780, by: -15))
+            let upSweep = Array(stride(from: downSweep[downSweep.count - 1] + 15, through: startWidth, by: 15))
+            let start = try visibleStart(modifiedPane(view))
+            var samples: [Double] = []
+            for cycle in 0..<10 {
+                for (direction, sweep) in [("down", downSweep), ("up", upSweep)] {
+                    var ordinaryFramesSinceCrossing = 0
+                    var crossings = 0
+                    for width in sweep {
+                        let label = "cycle \(cycle) \(direction) to \(width)"
+                        let layoutBefore = view.currentLayout
+                        let passesBefore = view.geometryPassCountForTesting
+                        let elapsed = clock.measure { setWidth(window, width) }
+                        if view.currentLayout != layoutBefore {
+                            crossings += 1
+                            #expect(ordinaryFramesSinceCrossing >= 5, "\(label): \(ordinaryFramesSinceCrossing) ordinary frames before the crossing")
+                            #expect(view.geometryPassCountForTesting - passesBefore == 1,
+                                    "\(label) ran \(view.geometryPassCountForTesting - passesBefore) geometry passes")
+                            samples.append(Double(elapsed.components.attoseconds) / 1e15 + Double(elapsed.components.seconds) * 1000)
+                            ordinaryFramesSinceCrossing = 0
+                        } else {
+                            ordinaryFramesSinceCrossing += 1
+                        }
+                        try expectSameStart(start, view, label)
+                    }
+                    #expect(crossings == 1, "cycle \(cycle) \(direction) crossed \(crossings) times")
+                    #expect(view.currentLayout == (direction == "down" ? .inline : .sideBySide))
+                    let passesAfterSweep = view.geometryPassCountForTesting
+                    try await settle(window)
+                    #expect(view.geometryPassCountForTesting == passesAfterSweep,
+                            "cycle \(cycle) \(direction) needed \(view.geometryPassCountForTesting - passesAfterSweep) more passes after the sweep")
+                    try expectSameStart(start, view, "cycle \(cycle) \(direction) settled")
+                }
+            }
+            #expect(samples.count == 20)
+            let sorted = samples.sorted()
+            let median = sorted[sorted.count / 2]
+            let maximum = sorted[sorted.count - 1]
+            let list = samples.map { String(format: "%.0f", $0) }.joined(separator: ",")
+            print("CROSSING-MEDIAN \(String(format: "%.2f", median)) ms max \(String(format: "%.2f", maximum)) ms")
+            #expect(median < 8, "median crossing frame \(String(format: "%.1f", median)) ms (samples \(list))")
+            #expect(maximum < 16, "max crossing frame \(String(format: "%.1f", maximum)) ms (samples \(list))")
+        }
+    }
+
+
+    private final class ResponderLog {
+        var responders: [NSResponder?] = []
+    }
+
+    private func hostedFocusView(startingIn layout: DiffLayout) async throws -> (ResizeTestWindow, DiffView) {
+        let (window, view) = try await makeHosted()
+        if layout == .inline {
+            setWidth(window, 880)
+            try await settle(window)
+        }
+        #expect(view.currentLayout == layout)
+        return (window, view)
+    }
+
+    private func focusCaret(_ window: NSWindow, _ pane: DiffPaneView, _ view: DiffView, modifiedLine: Int) throws {
+        #expect(window.makeFirstResponder(pane.linesView))
+        let row = try #require(view.row(forModifiedLine: modifiedLine))
+        pane.placeInsertionPoint(atRow: row)
+        #expect(view.currentModifiedLine() == modifiedLine)
+    }
+
+    private func crossLoggingResponders(_ window: NSWindow, to width: CGFloat) -> [NSResponder?] {
+        let log = ResponderLog()
+        let observation = window.observe(\.firstResponder, options: [.new]) { observed, _ in
+            log.responders.append(observed.firstResponder)
+        }
+        setWidth(window, width)
+        observation.invalidate()
+        return log.responders
+    }
+
+    @Test func layoutSwitch_inlineFocus_movesToCaretPaneOnTheSameLine() async throws {
+        try await withSettings(.automatic) {
+            let (window, view) = try await hostedFocusView(startingIn: .inline)
+            defer { window.orderOut(nil); window.close() }
+            try focusCaret(window, view.inlinePaneForTesting, view, modifiedLine: changedModifiedLines[1])
+            let responders = crossLoggingResponders(window, to: 1035)
+            #expect(view.currentLayout == .sideBySide)
+            let target = view.rightPaneForTesting.linesView
+            #expect(window.firstResponder === target, "first responder \(String(describing: window.firstResponder))")
+            #expect(view.currentModifiedLine() == changedModifiedLines[1])
+            let strays = responders.compactMap { $0 }.filter { !($0 is NSWindow) && $0 !== target }
+            #expect(strays.isEmpty, "responders in between: \(strays)")
+        }
+    }
+
+    @Test(arguments: [DiffSide.left, .right])
+    func layoutSwitch_sideBySideFocus_movesToInlinePaneOnTheSameLine(side: DiffSide) async throws {
+        try await withSettings(.automatic) {
+            let (window, view) = try await hostedFocusView(startingIn: .sideBySide)
+            defer { window.orderOut(nil); window.close() }
+            let pane = side == .left ? view.leftPaneForTesting : view.rightPaneForTesting
+            try focusCaret(window, pane, view, modifiedLine: changedModifiedLines[1])
+            let responders = crossLoggingResponders(window, to: 880)
+            #expect(view.currentLayout == .inline)
+            let target = view.inlinePaneForTesting.linesView
+            #expect(window.firstResponder === target, "first responder \(String(describing: window.firstResponder))")
+            #expect(view.currentModifiedLine() == changedModifiedLines[1])
+            let strays = responders.compactMap { $0 }.filter { !($0 is NSWindow) && $0 !== target }
+            #expect(strays.isEmpty, "responders in between: \(strays)")
+        }
+    }
+
+    @Test(arguments: [DiffLayout.inline, .sideBySide])
+    func layoutSwitch_focusOutsideTheDiff_staysWhereItIs(start: DiffLayout) async throws {
+        try await withSettings(.automatic) {
+            let (window, view) = try await hostedFocusView(startingIn: start)
+            defer { window.orderOut(nil); window.close() }
+            let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 80, height: 22))
+            view.addSubview(field)
+            #expect(window.makeFirstResponder(field))
+            let focused = window.firstResponder
+            let responders = crossLoggingResponders(window, to: start == .inline ? 1035 : 880)
+            #expect(view.currentLayout != start)
+            #expect(window.firstResponder === focused, "first responder \(String(describing: window.firstResponder))")
+            let strays = responders.compactMap { $0 }.filter { !($0 is NSWindow) && $0 !== focused }
+            #expect(strays.isEmpty, "responders in between: \(strays)")
+        }
+    }
 }
 
 }
