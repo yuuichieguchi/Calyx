@@ -63,8 +63,8 @@ final class DiffView: NSView {
     }
 
     private let inlinePane = DiffPaneView(side: .left, gutterColumns: .dual, accessibilitySuffix: ".inline")
-    private let leftPane = DiffPaneView(side: .left, gutterColumns: .single, accessibilitySuffix: ".old")
-    private let rightPane = DiffPaneView(side: .right, gutterColumns: .single, accessibilitySuffix: ".new")
+    private let leftPane = DiffPaneView(side: .left, gutterColumns: .single(.left), accessibilitySuffix: ".old")
+    private let rightPane = DiffPaneView(side: .right, gutterColumns: .single(.right), accessibilitySuffix: ".new")
     private let splitView = NSSplitView()
     private let rulerView = DiffOverviewRulerView(frame: .zero)
 
