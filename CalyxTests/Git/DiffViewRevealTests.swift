@@ -1,15 +1,3 @@
-// DiffViewRevealTests.swift
-// CalyxTests
-//
-// DiffView reveals the first change on first display (centred), navigates
-// changes with goToDiff (wrapping), and keeps the scroll position when the
-// same path is displayed again. The reveal is always deferred to layout()
-// and then the main queue, so tests drain the main queue after layout.
-//
-// Fixture: 400-line original; modified replaces lines 200-201 (2 -> 2) and
-// inserts one line at modified 350 (401 lines). Side-by-side rows: no filler
-// before modified 200, so modified line N (N <= 349) is row N-1 and the
-// inserted modified 350 is row 349 (its left cell is a filler).
 
 import AppKit
 import Foundation
@@ -57,15 +45,10 @@ struct DiffViewRevealTests {
         return view
     }
 
-    /// Suspends the main-actor test so the main queue runs the blocks
-    /// scheduled by layout() (layout switch, reveal). A nested run loop
-    /// cannot: the test itself runs inside a main-queue block.
     private func drainMainQueue() async throws {
         try await Task.sleep(for: .milliseconds(50))
     }
 
-    /// Layout pass + main-queue drain, twice: a layout switch applied on the
-    /// main queue requests another layout pass before the reveal runs.
     private func settle(_ view: NSView) async throws {
         for _ in 0..<2 {
             view.layoutSubtreeIfNeeded()
@@ -82,6 +65,7 @@ struct DiffViewRevealTests {
     private func makeWindow(holding view: NSView) -> NSWindow {
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
         window.contentView = view
         return window
     }
@@ -159,8 +143,6 @@ struct DiffViewRevealTests {
         }
     }
 
-    // MARK: Zero-size reveal (finding 1)
-
     @Test func zeroSizeDisplay_revealsAfterSizing() async throws {
         try await withIsolatedSettings {
             let view = DiffView(frame: .zero)
@@ -185,7 +167,6 @@ struct DiffViewRevealTests {
             try await settle(view)
             #expect(view.currentChangeIndex == 0)
 
-            // Programmatic scroll to the top (not a navigation).
             for scrollView in descendants(of: view, NSScrollView.self) {
                 scrollView.contentView.scroll(to: .zero)
                 scrollView.reflectScrolledClipView(scrollView.contentView)
@@ -199,7 +180,7 @@ struct DiffViewRevealTests {
         }
     }
 
-    @Test func pendingLayoutSwitch_revealWaitsForFinalLayout() async throws {
+    @Test func layoutSwitchInResizeFrame_revealRunsInFinalLayout() async throws {
         try await withIsolatedSettings {
             DiffLayoutSettings.preference = .automatic
             let view = DiffView(frame: NSRect(x: 0, y: 0, width: 1200, height: 400))
@@ -207,8 +188,7 @@ struct DiffViewRevealTests {
             #expect(view.currentLayout == .sideBySide)
             view.setFrameSize(NSSize(width: 800, height: 400))
             view.layoutSubtreeIfNeeded()
-            // The switch to inline is pending: no reveal in the old layout.
-            #expect(view.currentLayout == .sideBySide)
+            #expect(view.currentLayout == .inline)
             #expect(view.currentChangeIndex == nil)
             #expect(view.visibleRowRange.lowerBound == 0)
 
@@ -220,15 +200,13 @@ struct DiffViewRevealTests {
         }
     }
 
-    // MARK: User navigation cancels a waiting reveal (finding 2)
-
     @Test func goToDiff_beforeDeferredReveal_wins() async throws {
         try await withIsolatedSettings {
             let view = DiffView(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
             view.display(diff: DiffParser.parse(makeRaw(), path: "big.txt"))
-            view.layoutSubtreeIfNeeded() // reveal scheduled, not yet run
+            view.layoutSubtreeIfNeeded()
             #expect(view.currentChangeIndex == nil)
-            view.goToDiff(.previous) // from the top: wraps to the last change
+            view.goToDiff(.previous)
             try await settle(view)
             let row350 = try #require(view.row(forModifiedLine: 350))
             #expect(view.currentChangeIndex == 1)
@@ -249,8 +227,6 @@ struct DiffViewRevealTests {
             #expect(view.visibleRowRange.contains(380))
         }
     }
-
-    // MARK: Ruler toggle does not rebuild (finding 4)
 
     @Test func rulerToggle_keepsTextCaretAndScroll() async throws {
         try await withIsolatedSettings {
@@ -282,8 +258,6 @@ struct DiffViewRevealTests {
         }
     }
 
-    // MARK: Cursor line clamp (finding 5)
-
     @Test func cursorOnPureDeletionAtEOF_clampsToLastLine() async throws {
         try await withIsolatedSettings {
             DiffLayoutSettings.preference = .inline
@@ -300,16 +274,14 @@ struct DiffViewRevealTests {
                 window.orderOut(nil)
                 window.close()
             }
-            let textView = try #require(descendants(of: view, DiffTextView.self).first)
-            #expect(window.makeFirstResponder(textView))
-            let deletedRow = 10 // inline rows: lines 1-10, then deleted 11, 12
-            let location = try #require(textView.textStart(ofRow: deletedRow))
-            textView.setSelectedRange(NSRange(location: location, length: 0))
+            let linesView = try #require(descendants(of: view, DiffLinesView.self).first)
+            #expect(window.makeFirstResponder(linesView))
+            let deletedRow = 10
+            let location = linesView.rowRanges[deletedRow].location
+            linesView.setSelectedRange(NSRange(location: location, length: 0))
             #expect(view.currentModifiedLine() == 10)
         }
     }
-
-    // MARK: Left selection counts through the right caret (finding 6)
 
     @Test func leftPaneSelection_mirrorsToRightCaret() async throws {
         try await withIsolatedSettings {
@@ -320,13 +292,12 @@ struct DiffViewRevealTests {
                 window.close()
             }
             try await settle(view)
-            let textViews = descendants(of: view, DiffTextView.self)
-            #expect(textViews.count == 2)
-            // The split view's first subview is the original (left) pane.
-            let left = try #require(textViews.first)
+            let linesViews = descendants(of: view, DiffLinesView.self)
+            #expect(linesViews.count == 2)
+            let left = try #require(linesViews.first)
             #expect(window.makeFirstResponder(left))
             let row300 = try #require(view.row(forModifiedLine: 300))
-            let location = try #require(left.textStart(ofRow: row300))
+            let location = left.rowRanges[row300].location
             left.setSelectedRange(NSRange(location: location, length: 0))
             #expect(view.currentModifiedLine() == 300)
             view.goToDiff(.next)
@@ -335,4 +306,4 @@ struct DiffViewRevealTests {
     }
 }
 
-} // extension DiffViewWindowedSuites
+}

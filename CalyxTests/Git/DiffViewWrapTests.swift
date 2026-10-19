@@ -1,31 +1,14 @@
-// DiffViewWrapTests.swift
-// CalyxTests
-//
-// Word wrap in the diff view (plan Addendum 2, §3/§4/§7/§8): measured row
-// frames, side-by-side block alignment via paddings, virtual tail padding,
-// wrap toggle, width-change realign, inline / banner / zero-size cases.
-//
-// Fixtures (side-by-side, no filler before the change, so modified line N
-// sits at row N-1 until the change):
-// F1: 60 lines, line 30 replaced 1->1 by a 300-char modified line.
-// F2: 60 lines, line 30 replaced 1->2 by two 300-char lines (block of 2 rows:
-//     del/add, filler/add).
-// F3: 10 lines + one 300-char line inserted at end of file.
-// F4: 60 short lines, line 30 replaced 1->1 by a short line.
-
 import AppKit
 import Foundation
 import Testing
 @testable import Calyx
 
-/// 300 characters: 100 x "xx " (breakable by .byWordWrapping).
 private let longText = String(repeating: "xx ", count: 100)
 
 private func header(old: Int, new: Int) -> String {
     "diff --git a/w.txt b/w.txt\n--- a/w.txt\n+++ b/w.txt\n@@ -1,\(old) +1,\(new) @@\n"
 }
 
-/// F1 (`added == [longText]`), F2 (`[longText, longText]`), F4 (short).
 private func makeReplacementRaw(added: [String]) -> String {
     var out = header(old: 60, new: 59 + added.count)
     for n in 1...60 {
@@ -43,13 +26,10 @@ private func makeF1() -> FileDiff { DiffParser.parse(makeReplacementRaw(added: [
 private func makeF2() -> FileDiff { DiffParser.parse(makeReplacementRaw(added: [longText, longText]), path: "w.txt") }
 private func makeF4() -> FileDiff { DiffParser.parse(makeReplacementRaw(added: ["short line"]), path: "w.txt") }
 
-/// F5: line 30 replaced 1->1 by a deeply indented long line (indent leaves
-/// no room in a narrow pane, so it is zeroed by the no-room rule).
 private func makeF5() -> FileDiff {
     DiffParser.parse(makeReplacementRaw(added: [String(repeating: " ", count: 40) + longText]), path: "w.txt")
 }
 
-/// `lines` context lines + one 300-char line inserted at end of file.
 private func makeEOFInsertion(lines: Int) -> FileDiff {
     var out = header(old: lines, new: lines + 1)
     for n in 1...lines { out += " line \(n)\n" }
@@ -57,7 +37,6 @@ private func makeEOFInsertion(lines: Int) -> FileDiff {
     return DiffParser.parse(out, path: "w.txt")
 }
 
-/// 40 lines; rows 10 and 30 contain "needle".
 private func makeNeedleDiff() -> FileDiff {
     var out = header(old: 40, new: 40)
     for n in 1...40 { out += n == 10 || n == 30 ? " needle \(n)\n" : " line \(n)\n" }
@@ -108,30 +87,25 @@ struct DiffViewWrapTests {
     }
 
     private func frames(_ pane: DiffPaneView) -> [CGRect] {
-        pane.textView.ensureRowFrames()
+        let geometry = pane.linesView.geometry
+        return (0..<geometry.rowCount).map {
+            CGRect(x: 0, y: geometry.rowTop($0), width: pane.linesView.bounds.width, height: geometry.rowHeight($0))
+        }
     }
 
     private func docHeight(_ pane: DiffPaneView) -> CGFloat {
-        frames(pane).last?.maxY ?? 0
+        pane.linesView.geometry.documentHeight
     }
 
-    /// Counts NSTextStorage.didProcessEditingNotification per storage.
-    private final class EditCounter {
-        var left = 0
-        var right = 0
-        private var tokens: [NSObjectProtocol] = []
-        init(left: NSTextStorage, right: NSTextStorage) {
-            tokens.append(NotificationCenter.default.addObserver(
-                forName: NSTextStorage.didProcessEditingNotification, object: left, queue: nil
-            ) { [unowned self] _ in self.left += 1 })
-            tokens.append(NotificationCenter.default.addObserver(
-                forName: NSTextStorage.didProcessEditingNotification, object: right, queue: nil
-            ) { [unowned self] _ in self.right += 1 })
-        }
-        func stop() { tokens.forEach(NotificationCenter.default.removeObserver); tokens = [] }
+    private func pads(_ pane: DiffPaneView) -> [Int: CGFloat] {
+        var result: [Int: CGFloat] = [:]
+        for (row, pad) in pane.linesView.geometry.pads.enumerated() where pad > 0 { result[row] = pad }
+        return result
     }
 
-    // MARK: Fixture sanity
+    private func lastRowPad(_ pane: DiffPaneView) -> CGFloat {
+        pane.linesView.geometry.pads.last ?? 0
+    }
 
     @Test func fixtureSanity() {
         #expect(makeF1().changes.map(\.modified.startLineNumber) == [30])
@@ -139,8 +113,6 @@ struct DiffViewWrapTests {
         #expect(makeF3().newLineCount == 11)
         #expect(longText.count == 300)
     }
-
-    // MARK: Wrapping
 
     @Test func longLine_wrapsWhenOn() async throws {
         try await withIsolatedSettings {
@@ -151,11 +123,10 @@ struct DiffViewWrapTests {
             let f = frames(right)
             #expect(f[row].height > DiffMetrics.rowHeight, "the 300-char row must wrap at 600 pt")
             #expect(f[row - 1].height == DiffMetrics.rowHeight, "a short row must not wrap")
-            #expect(right.textView.frame.width <= right.scrollView.contentSize.width + 1)
+            #expect(right.linesView.frame.width <= right.scrollView.contentSize.width + 1)
             #expect(right.scrollView.hasHorizontalScroller == false)
-            let width = try #require(right.textView.textContainer).containerSize.width
-            #expect(width < .greatestFiniteMagnitude)
-            #expect(width > 0)
+            let column = try #require(right.linesView.wrappingColumn)
+            #expect(column > 0)
         }
     }
 
@@ -170,12 +141,12 @@ struct DiffViewWrapTests {
             for i in 0..<min(left.count, right.count) {
                 #expect(abs(left[i].minY - right[i].minY) <= 0.5, "row \(i) minY must align")
             }
-            let padding = view.leftPaneForTesting.textView.appliedPadding
+            let padding = pads(view.leftPaneForTesting)
             #expect(Array(padding.keys) == [row])
             let pad = try #require(padding[row])
             #expect(abs(pad - (right[row].height - DiffMetrics.rowHeight)) <= 0.5)
             #expect(abs(left[row].height - right[row].height) <= 0.5)
-            #expect(view.rightPaneForTesting.textView.appliedPadding.isEmpty)
+            #expect(pads(view.rightPaneForTesting).isEmpty)
         }
     }
 
@@ -184,7 +155,6 @@ struct DiffViewWrapTests {
             let view = try await makeView(makeF2())
             let row = try #require(view.row(forModifiedLine: 30))
             #expect(row == 29)
-            // 1 -> 2 replacement: rows 29 (del/add) and 30 (filler/add) form one block.
             #expect(view.blocksForTesting.contains(29..<31))
             let leftPane = view.leftPaneForTesting
             let rightPane = view.rightPaneForTesting
@@ -196,24 +166,23 @@ struct DiffViewWrapTests {
                 #expect(abs(left[block.lowerBound].minY - right[block.lowerBound].minY) <= 0.5,
                         "block \(block) start must align")
             }
-            // The shorter (left) side pads the block's last row only.
-            #expect(Array(leftPane.textView.appliedPadding.keys) == [30])
-            #expect(rightPane.textView.appliedPadding.isEmpty)
+            #expect(Array(pads(leftPane).keys) == [30])
+            #expect(pads(rightPane).isEmpty)
         }
     }
 
-    @Test func eofInsertion_padsVirtually() async throws {
+    @Test func eofInsertion_padsLastRowInGeometry() async throws {
         try await withIsolatedSettings {
             let view = try await makeView(makeF3())
             let leftPane = view.leftPaneForTesting
             let rightPane = view.rightPaneForTesting
-            #expect(leftPane.textView.tailPadding > 0)
-            #expect(rightPane.textView.tailPadding == 0)
+            #expect(lastRowPad(leftPane) > 0)
+            #expect(lastRowPad(rightPane) == 0)
             #expect(abs(docHeight(leftPane) - docHeight(rightPane)) <= 0.5)
-            let storage = try #require(leftPane.textView.textStorage)
-            #expect(storage.length > 0)
-            let style = storage.attribute(.paragraphStyle, at: storage.length - 1, effectiveRange: nil) as? NSParagraphStyle
-            #expect((style?.paragraphSpacing ?? 0) == 0, "the final pad is virtual, not an attribute")
+            let geometry = leftPane.linesView.geometry
+            let last = geometry.rowCount - 1
+            #expect(geometry.documentHeight == geometry.rowTop(last) + geometry.contentHeight(last) + lastRowPad(leftPane),
+                    "the final pad is part of the document height")
         }
     }
 
@@ -226,14 +195,11 @@ struct DiffViewWrapTests {
             let fontHeight: CGFloat = 12
             let y = DiffGutterGeometry.labelY(rowFrame: frame, rowHeight: DiffMetrics.rowHeight, fontHeight: fontHeight)
             #expect(abs(y - (frame.minY + (DiffMetrics.rowHeight - fontHeight) / 2)) <= 0.001)
-            // Independent of the frame height: one label in the first fragment.
             let tall = CGRect(x: 0, y: 100, width: 50, height: 3 * DiffMetrics.rowHeight)
             let y2 = DiffGutterGeometry.labelY(rowFrame: tall, rowHeight: DiffMetrics.rowHeight, fontHeight: fontHeight)
             #expect(abs(y2 - (100 + (DiffMetrics.rowHeight - fontHeight) / 2)) <= 0.001)
         }
     }
-
-    // MARK: Toggle
 
     @Test func toggleOff_restoresArithmeticFrames() async throws {
         try await withIsolatedSettings {
@@ -250,10 +216,10 @@ struct DiffViewWrapTests {
             }
             #expect(right.scrollView.hasHorizontalScroller == true)
             #expect(right.wordWrap == false)
-            #expect(right.textView.appliedPadding.isEmpty)
-            #expect(view.leftPaneForTesting.textView.appliedPadding.isEmpty)
-            #expect(view.leftPaneForTesting.textView.tailPadding == 0)
-            #expect(try #require(right.textView.textContainer).containerSize.width == .greatestFiniteMagnitude)
+            #expect(pads(right).isEmpty)
+            #expect(pads(view.leftPaneForTesting).isEmpty)
+            #expect(lastRowPad(view.leftPaneForTesting) == 0)
+            #expect(right.linesView.wrappingColumn == nil)
         }
     }
 
@@ -276,8 +242,6 @@ struct DiffViewWrapTests {
         }
     }
 
-    // MARK: Width change
-
     @Test func widthChange_realignsOnce() async throws {
         try await withIsolatedSettings {
             let view = try await makeView(makeF1())
@@ -285,9 +249,7 @@ struct DiffViewWrapTests {
             let leftPane = view.leftPaneForTesting
             let rightPane = view.rightPaneForTesting
             let before = frames(rightPane)[row].height
-            let counter = EditCounter(left: try #require(leftPane.textView.textStorage),
-                                      right: try #require(rightPane.textView.textStorage))
-            defer { counter.stop() }
+            let leftPadBefore = pads(leftPane)
 
             view.setFrameSize(NSSize(width: 400, height: 400))
             try await settle(view)
@@ -295,8 +257,9 @@ struct DiffViewWrapTests {
             #expect(view.currentLayout == .sideBySide)
             #expect(frames(rightPane)[row].height > before)
             #expect(abs(docHeight(leftPane) - docHeight(rightPane)) <= 0.5)
-            #expect(counter.left >= 1, "the left pad changes: at least one edit batch")
-            #expect(counter.right == 0, "the right side needs no pad: no edit")
+            #expect(pads(leftPane) != leftPadBefore, "the left pad changes")
+            #expect(pads(leftPane)[row] != nil)
+            #expect(pads(rightPane).isEmpty, "the right side needs no pad")
         }
     }
 
@@ -306,22 +269,19 @@ struct DiffViewWrapTests {
             let leftPane = view.leftPaneForTesting
             let rightPane = view.rightPaneForTesting
             let range = view.visibleRowRange
-            let counter = EditCounter(left: try #require(leftPane.textView.textStorage),
-                                      right: try #require(rightPane.textView.textStorage))
-            defer { counter.stop() }
+            let leftBefore = leftPane.linesView.geometry
+            let rightBefore = rightPane.linesView.geometry
 
             view.setFrameSize(NSSize(width: 400, height: 400))
             try await settle(view)
 
-            #expect(counter.left == 0)
-            #expect(counter.right == 0)
+            #expect(leftPane.linesView.geometry == leftBefore, "no row re-wraps and no pad changes")
+            #expect(rightPane.linesView.geometry == rightBefore, "no row re-wraps and no pad changes")
             #expect(view.visibleRowRange == range)
-            #expect(leftPane.textView.appliedPadding.isEmpty)
-            #expect(rightPane.textView.appliedPadding.isEmpty)
+            #expect(pads(leftPane).isEmpty)
+            #expect(pads(rightPane).isEmpty)
         }
     }
-
-    // MARK: Inline / banner / zero size
 
     @Test func inline_noAlignmentPass() async throws {
         try await withIsolatedSettings {
@@ -330,8 +290,8 @@ struct DiffViewWrapTests {
             #expect(view.currentLayout == .inline)
             let row = try #require(view.row(forModifiedLine: 30))
             let inline = view.inlinePaneForTesting
-            #expect(inline.textView.appliedPadding.isEmpty)
-            #expect(inline.textView.tailPadding == 0)
+            #expect(pads(inline).isEmpty)
+            #expect(lastRowPad(inline) == 0)
             #expect(frames(inline)[row].height > DiffMetrics.rowHeight)
         }
     }
@@ -360,28 +320,24 @@ struct DiffViewWrapTests {
             view.display(diff: makeF1())
             try await settle(view)
             let right = view.rightPaneForTesting
-            #expect(try #require(right.textView.textContainer).containerSize.width == .greatestFiniteMagnitude)
+            #expect(right.linesView.wrappingColumn == nil)
 
             view.setFrameSize(size)
             try await settle(view)
-            let width = try #require(right.textView.textContainer).containerSize.width
-            #expect(width < .greatestFiniteMagnitude)
-            #expect(width > 0)
+            let column = try #require(right.linesView.wrappingColumn)
+            #expect(column > 0)
         }
     }
 
-    // MARK: Indent zeroing before measuring
-
-    /// Indent zeroing changes wrap counts, so it must run before the heights
-    /// the pads are computed from: one realign yields aligned blocks.
     @Test func narrowView_deepIndentZeroed_blocksAlignedInOnePass() async throws {
         try await withIsolatedSettings {
             let view = try await makeView(makeF5(), width: 300)
             #expect(view.currentLayout == .sideBySide)
             let leftPane = view.leftPaneForTesting
             let rightPane = view.rightPaneForTesting
-            #expect(rightPane.wrappingColumns < 42, "the 40-space indent must leave no room")
+            #expect(try #require(rightPane.linesView.wrappingColumn) < 42, "the 40-space indent must leave no room")
             let row = try #require(view.row(forModifiedLine: 30))
+            #expect(rightPane.linesView.projections[row]?.wrappedTextIndentLength == 0)
             let left = frames(leftPane)
             let right = frames(rightPane)
             #expect(right[row].height > DiffMetrics.rowHeight)
@@ -390,11 +346,51 @@ struct DiffViewWrapTests {
         }
     }
 
-    // MARK: Legacy scroller
+    @Test func legacyScrollerAtTheToggleThreshold_settlesInOnePass() async throws {
+        try await withIsolatedSettings {
+            DiffLayoutSettings.preference = .inline
+            let view = DiffView(frame: NSRect(x: 0, y: 0, width: 700, height: 400))
+            let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.animationBehavior = .none
+            defer {
+                window.orderOut(nil)
+                window.close()
+            }
+            window.contentView = view
+            view.autoresizingMask = [.width, .height]
+            let pane = view.inlinePaneForTesting
+            pane.scrollView.scrollerStyle = .legacy
+            let rows = Int((400 - 2 * DiffMetrics.textInset.height) / DiffMetrics.rowHeight) - 2
+            var raw = header(old: rows, new: rows)
+            for n in 1...rows { raw += n == 3 ? " \(n) " + String(repeating: "word ", count: 24) + "\n" : " line \(n)\n" }
+            view.display(diff: DiffParser.parse(raw, path: "w.txt"))
+            window.layoutIfNeeded()
+            try await settle(view)
+            @MainActor func expectedColumn() -> Int {
+                let scrollView = pane.scrollView
+                let clip = scrollView.contentView
+                return DiffPaneView.wrappingColumn(textAreaWidth: clip.bounds.width - clip.contentInsets.left - clip.contentInsets.right,
+                                                   reservesLegacyScroller: scrollView.verticalScroller?.isHidden ?? true,
+                                                   scrollerStyle: .legacy)
+            }
+            for width in [520.0, 610.0, 480.0, 700.0] {
+                let before = view.geometryPassCountForTesting
+                window.setContentSize(NSSize(width: width, height: 400))
+                window.layoutIfNeeded()
+                let passes = view.geometryPassCountForTesting - before
+                #expect(passes <= 1, "width \(width): \(passes) re-wrap passes")
+                #expect(pane.linesView.wrappingColumn == expectedColumn(),
+                        "width \(width): column \(String(describing: pane.linesView.wrappingColumn)) vs \(expectedColumn())")
+                let settled = view.geometryPassCountForTesting
+                window.layoutIfNeeded()
+                try await settle(view)
+                #expect(view.geometryPassCountForTesting == settled, "width \(width): nothing re-wraps after the pass")
+                #expect(pane.linesView.wrappingColumn == expectedColumn())
+            }
+        }
+    }
 
-    /// A legacy (space-taking) vertical scroller that appears only once the
-    /// left pane's tail pad makes it taller than the clip must re-wrap the
-    /// pane at the narrower width.
     @Test func legacyScrollerAppearingAfterPad_rewrapsAtNewWidth() async throws {
         try await withIsolatedSettings {
             let lines = Int((400 - 4 * DiffMetrics.rowHeight) / DiffMetrics.rowHeight)
@@ -405,65 +401,56 @@ struct DiffViewWrapTests {
             view.display(diff: makeEOFInsertion(lines: lines))
             try await settle(view)
             let leftPane = view.leftPaneForTesting
-            #expect(leftPane.textView.tailPadding > 0)
-            #expect(leftPane.textView.frame.height > leftPane.scrollView.contentView.bounds.height)
+            #expect(lastRowPad(leftPane) > 0)
+            #expect(leftPane.linesView.frame.height > leftPane.scrollView.contentView.bounds.height)
             #expect(leftPane.scrollView.verticalScroller?.isHidden == false)
             for pane in [leftPane, view.rightPaneForTesting] {
-                let ruler = pane.scrollView.verticalRulerView?.requiredThickness ?? 0
-                let viewport = pane.scrollView.contentSize.width - ruler
-                let expected = max(viewport - 2 * DiffMetrics.textInset.width, 8 * DiffMetrics.columnWidth)
-                let width = try #require(pane.textView.textContainer).containerSize.width
-                #expect(abs(width - expected) <= 0.5, "container \(width) vs wrap width \(expected)")
+                let clip = pane.scrollView.contentView
+                let clipWidth = clip.bounds.width - clip.contentInsets.left - clip.contentInsets.right
+                #expect(clip.contentInsets.left >= pane.lineNumberView.requiredThickness - 0.5, "the gutter is outside the text area")
+                let expected = DiffPaneView.wrappingColumn(
+                    textAreaWidth: clipWidth, reservesLegacyScroller: pane.scrollView.verticalScroller?.isHidden ?? true,
+                    scrollerStyle: .legacy)
+                let column = try #require(pane.linesView.wrappingColumn)
+                #expect(column == expected, "wrapping column \(column) vs \(expected) for clip width \(clipWidth)")
             }
         }
     }
 
-    // MARK: Find bar
-
-    /// The find bar works on the explicit TextKit 1 network.
-    @Test func findNext_onOwnedTextKit1Stack_selectsNeedle() async throws {
+    @Test func findNext_onLinesView_selectsNeedle() async throws {
         try await withIsolatedSettings {
             let view = try await makeView(makeNeedleDiff())
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 400),
                                   styleMask: [.titled], backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
+            window.animationBehavior = .none
             defer {
                 window.orderOut(nil)
                 window.close()
             }
             window.contentView = view
             try await settle(view)
-            let textView = view.rightPaneForTesting.textView
-            let storage = try #require(textView.textStorage)
-            let layoutManager = try #require(textView.layoutManager)
-            #expect(storage.layoutManagers.contains { $0 === layoutManager })
-            #expect(layoutManager.textContainers.contains { $0 === textView.container })
-            #expect(textView.textLayoutManager == nil, "TextKit 1")
-            #expect(window.makeFirstResponder(textView))
-            textView.setSelectedRange(NSRange(location: 0, length: 0))
+            let linesView = view.rightPaneForTesting.linesView
+            #expect(window.makeFirstResponder(linesView))
+            let expected = (linesView.string as NSString).range(of: "needle")
+            #expect(expected.location != NSNotFound)
+            linesView.setSelectedRange(expected)
+            let useSelection = NSMenuItem(title: "Use Selection for Find",
+                                          action: #selector(DiffPaneView.performFindPanelAction(_:)), keyEquivalent: "")
+            useSelection.tag = NSTextFinder.Action.setSearchString.rawValue
+            view.rightPaneForTesting.performFindPanelAction(useSelection)
+            linesView.setSelectedRange(NSRange(location: 0, length: 0))
 
-            let pasteboard = NSPasteboard(name: .find)
-            pasteboard.clearContents()
-            pasteboard.setString("needle", forType: .string)
-            let item = NSMenuItem(title: "Find Next", action: #selector(NSTextView.performFindPanelAction(_:)),
+            let item = NSMenuItem(title: "Find Next", action: #selector(DiffPaneView.performFindPanelAction(_:)),
                                   keyEquivalent: "")
             item.tag = NSTextFinder.Action.nextMatch.rawValue
-            textView.performFindPanelAction(item)
+            view.rightPaneForTesting.performFindPanelAction(item)
             try await drainMainQueue()
 
-            let expected = (storage.string as NSString).range(of: "needle")
-            #expect(expected.location != NSNotFound)
-            #expect(textView.selectedRange() == expected)
+            #expect(linesView.selectedRange() == expected)
         }
     }
 
-    /// Regression: a clip-view frame change arrives inside
-    /// `NSScrollView.tile()` (mid layout pass). Re-marking layout from it
-    /// looped the window's layout pass (NSGenericException "more Update
-    /// Constraints in Window passes than there are views"). Window-hosted
-    /// views across wrap toggles and resizes must settle. (In isolation this
-    /// does not trip the loop; the original reproducer was DiffViewRevealTests
-    /// + DiffViewWrapTests in one launch.)
     @Test func windowHosted_wrapToggleAndResize_layoutSettles() async throws {
         try await withIsolatedSettings {
             var raw = header(old: 400, new: 401)
@@ -482,6 +469,7 @@ struct DiffViewWrapTests {
                 let view = DiffView(frame: NSRect(x: 0, y: 0, width: 800, height: 400))
                 let window = NSWindow(contentRect: view.frame, styleMask: [.titled], backing: .buffered, defer: false)
                 window.isReleasedWhenClosed = false
+                window.animationBehavior = .none
                 window.contentView = view
                 windows.append(window)
                 if legacy {
@@ -512,10 +500,6 @@ struct DiffViewWrapTests {
         }
     }
 
-    // MARK: Width change keeps the viewport (VS Code viewport-start line + delta)
-
-    /// 400 lines with long (wrapping) lines every 10 lines; line 200
-    /// replaced by a long line.
     private func makeAnchorDiff() -> FileDiff {
         var raw = header(old: 400, new: 400)
         for n in 1...400 {
@@ -543,6 +527,7 @@ struct DiffViewWrapTests {
             let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .resizable],
                                   backing: .buffered, defer: false)
             window.isReleasedWhenClosed = false
+            window.animationBehavior = .none
             defer {
                 window.orderOut(nil)
                 window.close()
@@ -554,26 +539,24 @@ struct DiffViewWrapTests {
 
             let panes = layout == .inline
                 ? [view.inlinePaneForTesting] : [view.leftPaneForTesting, view.rightPaneForTesting]
-            // The modified line 200 (its addition row; in side-by-side the
-            // row shared by the deletion and the addition).
             let addCells = view.rightPaneForTesting.cells
             let row = try #require((layout == .inline ? panes[0].cells : addCells).firstIndex {
                 if case .line(.addition)? = $0?.kind { return true }
                 return false
             })
-            // The modified side anchors the viewport; panes share one y.
             let reference = panes[panes.count - 1]
-            let natural0 = reference.textView.naturalHeights()[row]
-            if wrap { #expect(natural0 > DiffMetrics.rowHeight * 1.5, "line 200 wraps at 900 pt") }
-            // Viewport top inside line 200: half way down when wrapped, 7 pt otherwise.
-            let fraction: CGFloat = wrap ? 0.5 : 7 / natural0
+            let geometry0 = reference.linesView.geometry
+            if wrap { #expect(geometry0.contentHeight(row) > DiffMetrics.rowHeight * 1.5, "line 200 wraps at 900 pt") }
+            let offsetInRow: CGFloat = wrap ? DiffMetrics.rowHeight + 3 : 7
             for pane in panes {
-                pane.scroll(toY: pane.textView.ensureRowFrames()[row].minY + fraction * natural0)
+                pane.scroll(toY: pane.linesView.geometry.rowTop(row) + offsetInRow)
             }
             try await settle(view)
             #expect(reference.firstVisibleRow == row)
 
             for width in [600.0, 1200.0, 900.0] {
+                let start = try #require(reference.viewportStart())
+                #expect(start.row == row)
                 window.setContentSize(NSSize(width: width, height: 400))
                 window.layoutIfNeeded()
                 try await settle(view)
@@ -581,24 +564,19 @@ struct DiffViewWrapTests {
                     #expect(pane.firstVisibleRow == row, "width \(width): first visible row")
                     #expect(abs(viewportTop(pane) - viewportTop(reference)) <= 0.5, "width \(width): panes share y")
                 }
-                let frame = reference.textView.ensureRowFrames()[row]
-                let natural = reference.textView.naturalHeights()[row]
-                let offset = viewportTop(reference) - frame.minY
-                #expect(abs(offset - fraction * natural) <= 1,
-                        "width \(width): offset \(offset) vs \(fraction * natural) (natural \(natural))")
+                let expected = reference.scrollY(for: start)
+                #expect(abs(viewportTop(reference) - expected) <= 0.5,
+                        "width \(width): top \(viewportTop(reference)) vs \(expected) for \(start)")
             }
         }
     }
 
-    // MARK: A scroll during a pending width change supersedes the anchor
-
-    /// Window-hosted side-by-side wrapped view of `makeAnchorDiff()` at
-    /// 900 pt, its viewport top at the modified line 50.
     private func makeAnchoredWindow() async throws -> (NSWindow, DiffView) {
         let view = DiffView(frame: NSRect(x: 0, y: 0, width: 900, height: 400))
         let window = NSWindow(contentRect: view.frame, styleMask: [.titled, .resizable],
                               backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
         window.contentView = view
         view.display(diff: makeAnchorDiff())
         window.layoutIfNeeded()
@@ -610,8 +588,6 @@ struct DiffViewWrapTests {
         return (window, view)
     }
 
-    /// Starts a width change: the panes re-wrap (anchor captured and
-    /// restored) and the realign stays queued on the main queue.
     private func startWidthChange(_ window: NSWindow) {
         window.setContentSize(NSSize(width: 600, height: 400))
         window.layoutIfNeeded()
@@ -647,11 +623,11 @@ struct DiffViewWrapTests {
             let row200 = try #require(view.row(forModifiedLine: 200))
             let pane = view.rightPaneForTesting
             let visible = pane.scrollView.documentVisibleRect
-            let frame = pane.textView.ensureRowFrames()[row200]
+            let frame = frames(pane)[row200]
             #expect(frame.minY >= visible.minY && frame.minY < visible.maxY,
                     "the revealed change stays visible: \(frame) in \(visible)")
         }
     }
 }
 
-} // extension DiffViewWindowedSuites
+}

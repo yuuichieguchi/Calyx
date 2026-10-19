@@ -1,18 +1,3 @@
-// DiffGutterDrawingTests.swift
-// CalyxTests
-//
-// Regression: the line-number gutter (`DiffLineNumberView`) painted rows
-// above the diff view, over the tab bar / toolbar. With
-// `clipsToBounds == false` (macOS 14+) and no clipping ancestor (inline
-// layout: no NSSplitView), AppKit sizes the ruler's backing to its
-// `visibleRect`, which reaches the window top, and passes a dirty rect
-// taller than the ruler's bounds. The gutter drew every row intersecting
-// that rect; later scroll-time redraws only cover the bounds, so the rows
-// painted above stayed burned in.
-//
-// The pixel checks render the live layer tree (`CALayer.render(in:)`),
-// which shows stale backing contents; `cacheDisplay` redraws the views and
-// is checked as well.
 
 import AppKit
 import QuartzCore
@@ -21,7 +6,6 @@ import Testing
 
 private let longText = String(repeating: "xx ", count: 100)
 
-/// 400 lines; long (wrapping) lines every 40 lines, line 300 modified.
 private let layoutWrapCases: [(DiffLayoutPreference, Bool)] = [
     (.inline, true), (.inline, false), (.sideBySide, true), (.sideBySide, false),
 ]
@@ -47,15 +31,12 @@ extension DiffViewWindowedSuites {
 struct DiffGutterDrawingTests {
 
     private let suiteName = "com.calyx.tests.DiffGutterDrawingTests"
-    /// Height of the empty band above the diff view (stands in for the
-    /// tab bar / toolbar).
     private let bandHeight: CGFloat = 100
 
     private struct Hosted {
         let window: NSWindow
         let container: NSView
         let host: DiffGlassHostView
-        /// The container's live layer render before the diff view exists.
         let baseline: NSBitmapImageRep
 
         func close() {
@@ -74,13 +55,11 @@ struct DiffGutterDrawingTests {
         try await body()
     }
 
-    /// The app's open path: the host (and its DiffView) is created at
-    /// `.zero`, the diff is displayed before the view is sized, then the
-    /// view is laid out below an empty band, layer-backed, on screen.
     private func makeHosted(_ diff: FileDiff = makeLongDiff()) async throws -> Hosted {
         let window = NSWindow(contentRect: NSRect(x: 100, y: 100, width: 600, height: 400 + bandHeight),
                               styleMask: [.titled, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
+        window.animationBehavior = .none
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400 + bandHeight))
         container.wantsLayer = true
         window.contentView = container
@@ -113,9 +92,6 @@ struct DiffGutterDrawingTests {
         layout == .inline ? [view.inlinePaneForTesting] : [view.leftPaneForTesting, view.rightPaneForTesting]
     }
 
-    /// Pixels in the band above the diff view that differ from the
-    /// baseline rendered before the diff view existed, from the live layer
-    /// contents (stale pixels included).
     private func layerBandPixels(_ hosted: Hosted) throws -> Int {
         let rep = try renderLayer(hosted.container)
         let scale = CGFloat(rep.pixelsHigh) / hosted.container.bounds.height
@@ -136,7 +112,6 @@ struct DiffGutterDrawingTests {
         return count
     }
 
-    /// The container's live layer contents.
     private func renderLayer(_ container: NSView) throws -> NSBitmapImageRep {
         let root = try #require(container.layer)
         let width = Int(root.bounds.width)
@@ -148,14 +123,12 @@ struct DiffGutterDrawingTests {
         return NSBitmapImageRep(cgImage: try #require(context.makeImage()))
     }
 
-    /// Non-transparent pixels in the band above the diff view, redrawn.
     private func cachedBandPixels(_ container: NSView) throws -> Int {
         let rep = try #require(container.bitmapImageRepForCachingDisplay(in: container.bounds))
         container.cacheDisplay(in: container.bounds, to: rep)
         return bandPixels(rep, pointHeight: container.bounds.height)
     }
 
-    /// Row 0 of a bitmap rep is the top edge.
     private func bandPixels(_ rep: NSBitmapImageRep, pointHeight: CGFloat) -> Int {
         let scale = CGFloat(rep.pixelsHigh) / pointHeight
         let bandRows = Int(bandHeight * scale)
@@ -168,33 +141,27 @@ struct DiffGutterDrawingTests {
         return count
     }
 
-    /// Row frames in the ruler's coordinates (same conversion as drawing).
     private func rulerFrames(_ pane: DiffPaneView) -> [CGRect] {
         let ruler = pane.lineNumberView
-        return pane.textView.ensureRowFrames().map {
-            let y = ruler.convert(NSPoint(x: 0, y: $0.minY), from: pane.textView).y
-            return CGRect(x: 0, y: y, width: ruler.bounds.width, height: $0.height)
+        let geometry = pane.linesView.geometry
+        return (0..<geometry.rowCount).map {
+            let y = ruler.convert(NSPoint(x: 0, y: geometry.rowTop($0)), from: pane.linesView).y
+            return CGRect(x: 0, y: y, width: ruler.bounds.width, height: geometry.rowHeight($0))
         }
     }
 
-    // MARK: Pure geometry
-
     @Test func rowsToDraw_clipsDirtyRectToBounds() {
-        let frames = (0..<10).map { CGRect(x: 0, y: CGFloat($0) * 20 - 100, width: 40, height: 20) }
+        let geometry = DiffRowGeometry(segmentCounts: Array(repeating: 1, count: 10),
+                                       pads: Array(repeating: 0, count: 10), rowHeight: 20, topInset: 0)
         let bounds = CGRect(x: 0, y: 0, width: 40, height: 60)
-        // A dirty rect reaching 100 pt above and to the right of the bounds.
-        let rows = DiffGutterGeometry.rowsToDraw(rowFrames: frames, in: CGRect(x: 0, y: -100, width: 600, height: 300),
-                                                 bounds: bounds)
+        let rows = DiffGutterGeometry.rowsToDraw(geometry: geometry, offsetY: -100,
+                                                 in: CGRect(x: 0, y: -100, width: 600, height: 300), bounds: bounds)
         #expect(rows == 5..<8)
-        // Straddling rows (partially visible) are included.
-        let partial = DiffGutterGeometry.rowsToDraw(rowFrames: frames.map { $0.offsetBy(dx: 0, dy: -10) },
-                                                    in: bounds, bounds: bounds)
+        let partial = DiffGutterGeometry.rowsToDraw(geometry: geometry, offsetY: -110, in: bounds, bounds: bounds)
         #expect(partial == 5..<9)
-        #expect(DiffGutterGeometry.rowsToDraw(rowFrames: frames, in: CGRect(x: 0, y: -100, width: 40, height: 50),
-                                              bounds: bounds).isEmpty)
+        #expect(DiffGutterGeometry.rowsToDraw(geometry: geometry, offsetY: -100,
+                                              in: CGRect(x: 0, y: -100, width: 40, height: 50), bounds: bounds).isEmpty)
     }
-
-    // MARK: Window-hosted
 
     @Test(arguments: layoutWrapCases)
     func scrolledToRow300_gutterDrawsOnlyRowsInsideBounds(layout: DiffLayoutPreference, wrap: Bool) async throws {
@@ -208,8 +175,6 @@ struct DiffGutterDrawingTests {
             for pane in panes(hosted.host.diffView, layout: layout) {
                 let ruler = pane.lineNumberView
                 let frames = rulerFrames(pane)
-                // The real dirty rect can reach past the bounds (visibleRect), and an
-                // explicitly oversized one 200 pt above and below.
                 for rect in [ruler.visibleRect, ruler.bounds.insetBy(dx: 0, dy: -200)] {
                     let rows = ruler.rowsToDraw(in: rect)
                     #expect(!rows.isEmpty)
@@ -232,14 +197,11 @@ struct DiffGutterDrawingTests {
         try await withSettings(layout: layout, wrap: wrap) {
             let hosted = try await makeHosted()
             defer { hosted.close() }
-            // Opened and revealed (first change, row ~300).
             let opened = try layerBandPixels(hosted)
             #expect(opened == 0, "after open: \(opened) px")
-            // Scroll so a row straddles the top edge, then to row 300.
             for offset: CGFloat in [7, 0] {
                 for pane in panes(hosted.host.diffView, layout: layout) {
-                    let frames = pane.textView.ensureRowFrames()
-                    pane.scroll(toY: frames[300].minY + offset)
+                    pane.scroll(toY: pane.linesView.geometry.rowTop(300) + offset)
                 }
                 try await settle(hosted.window)
                 let live = try layerBandPixels(hosted)
@@ -250,11 +212,6 @@ struct DiffGutterDrawingTests {
         }
     }
 
-    // MARK: Overview ruler
-
-    /// Non-transparent pixels the ruler's layer tree renders outside its
-    /// bounds (rendered with a 50 pt margin on every side; sublayers AppKit
-    /// places outside the bounds are not clipped by the render).
     private func rulerPixelsOutsideBounds(_ ruler: NSView) throws -> Int {
         let layer = try #require(ruler.layer)
         let margin: CGFloat = 50
@@ -279,9 +236,6 @@ struct DiffGutterDrawingTests {
         return count
     }
 
-    /// The overview ruler draws nothing outside its frame: the viewport
-    /// slider spans the text insets (document y -inset at the top, past the
-    /// last row at the end) and a minimum-height mark sits at the last row.
     @Test(arguments: [(DiffLayoutPreference.inline, true), (.sideBySide, false)], [300, 400])
     func overviewRuler_neverDrawsOutsideItsFrame(layoutWrap: (DiffLayoutPreference, Bool),
                                                   changedLine: Int) async throws {
@@ -291,7 +245,6 @@ struct DiffGutterDrawingTests {
             let ruler = try #require(hosted.host.diffView.subviews.first { $0 is DiffOverviewRulerView })
             let opened = try rulerPixelsOutsideBounds(ruler)
             #expect(opened == 0, "after open: \(opened) px")
-            // Top, middle, end (`scroll(toY:)` clamps to the document).
             for y: CGFloat in [0, 2000, 1_000_000] {
                 for pane in panes(hosted.host.diffView, layout: layoutWrap.0) {
                     pane.scroll(toY: y)
@@ -304,4 +257,4 @@ struct DiffGutterDrawingTests {
     }
 }
 
-} // extension DiffViewWindowedSuites
+}
