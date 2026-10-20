@@ -717,19 +717,11 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
 
     // MARK: - Notification on submission
 
-    /// Mirrors `SessionReconnectGiveUpTests.GiveUpNotificationSpy`: a
-    /// `NotificationManager` subclass swapped into the existing
-    /// `NotificationManager.shared` DEBUG test seam to spy on
-    /// `sendNotification` instead of going through
-    /// `UNUserNotificationCenter` (a no-op in the test host regardless).
-    /// No new seam on `CalyxMCPServer` is needed -- this existing one
-    /// already lets a test observe every call `routeApprovalRequest`
-    /// makes when it submits a new request.
     private final class ApprovalHookNotificationSpy: NotificationManager {
-        private(set) var calls: [(title: String, body: String, tabID: UUID)] = []
+        private(set) var calls: [(title: String, body: String, originSurfaceID: UUID?)] = []
 
-        override func sendNotification(title: String, body: String, tabID: UUID) {
-            calls.append((title: title, body: body, tabID: tabID))
+        override func sendNotification(title: String, body: String, originSurfaceID: UUID?) {
+            calls.append((title: title, body: body, originSurfaceID: originSurfaceID))
         }
     }
 
@@ -737,8 +729,6 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         CockpitSettings.agentHookApprovalEnabled = true
         let approvalInbox = ApprovalInboxStore()
         server.approvalInbox = approvalInbox
-        // R4 seam: this test expects a genuine submission, so the
-        // stale/unknown-surface guard must not short-circuit it.
         server.approvalSurfaceExists = { _ in true }
         let surfaceID = UUID()
 
@@ -759,13 +749,12 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
                        "precondition: the request must be pending before asserting on the notification it triggers")
         XCTAssertEqual(spy.calls.count, 1,
                        "submitting a new agent-hook approval request must post exactly one user notification")
-        XCTAssertEqual(spy.calls.first?.tabID, surfaceID,
-                       "the notification's tabID must be the resolved target surface, so acting on it can " +
+        XCTAssertEqual(spy.calls.first?.originSurfaceID, surfaceID,
+                       "the notification's origin must be the resolved target surface, so clicking it can " +
                        "focus the right pane")
         XCTAssertFalse(spy.calls.first?.title.isEmpty ?? true, "the notification must carry a non-empty title")
         XCTAssertFalse(spy.calls.first?.body.isEmpty ?? true, "the notification must carry a non-empty body")
 
-        // Drain the held route so this test doesn't leak a suspended Task.
         guard let requestID = approvalInbox.pending.first?.id else {
             task.cancel()
             _ = await task.value
@@ -800,8 +789,6 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         CockpitSettings.agentHookApprovalEnabled = true
         let approvalInbox = ApprovalInboxStore()
         server.approvalInbox = approvalInbox
-        // R4 seam: this test expects a genuine submission, so the
-        // stale/unknown-surface guard must not short-circuit it.
         server.approvalSurfaceExists = { _ in true }
         let surfaceID = UUID()
 

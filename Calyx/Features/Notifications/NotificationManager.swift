@@ -1,8 +1,3 @@
-// NotificationManager.swift
-// Calyx
-//
-// UNUserNotificationCenter integration with rate limiting.
-
 import AppKit
 import UserNotifications
 import os
@@ -12,19 +7,6 @@ private let logger = Logger(subsystem: "com.calyx.terminal", category: "Notifica
 @MainActor
 class NotificationManager {
 
-    // `var`, not `let` (test seam): lets tests
-    // swap in a subclass that overrides `sendNotification` to spy on
-    // calls instead of going through `UNUserNotificationCenter` (which
-    // is a no-op in the test host anyway, `permissionGranted` is never
-    // set true under `XCTestCase`, see `requestPermission()` below).
-    // Mirrors `AppDelegate`'s existing `NSApp.delegate` swap pattern
-    // (see `SessionCommandPaletteTests.withMockAppDelegate`). Restored
-    // by every test that swaps it. DO NOT reassign from production code.
-    //
-    // `#if DEBUG`-gated, matching the other three seams' convention:
-    // an ungated `var` would weaken Release's compile-time singleton
-    // guarantee. `static let` (Release) still gives every production
-    // reader the same `NotificationManager.shared` API.
     #if DEBUG
     static var shared = NotificationManager()
     #else
@@ -35,10 +17,6 @@ class NotificationManager {
     private var rateLimiter = RateLimiter(maxPerSecond: 5)
     private var permissionGranted = false
 
-    // Not `private` in DEBUG (same test seam as `shared` above): a
-    // test-only subclass defined outside this file must be able to call
-    // `super.init()`. `private` in Release, since no Release
-    // reader needs to construct a second instance.
     #if DEBUG
     init() {
         requestPermission()
@@ -49,18 +27,13 @@ class NotificationManager {
     }
     #endif
 
+    #if DEBUG
+    func _setPermissionGrantedForTesting(_ granted: Bool) {
+        permissionGranted = granted
+    }
+    #endif
+
     private func requestPermission() {
-        // The CalyxTests process is an XCTest host, not a real running
-        // app -- requesting notification permission here would either
-        // hang the test run on a system permission dialog or spuriously
-        // prompt on a developer's machine every test run.
-        // Shares `TestEnvironment.isTestHost` with
-        // `AppDelegate.installGlobalEventTap`'s
-        // equivalent check, this codebase's established convention for
-        // skipping side-effecting setup under test. Also skipped under
-        // `--uitesting` (mirrors `installGlobalEventTap`'s combined
-        // guard): a give-up/OSC9 notification firing during a UI test
-        // must not pop the system permission dialog over the app under test.
         guard !TestEnvironment.isTestHost,
               !ProcessInfo.processInfo.arguments.contains("--uitesting") else { return }
         center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
@@ -73,20 +46,21 @@ class NotificationManager {
         }
     }
 
-    func sendNotification(title: String, body: String, tabID: UUID) {
+    func sendNotification(title: String, body: String, originSurfaceID: UUID?) {
         guard permissionGranted else { return }
-        let sanitizedTitle = NotificationSanitizer.sanitize(title)
-        let sanitizedBody = NotificationSanitizer.sanitize(body)
 
-        guard rateLimiter.allow(key: tabID) else {
-            logger.debug("Rate limited notification for tab \(tabID)")
+        if let originSurfaceID, !rateLimiter.allow(key: originSurfaceID) {
+            logger.debug("Rate limited notification for surface \(originSurfaceID)")
             return
         }
 
         let content = UNMutableNotificationContent()
-        content.title = sanitizedTitle
-        content.body = sanitizedBody
+        content.title = NotificationSanitizer.sanitize(title)
+        content.body = NotificationSanitizer.sanitize(body)
         content.sound = .default
+        if let originSurfaceID {
+            content.userInfo = NotificationOrigin.userInfo(surfaceID: originSurfaceID)
+        }
 
         let request = UNNotificationRequest(
             identifier: UUID().uuidString,
@@ -94,19 +68,13 @@ class NotificationManager {
             trigger: nil
         )
 
-        center.add(request) { error in
-            if let error {
-                logger.error("Failed to deliver notification: \(error.localizedDescription)")
-            }
-        }
+        PaneNotificationLedger.shared.deliver(request, originSurfaceID: originSurfaceID)
     }
 
     func bounceDockIcon() {
         NSApp.requestUserAttention(.informationalRequest)
     }
 }
-
-// MARK: - Rate Limiter
 
 struct RateLimiter {
     let maxPerSecond: Int

@@ -1,6 +1,7 @@
 import AppKit
 import GhosttyKit
 import OSLog
+import UserNotifications
 
 private let logger = Logger(
     subsystem: Bundle.main.bundleIdentifier ?? "com.calyx.terminal",
@@ -12,6 +13,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     private(set) var appSession = AppSession()
     private(set) var browserTabBroker = BrowserTabBroker()
     private var windowControllers: [CalyxWindowController] = []
+    private let notificationClickRouter = NotificationClickRouter()
     private var pendingURLs: [URL] = []
     private var quickTerminalController: QuickTerminalController?
     /// The `.calyxIPCStateDidChange` observer `startUsageLedger` installs;
@@ -1052,48 +1054,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     // MARK: - NSApplicationDelegate
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // The CalyxTests scheme runs this app itself as its unit-test
-        // HOST, so this method runs for real, unguarded, against the
-        // developer's own ~/.calyx before a single test method executes.
-        // That already caused a live incident on 2026-03-20 (commit
-        // 8a0a76bcc, "Skip global event tap in unit test host
-        // environment"): the global event tap was installed for real
-        // from the test host. Left ungated, the rest of this method is
-        // worse -- it increments the real crash-loop recovery counter
-        // and, on terminate, overwrites the real sessions.json (see
-        // applicationWillTerminate's own matching gate below); with
-        // persistentSessionsEnabled == true in the developer's real
-        // UserDefaults, restoreSession()/createNewWindow() would also
-        // spawn real persistent calyx-session daemons; it starts
-        // BrowserServer's real loopback listener; and setupMainMenu()
-        // transitively initializes UpdateController.shared, pulling in
-        // Sparkle. CalyxUITests launches the app-under-test as a
-        // separate process with "--uitesting" and no XCTest loaded, so
-        // it always evaluates false here and keeps running the full
-        // launch unchanged.
         if LaunchEnvironmentPolicy.isUnitTestHost() { return }
 
-        // Open the secure-input datagram socket before any surface is
-        // created (restoreSession()/createNewWindow() below): each
-        // surface calls SecureInputChannel.shared.ensureStarted() while
-        // building its env (so a launch-time failure is retried per
-        // surface). Deliberately not gated on --uitesting or on
-        // the AI Agent IPC switch -- see SecureInputChannel.
         SecureInputChannel.shared.start()
 
-        // Wire the real Ghostty-FFI-backed output reader now that we're
-        // definitely not in the unit-test host (a GhosttyCommandOutputReader
-        // read touches live ghostty FFI, unsafe there).
         CommandLogStore.shared.reader = GhosttyCommandOutputReader()
 
-        // Must run before GhosttyAppController.shared's first access below:
-        // ghostty forwards shell-integration scripts to surface children
-        // only when GHOSTTY_RESOURCES_DIR is already set in this process's
-        // own environment at engine init.
         applyGhosttyResourcesDirEnvironmentIfNeeded()
         applyCalyxShellIntegrationIfEnabled()
 
-        // Add CLI to PATH for terminals launched within Calyx
         if let binPath = Bundle.main.resourceURL?.appendingPathComponent("bin").path {
             let currentPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin"
             setenv("PATH", "\(binPath):\(currentPath)", 1)
@@ -1123,35 +1092,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         installKeyMonitor()
         installGlobalEventTap()
         SurfacePropertyStore.shared.startObserving()
+        UNUserNotificationCenter.current().delegate = notificationClickRouter
+        PaneNotificationLedger.shared.startObserving()
         HerdrHostedSurfaces.shared.startObserving()
         CommandHostedSurfaces.shared.startObserving()
-        // Started unconditionally here (not deferred to herdrTabCoordinator's
-        // own lazy construction, HerdrTabCoordinator.init's own idempotent
-        // startObserving() call): a restore-time bridge-command surface
-        // (AppDelegate.createSurfaceWithPwd) can register into
-        // HerdrPaneRegistry.shared before herdrTabCoordinator is ever
-        // accessed at all (e.g. herdr resolves, but the coordinator's own
-        // first access happens later, or never, this launch), and its
-        // .calyxSurfaceDestroyed self-pruning (HerdrPaneRegistry.swift's
-        // own header) must be armed before that can happen.
         HerdrPaneRegistry.shared.startObserving()
-        // Wired here, before restoreSession() below, so no
-        // HerdrPaneRegistry.shared.register call (including
-        // AppDelegate.createSurfaceWithPwd's own restore-time call) ever
-        // runs before herdrAgentMirror is listening: any row it later
-        // creates or already owns for that pane gets its focusSurfaceID
-        // pushed the moment a bridge changes, on top of the upsert-time
-        // resolution HerdrAgentMirror.swift's own header already
-        // documents (which is what actually self-heals a row created
-        // before this launch's herdr connection is even established).
         HerdrPaneRegistry.shared.setBridgeObserver(herdrAgentMirror)
         startHerdrIntegration()
-        // Before `resyncAgentHooksIfInstalled()`, so the IPC start it may
-        // trigger reaches the MCP host.
         startMCPHost()
-        // Before `resyncAgentHooksIfInstalled()`, so the usage route's
-        // endpoint is in place before the IPC start it may trigger
-        // accepts an export.
         startUsageLedger(server: .shared, ledger: .shared)
         resyncAgentHooksIfInstalled()
 
@@ -1161,58 +1109,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         BrowserServer.shared.start()
         NSApp.servicesProvider = self
 
-        // No `--uitesting` bypass here: `restoreSession()` returns false
-        // whenever there is no snapshot to restore (see its guard against
-        // a nil or empty-`windows` snapshot), and every UI test launches
-        // with a fresh, never-before-used `CALYX_UITEST_SESSION_DIR`
-        // (`CalyxUITestCase.setUp`), so this always falls through to
-        // `createNewWindow()` exactly as before for every existing test.
-        // Only a test that relaunches with the SAME session dir (the
-        // persistence E2E suite) can find a snapshot and take the
-        // restore path, which is required for the restored pane to
-        // reattach to its pre-restart session instead of a fresh one
-        // being created.
         if !restoreSession() {
             if pendingURLs.isEmpty {
                 createNewWindow()
-                // Demo-recording scenario only (CalyxUITests
-                // /DemoRecordingScenario.swift): every UI test launches
-                // with a fresh session dir (see comment above), so
-                // launch always takes THIS branch, not restoreSession()'s
-                // -- no equivalent hook is needed there.
                 applyDemoWindowFrameIfNeeded()
             }
         }
-        // issue #37 recurrence guard: issue #37 ("Calyx closes after
-        // opening") was a snapshot restoring a window with no tabs, that
-        // window closing immediately, and `removeWindowController` reading
-        // the resulting empty `windowControllers` as "last window closed"
-        // and terminating the app outright -- fixed by
-        // `SessionSnapshot.removingEmptyWindows()` below `restoreSession()`,
-        // still in place, still load-bearing. Closing the last window no
-        // longer terminates the app at all (see
-        // `applicationShouldTerminateAfterLastWindowClosed`), so the same
-        // gap can no longer manifest as a silent quit -- but with
-        // nothing above having produced a window (an edge case
-        // `removingEmptyWindows()` doesn't fully rule out) and no URL
-        // still pending one (`application(_:open:)` runs below and
-        // creates its own window(s)), it would instead surface as a
-        // launch that shows nothing at all, just as unrecoverable to the
-        // user. This is the safety net for that: nothing above created a
-        // window and none is still coming, so create one now.
         if windowControllers.isEmpty && pendingURLs.isEmpty {
             createNewWindow()
         }
-        // A snapshot preserved by a PREVIOUS run's
-        // restoreSession() (via preserveSnapshotForRecovery()) still sits
-        // on disk at launch even though THIS run never called that method
-        // itself -- without this, `session.recoverPreviousSession` would
-        // stay unavailable until the next skipped/failed restore, instead
-        // of offering the still-pending recovery from before. Mirrors
-        // reassertHistoryPersistenceIfNeeded()'s own async-Task-after-launch shape.
         Task { await initializeHasPreservedSessionSnapshotFlag() }
         Task { await reassertHistoryPersistenceIfNeeded() }
-        // Process any URLs that arrived before launch completed
         if !pendingURLs.isEmpty {
             let urls = pendingURLs
             pendingURLs = []
@@ -1289,40 +1196,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Mirrors applicationDidFinishLaunching's own gate (see that
-        // method's doc comment for the full incident narrative): a
-        // unit-test host's applicationDidFinishLaunching already
-        // returned early and never populated windowControllers or
-        // appSession, but this notification still fires for real at
-        // host process teardown regardless. Without this gate,
-        // saveAtTermination/resetRecoveryCounter below would still run
-        // against SessionPersistenceActor.shared and write to the
-        // developer's real ~/.calyx even though nothing in this launch
-        // was ever gated by a window/session-emptiness check alone.
         if LaunchEnvironmentPolicy.isUnitTestHost() { return }
 
+        PaneNotificationLedger.shared.removeAllPaneNotifications()
         SecureInputChannel.shared.stop()
 
-        // Belt-and-suspenders alongside
-        // applicationShouldTerminate's own set, in case this notification
-        // ever fires without that method having run first (see
-        // isApplicationTerminating's own doc comment).
         isApplicationTerminating = true
 
-        // Only if the app-wide approval panel was ever actually created --
-        // reading `_approvalPanelController` directly, never the
-        // `approvalPanelController` computed property, so this never
-        // creates one that was never needed just to tear it down again.
         _approvalPanelController?.tearDown()
 
-        // Give any kill(id:) calls dispatched by an explicit pane/tab
-        // close that raced with this quit a short, bounded window to
-        // actually finish (see SessionKillTracker's header comment) —
-        // otherwise a kill's Task could be torn down mid-Process-spawn,
-        // silently leaving the calyx-session running as an orphan even
-        // though the user asked to end it. Runs regardless of
-        // windowControllers/appSession state below, since kills can be
-        // in flight even after every window has already closed.
         var killsDrained = false
         Task {
             await SessionKillTracker.drain(timeoutSeconds: 2.0)
@@ -1333,19 +1215,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
             RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01))
         }
 
-        // Closing the last window already persists synchronously in
-        // `removeWindowController` (see that method's own doc comment).
-        // This guard's ONLY remaining job is skipping pointless work when
-        // there is neither a captured confirm-time pendingTerminationSnapshot
-        // nor any live window left to build one from -- saveForTermination()'s
-        // own saveAtTermination(_:) call already refuses to let an empty
-        // snapshot clobber a non-empty on-disk one, so this is not a
-        // correctness gate: a non-nil pendingTerminationSnapshot (captured
-        // by applicationShouldTerminate's own Cmd+Q path, see that
-        // property's own doc comment) must still be saved even when
-        // windowControllers/appSession are already empty by the time this
-        // runs (e.g. every window was already closed, each already saved
-        // via removeWindowController, before the user then pressed Cmd+Q).
         let hasLiveWindows = !windowControllers.isEmpty && !appSession.windows.isEmpty
         guard pendingTerminationSnapshot != nil || hasLiveWindows else {
             return
@@ -3092,21 +2961,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
         }
     }
 
-    /// Tells the user restoreSession() skipped or failed to restore
-    /// their previous windows/tabs, and that the previous session was
-    /// preserved (see SessionPersistenceActor.preserveSnapshotForRecovery(),
-    /// Bug 3a) and can be recovered via the command palette's
-    /// "Recover Previous Session" action (session.recoverPreviousSession,
-    /// Bug 3c). Called once from restoreSession()'s crash-loop-skip and
-    /// restoredAny-false branches (see
-    /// SessionPersistenceActorRecoveryPreservationTests's wire-point
-    /// note for the full branch list), alongside preserveSnapshotForRecovery().
     func notifyPreviousSessionNotRestored() {
         NotificationManager.shared.sendNotification(
             title: "Previous session not restored",
             body: "Calyx didn't restore your previous windows and tabs, but they're safely preserved. " +
                   "Recover them from the command palette (\"Recover Previous Session\").",
-            tabID: UUID()
+            originSurfaceID: nil
         )
     }
 

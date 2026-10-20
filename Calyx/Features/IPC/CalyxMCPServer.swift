@@ -951,8 +951,6 @@ final class CalyxMCPServer {
         case decision(Data?)
     }
 
-    /// Everything `routeApprovalRequest` decides after the bearer and
-    /// nonce checks. `signed` is whether the request carried a nonce.
     private func approvalOutcome(request: HTTPRequest, signed: Bool) async -> ApprovalRouteOutcome {
         guard let body = request.body else {
             return .status(400)
@@ -961,9 +959,6 @@ final class CalyxMCPServer {
             return .status(413)
         }
 
-        // Read before decode: `agentKind(from:)` has no failure path, so
-        // reading it here first does not change this method's response
-        // ordering for any existing guard below.
         let kind = agentKind(from: request.headers)
         guard let call = AgentHookToolCall.decode(from: body, kind: kind) else {
             return .status(400)
@@ -975,33 +970,17 @@ final class CalyxMCPServer {
 
         guard kind == AgentEntry.claudeCodeKind || kind == AgentEntry.codexKind
             || kind == AgentEntry.grokKind || kind == AgentEntry.piKind else {
-            // An agent CLI Calyx doesn't have a hook-response contract
-            // for at all (see `AgentHookPermissionResponse`'s own
-            // fail-safe contract) -- never submit to the inbox for one.
             return .status(200)
         }
 
         guard ApprovalHookEvent.isApprovalGate(call.hookEventName, kind: kind) else {
-            // A stale PreToolUse-fired POST (a not-yet-migrated install,
-            // see this method's own doc comment) or any other/missing
-            // hook event name -- inert, same as the unrecognized-kind
-            // guard above, never submitted to the inbox.
             return .status(200)
         }
 
         guard ApprovalHookEvent.gateIsSoleAuthority(kind: kind, permissionMode: call.permissionMode) else {
-            // A Grok session outside bypassPermissions: Grok's own
-            // permission pipeline, its in-pane prompt included, still
-            // runs after this gate, and a decision here could not grant
-            // anything anyway (see `gateIsSoleAuthority`). Answering
-            // with no decision at all leaves that pipeline deciding
-            // exactly as it would without Calyx, rather than asking the
-            // same human the same question in two places.
             return .status(200)
         }
 
-        // D20 analog: this start's key never reached agent-endpoint.json,
-        // so no proof could verify; answer signed empty and queue nothing.
         guard !signed || wakeProofKeyPublished else {
             return .status(200)
         }
@@ -1010,22 +989,6 @@ final class CalyxMCPServer {
             return .status(200)
         }
 
-        // An AskUserQuestion call must always ask a human: neither global
-        // auto-approve nor pane-scoped Always-Allow memory may ever
-        // short-circuit a question the way they do a plain tool call --
-        // a "yes always allow this tool" memory says nothing about which
-        // OPTION a human would have picked. Gated on `call.isQuestionTool`,
-        // not `call.question == nil`: a malformed `tool_input.questions`
-        // (decoded to `nil` by `decodeQuestions`) still reaches the
-        // generic `.agentHook` banner below, but must still never be
-        // auto-allowed just because decoding failed to produce option
-        // buttons to answer with -- the hold window expiring with no
-        // decision made (`.expired`, no body -- see
-        // `AgentHookPermissionResponse`'s own fail-safe contract) is one
-        // path that hands an AskUserQuestion call to Claude Code's own
-        // in-pane prompt; the panel's own × dismiss action
-        // (`ApprovalDecision.dismissed`, also no body for claude-code) is
-        // another.
         if !call.isQuestionTool {
             guard ApprovalPolicy.requiresApproval() else {
                 return .decision(AgentHookPermissionResponse.body(kind: kind, decision: .allowed))
@@ -1036,11 +999,6 @@ final class CalyxMCPServer {
             }
         }
 
-        // R4: a valid-FORMAT surface UUID no live surface registry
-        // actually knows about (pane already closed, or a stale/forged
-        // header) -- inert pass-through, same as the unrecognized-kind
-        // guard above, rather than queuing a request whose banner no
-        // window could ever show.
         guard approvalSurfaceExists(surfaceID) else {
             return .status(200)
         }
@@ -1069,24 +1027,8 @@ final class CalyxMCPServer {
             payload: call.payload,
             createdAt: Date()
         ))
-        // R3 fix-pin: the notification body is redacted through
-        // SecretRedactor -- the same redaction CommandLogStore already
-        // runs text through before persistence (see that type's own
-        // header comment) -- because a notification can leak into places
-        // (Notification Center history, a screen someone else can see)
-        // the human never explicitly chose to expose a raw secret to.
-        // The BANNER, in contrast, deliberately keeps `call.summary`/the
-        // question text verbatim (via `ApprovalRequest.displayPayload` --
-        // `.agentHook`'s own `summary`, `.agentQuestion`'s own question
-        // texts) -- the human approving this exact tool call must see
-        // exactly what they're being asked to approve, unredacted;
-        // `ControlCharacterDisplay` there guards a different concern
-        // (terminal-control-character spoofing), not secret leakage.
-        // NotificationSanitizer still runs inside sendNotification itself
-        // -- no need to sanitize title/body for that separate concern
-        // here.
         NotificationManager.shared.sendNotification(
-            title: notificationTitle, body: notificationBody, tabID: surfaceID
+            title: notificationTitle, body: notificationBody, originSurfaceID: surfaceID
         )
 
         let decision = await approvalInbox.awaitDecisionHonoringCancellation(id: requestID, timeoutMs: approvalRequestTimeoutMs)
