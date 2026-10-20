@@ -2,7 +2,8 @@
 set -euo pipefail
 
 VERSION=$(grep 'MARKETING_VERSION' project.yml | grep -v '\$(' | sed 's/.*"\(.*\)"/\1/')
-APP_PATH="/tmp/CalyxRelease/Build/Products/Release/Calyx.app"
+DERIVED_DATA_PATH="/tmp/CalyxRelease"
+APP_PATH="$DERIVED_DATA_PATH/Build/Products/Release/Calyx.app"
 ZIP_PATH="/tmp/Calyx.zip"
 
 echo "=== Calyx Release v$VERSION ==="
@@ -27,8 +28,8 @@ echo "Building calyx-session (host + Linux remote targets)..."
 scripts/build-session.sh --all
 echo "calyx-session build complete."
 
-# 3. Build
 echo "Building Calyx (Release)..."
+rm -rf "$DERIVED_DATA_PATH"
 xcodebuild \
   -project Calyx.xcodeproj \
   -scheme Calyx \
@@ -37,8 +38,8 @@ xcodebuild \
   CODE_SIGN_IDENTITY="Developer ID Application: Yuuichi Eguchi (PQQBSRKD72)" \
   CODE_SIGN_STYLE=Manual \
   DEVELOPMENT_TEAM=PQQBSRKD72 \
-  -derivedDataPath /tmp/CalyxRelease \
-  clean build
+  -derivedDataPath "$DERIVED_DATA_PATH" \
+  build
 echo "Build succeeded."
 
 # 3.5a. Validate Sparkle.framework structure
@@ -160,12 +161,7 @@ echo "Distributed artifact verification passed."
 
 # 7.5. Sparkle EdDSA signing (must be AFTER re-zip so signature matches the final artifact)
 echo "Signing final zip with Sparkle EdDSA..."
-# Resolve Sparkle tools from THIS build's DerivedData. A find over
-# ~/Library/Developer/Xcode/DerivedData is order-dependent (APFS directory
-# enumeration reshuffles as sibling dirs come and go) and once matched the
-# legacy DSA *shell script* (Sparkle/bin/old_dsa_scripts/sign_update), which
-# blocks on stdin when called without a key file.
-SPARKLE_BIN="/tmp/CalyxRelease/SourcePackages/artifacts/sparkle/Sparkle/bin"
+SPARKLE_BIN="$DERIVED_DATA_PATH/SourcePackages/artifacts/sparkle/Sparkle/bin"
 SPARKLE_SIGN="$SPARKLE_BIN/sign_update"
 if [ ! -x "$SPARKLE_SIGN" ]; then
   echo "ERROR: sign_update not found at $SPARKLE_SIGN."
