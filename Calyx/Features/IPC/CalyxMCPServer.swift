@@ -773,7 +773,6 @@ final class CalyxMCPServer {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
-        // J7: a malformed nonce is rejected before the body is looked at.
         let nonce = header(named: ApprovalHookResponse.nonceHeader, in: request.headers)
         if let nonce, !Self.isCanonicalNonce(nonce) {
             return HTTPParser.response(statusCode: 400, body: nil)
@@ -781,7 +780,6 @@ final class CalyxMCPServer {
 
         let outcome = await approvalOutcome(request: request, signed: nonce != nil)
 
-        // The single 200 exit (J8): with a nonce every 200 is signed.
         let decisionBody: Data?
         switch outcome {
         case .status(let statusCode) where statusCode != 200:
