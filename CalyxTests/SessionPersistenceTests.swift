@@ -310,6 +310,105 @@ final class SessionPersistenceTests: XCTestCase {
         XCTAssertEqual(session.showSidebar, false, "showSidebar should match snapshot")
     }
 
+    @MainActor
+    func test_tabGroup_from_snapshot_activeTabIDNamingNoTab_selectsFirstTab() {
+        let first = TabSnapshot(id: UUID(), title: "One", pwd: "/tmp", splitTree: SplitTree(leafID: UUID()))
+        let second = TabSnapshot(id: UUID(), title: "Two", pwd: "/tmp", splitTree: SplitTree(leafID: UUID()))
+        let group = TabGroup(snapshot: TabGroupSnapshot(name: "G", tabs: [first, second], activeTabID: UUID()))
+
+        XCTAssertEqual(group.activeTabID, first.id)
+        XCTAssertEqual(group.activeTab?.id, first.id)
+    }
+
+    @MainActor
+    func test_tabGroup_from_snapshot_nilActiveTabID_selectsFirstTab() {
+        let first = TabSnapshot(id: UUID(), title: "One", pwd: "/tmp", splitTree: SplitTree(leafID: UUID()))
+        let second = TabSnapshot(id: UUID(), title: "Two", pwd: "/tmp", splitTree: SplitTree(leafID: UUID()))
+        let group = TabGroup(snapshot: TabGroupSnapshot(name: "G", tabs: [first, second], activeTabID: nil))
+
+        XCTAssertEqual(group.activeTabID, first.id)
+        XCTAssertEqual(group.activeTab?.id, first.id)
+    }
+
+    @MainActor
+    func test_tabGroup_from_snapshot_activeTabIDNamingSecondTab_keepsIt() {
+        let first = TabSnapshot(id: UUID(), title: "One", pwd: "/tmp", splitTree: SplitTree(leafID: UUID()))
+        let second = TabSnapshot(id: UUID(), title: "Two", pwd: "/tmp", splitTree: SplitTree(leafID: UUID()))
+        let group = TabGroup(snapshot: TabGroupSnapshot(name: "G", tabs: [first, second], activeTabID: second.id))
+
+        XCTAssertEqual(group.activeTabID, second.id)
+        XCTAssertEqual(group.activeTab?.id, second.id)
+    }
+
+    @MainActor
+    func test_tabGroup_from_snapshot_withoutTabs_hasNoActiveTab() {
+        let group = TabGroup(snapshot: TabGroupSnapshot(name: "G", tabs: [], activeTabID: UUID()))
+
+        XCTAssertNil(group.activeTabID)
+    }
+
+    private var sessionFileWithDanglingActiveTabID: String {
+        """
+        {
+            "schemaVersion": 7,
+            "windows": [
+                {
+                    "id": "00000000-0000-0000-0000-000000000001",
+                    "frame": [[0, 0], [800, 600]],
+                    "groups": [
+                        {
+                            "id": "00000000-0000-0000-0000-000000000010",
+                            "name": "Default",
+                            "color": "blue",
+                            "tabs": [
+                                {
+                                    "id": "00000000-0000-0000-0000-000000000020",
+                                    "title": "First",
+                                    "titleOverride": null,
+                                    "pwd": "/Users/dev/repo",
+                                    "splitTree": {
+                                        "focusedLeafID": "00000000-0000-0000-0000-000000000030",
+                                        "root": {"leaf": {"id": "00000000-0000-0000-0000-000000000030"}}
+                                    },
+                                    "browserURL": null
+                                },
+                                {
+                                    "id": "00000000-0000-0000-0000-000000000021",
+                                    "title": "Second",
+                                    "titleOverride": null,
+                                    "pwd": "/Users/dev/repo",
+                                    "splitTree": {
+                                        "focusedLeafID": "00000000-0000-0000-0000-000000000031",
+                                        "root": {"leaf": {"id": "00000000-0000-0000-0000-000000000031"}}
+                                    },
+                                    "browserURL": null
+                                }
+                            ],
+                            "activeTabID": "00000000-0000-0000-0000-000000000029",
+                            "isCollapsed": false
+                        }
+                    ],
+                    "activeGroupID": "00000000-0000-0000-0000-000000000010",
+                    "showSidebar": true,
+                    "sidebarWidth": 260,
+                    "isFullScreen": false
+                }
+            ]
+        }
+        """
+    }
+
+    @MainActor
+    func test_windowSession_from_decodedSessionFile_activeTabIDNamingNoTab_activatesFirstTab() throws {
+        let decoded = try JSONDecoder().decode(SessionSnapshot.self, from: Data(sessionFileWithDanglingActiveTabID.utf8))
+        let restored = SessionSnapshot.migrate(decoded).removingEmptyWindows()
+        let windowSnapshot = try XCTUnwrap(restored.windows.first)
+
+        let session = WindowSession(snapshot: windowSnapshot)
+
+        XCTAssertEqual(session.activeGroup?.activeTab?.id, UUID(uuidString: "00000000-0000-0000-0000-000000000020"))
+    }
+
     // MARK: - Phase 6: Forward Conversions Updated
 
     /// TabGroup.snapshot() should include isCollapsed in the resulting TabGroupSnapshot.

@@ -236,37 +236,27 @@ extension WindowSession {
 }
 
 extension TabGroup {
-    /// - Parameter browserURLOverride: Consulted per-tab (by tab id) for
-    ///   a live URL that wins over a `.browser` tab's configured one.
-    ///   Lets
-    ///   `CalyxWindowController.windowSnapshot()` delegate its
-    ///   TabGroupSnapshot/TabSnapshot construction to this tested chain
-    ///   while still injecting its live `browserControllers` state;
-    ///   every other caller uses the default (no override) and gets
-    ///   each tab's configured URL unchanged.
     func snapshot(browserURLOverride: (UUID) -> URL? = { _ in nil }) -> TabGroupSnapshot {
-        TabGroupSnapshot(
+        let persistedTabs = tabs.compactMap { $0.snapshot(browserURLOverride: browserURLOverride($0.id)) }
+        return TabGroupSnapshot(
             id: id,
             name: name,
             color: color.rawValue,
-            tabs: tabs.compactMap { $0.snapshot(browserURLOverride: browserURLOverride($0.id)) },
-            activeTabID: activeTabID,
+            tabs: persistedTabs,
+            activeTabID: activeTabID(ifOnlyTabsRemain: Set(persistedTabs.map(\.id))),
             isCollapsed: isCollapsed
         )
     }
 }
 
 extension Tab {
-    /// - Parameter browserURLOverride: When non-nil and `content` is
-    ///   `.browser`, wins over the tab's configured URL. See
-    ///   `TabGroup.snapshot(browserURLOverride:)`'s doc comment.
     func snapshot(browserURLOverride: URL? = nil) -> TabSnapshot? {
         let refs = sessionRefs.isEmpty ? nil : sessionRefs
         let herdrRefs = herdrPaneRefs.isEmpty ? nil : herdrPaneRefs
         let cardOffsets = missionMapCardOffsets.isEmpty ? nil : missionMapCardOffsets
         switch content {
         case .diff:
-            return nil  // Diff tabs are not persisted
+            return nil
         case .terminal:
             return TabSnapshot(id: id, title: title, titleOverride: titleOverride, pwd: pwd, splitTree: splitTree, browserURL: nil, sessionRefs: refs, herdrPaneRefs: herdrRefs, missionMapCardOffsets: cardOffsets)
         case .browser(let url):
@@ -301,13 +291,14 @@ extension TabGroup {
     convenience init(snapshot: TabGroupSnapshot) {
         let tabs = snapshot.tabs.map { Tab(snapshot: $0) }
         let color = TabGroupColor(rawValue: snapshot.color ?? "blue") ?? .blue
+        let activeTabStillExists = tabs.contains { $0.id == snapshot.activeTabID }
         self.init(
             id: snapshot.id,
             name: snapshot.name,
             color: color,
             isCollapsed: snapshot.isCollapsed,
             tabs: tabs,
-            activeTabID: snapshot.activeTabID
+            activeTabID: activeTabStillExists ? snapshot.activeTabID : tabs.first?.id
         )
     }
 }

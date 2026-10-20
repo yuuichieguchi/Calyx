@@ -1,17 +1,3 @@
-// DiffLayoutE2ETests.swift
-// CalyxUITests
-//
-// End-to-end coverage for the diff layout feature (plan §8):
-// (a) Settings -> Appearance layout popup persists across relaunch;
-// (b) diff toolbar "..." -> Diff View -> Inline / Side by Side swaps the
-//     gutter(s) (calyx.diff.lineNumbers.inline vs .old + .new).
-//
-// No existing UI test opens a diff tab. (b) builds the steps from
-// AccessibilityID ids: a fixture repo with an unstaged edit is created by
-// the pane's shell (pattern WorktreeTaskFlowE2ETests), the Changes sidebar
-// is opened with the "Show Git Changes" palette command, and the file row
-// calyx.git.file.<path> is clicked.
-
 import AppKit
 import XCTest
 
@@ -40,8 +26,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
             try? FileManager.default.removeItem(atPath: homeDir)
         }
     }
-
-    // MARK: - Helpers
 
     private func element(_ identifier: String) -> XCUIElement {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
@@ -72,6 +56,15 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         XCTAssertTrue(waitFor(app.menuBars.firstMatch, timeout: 20), "menu bar did not appear")
     }
 
+    private func quitViaMenuAndRelaunch() {
+        menuAction("Calyx", item: "Quit Calyx")
+        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10), "Calyx did not quit")
+
+        terminateStaleAppUnderTestInstances()
+        app.launch()
+        waitForMainWindow()
+    }
+
     private func openAppearancePane() {
         app.activate()
         Thread.sleep(forTimeInterval: 0.5)
@@ -97,8 +90,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         element("calyx.settings.appearance.gitDiffLayoutPopup")
     }
 
-    // MARK: - (a) Settings popup persists across relaunch
-
     func test_layoutPopupSelection_persistsAcrossRelaunch() {
         waitForMainWindow()
         openAppearancePane()
@@ -114,12 +105,7 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         inlineItem.click()
         XCTAssertEqual(popup.value as? String, "Side by Side")
 
-        menuAction("Calyx", item: "Quit Calyx")
-        XCTAssertTrue(app.wait(for: .notRunning, timeout: 10), "Calyx did not quit")
-
-        terminateStaleAppUnderTestInstances()
-        app.launch()
-        waitForMainWindow()
+        quitViaMenuAndRelaunch()
         openAppearancePane()
 
         let popupAfter = layoutPopup()
@@ -128,8 +114,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         XCTAssertEqual(popupAfter.value as? String, "Side by Side",
                        "a new process must seed the popup from the persisted preference")
     }
-
-    // MARK: - (b) Toolbar "..." -> Diff View switches layout
 
     private func chooseDiffView(_ title: String) {
         let more = element("calyx.diff.moreActions")
@@ -212,8 +196,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
                        "the inline gutter must be removed in Side by Side")
     }
 
-    // MARK: - (c) Toolbar "..." -> Word Wrap toggles the Settings switch
-
     private func wordWrapSwitch() -> XCUIElement {
         element("calyx.settings.appearance.gitDiffWordWrapSwitch")
     }
@@ -246,8 +228,6 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         toggleWordWrapFromMoreActions()
         assertWordWrapSwitch(1, "a second toggle must turn word wrap back on")
     }
-
-    // MARK: - (d) Long diff, inline: screenshots for visual inspection
 
     private func shot(_ name: String) {
         let a = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
@@ -512,5 +492,15 @@ final class DiffLayoutE2ETests: CalyxUITestCase {
         Thread.sleep(forTimeInterval: 0.5)
         assertDragSelectionKeepsViewport("after + then Escape", in: content,
                                          from: CGVector(dx: 0.3, dy: 0.45), to: CGVector(dx: 0.6, dy: 0.55))
+    }
+
+    func test_activeDiffTabAtQuit_relaunchRestoresTerminalPane() {
+        openDiffTab()
+        quitViaMenuAndRelaunch()
+
+        XCTAssertTrue(waitFor(terminalPane(), timeout: 10),
+                      "the restored window must show the terminal tab that was next to the active diff tab")
+        XCTAssertFalse(element("calyx.diff.toolbar").exists,
+                       "a diff tab must not be restored after relaunch")
     }
 }

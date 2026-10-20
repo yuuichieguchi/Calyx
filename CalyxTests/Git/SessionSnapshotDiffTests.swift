@@ -1,8 +1,3 @@
-// SessionSnapshotDiffTests.swift
-// CalyxTests
-//
-// Tests that diff tabs are excluded from session snapshots and not restored.
-
 import Foundation
 import Testing
 @testable import Calyx
@@ -26,6 +21,7 @@ struct SessionSnapshotDiffTests {
 
         let snapshot = group.snapshot()
         #expect(snapshot.tabs.isEmpty)
+        #expect(snapshot.activeTabID == nil)
     }
 
     @Test func terminalAndBrowserPreservedWithDiff() {
@@ -48,5 +44,98 @@ struct SessionSnapshotDiffTests {
         for tab in group.tabs {
             #expect(!tab.content.isDiff)
         }
+    }
+
+    private func diffTab(_ path: String) -> Tab {
+        Tab(title: path, content: .diff(source: .unstaged(path: path, workDir: "/tmp")))
+    }
+
+    private func browserTab(_ title: String) -> Tab {
+        Tab(title: title, content: .browser(url: URL(string: "https://example.com")!))
+    }
+
+    @Test func activeDiffTabHandsActiveToFollowingPersistedTab() {
+        let terminalA = Tab(title: "A")
+        let diff = diffTab("d.swift")
+        let terminalB = Tab(title: "B")
+        let group = TabGroup(name: "Test", tabs: [terminalA, diff, terminalB], activeTabID: diff.id)
+
+        #expect(group.snapshot().activeTabID == terminalB.id)
+    }
+
+    @Test func activeLastDiffTabHandsActiveToPrecedingPersistedTab() {
+        let terminalA = Tab(title: "A")
+        let terminalB = Tab(title: "B")
+        let diff = diffTab("d.swift")
+        let group = TabGroup(name: "Test", tabs: [terminalA, terminalB, diff], activeTabID: diff.id)
+
+        #expect(group.snapshot().activeTabID == terminalB.id)
+    }
+
+    @Test func activeDiffTabSkipsDiffTabsAfterItToReachAPersistedTab() {
+        let terminalA = Tab(title: "A")
+        let diff1 = diffTab("d1.swift")
+        let diff2 = diffTab("d2.swift")
+        let diff3 = diffTab("d3.swift")
+        let browserB = browserTab("B")
+        let group = TabGroup(name: "Test", tabs: [terminalA, diff1, diff2, diff3, browserB], activeTabID: diff2.id)
+
+        #expect(group.snapshot().activeTabID == browserB.id)
+    }
+
+    @Test func activeDiffTabWithOnlyDiffTabsAfterItFallsBackToPrecedingPersistedTab() {
+        let terminalA = Tab(title: "A")
+        let diff1 = diffTab("d1.swift")
+        let diff2 = diffTab("d2.swift")
+        let group = TabGroup(name: "Test", tabs: [terminalA, diff1, diff2], activeTabID: diff2.id)
+
+        #expect(group.snapshot().activeTabID == terminalA.id)
+    }
+
+    @Test func activeFirstDiffTabSkipsDiffTabsToReachFollowingPersistedTab() {
+        let diff1 = diffTab("d1.swift")
+        let diff2 = diffTab("d2.swift")
+        let terminalA = Tab(title: "A")
+        let group = TabGroup(name: "Test", tabs: [diff1, diff2, terminalA], activeTabID: diff1.id)
+
+        #expect(group.snapshot().activeTabID == terminalA.id)
+    }
+
+    @Test func persistedActiveTabStaysActiveAfterDiffTabs() {
+        let terminalA = Tab(title: "A")
+        let diff = diffTab("d.swift")
+        let browserB = browserTab("B")
+        let group = TabGroup(name: "Test", tabs: [terminalA, diff, browserB], activeTabID: browserB.id)
+
+        #expect(group.snapshot().activeTabID == browserB.id)
+    }
+
+    @Test func activeTabIDNamingNoTabPersistsFirstPersistedTab() {
+        let diff = diffTab("d.swift")
+        let terminalA = Tab(title: "A")
+        let terminalB = Tab(title: "B")
+        let group = TabGroup(name: "Test", tabs: [diff, terminalA, terminalB], activeTabID: UUID())
+
+        #expect(group.snapshot().activeTabID == terminalA.id)
+    }
+
+    @Test func noActiveTabPersistsFirstPersistedTab() {
+        let terminalA = Tab(title: "A")
+        let terminalB = Tab(title: "B")
+        let group = TabGroup(name: "Test", tabs: [terminalA, terminalB], activeTabID: nil)
+
+        #expect(group.snapshot().activeTabID == terminalA.id)
+    }
+
+    @Test func activeDiffTabAtSaveRestoresWithPrecedingTabActive() throws {
+        let terminalA = Tab(title: "A")
+        let diff = diffTab("d.swift")
+        let group = TabGroup(name: "Test", tabs: [terminalA, diff], activeTabID: diff.id)
+
+        let data = try JSONEncoder().encode(group.snapshot())
+        let decoded = try JSONDecoder().decode(TabGroupSnapshot.self, from: data)
+        let restored = TabGroup(snapshot: decoded)
+
+        #expect(restored.activeTab?.id == terminalA.id)
     }
 }

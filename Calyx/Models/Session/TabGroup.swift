@@ -57,14 +57,20 @@ class TabGroup: Identifiable {
         tabs.remove(at: index)
 
         if activeTabID == id {
-            if tabs.isEmpty {
-                activeTabID = nil
-            } else if index < tabs.count {
-                activeTabID = tabs[index].id
-            } else {
-                activeTabID = tabs[tabs.count - 1].id
-            }
+            activeTabID = successorTab(at: index)?.id
         }
+    }
+
+    func activeTabID(ifOnlyTabsRemain remainingTabIDs: Set<UUID>) -> UUID? {
+        let remains: (Tab) -> Bool = { remainingTabIDs.contains($0.id) }
+        guard let activeIndex = tabs.firstIndex(where: { $0.id == activeTabID }) else {
+            return tabs.first(where: remains)?.id
+        }
+        return successorTab(at: activeIndex, where: remains)?.id
+    }
+
+    private func successorTab(at index: Int, where isCandidate: (Tab) -> Bool = { _ in true }) -> Tab? {
+        tabs[index...].first(where: isCandidate) ?? tabs[..<index].last(where: isCandidate)
     }
 
     func moveTab(fromIndex: Int, toIndex: Int) {
