@@ -1779,8 +1779,13 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         tab.registry.controller(for: focusedID)?.setFocus(true)
         tab.registry.controller(for: focusedID)?.refresh()
         focusView.needsDisplay = true
-        tab.clearUnreadNotifications()
+        markNotificationsRead(in: tab)
         return true
+    }
+
+    private func markNotificationsRead(in tab: Tab) {
+        tab.clearUnreadNotifications()
+        PaneNotificationLedger.shared.removeNotifications(originatingIn: tab.splitTree.allLeafIDs())
     }
 
     // MARK: - Tab Activation Helpers
@@ -2691,24 +2696,36 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    /// A card double click (or its open button): closes the map and
-    /// focuses the card's pane. A pane in this window gets the goto-split
-    /// sequence (which also clears split zoom, so a zoomed-away pane
-    /// actually shows); a pane in another window is handed to that
-    /// window's controller through `.calyxFocusSurface`.
-    /// Not `private`: pinned by `CalyxWindowControllerToggleMissionMapTests`.
     func missionMapCardDoubleClicked(surfaceID: UUID) {
-        dismissMissionMap(restoresFocus: false)
-        guard let tab = findTab(bySplitLeaf: surfaceID) else {
+        guard focusPane(surfaceID: surfaceID) else {
+            dismissMissionMap(restoresFocus: false)
             NotificationCenter.default.post(name: .calyxFocusSurface, object: nil, userInfo: ["surfaceID": surfaceID])
             return
         }
-        switchToTab(id: tab.id)
-        tab.splitTree = tab.splitTree.settingFocus(surfaceID)
-        splitContainerView?.updateLayout(tree: tab.splitTree)
+    }
+
+    @discardableResult
+    private func focusPane(surfaceID: UUID) -> Bool {
+        guard let tab = findTab(bySplitLeaf: surfaceID) else { return false }
+        dismissMissionMap(restoresFocus: false)
+
+        let changesFocus = tab.splitTree.focusedLeafID != surfaceID
+        if changesFocus {
+            tab.splitTree = tab.splitTree.settingFocus(surfaceID)
+        }
+        if tab.id != activeTab?.id {
+            switchToTab(id: tab.id)
+        } else if changesFocus {
+            splitContainerView?.updateLayout(tree: tab.splitTree)
+        }
         if let view = tab.registry.view(for: surfaceID) {
             window?.makeFirstResponder(view)
         }
+        if window?.isMiniaturized == true {
+            window?.deminiaturize(nil)
+        }
+        window?.makeKeyAndOrderFront(nil)
+        return true
     }
 
     /// A card's inline Allow button.
@@ -2823,13 +2840,10 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     private func attemptFocusRestore(requestID: UInt64, startTime: Double) {
         guard requestID == focusRequestID else { return }
-        // Mission Map holds first responder while shown (e.g. a hosting
-        // view recreated on de-occlusion queues a restore under it).
         guard !windowSession.showMissionMap else { return }
 
         let elapsed = CACurrentMediaTime() - startTime
 
-        // Non-key window → skip; windowDidBecomeKey will call restoreFocus()
         guard window?.isKeyWindow == true else { return }
 
         guard let tab = activeTab,
@@ -2839,7 +2853,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         let inWindow = focusView.window === self.window
         let hasSuperview = focusView.superview != nil
 
-        // View must be attached to THIS window's hierarchy
         guard inWindow, hasSuperview else {
             guard elapsed < Self.focusRestoreTimeout else {
                 splitContainerView?.onDeferredLayoutComplete = { [weak self] in
@@ -2848,7 +2861,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
                 }
                 return
             }
-            // Retry with 10ms backoff
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
                 self?.attemptFocusRestore(requestID: requestID, startTime: startTime)
             }
@@ -2860,7 +2872,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             tab.registry.controller(for: focusedID)?.setFocus(true)
             tab.registry.controller(for: focusedID)?.refresh()
             focusView.needsDisplay = true
-            activeTab?.clearUnreadNotifications()
+            markNotificationsRead(in: tab)
         }
     }
 
@@ -3907,26 +3919,17 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         applyInitialSize(NSSize(width: CGFloat(width), height: CGFloat(height)))
     }
 
-    /// `.ghosttyRendererHealth` (`GHOSTTY_ACTION_RENDERER_HEALTH`)
-    /// receiver — mirrors `healthy` onto `surfaceView.isRendererHealthy`
-    /// (`SurfaceView.swift`) unconditionally (no ownership check of its
-    /// own, mirroring `processCloseSurface`'s identical shape: routing
-    /// lives in `handleRendererHealthNotification` below). When
-    /// unhealthy, additionally logs and — if this window can resolve the
-    /// surface's owning tab — surfaces a user-facing notification via
-    /// `NotificationManager`; pane-level overlay presentation is out of
-    /// scope here.
     func processRendererHealth(surfaceView: SurfaceView, healthy: Bool) {
         surfaceView.isRendererHealthy = healthy
         guard !healthy else { return }
 
         logger.error("Renderer reported unhealthy for a surface")
-        guard let (tab, _) = findTab(for: surfaceView) else { return }
+        guard let owner = findOwner(of: surfaceView) else { return }
         NotificationManager.shared.sendNotification(
             title: "Rendering Issue",
             body: "This pane's renderer reported a problem. Try resizing the window, or restart Calyx if " +
                   "the display looks wrong.",
-            tabID: tab.id
+            originSurfaceID: owner.surfaceID
         )
     }
 
@@ -4321,62 +4324,6 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         closeSurfaceAndCleanUp(tab: tab, group: group, surfaceID: surfaceID)
     }
 
-    /// Reconnect attempts for `surfaceID`'s session exceeded
-    /// `maxReconnectAttempts` (`SessionReconnectDecision.giveUp`).
-    /// Unlike `.closePane` (the daemon confirmed the session's process
-    /// actually exited, so a full kill is correct), the daemon here was
-    /// only ever reported unreachable — the underlying `calyx-session`
-    /// daemon may still be legitimately running (e.g. slow to start),
-    /// so this closes the pane with DETACH, not kill, semantics: the
-    /// session survives, reattachable later from the session browser
-    /// (`calyx-session ls --all` still lists it) or a future restore.
-    ///
-    /// Deliberately closes the pane now, through the same
-    /// `closeSurfaceAndCleanUp` path `closeDeadPersistentSessionSurface`
-    /// uses (with `killSessions: false`), rather than leaving it open:
-    /// leaving a dead pane open does not prevent the
-    /// last-pane/last-window quit cascade it might seem to avoid, it
-    /// only defers that same cascade to whenever the user next
-    /// presses a key on the dead pane, and ghostty may not even render
-    /// an informative screen by then on a fast/abnormal exit. Closing
-    /// deterministically here keeps cascade timing consistent with
-    /// every other session-ending path.
-    ///
-    /// The condition below is `isLastPaneEverywhere` alone: closing this
-    /// pane deterministically, the way the
-    /// two-pane case below always has, is wrong specifically when it is
-    /// the LAST pane app-wide, since that would silently close the user's
-    /// only remaining window with no trace of why, right as they were
-    /// waiting for a reconnect. So when `isLastPaneEverywhere`, this
-    /// method does not close the pane at all: it does detach bookkeeping
-    /// only (clearing `SessionSurfaceMap`/`tab.sessionRefs` tracking) and
-    /// leaves the leaf in the split tree. The surface still shows
-    /// ghostty's own child-exited state; a later keypress on it closes it
-    /// through the ordinary `handleCloseSurfaceNotification` path, with
-    /// `hasSession` now `false`, so no kill call and no data loss. The
-    /// two-pane (and any other non-last-pane-everywhere) case below is
-    /// unchanged: closing deterministically is safe there because it can
-    /// never empty the window.
-    ///
-    /// The remaining close branch inserts `tab.id`
-    /// into `closingTabIDs` before tearing the surface down, mirroring
-    /// `closeFocusedSessionSurface`'s own insert (see its doc comment).
-    ///
-    /// A no-op if the pane was already closed by the user in the
-    /// meantime (`findTabAndGroup` returns `nil`).
-    ///
-    /// Bails out
-    /// entirely while this window or the app itself is shutting down,
-    /// for the same reason `handleSessionReconnectDecision`'s identical
-    /// guard does (this method is also reachable directly, from tests
-    /// and potentially future callers, not only via that dispatcher).
-    ///
-    /// The kept-pane (last-pane-everywhere)
-    /// branch also shows a persistent in-pane overlay (see
-    /// `showReconnectGiveUpOverlay`'s doc comment): the macOS
-    /// notification alone can silently vanish (permission not granted),
-    /// and ghostty's own child-exited text is suppressed for this
-    /// surface, leaving no other in-app signal.
     private func handleReconnectGiveUp(surfaceID: UUID) {
         guard !isShuttingDown else { return }
         guard let (tab, group) = findTabAndGroup(surfaceID: surfaceID) else { return }
@@ -4386,7 +4333,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
             logger.info("Reconnect exhausted for last pane app-wide; detaching without closing (see F1)")
             detachSessionIfPersistent(tab: tab, surfaceID: surfaceID)
             showReconnectGiveUpOverlay(tab: tab, surfaceID: surfaceID)
-            sendReconnectGiveUpNotification(tabID: tab.id)
+            sendReconnectGiveUpNotification(originSurfaceID: surfaceID)
             return
         }
 
@@ -4394,7 +4341,7 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
         let sessionID = SessionSurfaceMap.shared.sessionID(for: surfaceID)
         logger.error("Reconnect attempts exhausted for session \(sessionID ?? "unknown", privacy: .public); detaching and closing pane")
-        sendReconnectGiveUpNotification(tabID: tab.id)
+        sendReconnectGiveUpNotification(originSurfaceID: nil)
 
         closeSurfaceAndCleanUp(
             tab: tab, group: group, surfaceID: surfaceID,
@@ -4404,22 +4351,12 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         closingTabIDs.remove(tab.id)
     }
 
-    /// Shared give-up notification
-    /// text for both of `handleReconnectGiveUp`'s branches. Avoids claiming
-    /// scrollback or running commands are lost, or that only a brand-new
-    /// session with the same ID is possible: both are false in the
-    /// reachable cases this fires for. `SessionReconnectCoordinator` feeds
-    /// `.giveUp` from both `.running` and `.unreachable` daemon states
-    /// (i.e. even when the daemon just confirmed the session is alive),
-    /// the daemon-side PTY is `setsid()`'d (surviving the attach
-    /// process disconnecting), and the session browser's `attach()`
-    /// reattaches the SAME session, not a new one.
-    private func sendReconnectGiveUpNotification(tabID: UUID) {
+    private func sendReconnectGiveUpNotification(originSurfaceID: UUID?) {
         NotificationManager.shared.sendNotification(
             title: "Session unreachable",
             body: "Calyx couldn't reattach this session, but it may still be running with its state intact. " +
                   "Reattach it from the session browser once the daemon is reachable again.",
-            tabID: tabID
+            originSurfaceID: originSurfaceID
         )
     }
 
@@ -4904,25 +4841,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         AgentRegistry.shared.handleProgressReport(surfaceID: surfaceID, isActive: isActive)
     }
 
-    /// Resolves an Agents sidebar row click to a surface owned by this
-    /// window and focuses it. A no-op in every other window's controller
-    /// (its `windowSession` won't resolve the surface), and a no-op for
-    /// QuickTerminal-hosted panes, which aren't part of any `windowSession`
-    /// (out of scope for v1 — the row is still shown, just not focusable).
     @objc private func handleFocusSurfaceNotification(_ notification: Notification) {
         guard let surfaceID = notification.userInfo?["surfaceID"] as? UUID else { return }
-        guard let tab = findTab(surfaceID: surfaceID) else { return }
-
-        switchToTab(id: tab.id)
-        if let view = tab.registry.view(for: surfaceID) {
-            window?.makeFirstResponder(view)
-        }
-        // Every window's controller observes this notification, but only
-        // the one that actually resolves the surface (above) should come
-        // to the front — otherwise clicking a sidebar row for a pane in a
-        // background window would focus that pane without raising its
-        // window, leaving it invisible behind the current one.
-        window?.makeKeyAndOrderFront(nil)
+        focusPane(surfaceID: surfaceID)
     }
 
     /// Ownership is resolved with `findTab(for:)`, not
@@ -5017,7 +4938,8 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func handleDesktopNotification(_ notification: Notification) {
         guard let surfaceView = notification.object as? SurfaceView else { return }
-        guard let (owningTab, _) = findTab(for: surfaceView) else { return }
+        guard let owner = findOwner(of: surfaceView) else { return }
+        let owningTab = owner.tab
         guard let title = notification.userInfo?["title"] as? String else { return }
         let body = notification.userInfo?["body"] as? String ?? ""
 
@@ -5028,7 +4950,9 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
         owningTab.unreadNotifications += 1
         owningTab.lastNotificationTime = Date()
 
-        NotificationManager.shared.sendNotification(title: title, body: body, tabID: owningTab.id)
+        NotificationManager.shared.sendNotification(
+            title: title, body: body, originSurfaceID: owner.surfaceID
+        )
 
         if isFirstUnread {
             NotificationManager.shared.bounceDockIcon()
@@ -5341,10 +5265,14 @@ class CalyxWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func findTab(for surfaceView: SurfaceView) -> (Tab, TabGroup)? {
+        findOwner(of: surfaceView).map { ($0.tab, $0.group) }
+    }
+
+    private func findOwner(of surfaceView: SurfaceView) -> (tab: Tab, group: TabGroup, surfaceID: UUID)? {
         for group in windowSession.groups {
             for tab in group.tabs {
-                if tab.registry.id(for: surfaceView) != nil {
-                    return (tab, group)
+                if let surfaceID = tab.registry.id(for: surfaceView) {
+                    return (tab, group, surfaceID)
                 }
             }
         }

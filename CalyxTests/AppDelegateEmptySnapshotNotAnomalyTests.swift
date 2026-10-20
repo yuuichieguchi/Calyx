@@ -143,12 +143,10 @@ private final class FakeRunningSessionDaemonClient: SessionDaemonClientProtocol,
 @MainActor
 final class AppDelegateEmptySnapshotNotAnomalyTests: XCTestCase {
 
-    /// Mirrors AppDelegateNotifyPreviousSessionNotRestoredTests.NotifySpy
-    /// exactly (also file-private there, so copied rather than reused).
     private final class NotifySpy: NotificationManager {
         private(set) var callCount = 0
 
-        override func sendNotification(title: String, body: String, tabID: UUID) {
+        override func sendNotification(title: String, body: String, originSurfaceID: UUID?) {
             callCount += 1
         }
     }

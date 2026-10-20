@@ -768,148 +768,11 @@ final class CalyxMCPServer {
         return HTTPParser.response(statusCode: 204, body: nil)
     }
 
-    /// Handles `POST /approval-request`, the long-poll endpoint the
-    /// `calyx-approval-hook` script blocks on from a CLI agent's
-    /// PermissionRequest hook while a human decides whether to allow its
-    /// next tool call.
-    ///
-    /// Signing (J7/J8): an `X-Calyx-Approval-Nonce`
-    /// (`ApprovalHookResponse.nonceHeader`) that is not an uppercase
-    /// canonical UUID is answered 400 right after the bearer check,
-    /// before the body is read. With a valid nonce every 200 below leaves
-    /// through one exit as `text/plain; charset=utf-8`
-    /// `ApprovalHookResponse.signedBody`, a decision larger than
-    /// `ApprovalHookResponse.maxBodyBytes` becoming a signed empty body;
-    /// and when this start's key was never published
-    /// (`wakeProofKeyPublished == false`) the request is answered signed
-    /// empty right after the sole-authority check, before the setting and
-    /// the allow short-circuits, without entering the inbox. Without the
-    /// header every answer is unchanged (`application/json`).
-    ///
-    /// Contract, in order: bearer auth (401) -> nonce shape (400) -> body
-    /// present (400) -> body.count <= maxEventBodyBytes, checked BEFORE
-    /// decode (413, mirrors `routeCommandEvent`) -> `X-Calyx-Agent-Kind`
-    /// read (no failure path, so reading it before decode does not
-    /// reorder anything below) -> `AgentHookToolCall.decode(from:kind:)`
-    /// (400) -> `resolveSurfaceID` (400) -> an unrecognized
-    /// `X-Calyx-Agent-Kind` (anything other than
-    /// claude-code/codex/grok/pi)
-    /// short-circuits to 200 with an EMPTY body, never submitting
-    /// anything -> a hook event name that isn't the one this kind's gate
-    /// fires under (`ApprovalHookEvent.isApprovalGate(_:kind:)` -- so
-    /// anything else, including a missing key, or `"PreToolUse"`
-    /// specifically) short-circuits the same inert way. NOT harmless during the
-    /// migration window it exists for: a CLI session already running
-    /// before an app update re-migrates `settings.json`/`config.toml`
-    /// (see `AgentHooksCoordinator.resyncInstalled()`, run from
-    /// `AppDelegate.applicationDidFinishLaunching`) keeps the hook
-    /// snapshot it loaded at its own startup, so it keeps POSTing here
-    /// with `hook_event_name: "PreToolUse"` from the OLD synchronous
-    /// approval entry for as long as it stays alive. Before this
-    /// migration that same POST reached the auto-approve /
-    /// Always-Allow-memory / inbox-submission branches below;
-    /// short-circuiting it here instead means that, until such a
-    /// session restarts, no Calyx banner shows for its tool calls, and
-    /// any confirmation cockpit auto-approve or a remembered
-    /// Always-Allow used to suppress silently now surfaces instead as
-    /// that CLI's own local prompt, with no reason shown. Answering in
-    /// the OLD `PreToolUse` shape here to close that gap is not an
-    /// option: `PreToolUse` fires for every tool call regardless of
-    /// whether the CLI itself would ever show a confirmation for it, so
-    /// a real decision on this path would resurrect, for old sessions
-    /// only, exactly the over-prompting this migration to
-    /// `PermissionRequest` exists to remove for everyone (see
-    /// `ClaudeHooksConfigManager.installHooks`'s own doc comment).
-    /// Staying inert is the smaller, temporary cost, and resolves
-    /// itself the moment the session restarts and reloads its migrated
-    /// config -> a grok payload whose `permissionMode` is anything but
-    /// `bypassPermissions` (`ApprovalHookEvent.gateIsSoleAuthority`)
-    /// short-circuits the same inert way, because Grok's own permission
-    /// pipeline still runs behind this gate in every other mode: a
-    /// banner here would duplicate the prompt Grok is about to show in
-    /// its own pane, and an allow here would not answer that prompt
-    /// -> `CockpitSettings.agentHookApprovalEnabled` being off does the
-    /// same -> for a non-question-tool call (`!call.isQuestionTool`):
-    /// global auto-approve (`!ApprovalPolicy.requiresApproval()`)
-    /// short-circuits to 200 with an ALLOW body, also without ever
-    /// submitting -> an `agentHookApprovalMemory.isAutoAllowed` (pane
-    /// scope) hit short-circuits the same way, also without submitting.
-    /// Neither of those two short-circuits ever applies to a
-    /// claude-code `AskUserQuestion` call (`call.isQuestionTool`) --
-    /// gated on the TOOL, not on whether `tool_input.questions` happened
-    /// to decode: a question must always reach a human, even one whose
-    /// malformed shape falls back to the generic `.agentHook` banner
-    /// below, so both are skipped for it. -> an
-    /// `approvalSurfaceExists` miss (a stale/forged/torn-down surface)
-    /// short-circuits the same inert way
-    /// as the unrecognized-kind case above, also without submitting ->
-    /// otherwise submits an `ApprovalRequest`, sourced `.agentQuestion`
-    /// for a claude-code `AskUserQuestion` call (`call.question != nil`)
-    /// or `.agentHook` otherwise, posts one user notification (its `body`
-    /// run through `SecretRedactor.redact` first -- see that call site's
-    /// own comment for why only the notification, never the banner, is
-    /// redacted; a question's notification title is "... asks a
-    /// question" and its body is the first question's own text), and
-    /// long-polls `approvalInbox.awaitDecisionHonoringCancellation`. The
-    /// resolved `ApprovalDecision` already carries its own `DenyReason`/
-    /// `InterruptReason` (the model/view picked it when the human
-    /// decided) -- `AgentHookPermissionResponse.body(kind:decision:)`
-    /// alone maps that reason to the message/reason text a given `kind`'s
-    /// hook actually reads; this route never passes a message string of
-    /// its own.
-    ///
-    /// Three invariants a future change here must preserve:
-    ///
-    /// (a) THE RESPONSE BODY IS THE HOOK'S STDOUT, BYTE FOR BYTE --
-    ///     Claude Code / Codex parse it directly as their own
-    ///     PermissionRequest hook JSON contract, Grok as its own flat
-    ///     PreToolUse decision, and pi's extension reads that same flat
-    ///     decision from the response body of this very request (see
-    ///     `AgentHookPermissionResponse`'s header comment). Nothing here
-    ///     may wrap, prepend, or otherwise reshape it.
-    ///
-    /// (b) Fail-safe mapping: every path that resolves without a genuine
-    ///     human decision (timed-out long-poll, `server.stop()`'s drain,
-    ///     or this call's own Task being cancelled mid-poll) maps to
-    ///     `.expired`, which `AgentHookPermissionResponse` renders as an
-    ///     EMPTY body for both claude-code and codex -- neither CLI has
-    ///     an "ask" analog under PermissionRequest, so absent output
-    ///     lets that CLI's own confirmation prompt take over -- and as an
-    ///     explicit deny for grok and pi: a grok request reaches this
-    ///     point only under `bypassPermissions`, the one mode where
-    ///     nothing behind this gate would ask anyone before running the
-    ///     call, and pi has no prompt of its own in any mode, so silence
-    ///     for either would let the call run unreviewed. NEVER
-    ///     "allow". `awaitDecisionHonoringCancellation` is what re-maps an
-    ///     `.allowed` decision that raced a concurrent cancellation of
-    ///     this call's own Task to `.expired` -- see that method's own
-    ///     doc comment on `ApprovalInboxStore` (the same re-check
-    ///     `MCPCockpitBridge.gate` also goes through, centralized there
-    ///     rather than duplicated in both places).
-    ///
-    /// (c) A hook killed client-side (curl's own `-m` deadline, the CLI's
-    ///     hook-entry timeout, or the whole hook process being killed
-    ///     outright, e.g. by SIGKILL) drops this connection out from
-    ///     under the still-suspended long-poll. `dispatchRoute`'s sentinel
-    ///     receive (scoped to this endpoint only -- see that method's own
-    ///     doc comment for the real detection mechanism, and why a
-    ///     `stateUpdateHandler`-based approach does NOT work here) is what
-    ///     notices the drop and cancels the `Task` running this call,
-    ///     which propagates into `approvalInbox.awaitDecision`'s
-    ///     cancellation handler and expires the pending request through
-    ///     the same mechanism as a timeout, clearing its banner. A
-    ///     decision that still resolves `.allowed` for such an
-    ///     already-abandoned call is harmless: no hook process is left to
-    ///     read this response, and nothing executes server-side as a
-    ///     result of it -- execution happens inside the CLI agent's own
-    ///     process, driven entirely by whatever it read from its own
-    ///     hook's stdout.
     private func routeApprovalRequest(request: HTTPRequest) async -> HTTPResponse {
         guard isAuthorized(request) else {
             return HTTPParser.response(statusCode: 401, body: nil)
         }
 
-        // J7: a malformed nonce is rejected before the body is looked at.
         let nonce = header(named: ApprovalHookResponse.nonceHeader, in: request.headers)
         if let nonce, !Self.isCanonicalNonce(nonce) {
             return HTTPParser.response(statusCode: 400, body: nil)
@@ -917,7 +780,6 @@ final class CalyxMCPServer {
 
         let outcome = await approvalOutcome(request: request, signed: nonce != nil)
 
-        // The single 200 exit (J8): with a nonce every 200 is signed.
         let decisionBody: Data?
         switch outcome {
         case .status(let statusCode) where statusCode != 200:
@@ -951,8 +813,6 @@ final class CalyxMCPServer {
         case decision(Data?)
     }
 
-    /// Everything `routeApprovalRequest` decides after the bearer and
-    /// nonce checks. `signed` is whether the request carried a nonce.
     private func approvalOutcome(request: HTTPRequest, signed: Bool) async -> ApprovalRouteOutcome {
         guard let body = request.body else {
             return .status(400)
@@ -961,9 +821,6 @@ final class CalyxMCPServer {
             return .status(413)
         }
 
-        // Read before decode: `agentKind(from:)` has no failure path, so
-        // reading it here first does not change this method's response
-        // ordering for any existing guard below.
         let kind = agentKind(from: request.headers)
         guard let call = AgentHookToolCall.decode(from: body, kind: kind) else {
             return .status(400)
@@ -975,33 +832,17 @@ final class CalyxMCPServer {
 
         guard kind == AgentEntry.claudeCodeKind || kind == AgentEntry.codexKind
             || kind == AgentEntry.grokKind || kind == AgentEntry.piKind else {
-            // An agent CLI Calyx doesn't have a hook-response contract
-            // for at all (see `AgentHookPermissionResponse`'s own
-            // fail-safe contract) -- never submit to the inbox for one.
             return .status(200)
         }
 
         guard ApprovalHookEvent.isApprovalGate(call.hookEventName, kind: kind) else {
-            // A stale PreToolUse-fired POST (a not-yet-migrated install,
-            // see this method's own doc comment) or any other/missing
-            // hook event name -- inert, same as the unrecognized-kind
-            // guard above, never submitted to the inbox.
             return .status(200)
         }
 
         guard ApprovalHookEvent.gateIsSoleAuthority(kind: kind, permissionMode: call.permissionMode) else {
-            // A Grok session outside bypassPermissions: Grok's own
-            // permission pipeline, its in-pane prompt included, still
-            // runs after this gate, and a decision here could not grant
-            // anything anyway (see `gateIsSoleAuthority`). Answering
-            // with no decision at all leaves that pipeline deciding
-            // exactly as it would without Calyx, rather than asking the
-            // same human the same question in two places.
             return .status(200)
         }
 
-        // D20 analog: this start's key never reached agent-endpoint.json,
-        // so no proof could verify; answer signed empty and queue nothing.
         guard !signed || wakeProofKeyPublished else {
             return .status(200)
         }
@@ -1010,22 +851,6 @@ final class CalyxMCPServer {
             return .status(200)
         }
 
-        // An AskUserQuestion call must always ask a human: neither global
-        // auto-approve nor pane-scoped Always-Allow memory may ever
-        // short-circuit a question the way they do a plain tool call --
-        // a "yes always allow this tool" memory says nothing about which
-        // OPTION a human would have picked. Gated on `call.isQuestionTool`,
-        // not `call.question == nil`: a malformed `tool_input.questions`
-        // (decoded to `nil` by `decodeQuestions`) still reaches the
-        // generic `.agentHook` banner below, but must still never be
-        // auto-allowed just because decoding failed to produce option
-        // buttons to answer with -- the hold window expiring with no
-        // decision made (`.expired`, no body -- see
-        // `AgentHookPermissionResponse`'s own fail-safe contract) is one
-        // path that hands an AskUserQuestion call to Claude Code's own
-        // in-pane prompt; the panel's own × dismiss action
-        // (`ApprovalDecision.dismissed`, also no body for claude-code) is
-        // another.
         if !call.isQuestionTool {
             guard ApprovalPolicy.requiresApproval() else {
                 return .decision(AgentHookPermissionResponse.body(kind: kind, decision: .allowed))
@@ -1036,11 +861,6 @@ final class CalyxMCPServer {
             }
         }
 
-        // R4: a valid-FORMAT surface UUID no live surface registry
-        // actually knows about (pane already closed, or a stale/forged
-        // header) -- inert pass-through, same as the unrecognized-kind
-        // guard above, rather than queuing a request whose banner no
-        // window could ever show.
         guard approvalSurfaceExists(surfaceID) else {
             return .status(200)
         }
@@ -1052,7 +872,7 @@ final class CalyxMCPServer {
         if let question = call.question {
             source = .agentQuestion(kind: kind, prompt: question)
             notificationTitle = "\(AgentEntry.displayName(forKind: kind)) asks a question"
-            notificationBody = SecretRedactor.redact(question.questions[0].text)
+            notificationBody = question.questions[0].text
         } else {
             let offers = AgentHookOffers(
                 permissionUpdates: call.permissionOffers,
@@ -1060,7 +880,7 @@ final class CalyxMCPServer {
             )
             source = .agentHook(toolName: call.toolName, kind: kind, summary: call.summary, offers: offers)
             notificationTitle = "\(AgentEntry.displayName(forKind: kind)) wants to run \(call.toolName)"
-            notificationBody = SecretRedactor.redact("\(call.toolName): \(call.summary)")
+            notificationBody = "\(call.toolName): \(call.summary)"
         }
         approvalInbox.submit(ApprovalRequest(
             id: requestID,
@@ -1069,24 +889,8 @@ final class CalyxMCPServer {
             payload: call.payload,
             createdAt: Date()
         ))
-        // R3 fix-pin: the notification body is redacted through
-        // SecretRedactor -- the same redaction CommandLogStore already
-        // runs text through before persistence (see that type's own
-        // header comment) -- because a notification can leak into places
-        // (Notification Center history, a screen someone else can see)
-        // the human never explicitly chose to expose a raw secret to.
-        // The BANNER, in contrast, deliberately keeps `call.summary`/the
-        // question text verbatim (via `ApprovalRequest.displayPayload` --
-        // `.agentHook`'s own `summary`, `.agentQuestion`'s own question
-        // texts) -- the human approving this exact tool call must see
-        // exactly what they're being asked to approve, unredacted;
-        // `ControlCharacterDisplay` there guards a different concern
-        // (terminal-control-character spoofing), not secret leakage.
-        // NotificationSanitizer still runs inside sendNotification itself
-        // -- no need to sanitize title/body for that separate concern
-        // here.
         NotificationManager.shared.sendNotification(
-            title: notificationTitle, body: notificationBody, tabID: surfaceID
+            title: notificationTitle, redactingSecretsIn: notificationBody, originSurfaceID: surfaceID
         )
 
         let decision = await approvalInbox.awaitDecisionHonoringCancellation(id: requestID, timeoutMs: approvalRequestTimeoutMs)

@@ -329,26 +329,48 @@ final class SessionReconnectGiveUpTests: XCTestCase {
 
     // MARK: - F2/T2 & F5/T5: closingTabIDs insertion + corrected notification text
 
-    /// `NotificationManager` subclass spying on `sendNotification`
-    /// instead of going through `UNUserNotificationCenter` (a no-op in
-    /// the test host regardless, see `NotificationManager`'s own
-    /// test-seam doc comment). Also captures
-    /// `CalyxWindowController._closingTabIDsForTesting` AT THE MOMENT
-    /// `sendNotification` fires, `handleReconnectGiveUp` calls
-    /// `NotificationManager.shared.sendNotification` before
-    /// `closeSurfaceAndCleanUp` in the current code, giving a
-    /// conveniently-already-present mid-sequence checkpoint for F2's
-    /// "insert into closingTabIDs before tearing the surface down"
-    /// contract, without needing to simulate real ghostty reentrancy.
     private final class GiveUpNotificationSpy: NotificationManager {
         weak var controller: CalyxWindowController?
         private(set) var observedClosingTabIDs: Set<UUID>?
         private(set) var lastBody: String?
+        private(set) var origins: [UUID?] = []
 
-        override func sendNotification(title: String, body: String, tabID: UUID) {
+        override func sendNotification(title: String, body: String, originSurfaceID: UUID?) {
             lastBody = body
+            origins.append(originSurfaceID)
             observedClosingTabIDs = controller?._closingTabIDsForTesting
         }
+    }
+
+    func test_giveUp_multiPaneCloseBranch_sendsWithNilOrigin() {
+        let fixture = makeFixture()
+        let spy = GiveUpNotificationSpy()
+        let originalManager = NotificationManager.shared
+        NotificationManager.shared = spy
+        defer { NotificationManager.shared = originalManager }
+
+        fixture.controller.handleSessionReconnectDecision(surfaceID: fixture.trackedLeafID, decision: .giveUp)
+
+        XCTAssertEqual(spy.origins, [nil])
+    }
+
+    func test_giveUp_lastPaneEverywhereKeptBranch_sendsWithKeptPaneOrigin() {
+        let fixture = makeSinglePaneFixture()
+        let mock = LastPaneGiveUpMockAppDelegate()
+        let originalDelegate = NSApp.delegate
+        NSApp.delegate = mock
+        defer { NSApp.delegate = originalDelegate }
+        let spy = GiveUpNotificationSpy()
+        let originalManager = NotificationManager.shared
+        NotificationManager.shared = spy
+        defer { NotificationManager.shared = originalManager }
+
+        withExtendedLifetime(mock) {
+            fixture.controller.handleSessionReconnectDecision(surfaceID: fixture.leafID, decision: .giveUp)
+        }
+
+        XCTAssertEqual(fixture.tab.splitTree.allLeafIDs(), [fixture.leafID])
+        XCTAssertEqual(spy.origins, [fixture.leafID])
     }
 
     /// F2 (V02, CRITICAL): `handleReconnectGiveUp`'s multi-pane close

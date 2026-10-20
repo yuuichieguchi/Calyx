@@ -717,19 +717,16 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
 
     // MARK: - Notification on submission
 
-    /// Mirrors `SessionReconnectGiveUpTests.GiveUpNotificationSpy`: a
-    /// `NotificationManager` subclass swapped into the existing
-    /// `NotificationManager.shared` DEBUG test seam to spy on
-    /// `sendNotification` instead of going through
-    /// `UNUserNotificationCenter` (a no-op in the test host regardless).
-    /// No new seam on `CalyxMCPServer` is needed -- this existing one
-    /// already lets a test observe every call `routeApprovalRequest`
-    /// makes when it submits a new request.
     private final class ApprovalHookNotificationSpy: NotificationManager {
-        private(set) var calls: [(title: String, body: String, tabID: UUID)] = []
+        private(set) var calls: [(title: String, body: String, originSurfaceID: UUID?)] = []
+        private(set) var plainCalls: [(title: String, body: String, originSurfaceID: UUID?)] = []
 
-        override func sendNotification(title: String, body: String, tabID: UUID) {
-            calls.append((title: title, body: body, tabID: tabID))
+        override func sendNotification(title: String, redactingSecretsIn body: String, originSurfaceID: UUID?) {
+            calls.append((title: title, body: body, originSurfaceID: originSurfaceID))
+        }
+
+        override func sendNotification(title: String, body: String, originSurfaceID: UUID?) {
+            plainCalls.append((title: title, body: body, originSurfaceID: originSurfaceID))
         }
     }
 
@@ -737,8 +734,6 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         CockpitSettings.agentHookApprovalEnabled = true
         let approvalInbox = ApprovalInboxStore()
         server.approvalInbox = approvalInbox
-        // R4 seam: this test expects a genuine submission, so the
-        // stale/unknown-surface guard must not short-circuit it.
         server.approvalSurfaceExists = { _ in true }
         let surfaceID = UUID()
 
@@ -759,13 +754,12 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
                        "precondition: the request must be pending before asserting on the notification it triggers")
         XCTAssertEqual(spy.calls.count, 1,
                        "submitting a new agent-hook approval request must post exactly one user notification")
-        XCTAssertEqual(spy.calls.first?.tabID, surfaceID,
-                       "the notification's tabID must be the resolved target surface, so acting on it can " +
+        XCTAssertEqual(spy.calls.first?.originSurfaceID, surfaceID,
+                       "the notification's origin must be the resolved target surface, so clicking it can " +
                        "focus the right pane")
         XCTAssertFalse(spy.calls.first?.title.isEmpty ?? true, "the notification must carry a non-empty title")
         XCTAssertFalse(spy.calls.first?.body.isEmpty ?? true, "the notification must carry a non-empty body")
 
-        // Drain the held route so this test doesn't leak a suspended Task.
         guard let requestID = approvalInbox.pending.first?.id else {
             task.cancel()
             _ = await task.value
@@ -775,33 +769,10 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         _ = await task.value
     }
 
-    /// R3 fix-pin: the notification `routeApprovalRequest` posts on
-    /// submission embeds `call.summary` verbatim into its `body` -- must
-    /// never leak a raw secret token through that string. `SecretRedactor`
-    /// already exists and runs before text ever reaches `CommandLogStore`
-    /// (see that type's own header comment); this pins that the SAME
-    /// redaction must also apply at THIS notification call site.
-    ///
-    /// Scoping note (deliberately NOT pinned here): whether
-    /// `AgentHookToolCall.decode` itself should redact -- baking it into
-    /// every `summary`/`payload` everywhere, including the banner -- or
-    /// only this one notification call site, is a separate design
-    /// question this test does not settle. The approval banner must keep
-    /// showing the tool call the human is being asked to approve
-    /// VERBATIM (ControlCharacterDisplay already handles a different
-    /// concern there -- terminal-control-character spoofing, not secret
-    /// leakage), so this test deliberately scopes the fix to
-    /// `NotificationManager.shared.sendNotification`'s `body` only.
-    ///
-    /// The token is composed at runtime from two non-secret-shaped
-    /// halves (mirrors SecretRedactorTests' own convention) so no
-    /// contiguous secret-format literal appears in this tracked file.
-    func test_route_submission_notificationBody_redactsSecretToken() async throws {
+    func test_route_submission_notificationBody_passesRawSummaryToRedactingEntryPoint() async throws {
         CockpitSettings.agentHookApprovalEnabled = true
         let approvalInbox = ApprovalInboxStore()
         server.approvalInbox = approvalInbox
-        // R4 seam: this test expects a genuine submission, so the
-        // stale/unknown-surface guard must not short-circuit it.
         server.approvalSurfaceExists = { _ in true }
         let surfaceID = UUID()
 
@@ -810,11 +781,6 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         NotificationManager.shared = spy
         defer { NotificationManager.shared = originalManager }
 
-        // No embedded double quotes: `validToolCallBody` interpolates
-        // `command` directly into a JSON string literal without
-        // escaping, so a literal `"` here would corrupt the JSON body
-        // and make AgentHookToolCall.decode reject it as malformed --
-        // an unrelated false failure this fixture must avoid.
         let secretToken = "ghp_" + String(repeating: "a", count: 36)
         let command = "curl -H Authorization: Bearer \(secretToken) https://example.com"
         let request = approvalRequestRequest(
@@ -828,11 +794,10 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         XCTAssertEqual(approvalInbox.pending.count, 1,
                        "precondition: the request must be pending before asserting on the notification it triggers")
         XCTAssertEqual(spy.calls.count, 1)
+        XCTAssertEqual(spy.plainCalls.count, 0)
         let body = try XCTUnwrap(spy.calls.first?.body)
-        XCTAssertFalse(body.contains(secretToken), "the notification body must never contain the raw secret token")
-        XCTAssertTrue(body.contains(SecretRedactor.marker),
-                      "the notification body must contain SecretRedactor's own redaction marker in the " +
-                      "token's place")
+        XCTAssertTrue(body.contains(secretToken))
+        XCTAssertFalse(body.contains(SecretRedactor.marker))
 
         guard let requestID = approvalInbox.pending.first?.id else {
             task.cancel()
@@ -841,6 +806,60 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         }
         approvalInbox.decide(id: requestID, .allowed)
         _ = await task.value
+    }
+
+    private func routeApprovalThroughRealNotificationManager(body: Data) async throws -> String {
+        CockpitSettings.agentHookApprovalEnabled = true
+        let approvalInbox = ApprovalInboxStore()
+        server.approvalInbox = approvalInbox
+        server.approvalSurfaceExists = { _ in true }
+
+        let center = RecordingUserNotificationCenterClient()
+        center.authorizationStatus = .authorized
+        let originalLedger = PaneNotificationLedger.shared
+        PaneNotificationLedger.shared = PaneNotificationLedger(center: center)
+        defer { PaneNotificationLedger.shared = originalLedger }
+        let manager = NotificationManager()
+        let originalManager = NotificationManager.shared
+        NotificationManager.shared = manager
+        defer { NotificationManager.shared = originalManager }
+
+        let request = approvalRequestRequest(
+            token: testToken, surfaceIDHeader: UUID().uuidString, body: body
+        )
+        let task = Task { @MainActor in
+            await self.server.route(request: request)
+        }
+        await yieldToScheduler()
+
+        XCTAssertEqual(center.addedRequests.count, 1)
+        let delivered = center.addedRequests.first?.content.body ?? ""
+
+        if let requestID = approvalInbox.pending.first?.id {
+            approvalInbox.decide(id: requestID, .expired)
+        } else {
+            task.cancel()
+        }
+        _ = await task.value
+        return delivered
+    }
+
+    func test_route_submission_zeroWidthSplitSecretInSummary_deliveredBodyRedacted() async throws {
+        let body = try await routeApprovalThroughRealNotificationManager(
+            body: validToolCallBody(command: "export API_\u{200B}KEY=abc123")
+        )
+
+        XCTAssertTrue(body.contains("API_KEY=[redacted]"), body)
+        XCTAssertFalse(body.contains("abc123"), body)
+    }
+
+    func test_route_askUserQuestion_zeroWidthSplitSecretInQuestion_deliveredBodyRedacted() async throws {
+        let body = try await routeApprovalThroughRealNotificationManager(
+            body: askUserQuestionBody(questionText: "Run export API_\u{200B}KEY=abc123 now?")
+        )
+
+        XCTAssertTrue(body.contains("API_KEY=[redacted]"), body)
+        XCTAssertFalse(body.contains("abc123"), body)
     }
 
     // MARK: - AskUserQuestion (.agentQuestion source)
@@ -1090,7 +1109,7 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         XCTAssertTrue(approvalInbox.pending.isEmpty)
     }
 
-    func test_route_askUserQuestion_notification_titleAndRedactedBody() async throws {
+    func test_route_askUserQuestion_notification_titleAndRawBodyToRedactingEntryPoint() async throws {
         CockpitSettings.agentHookApprovalEnabled = true
         let approvalInbox = ApprovalInboxStore()
         server.approvalInbox = approvalInbox
@@ -1101,9 +1120,6 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         NotificationManager.shared = spy
         defer { NotificationManager.shared = originalManager }
 
-        // Composed at runtime from non-secret-shaped halves, mirroring
-        // test_route_submission_notificationBody_redactsSecretToken --
-        // no contiguous secret-format literal appears in this tracked file.
         let secretToken = "AIza" + String(repeating: "A", count: 35)
         let questionText = "Should I use the \(secretToken) API key?"
         let request = approvalRequestRequest(
@@ -1117,10 +1133,10 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
 
         XCTAssertEqual(spy.calls.count, 1)
         XCTAssertEqual(spy.calls.first?.title, "\(AgentEntry.displayName(forKind: AgentEntry.claudeCodeKind)) asks a question")
+        XCTAssertEqual(spy.plainCalls.count, 0)
         let body = try XCTUnwrap(spy.calls.first?.body)
-        XCTAssertFalse(body.contains(secretToken), "the notification body must never contain the raw secret token")
-        XCTAssertTrue(body.contains(SecretRedactor.marker),
-                      "the notification body must contain SecretRedactor's own redaction marker in the token's place")
+        XCTAssertTrue(body.contains(secretToken))
+        XCTAssertFalse(body.contains(SecretRedactor.marker))
 
         guard let requestID = approvalInbox.pending.first?.id else {
             task.cancel()

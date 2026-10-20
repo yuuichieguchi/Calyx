@@ -34,7 +34,6 @@ final class NotificationSanitizerTests: XCTestCase {
     }
 
     func test_nfc_normalization() {
-        // é composed (U+00E9) vs decomposed (e + U+0301)
         let decomposed = "e\u{0301}"
         let result = NotificationSanitizer.sanitize(decomposed)
         XCTAssertEqual(result, "\u{00E9}")
@@ -73,5 +72,37 @@ final class NotificationSanitizerTests: XCTestCase {
         let input = "Build complete 🎉"
         let result = NotificationSanitizer.sanitize(input)
         XCTAssertEqual(result, "Build complete 🎉")
+    }
+
+    func test_sanitizeRedactingSecrets_zeroWidthSplitSecret_redacted() {
+        let result = NotificationSanitizer.sanitizeRedactingSecrets("export API_\u{200B}KEY=abc123")
+        XCTAssertEqual(result, "export API_KEY=[redacted]")
+    }
+
+    func test_sanitizeRedactingSecrets_githubTokenStraddlingCap_tokenBodyAbsentAndCapped() {
+        let tokenBody = "iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g"
+        let input = String(repeating: "x", count: 230) + " ghp_" + tokenBody
+        let result = NotificationSanitizer.sanitizeRedactingSecrets(input)
+        XCTAssertFalse(result.contains(String(tokenBody.prefix(12))))
+        XCTAssertLessThanOrEqual(result.count, 256)
+    }
+
+    func test_sanitizeRedactingSecrets_jwtStraddlingCap_headerAndPayloadAbsent() {
+        let jwtHeader = "eyJ" + "hbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        let jwtPayload = "eyJ" + "zdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ"
+        let jwtSignature = "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        let fillerCount = 245 - (jwtHeader.count + jwtPayload.count + 2) - 1
+        let input = String(repeating: "x", count: fillerCount) + " \(jwtHeader).\(jwtPayload).\(jwtSignature)"
+        let result = NotificationSanitizer.sanitizeRedactingSecrets(input)
+        XCTAssertFalse(result.contains(jwtHeader))
+        XCTAssertFalse(result.contains(jwtPayload))
+        XCTAssertLessThanOrEqual(result.count, 256)
+    }
+
+    func test_sanitizeRedactingSecrets_manyShortSecretsNearCap_capped() {
+        let input = String(repeating: "TOKEN=x ", count: 31)
+        let result = NotificationSanitizer.sanitizeRedactingSecrets(input)
+        XCTAssertTrue(result.contains("TOKEN=[redacted]"))
+        XCTAssertLessThanOrEqual(result.count, 256)
     }
 }
