@@ -57,6 +57,7 @@ class NotificationManager {
         let content = UNMutableNotificationContent()
         content.title = NotificationSanitizer.sanitize(title)
         content.body = NotificationSanitizer.sanitize(body)
+        content.subtitle = paneSubtitle(for: originSurfaceID)
         content.sound = .default
         if let originSurfaceID {
             content.userInfo = NotificationOrigin.userInfo(surfaceID: originSurfaceID)
@@ -69,6 +70,12 @@ class NotificationManager {
         )
 
         PaneNotificationLedger.shared.deliver(request, originSurfaceID: originSurfaceID)
+    }
+
+    private func paneSubtitle(for originSurfaceID: UUID?) -> String {
+        guard let originSurfaceID,
+              let paneTitle = SurfacePropertyStore.shared.title(for: originSurfaceID) else { return "" }
+        return NotificationSanitizer.sanitizeRedactingSecrets(paneTitle).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     func bounceDockIcon() {

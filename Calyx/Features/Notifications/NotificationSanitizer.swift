@@ -1,43 +1,52 @@
-// NotificationSanitizer.swift
-// Calyx
-//
-// Sanitizes notification text for security.
-
 import Foundation
 
 enum NotificationSanitizer {
 
+    private static let maxGraphemeClusters = 256
+
     static func sanitize(_ text: String) -> String {
-        var result = text
+        truncated(strip(text))
+    }
 
-        // Strip bidi overrides: U+202A-202E, U+2066-2069
-        result = result.replacing(/[\u{202A}-\u{202E}\u{2066}-\u{2069}]/, with: "")
+    static func sanitizeRedactingSecrets(_ text: String) -> String {
+        truncated(SecretRedactor.redact(strip(text)))
+    }
 
-        // Strip C0/C1 control chars except \n (0x0A) and \t (0x09)
-        result = result.unicodeScalars.filter { scalar in
-            let v = scalar.value
-            if v == 0x09 || v == 0x0A { return true }
-            if v <= 0x1F { return false }
-            if v == 0x7F { return false }
-            if v >= 0x80 && v <= 0x9F { return false }
-            return true
-        }.map { String($0) }.joined()
+    private static func strip(_ text: String) -> String {
+        let withoutBidi = removingBidiOverrides(text)
+        let withoutControls = removingControlCharactersExceptNewlineAndTab(withoutBidi)
+        let withoutZeroWidth = removingZeroWidthCharacters(withoutControls)
+        let newlinesNormalized = collapsingAndTrimmingNewlines(withoutZeroWidth)
+        return newlinesNormalized.precomposedStringWithCanonicalMapping
+    }
 
-        // Strip zero-width chars: U+200B-200F, U+FEFF
-        result = result.replacing(/[\u{200B}-\u{200F}\u{FEFF}]/, with: "")
+    private static func removingBidiOverrides(_ text: String) -> String {
+        text.replacing(/[\u{202A}-\u{202E}\u{2066}-\u{2069}]/, with: "")
+    }
 
-        // Normalize newlines: collapse multiple \n to single, strip leading/trailing
-        result = result.replacing(/\n{2,}/, with: "\n")
-        result = result.trimmingCharacters(in: .newlines)
+    private static func removingControlCharactersExceptNewlineAndTab(_ text: String) -> String {
+        text.unicodeScalars.filter(isAllowedScalar).map { String($0) }.joined()
+    }
 
-        // Unicode NFC normalization
-        result = result.precomposedStringWithCanonicalMapping
+    private static func isAllowedScalar(_ scalar: Unicode.Scalar) -> Bool {
+        let value = scalar.value
+        if value == 0x09 || value == 0x0A { return true }
+        if value <= 0x1F { return false }
+        if value == 0x7F { return false }
+        if value >= 0x80 && value <= 0x9F { return false }
+        return true
+    }
 
-        // Truncate to 256 grapheme clusters
-        if result.count > 256 {
-            result = String(result.prefix(256))
-        }
+    private static func removingZeroWidthCharacters(_ text: String) -> String {
+        text.replacing(/[\u{200B}-\u{200F}\u{FEFF}]/, with: "")
+    }
 
-        return result
+    private static func collapsingAndTrimmingNewlines(_ text: String) -> String {
+        text.replacing(/\n{2,}/, with: "\n").trimmingCharacters(in: .newlines)
+    }
+
+    private static func truncated(_ text: String) -> String {
+        guard text.count > maxGraphemeClusters else { return text }
+        return String(text.prefix(maxGraphemeClusters))
     }
 }
