@@ -103,11 +103,12 @@ final class CalyxWindowControllerNotificationOriginTests: XCTestCase {
     func test_tabRead_switchingToTab_removesItsPanesNotifications() {
         let fixture = makeFixture()
         let center = RecordingUserNotificationCenterClient()
+        center.authorizationStatus = .authorized
         let originalLedger = PaneNotificationLedger.shared
         PaneNotificationLedger.shared = PaneNotificationLedger(center: center)
         defer { PaneNotificationLedger.shared = originalLedger }
-        PaneNotificationLedger.shared.deliver(makeNotificationRequest(identifier: "pane-note"), originSurfaceID: fixture.backgroundLeafID)
-        PaneNotificationLedger.shared.deliver(makeNotificationRequest(identifier: "unrelated"), originSurfaceID: UUID())
+        PaneNotificationLedger.shared.deliverIfAuthorized(makeNotificationRequest(identifier: "pane-note"), originSurfaceID: fixture.backgroundLeafID, admit: { true })
+        PaneNotificationLedger.shared.deliverIfAuthorized(makeNotificationRequest(identifier: "unrelated"), originSurfaceID: UUID(), admit: { true })
         fixture.backgroundTab.unreadNotifications = 1
 
         fixture.controller.activateTabContaining(surfaceID: fixture.backgroundLeafID)

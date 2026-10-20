@@ -12,10 +12,10 @@ final class NotificationManagerOriginTests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
         center = RecordingUserNotificationCenterClient()
+        center.authorizationStatus = .authorized
         originalLedger = PaneNotificationLedger.shared
         PaneNotificationLedger.shared = PaneNotificationLedger(center: center)
         manager = NotificationManager()
-        manager._setPermissionGrantedForTesting(true)
     }
 
     override func tearDown() async throws {

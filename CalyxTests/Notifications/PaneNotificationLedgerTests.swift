@@ -13,11 +13,12 @@ final class PaneNotificationLedgerTests: XCTestCase {
     override func setUp() {
         super.setUp()
         center = RecordingUserNotificationCenterClient()
+        center.authorizationStatus = .authorized
         ledger = PaneNotificationLedger(center: center)
-        ledger.deliver(makeNotificationRequest(identifier: "a1"), originSurfaceID: paneA)
-        ledger.deliver(makeNotificationRequest(identifier: "a2"), originSurfaceID: paneA)
-        ledger.deliver(makeNotificationRequest(identifier: "b1"), originSurfaceID: paneB)
-        ledger.deliver(makeNotificationRequest(identifier: "n1"), originSurfaceID: nil)
+        ledger.deliverIfAuthorized(makeNotificationRequest(identifier: "a1"), originSurfaceID: paneA, admit: { true })
+        ledger.deliverIfAuthorized(makeNotificationRequest(identifier: "a2"), originSurfaceID: paneA, admit: { true })
+        ledger.deliverIfAuthorized(makeNotificationRequest(identifier: "b1"), originSurfaceID: paneB, admit: { true })
+        ledger.deliverIfAuthorized(makeNotificationRequest(identifier: "n1"), originSurfaceID: nil, admit: { true })
     }
 
     override func tearDown() {

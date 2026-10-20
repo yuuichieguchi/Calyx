@@ -10,8 +10,17 @@ final class PaneNotificationLedger: NSObject {
     static let shared = PaneNotificationLedger()
     #endif
 
+    private struct AwaitingDelivery {
+        let request: UNNotificationRequest
+        let originSurfaceID: UUID?
+        let admit: @MainActor () -> Bool
+    }
+
     private let center: UserNotificationCenterClient
     private var identifiersBySurfaceID: [UUID: [String]] = [:]
+    private var awaitingDeliveries: [UUID: AwaitingDelivery] = [:]
+    private var tokensAwaitingAuthorization: [UUID] = []
+    private var isRequestingAuthorization = false
     private var isObserving = false
 
     init(center: UserNotificationCenterClient = SystemUserNotificationCenterClient()) {
@@ -19,14 +28,53 @@ final class PaneNotificationLedger: NSObject {
         super.init()
     }
 
-    func deliver(_ request: UNNotificationRequest, originSurfaceID: UUID?) {
-        if let originSurfaceID {
-            identifiersBySurfaceID[originSurfaceID, default: []].append(request.identifier)
+    func deliverIfAuthorized(
+        _ request: UNNotificationRequest,
+        originSurfaceID: UUID?,
+        admit: @escaping @MainActor () -> Bool
+    ) {
+        let token = UUID()
+        awaitingDeliveries[token] = AwaitingDelivery(request: request, originSurfaceID: originSurfaceID, admit: admit)
+        center.getAuthorizationStatus { status in
+            switch status {
+            case .authorized, .provisional, .ephemeral:
+                self.finishAwaitingDelivery(token, granted: true)
+            case .notDetermined:
+                self.awaitAuthorization(token)
+            case .denied:
+                self.finishAwaitingDelivery(token, granted: false)
+            @unknown default:
+                self.finishAwaitingDelivery(token, granted: false)
+            }
         }
-        center.add(request)
+    }
+
+    private func awaitAuthorization(_ token: UUID) {
+        guard awaitingDeliveries[token] != nil else { return }
+        tokensAwaitingAuthorization.append(token)
+        guard !isRequestingAuthorization else { return }
+        isRequestingAuthorization = true
+        center.requestAuthorization { granted in
+            self.isRequestingAuthorization = false
+            let tokens = self.tokensAwaitingAuthorization
+            self.tokensAwaitingAuthorization.removeAll()
+            tokens.forEach { self.finishAwaitingDelivery($0, granted: granted) }
+        }
+    }
+
+    private func finishAwaitingDelivery(_ token: UUID, granted: Bool) {
+        guard let delivery = awaitingDeliveries.removeValue(forKey: token), granted, delivery.admit() else { return }
+        if let originSurfaceID = delivery.originSurfaceID {
+            identifiersBySurfaceID[originSurfaceID, default: []].append(delivery.request.identifier)
+        }
+        center.add(delivery.request)
     }
 
     func removeNotifications(originatingIn surfaceIDs: [UUID]) {
+        let removedOrigins = Set(surfaceIDs)
+        awaitingDeliveries = awaitingDeliveries.filter { _, delivery in
+            delivery.originSurfaceID.map { !removedOrigins.contains($0) } ?? true
+        }
         let identifiers = surfaceIDs.flatMap { identifiersBySurfaceID.removeValue(forKey: $0) ?? [] }
         removeFromCenter(identifiers)
     }
@@ -34,6 +82,7 @@ final class PaneNotificationLedger: NSObject {
     func removeAllPaneNotifications() {
         let identifiers = identifiersBySurfaceID.values.flatMap { $0 }
         identifiersBySurfaceID.removeAll()
+        awaitingDeliveries = awaitingDeliveries.filter { _, delivery in delivery.originSurfaceID == nil }
         removeFromCenter(identifiers)
     }
 

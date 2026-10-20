@@ -815,11 +815,11 @@ final class CalyxMCPServerApprovalRequestTests: XCTestCase {
         server.approvalSurfaceExists = { _ in true }
 
         let center = RecordingUserNotificationCenterClient()
+        center.authorizationStatus = .authorized
         let originalLedger = PaneNotificationLedger.shared
         PaneNotificationLedger.shared = PaneNotificationLedger(center: center)
         defer { PaneNotificationLedger.shared = originalLedger }
         let manager = NotificationManager()
-        manager._setPermissionGrantedForTesting(true)
         let originalManager = NotificationManager.shared
         NotificationManager.shared = manager
         defer { NotificationManager.shared = originalManager }

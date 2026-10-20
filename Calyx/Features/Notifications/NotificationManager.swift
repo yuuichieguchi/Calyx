@@ -13,38 +13,13 @@ class NotificationManager {
     static let shared = NotificationManager()
     #endif
 
-    private let center = UNUserNotificationCenter.current()
     private var rateLimiter = RateLimiter(maxPerSecond: 5)
-    private var permissionGranted = false
 
     #if DEBUG
-    init() {
-        requestPermission()
-    }
+    init() {}
     #else
-    private init() {
-        requestPermission()
-    }
+    private init() {}
     #endif
-
-    #if DEBUG
-    func _setPermissionGrantedForTesting(_ granted: Bool) {
-        permissionGranted = granted
-    }
-    #endif
-
-    private func requestPermission() {
-        guard !TestEnvironment.isTestHost,
-              !ProcessInfo.processInfo.arguments.contains("--uitesting") else { return }
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, error in
-            Task { @MainActor in
-                self.permissionGranted = granted
-                if let error {
-                    logger.error("Notification permission error: \(error.localizedDescription)")
-                }
-            }
-        }
-    }
 
     func sendNotification(title: String, body: String, originSurfaceID: UUID?) {
         deliverNotification(title: title, cleanedBody: NotificationSanitizer.sanitize(body), originSurfaceID: originSurfaceID)
@@ -59,13 +34,6 @@ class NotificationManager {
     }
 
     private func deliverNotification(title: String, cleanedBody: String, originSurfaceID: UUID?) {
-        guard permissionGranted else { return }
-
-        if let originSurfaceID, !rateLimiter.allow(key: originSurfaceID) {
-            logger.debug("Rate limited notification for surface \(originSurfaceID)")
-            return
-        }
-
         let content = UNMutableNotificationContent()
         content.title = NotificationSanitizer.sanitize(title)
         content.body = cleanedBody
@@ -81,7 +49,18 @@ class NotificationManager {
             trigger: nil
         )
 
-        PaneNotificationLedger.shared.deliver(request, originSurfaceID: originSurfaceID)
+        PaneNotificationLedger.shared.deliverIfAuthorized(request, originSurfaceID: originSurfaceID) {
+            self.spendRateBudget(for: originSurfaceID)
+        }
+    }
+
+    private func spendRateBudget(for originSurfaceID: UUID?) -> Bool {
+        guard let originSurfaceID else { return true }
+        guard rateLimiter.allow(key: originSurfaceID) else {
+            logger.debug("Rate limited notification for surface \(originSurfaceID)")
+            return false
+        }
+        return true
     }
 
     private func paneSubtitle(for originSurfaceID: UUID?) -> String {

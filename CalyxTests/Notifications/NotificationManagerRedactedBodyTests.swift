@@ -12,10 +12,10 @@ final class NotificationManagerRedactedBodyTests: XCTestCase {
     override func setUp() async throws {
         try await super.setUp()
         center = RecordingUserNotificationCenterClient()
+        center.authorizationStatus = .authorized
         originalLedger = PaneNotificationLedger.shared
         PaneNotificationLedger.shared = PaneNotificationLedger(center: center)
         manager = NotificationManager()
-        manager._setPermissionGrantedForTesting(true)
     }
 
     override func tearDown() async throws {
@@ -78,8 +78,8 @@ final class NotificationManagerRedactedBodyTests: XCTestCase {
         XCTAssertEqual(center.addedRequests.count, 5)
     }
 
-    func test_sendNotificationRedacting_permissionNotGranted_nothingAdded() {
-        manager._setPermissionGrantedForTesting(false)
+    func test_sendNotificationRedacting_authorizationDenied_nothingAdded() {
+        center.authorizationStatus = .denied
 
         manager.sendNotification(title: "t", redactingSecretsIn: "b", originSurfaceID: nil)
 
