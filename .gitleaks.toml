@@ -14,3 +14,8 @@ regexes = ['''^(?:0123456789abcdef){4}$''']
 description = "Placeholder UUID token used as a test fixture"
 regexTarget = "secret"
 regexes = ['''^7B0D1F5C-2E44-4C0A-9D1B-6A5E3C2F1A00$''']
+
+[[allowlists]]
+description = "Synthetic GitHub token body used to test notification secret redaction"
+regexTarget = "secret"
+regexes = ['''^iK2ZWeqhFWCEPyYngFb51yBMWXaSCrUZoL8g$''']
