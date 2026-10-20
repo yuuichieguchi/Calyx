@@ -47,6 +47,18 @@ class NotificationManager {
     }
 
     func sendNotification(title: String, body: String, originSurfaceID: UUID?) {
+        deliverNotification(title: title, cleanedBody: NotificationSanitizer.sanitize(body), originSurfaceID: originSurfaceID)
+    }
+
+    func sendNotification(title: String, redactingSecretsIn body: String, originSurfaceID: UUID?) {
+        deliverNotification(
+            title: title,
+            cleanedBody: NotificationSanitizer.sanitizeRedactingSecrets(body),
+            originSurfaceID: originSurfaceID
+        )
+    }
+
+    private func deliverNotification(title: String, cleanedBody: String, originSurfaceID: UUID?) {
         guard permissionGranted else { return }
 
         if let originSurfaceID, !rateLimiter.allow(key: originSurfaceID) {
@@ -56,7 +68,7 @@ class NotificationManager {
 
         let content = UNMutableNotificationContent()
         content.title = NotificationSanitizer.sanitize(title)
-        content.body = NotificationSanitizer.sanitize(body)
+        content.body = cleanedBody
         content.subtitle = paneSubtitle(for: originSurfaceID)
         content.sound = .default
         if let originSurfaceID {
