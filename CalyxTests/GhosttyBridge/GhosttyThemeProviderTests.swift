@@ -1,47 +1,56 @@
-// GhosttyThemeProviderTests.swift
-// CalyxTests
-//
-// Tests for GhosttyThemeProvider.ghosttyForeground property.
-//
-// GhosttyThemeProvider currently exposes only `ghosttyBackground`.
-// These tests verify the existence and behavior of a new
-// `ghosttyForeground` property (NSColor, default .white).
-// All tests will FAIL until the implementation adds this property.
-
 import AppKit
 import Testing
+import GhosttyKit
 @testable import Calyx
 
-@MainActor
-@Suite("GhosttyThemeProvider foreground color Tests")
-struct GhosttyThemeProviderTests {
+extension GhosttySharedAppConfigTests {
+    @MainActor
+    @Suite("GhosttyThemeProvider foreground color Tests")
+    struct GhosttyThemeProviderTests {
 
-    // ==================== Property Existence ====================
+        private func expectForegroundIsA0B0C0() throws {
+            let actual = try #require(GhosttyThemeProvider.shared.ghosttyForeground.usingColorSpace(.sRGB))
+            #expect(abs(actual.redComponent - 0xa0 / 255.0) < 0.01)
+            #expect(abs(actual.greenComponent - 0xb0 / 255.0) < 0.01)
+            #expect(abs(actual.blueComponent - 0xc0 / 255.0) < 0.01)
+        }
 
-    @Test("ghosttyForeground property exists and returns an NSColor")
-    func ghosttyForegroundPropertyExistsAndReturnsNSColor() {
-        let provider = GhosttyThemeProvider.shared
-        let foreground: NSColor = provider.ghosttyForeground
-        #expect(foreground is NSColor,
-                "ghosttyForeground must be an NSColor instance")
-    }
+        @Test("ghosttyForeground property exists and returns an NSColor")
+        func ghosttyForegroundPropertyExistsAndReturnsNSColor() {
+            let provider = GhosttyThemeProvider.shared
+            let foreground: NSColor = provider.ghosttyForeground
+            #expect(foreground is NSColor,
+                    "ghosttyForeground must be an NSColor instance")
+        }
 
-    // ==================== Default Value ====================
+        @Test func foregroundFollowsConfigWithExplicitBackgroundAndForeground() throws {
+            let original = try #require(GhosttyAppController.shared.configManager.cloneConfig())
+            defer { GhosttyAppConfigFixture.restore(original) }
+            _ = GhosttyThemeProvider.shared
+            let passed = try GhosttyAppConfigFixture.makeConfig(contents: "background = #102030\nforeground = #a0b0c0\n")
+            defer { GhosttyFFI.configFree(passed) }
 
-    @Test("ghosttyForeground defaults to white")
-    func ghosttyForegroundDefaultsToWhite() {
-        let provider = GhosttyThemeProvider.shared
-        let foreground = provider.ghosttyForeground
+            GhosttyAppConfigFixture.routeConfigChange(passed)
+            GhosttyAppConfigFixture.settleMainRunLoop()
 
-        // Compare RGBA components to avoid colorspace mismatch issues
-        let expected = NSColor.white.usingColorSpace(.sRGB)!
-        let actual = foreground.usingColorSpace(.sRGB)!
+            try expectForegroundIsA0B0C0()
+        }
 
-        #expect(
-            abs(actual.redComponent - expected.redComponent) < 0.01 &&
-            abs(actual.greenComponent - expected.greenComponent) < 0.01 &&
-            abs(actual.blueComponent - expected.blueComponent) < 0.01,
-            "ghosttyForeground should default to white (1.0, 1.0, 1.0) but got (\(actual.redComponent), \(actual.greenComponent), \(actual.blueComponent))"
-        )
+        @Test func foregroundFollowsConfigWhenBackgroundIsLibghosttyDefault() throws {
+            let original = try #require(GhosttyAppController.shared.configManager.cloneConfig())
+            defer { GhosttyAppConfigFixture.restore(original) }
+            _ = GhosttyThemeProvider.shared
+            let passed = try GhosttyAppConfigFixture.makeConfig(contents: "foreground = #a0b0c0\n")
+            defer { GhosttyFFI.configFree(passed) }
+
+            GhosttyAppConfigFixture.routeConfigChange(passed)
+            GhosttyAppConfigFixture.settleMainRunLoop()
+
+            let background = try #require(GhosttyAppController.shared.configManager.getColor("background"))
+            #expect(background.r == 0x28)
+            #expect(background.g == 0x2c)
+            #expect(background.b == 0x34)
+            try expectForegroundIsA0B0C0()
+        }
     }
 }

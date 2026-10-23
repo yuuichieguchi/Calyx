@@ -73,7 +73,9 @@ targets:
           - "**/*.entitlements"
     postBuildScripts:
       - script: |
+          rm -rf "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/ghostty"
           cp -R "${PROJECT_DIR}/Resources/ghostty" "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/ghostty"
+          rm -rf "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/terminfo"
           cp -R "${PROJECT_DIR}/Resources/terminfo" "${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/Resources/terminfo"
         name: Copy Ghostty Resources
       - script: |
