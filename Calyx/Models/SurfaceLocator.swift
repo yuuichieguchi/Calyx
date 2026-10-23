@@ -74,6 +74,11 @@ final class WeakValueRegistry<Key: Hashable, Value: AnyObject> {
         return boxes.first(where: { $0.value.value === value })?.key
     }
 
+    func allValues() -> [Value] {
+        pruneStaleBoxes()
+        return boxes.values.compactMap(\.value)
+    }
+
     /// Drops every entry whose weak `value` has already been released
     /// (its object deallocated without an explicit `unregister`), so a
     /// caller that forgets to unregister doesn't grow this dictionary
@@ -122,6 +127,10 @@ final class SurfaceLocator {
 
     func controller(for id: UUID) -> GhosttySurfaceController? {
         registry.value(for: id)
+    }
+
+    func allControllers() -> [GhosttySurfaceController] {
+        registry.allValues()
     }
 
     func registerView(id: UUID, view: SurfaceView) {

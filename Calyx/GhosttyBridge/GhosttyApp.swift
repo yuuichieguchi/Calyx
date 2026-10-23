@@ -42,6 +42,8 @@ final class GhosttyAppController {
     /// File watcher for ghostty config file.
     private var configFileWatcher: ConfigFileWatcher?
 
+    private var systemAppearanceObservation: NSKeyValueObservation?
+
     /// True if the app needs confirmation before quitting.
     var needsConfirmQuit: Bool {
         guard let app else { return false }
@@ -55,7 +57,6 @@ final class GhosttyAppController {
     // MARK: - Initialization
 
     private init() {
-        // Initialize the ghostty library.
         guard GhosttyFFI.initialize() else {
             logger.critical("ghostty_init failed")
             self.configManager = GhosttyConfigManager()
@@ -63,7 +64,6 @@ final class GhosttyAppController {
             return
         }
 
-        // Load configuration.
         self.configManager = GhosttyConfigManager()
         guard configManager.isLoaded, let config = configManager.config else {
             logger.critical("Failed to load configuration")
@@ -71,8 +71,6 @@ final class GhosttyAppController {
             return
         }
 
-        // Create the runtime config with our callbacks.
-        // We pass `self` as userdata via Unmanaged so C callbacks can recover it.
         var runtimeConfig: ghostty_runtime_config_s = ghostty_runtime_config_s(
             userdata: Unmanaged.passUnretained(self).toOpaque(),
             supports_selection_clipboard: false,
@@ -84,7 +82,6 @@ final class GhosttyAppController {
             close_surface_cb: ghosttyCloseSurfaceCallback
         )
 
-        // Create the ghostty app.
         guard let newApp = GhosttyFFI.appNew(&runtimeConfig, config: config) else {
             logger.critical("ghostty_app_new failed")
             handleAppCreationFailure(config: config)
@@ -94,19 +91,15 @@ final class GhosttyAppController {
         self.app = newApp
         self.readiness = .ready
 
-        // Set initial focus state.
         GhosttyFFI.appSetFocus(newApp, focused: NSApp.isActive)
 
-        // Register for system notifications.
         registerNotifications()
 
-        // Initialize the config reload coordinator.
         let adapter = ReloadDepsAdapter(controller: self)
         self.reloadCoordinator = ConfigReloadCoordinator(deps: adapter)
 
-        // Start watching ghostty config file for changes.
         self.configFileWatcher = ConfigFileWatcher { [weak self] in
-            self?.reloadConfig(soft: false)
+            self?.reloadConfig()
         }
 
         logger.info("GhosttyAppController initialized successfully")
@@ -133,10 +126,21 @@ final class GhosttyAppController {
         GhosttyFFI.appSetFocus(app, focused: focused)
     }
 
-    /// Set the color scheme for the entire app.
-    func setColorScheme(_ scheme: ghostty_color_scheme_e) {
+    func startFollowingSystemAppearance() {
+        systemAppearanceObservation = NSApp.observe(\.effectiveAppearance, options: [.initial, .new]) { [weak self] application, _ in
+            MainActor.assumeIsolated {
+                self?.applyColorScheme(GhosttyColorScheme.scheme(for: application.effectiveAppearance))
+            }
+        }
+    }
+
+    private func applyColorScheme(_ scheme: ghostty_color_scheme_e) {
         guard let app else { return }
-        GhosttyFFI.appSetColorScheme(app, scheme: scheme)
+        GhosttyColorSchemeBroadcaster.broadcast(
+            scheme,
+            setAppScheme: { GhosttyFFI.appSetColorScheme(app, scheme: $0) },
+            receivers: SurfaceLocator.shared.allControllers()
+        )
     }
 
     /// Notify ghostty that the keyboard layout has changed.
@@ -145,51 +149,56 @@ final class GhosttyAppController {
         GhosttyFFI.appKeyboardChanged(app)
     }
 
-    /// Reload configuration from disk.
-    func reloadConfig(soft: Bool = false) {
+    func reloadConfig() {
         guard let app else { return }
 
-        // Read fresh config from disk.
         let newConfigManager = GhosttyConfigManager()
         guard newConfigManager.isLoaded, let newConfig = newConfigManager.config else {
             logger.warning("Config reload failed — keeping previous config")
             return
         }
 
-        // Update ghostty's app-level config. The swap to `newConfigManager`
-        // happens BEFORE this call, not after (the original order):
-        // `ghostty_app_update_config` synchronously triggers
-        // GHOSTTY_ACTION_CONFIG_CHANGE (App.zig's `updateConfig` ->
-        // apprt.performAction -> ghosttyActionCallback, no queue, no async
-        // dispatch), which `NotificationCenter.default.post` then delivers
-        // to every `.ghosttyConfigChange` observer (`GhosttyThemeProvider`,
-        // `SurfaceScrollView`, `AppDelegate.refreshBellFeaturesCache`, ...)
-        // SYNCHRONOUSLY, still inside this call. If the swap ran after (as
-        // it used to), every one of those observers would read `self
-        // .configManager` while it was still the STALE, pre-reload
-        // instance, for the entire reload that was supposed to deliver the
-        // new value — a full generation behind, only picked up by
-        // whichever reload happens to occur next. `withExtendedLifetime`
-        // keeps the OLD `GhosttyConfigManager` (and the `ghostty_config_t`
-        // it owns — freed from `GhosttyConfigManager.deinit`) alive for the
-        // duration of this call despite `self.configManager` no longer
-        // referencing it, preserving the ORIGINAL intent behind "update
-        // config manager after updating so old config memory stays valid
-        // during update" without needing the assignment to stay literally
-        // last. Do not "simplify" this back to assign-then-call: that
-        // reintroduces the stale-read window this fix closes.
         let previousConfigManager = self.configManager
         self.configManager = newConfigManager
-        withExtendedLifetime(previousConfigManager) {
+        withExtendedLifetime((previousConfigManager, newConfigManager)) {
             GhosttyFFI.appUpdateConfig(app, config: newConfig)
         }
 
-        // Propagate to all surfaces.
-        if !soft {
-            if let appDelegate = NSApp.delegate as? AppDelegate {
-                appDelegate.applyCurrentGhosttyConfigToAllWindows()
-            }
+        if let appDelegate = NSApp.delegate as? AppDelegate {
+            appDelegate.applyCurrentGhosttyConfigToAllWindows()
         }
+    }
+
+    func reapplyCurrentConfig() {
+        guard let app else { return }
+        let currentConfigManager = configManager
+        guard let config = currentConfigManager.config else { return }
+        withExtendedLifetime(currentConfigManager) {
+            GhosttyFFI.appUpdateConfig(app, config: config)
+        }
+    }
+
+    func reapplyCurrentConfig(to surfaceController: GhosttySurfaceController) {
+        let currentConfigManager = configManager
+        guard let config = currentConfigManager.config else { return }
+        withExtendedLifetime(currentConfigManager) {
+            surfaceController.updateConfig(config)
+        }
+    }
+
+    func reloadConfigFromDisk(for surfaceController: GhosttySurfaceController) {
+        let freshConfigManager = GhosttyConfigManager()
+        guard freshConfigManager.isLoaded, let config = freshConfigManager.config else {
+            logger.warning("Surface config reload failed — keeping previous config")
+            return
+        }
+        withExtendedLifetime(freshConfigManager) {
+            surfaceController.updateConfig(config)
+        }
+    }
+
+    func adoptAppliedConfig(_ config: ghostty_config_t) {
+        configManager = GhosttyConfigManager(clone: config)
     }
 
     /// Request the surface to close.
@@ -219,17 +228,9 @@ final class GhosttyAppController {
                 return nil
             }
 
-            // Swap BEFORE calling appUpdateConfig, then keep the old
-            // manager alive across that call via withExtendedLifetime --
-            // mirrors `reloadConfig(soft:)` above; see that call site's
-            // own comment for the full "why" (appUpdateConfig delivers
-            // GHOSTTY_ACTION_CONFIG_CHANGE synchronously, so every
-            // `.ghosttyConfigChange` observer must already see the fresh
-            // `configManager`, not a stale one, by the time this call
-            // returns). Do not reorder this back to assign-after.
             let previousConfigManager = controller.configManager
             controller.configManager = newConfigManager
-            withExtendedLifetime(previousConfigManager) {
+            withExtendedLifetime((previousConfigManager, newConfigManager)) {
                 GhosttyFFI.appUpdateConfig(app, config: newConfig)
             }
             controller.reloadGeneration += 1
@@ -246,7 +247,6 @@ final class GhosttyAppController {
 
     // MARK: - Private
 
-    /// Handle failure of ghostty_app_new by showing an alert and retrying with default config.
     private func handleAppCreationFailure(config: ghostty_config_t) {
         let alert = NSAlert()
         alert.messageText = "Terminal Initialization Failed"
@@ -257,7 +257,6 @@ final class GhosttyAppController {
 
         let response = alert.runModal()
         if response == .alertFirstButtonReturn {
-            // Retry with a fresh default config.
             let freshConfig = GhosttyConfigManager()
             guard freshConfig.isLoaded, let cfg = freshConfig.config else {
                 self.readiness = .error
@@ -285,7 +284,7 @@ final class GhosttyAppController {
                 let adapter = ReloadDepsAdapter(controller: self)
                 self.reloadCoordinator = ConfigReloadCoordinator(deps: adapter)
                 self.configFileWatcher = ConfigFileWatcher { [weak self] in
-                    self?.reloadConfig(soft: false)
+                    self?.reloadConfig()
                 }
             } else {
                 self.readiness = .error

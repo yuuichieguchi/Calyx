@@ -625,7 +625,9 @@ enum GhosttyActionRouter {
         value: ghostty_action_config_change_s
     ) -> Bool {
         guard let surfaceView = surfaceView(from: target) else {
-            // App-level config change.
+            if target.tag == GHOSTTY_TARGET_APP, let config = value.config {
+                GhosttyAppController.shared.adoptAppliedConfig(config)
+            }
             NotificationCenter.default.post(
                 name: .ghosttyConfigChange,
                 object: nil,
@@ -647,7 +649,19 @@ enum GhosttyActionRouter {
         target: ghostty_target_s,
         value: ghostty_action_reload_config_s
     ) -> Bool {
-        GhosttyAppController.shared.reloadConfig(soft: value.soft)
+        let appController = GhosttyAppController.shared
+        switch GhosttyReloadConfigRoute.route(targetTag: target.tag, soft: value.soft) {
+        case .reapplyApp:
+            appController.reapplyCurrentConfig()
+        case .reloadAppFromDisk:
+            appController.reloadConfig()
+        case .reapplySurface:
+            guard let surfaceController = surfaceView(from: target)?.surfaceController else { return true }
+            appController.reapplyCurrentConfig(to: surfaceController)
+        case .reloadSurfaceFromDisk:
+            guard let surfaceController = surfaceView(from: target)?.surfaceController else { return true }
+            appController.reloadConfigFromDisk(for: surfaceController)
+        }
         return true
     }
 
