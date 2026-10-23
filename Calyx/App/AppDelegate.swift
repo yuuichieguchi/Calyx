@@ -1080,11 +1080,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
             return
         }
 
-        if let app = controller.app {
-            let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            let scheme: ghostty_color_scheme_e = isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT
-            ghostty_app_set_color_scheme(app, scheme)
-        }
+        controller.startFollowingSystemAppearance()
 
         setupMainMenu()
         registerNotificationObservers()
@@ -1222,14 +1218,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, HerdrSessionPresenceObserver
 
         saveForTermination()
         windowControllers.removeAll()
-    }
-
-    func applicationDidChangeOcclusionState(_ notification: Notification) {
-        if let app = GhosttyAppController.shared.app {
-            let isDark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-            let scheme: ghostty_color_scheme_e = isDark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT
-            ghostty_app_set_color_scheme(app, scheme)
-        }
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {

@@ -20,7 +20,7 @@ protocol SearchQuerySender: AnyObject {
 // MARK: - GhosttySurfaceController
 
 @MainActor
-final class GhosttySurfaceController: Identifiable {
+final class GhosttySurfaceController: Identifiable, GhosttyColorSchemeReceiving {
 
     /// Scrollbar state sent from ghostty core.
     struct ScrollbarState {
@@ -223,7 +223,6 @@ final class GhosttySurfaceController: Identifiable {
         GhosttyFFI.surfaceSetDisplayID(surface, displayID: displayID)
     }
 
-    /// Set the color scheme for this surface.
     func setColorScheme(_ scheme: ghostty_color_scheme_e) {
         guard let surface else { return }
         GhosttyFFI.surfaceSetColorScheme(surface, scheme: scheme)
